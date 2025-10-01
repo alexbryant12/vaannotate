@@ -7,4 +7,7 @@ __all__ = [
     "metrics",
     "annotator_cli",
     "admin_cli",
+    "AdminApp",
+    "ClientApp",
+    "shared",
 ]
