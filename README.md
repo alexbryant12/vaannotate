@@ -1,6 +1,6 @@
 # VAAnnotate
 
-VAAnnotate is a file-based toolkit for managing multi-annotator NLP phenotyping projects in fully disconnected environments. The project provides a command-line admin workflow and a lightweight console annotator client that store all state inside a single project folder, mirroring the architecture described in the specification.
+VAAnnotate is a file-based toolkit for managing multi-annotator NLP phenotyping projects in fully disconnected environments. The project now ships with a PySide6 administrative console and an annotator client that mirror the architecture described in the specification while keeping all state inside a single project folder.
 
 ## Features
 
@@ -8,8 +8,8 @@ VAAnnotate is a file-based toolkit for managing multi-annotator NLP phenotyping 
 * Corpus ingestion utilities that canonicalize clinical text and capture content hashes for immutability checks.
 * Round generation that applies deterministic filtering, stratification, overlap, and reviewer assignment logic while writing manifests and reviewer-specific SQLite bundles.
 * Import and aggregation helpers for combining reviewer submissions into round-level databases and exports.
-* Agreement metrics including percent agreement, Cohen's κ (two reviewers), and Fleiss' κ (three or more reviewers) surfaced through the admin CLI.
-* Console-based annotator client that updates assignment databases, records completion timestamps, and writes audit events.
+* Agreement metrics including percent agreement, Cohen's κ (two reviewers), and Fleiss' κ (three or more reviewers) surfaced through the Admin GUI.
+* PySide6-based annotator client that provides tri-pane navigation, autosave, rationale capture, and completion tracking.
 
 ## Installation
 
@@ -23,49 +23,31 @@ pip install -e .
 
 ## Admin workflow
 
-1. **Initialize a project**
+1. **Launch the Admin application**
    ```bash
-   python -m vaannotate.admin_cli init ./demo_project --project-id demo --name "Demo Project"
+   python -m vaannotate.AdminApp.main
    ```
+   Choose or create a project directory. The Admin dashboard exposes project management, phenotype creation, round generation, and agreement metric dashboards.
 
-2. **Import a staged corpus** (expects CSV files with the schema documented in the specification):
-   ```bash
-   python -m vaannotate.admin_cli import-corpus ./demo_project --patients-csv patients.csv --documents-csv documents.csv
-   ```
+2. **Stage a corpus** by placing a `corpus.db` file in the project's `/corpus` folder or by using future ingestion tooling. The Admin UI automatically creates the SQLite schema on first open.
 
-3. **Register reviewers and create phenotypes/label sets** using JSON descriptors:
-   ```bash
-   python -m vaannotate.admin_cli addreviewer ./demo_project --reviewer-id r1 --name "Reviewer 1"
-   python -m vaannotate.admin_cli addphenotype ./demo_project --pheno-id ph1 --project-id demo --name "Phenotype" --level single_doc
-   python -m vaannotate.admin_cli createlabelset ./demo_project --config-json labelset.json
-   ```
+3. **Create phenotypes and label sets** from the Phenotypes tab. Label sets are versioned; newly generated rounds can auto-provision a starter boolean label if a label set is absent.
 
-4. **Generate a round** from a frozen configuration JSON:
-   ```bash
-   python -m vaannotate.admin_cli generateround ./demo_project --pheno-id ph1 --config-json round_config.json
-   ```
+4. **Generate rounds** from the Rounds tab. Configure reviewers, seeds, overlap, and sample size, then generate manifests and reviewer assignments. The Admin app writes `manifest.csv`, reviewer folders with `assignment.db`, and accompanying `label_schema.json` descriptors.
 
-5. **Import assignment submissions and build aggregates** once annotators return their SQLite files:
-   ```bash
-   python -m vaannotate.admin_cli importassignment ./demo_project --pheno-id ph1 --round-number 1 --reviewer-id r1
-   python -m vaannotate.admin_cli aggregate ./demo_project --pheno-id ph1 --round-number 1
-   ```
+5. **Review agreement metrics** in the IAA tab. The dashboard computes percent agreement, Cohen's κ, and Fleiss' κ using embedded deterministic formulas and prepares the reports directory.
 
-6. **Compute inter-annotator agreement** and export merged annotations:
-   ```bash
-   python -m vaannotate.admin_cli iaa ./demo_project --pheno-id ph1 --round-number 1 --label-id has_phenotype
-   python -m vaannotate.admin_cli export-annotations ./demo_project --pheno-id ph1 --round-number 1
-   ```
+The Admin app can be packaged with PyInstaller for disconnected VA workstations; all state lives inside the selected project directory.
 
 ## Annotator workflow
 
-Annotators open the console client inside their assignment directory:
+Annotators open the client inside their assignment directory or pass the path on the command line:
 
 ```bash
-python -m vaannotate.annotator_cli open-assignment ./demo_project/phenotypes/ph1/rounds/round_1/assignments/r1
+python -m vaannotate.ClientApp.main ./project_root/phenotypes/<pheno_id>/rounds/<round_n>/assignments/<reviewer_id>
 ```
 
-The client walks through each unit in randomized order, prompting for label values, marking completion timestamps, and writing event logs for auditing. Submissions are ready once all units are complete.
+The client loads the assignment SQLite bundle locally, presents unit navigation, renders note text, and displays the label form. Changes are autosaved with audit log events, highlights can be captured directly from the note viewer, and completion is tracked per unit. Submitting creates a `submitted.json` receipt file that the Admin app imports.
 
 ## Project layout
 
