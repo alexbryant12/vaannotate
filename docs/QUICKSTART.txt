@@ -1,0 +1,17 @@
+WORKED TOY EXAMPLE QUICKSTART
+=============================
+
+1. Download or copy this folder to a shared network location accessible to reviewers.
+   *Example: \\server\share\Project_Toy\*
+2. Unzip the archive if needed.
+3. Hydrate the toy workspace (binaries are not stored in Git):
+   - Double-click `scripts\new_toy_project.ps1`, **or**
+   - Run `python tools\seed_toy_project.py` from a terminal.
+   The script recreates `demo\Project_Toy\`, the reviewer assignments, and placeholder clients.
+4. In the Admin window (opens automatically from the PowerShell script), browse the project to review the seeded round.
+5. For annotation, have each reviewer open their assignment folder under
+   `phenotypes\ph_diabetes\rounds\round_1\assignments\<reviewer_id>\`.
+6. Inside that folder, double-click `scripts\run_client.ps1` (or `client.exe` directly).
+   - The annotator client launches and loads the assignment database.
+7. Annotate all units. The **Next** button remains disabled until every required label is set (or N/A when allowed).
+8. When 100% complete, click **Submit** in the client and close the application.

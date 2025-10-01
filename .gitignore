@@ -1,0 +1,6 @@
+# Generated demo workspace and binaries
+/demo/Project_Toy/
+/dist/AdminApp.exe
+/dist/ClientApp.exe
+**/assignment.db
+**/client.exe
