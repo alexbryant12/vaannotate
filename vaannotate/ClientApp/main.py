@@ -11,8 +11,8 @@ from typing import Callable, Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..shared import models
-from ..shared.database import Database, ensure_schema
+from vaannotate.shared import models
+from vaannotate.shared.database import Database, ensure_schema
 
 
 @dataclass

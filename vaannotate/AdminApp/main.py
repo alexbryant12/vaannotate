@@ -13,10 +13,10 @@ from typing import Dict, Iterable, List, Optional, Set
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..schema import initialize_round_aggregate_db
-from ..shared import models
-from ..shared.database import Database, ensure_schema
-from ..shared.sampling import (
+from vaannotate.schema import initialize_round_aggregate_db
+from vaannotate.shared import models
+from vaannotate.shared.database import Database, ensure_schema
+from vaannotate.shared.sampling import (
     SamplingFilters,
     allocate_units,
     candidate_documents,
@@ -24,8 +24,8 @@ from ..shared.sampling import (
     populate_assignment_db,
     write_manifest,
 )
-from ..shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
-from ..utils import copy_sqlite_database, ensure_dir
+from vaannotate.shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
+from vaannotate.utils import copy_sqlite_database, ensure_dir
 
 PROJECT_MODELS = [
     models.Project,
