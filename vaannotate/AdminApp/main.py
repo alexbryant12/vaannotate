@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -750,6 +750,9 @@ class IaaPage(QtWidgets.QWidget):
         self.assignment_paths: Dict[str, Path] = {}
         self.unit_rows: List[Dict[str, object]] = []
         self.round_manifest: Dict[str, Dict[str, bool]] = {}
+        self.label_lookup: Dict[str, str] = {}
+        self.label_order: List[str] = []
+        self.reviewer_column_order: List[str] = []
         self._setup_ui()
         self.ctx.project_changed.connect(self.refresh)
 
@@ -823,10 +826,7 @@ class IaaPage(QtWidgets.QWidget):
         right_layout.addWidget(units_label)
 
         self.unit_table = QtWidgets.QTableWidget()
-        self.unit_table.setColumnCount(6)
-        self.unit_table.setHorizontalHeaderLabels(
-            ["Reviewer", "Unit", "Patient", "Document", "Overlap", "Status"]
-        )
+        self._update_unit_table_headers()
         self.unit_table.verticalHeader().setVisible(False)
         self.unit_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.unit_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -906,6 +906,9 @@ class IaaPage(QtWidgets.QWidget):
         self.assignment_paths = {}
         self.unit_rows = []
         self.round_manifest = {}
+        self.label_lookup = {}
+        self.label_order = []
+        self.reviewer_column_order = []
         if not items:
             return
         pheno = items[0].data(QtCore.Qt.ItemDataRole.UserRole) or {}
@@ -962,6 +965,8 @@ class IaaPage(QtWidgets.QWidget):
         self.assignment_paths = {}
         self.unit_rows = []
         self.round_manifest = {}
+        self.label_lookup = {}
+        self.label_order = []
         if not items:
             self.current_round = None
             self.round_summary.setText("Select a round to review agreement metrics")
@@ -974,6 +979,9 @@ class IaaPage(QtWidgets.QWidget):
         self.current_round = round_data
         reviewers = round_data.get("reviewers", [])
         self.current_reviewer_names = {rev["reviewer_id"]: rev["name"] for rev in reviewers if "reviewer_id" in rev}
+        self.reviewer_column_order = sorted(
+            self.current_reviewer_names.keys(), key=lambda rid: self.current_reviewer_names[rid].lower()
+        )
         self.manual_reviewer_combo.clear()
         for reviewer in reviewers:
             reviewer_id = reviewer.get("reviewer_id")
@@ -999,6 +1007,8 @@ class IaaPage(QtWidgets.QWidget):
         for label in labels:
             display = label["name"]
             self.label_selector.addItem(display, label["label_id"])
+        self.label_lookup = {label["label_id"]: label["name"] for label in labels}
+        self.label_order = [label["label_id"] for label in labels]
         if self.label_selector.count():
             self.label_selector.setCurrentIndex(0)
         round_dir = self._resolve_round_dir()
@@ -1186,6 +1196,35 @@ class IaaPage(QtWidgets.QWidget):
             if candidate.exists():
                 self.assignment_paths[reviewer_id] = candidate
 
+    def _update_unit_table_headers(self, reviewer_ids: Optional[List[str]] = None) -> None:
+        if reviewer_ids is None:
+            reviewer_ids = self.reviewer_column_order
+        headers = ["Unit", "Patient", "Document", "Overlap", "Status"]
+        for reviewer_id in reviewer_ids:
+            headers.append(self.current_reviewer_names.get(reviewer_id, reviewer_id))
+        self.unit_table.setColumnCount(len(headers))
+        self.unit_table.setHorizontalHeaderLabels(headers)
+
+    def _format_annotation_summary(self, annotations: Dict[str, str]) -> str:
+        if not annotations:
+            return ""
+        lines: List[str] = []
+        seen: Set[str] = set()
+        for label_id in self.label_order:
+            if label_id not in annotations:
+                continue
+            seen.add(label_id)
+            value = annotations[label_id]
+            label_name = self.label_lookup.get(label_id, label_id)
+            display_value = value if value else "—"
+            lines.append(f"{label_name}: {display_value}")
+        for label_id in sorted(annotations.keys() - seen):
+            value = annotations[label_id]
+            label_name = self.label_lookup.get(label_id, label_id)
+            display_value = value if value else "—"
+            lines.append(f"{label_name}: {display_value}")
+        return "\n".join(lines)
+
     def _selected_unit_index(self) -> Optional[int]:
         current_row = self.unit_table.currentRow()
         if current_row < 0:
@@ -1201,12 +1240,12 @@ class IaaPage(QtWidgets.QWidget):
         except (TypeError, ValueError):
             return None
 
-    def _selected_unit_key(self) -> Optional[Tuple[str, str]]:
+    def _selected_unit_id(self) -> Optional[str]:
         index = self._selected_unit_index()
         if index is None or index >= len(self.unit_rows):
             return None
         row = self.unit_rows[index]
-        return (row["reviewer_id"], row["unit_id"])
+        return row.get("unit_id")
 
     def _clear_document_panel(self) -> None:
         self.document_table.clearContents()
@@ -1214,55 +1253,84 @@ class IaaPage(QtWidgets.QWidget):
         self.document_preview.clear()
 
     def _refresh_units_table(self) -> None:
-        selected_key = self._selected_unit_key()
+        selected_unit = self._selected_unit_id()
         existing_discord = {row["unit_id"] for row in self.unit_rows if row.get("discord")}
         self.unit_rows = []
         self.unit_table.clearContents()
         self.unit_table.setRowCount(0)
         self._clear_document_panel()
         if not self.assignment_paths:
+            self._update_unit_table_headers()
             return
-        for reviewer_id, path in sorted(self.assignment_paths.items()):
-            if not path.exists():
+        for reviewer_id in sorted(self.assignment_paths.keys()):
+            if reviewer_id not in self.reviewer_column_order:
+                self.reviewer_column_order.append(reviewer_id)
+        self.reviewer_column_order.sort(key=lambda rid: self.current_reviewer_names.get(rid, rid).lower())
+        unit_map: Dict[str, Dict[str, object]] = {}
+        for reviewer_id in self.reviewer_column_order:
+            path = self.assignment_paths.get(reviewer_id)
+            if not path or not path.exists():
                 continue
             with sqlite3.connect(path) as conn:
                 conn.row_factory = sqlite3.Row
                 units = conn.execute(
                     "SELECT unit_id, patient_icn, doc_id FROM units ORDER BY display_rank"
                 ).fetchall()
+                annotations = conn.execute(
+                    "SELECT unit_id, label_id, value, value_num, value_date, na FROM annotations"
+                ).fetchall()
+            ann_map: Dict[str, Dict[str, str]] = {}
+            for ann_row in annotations:
+                unit_id = ann_row["unit_id"]
+                formatted = self._format_value(ann_row)
+                ann_map.setdefault(unit_id, {})[ann_row["label_id"]] = formatted
             for unit_row in units:
                 unit_id = unit_row["unit_id"]
-                record = {
-                    "unit_id": unit_id,
-                    "patient_icn": unit_row["patient_icn"],
-                    "doc_id": unit_row["doc_id"],
-                    "reviewer_id": reviewer_id,
-                    "reviewer_name": self.current_reviewer_names.get(reviewer_id, reviewer_id),
-                    "is_overlap": bool(self.round_manifest.get(unit_id, {}).get(reviewer_id)),
-                    "discord": unit_id in existing_discord,
-                }
-                self.unit_rows.append(record)
+                entry = unit_map.setdefault(
+                    unit_id,
+                    {
+                        "unit_id": unit_id,
+                        "patient_icn": unit_row["patient_icn"],
+                        "doc_id": unit_row["doc_id"],
+                        "reviewer_annotations": {},
+                        "reviewer_ids": set(),
+                    },
+                )
+                entry["patient_icn"] = entry.get("patient_icn") or unit_row["patient_icn"]
+                entry["doc_id"] = entry.get("doc_id") or unit_row["doc_id"]
+                entry["reviewer_ids"].add(reviewer_id)
+                entry["reviewer_annotations"][reviewer_id] = ann_map.get(unit_id, {})
+        for unit_id, entry in unit_map.items():
+            reviewer_ids = sorted(entry["reviewer_ids"], key=lambda rid: self.current_reviewer_names.get(rid, rid))
+            entry["reviewer_ids"] = reviewer_ids
+            entry["is_overlap"] = self._is_overlap_unit(unit_id, reviewer_ids)
+            entry["discord"] = unit_id in existing_discord
+            summaries: Dict[str, str] = {}
+            for reviewer_id in self.reviewer_column_order:
+                annotations = entry["reviewer_annotations"].get(reviewer_id, {})
+                summaries[reviewer_id] = self._format_annotation_summary(annotations)
+            entry["reviewer_summaries"] = summaries
+            self.unit_rows.append(entry)
         for index, row in enumerate(self.unit_rows):
             row["index"] = index
-        self._display_unit_rows(selected_key)
+        self._display_unit_rows(selected_unit)
 
-    def _display_unit_rows(self, selected_key: Optional[Tuple[str, str]] = None) -> None:
+    def _display_unit_rows(self, selected_unit: Optional[str] = None) -> None:
         self.unit_table.clearContents()
+        self._update_unit_table_headers()
         if not self.unit_rows:
             self.unit_table.setRowCount(0)
             return
         sorted_rows = sorted(
             self.unit_rows,
-            key=lambda row: (not row["is_overlap"], row["reviewer_name"], row["unit_id"]),
+            key=lambda row: (not row["is_overlap"], row["unit_id"]),
         )
         self.unit_table.setRowCount(len(sorted_rows))
         highlight = QtGui.QColor("#ffebee")
         for row_index, row in enumerate(sorted_rows):
             items: List[QtWidgets.QTableWidgetItem] = []
-            reviewer_item = QtWidgets.QTableWidgetItem(row["reviewer_name"])
-            reviewer_item.setData(QtCore.Qt.ItemDataRole.UserRole, row["index"])
-            items.append(reviewer_item)
             unit_item = QtWidgets.QTableWidgetItem(row["unit_id"])
+            unit_item.setData(QtCore.Qt.ItemDataRole.UserRole, row["index"])
             items.append(unit_item)
             patient_item = QtWidgets.QTableWidgetItem(row.get("patient_icn") or "")
             items.append(patient_item)
@@ -1272,6 +1340,9 @@ class IaaPage(QtWidgets.QWidget):
             items.append(overlap_item)
             status_item = QtWidgets.QTableWidgetItem("Discordant" if row.get("discord") else "")
             items.append(status_item)
+            for reviewer_id in self.reviewer_column_order:
+                summary = row["reviewer_summaries"].get(reviewer_id, "")
+                items.append(QtWidgets.QTableWidgetItem(summary))
             for column, item in enumerate(items):
                 self.unit_table.setItem(row_index, column, item)
             if row["is_overlap"]:
@@ -1282,7 +1353,7 @@ class IaaPage(QtWidgets.QWidget):
             if row.get("discord"):
                 for item in items:
                     item.setBackground(highlight)
-            if selected_key and (row["reviewer_id"], row["unit_id"]) == selected_key:
+            if selected_unit and row["unit_id"] == selected_unit:
                 self.unit_table.selectRow(row_index)
         self.unit_table.resizeColumnsToContents()
 
@@ -1298,12 +1369,17 @@ class IaaPage(QtWidgets.QWidget):
         self.document_table.clearContents()
         self.document_table.setRowCount(0)
         self.document_preview.clear()
-        reviewer_id = unit_row.get("reviewer_id")
         unit_id = unit_row.get("unit_id")
-        if not reviewer_id or not unit_id:
+        if not unit_id:
             return
-        assignment_path = self.assignment_paths.get(reviewer_id)
-        if not assignment_path or not assignment_path.exists():
+        reviewer_ids = unit_row.get("reviewer_ids") or []
+        assignment_path: Optional[Path] = None
+        for reviewer_id in reviewer_ids:
+            candidate = self.assignment_paths.get(reviewer_id)
+            if candidate and candidate.exists():
+                assignment_path = candidate
+                break
+        if not assignment_path:
             return
         with sqlite3.connect(assignment_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -1384,17 +1460,15 @@ class IaaPage(QtWidgets.QWidget):
         return all(manifest_entry.get(reviewer_id) for reviewer_id in reviewer_ids)
 
     def _apply_discord_flags(self, discordant_units: Set[str]) -> None:
-        selected_key = self._selected_unit_key()
+        selected_unit = self._selected_unit_id()
         updated = False
         for row in self.unit_rows:
             flag = row["unit_id"] in discordant_units
             if row.get("discord") != flag:
                 row["discord"] = flag
                 updated = True
-        if updated:
-            self._display_unit_rows(selected_key)
-        elif selected_key:
-            self._display_unit_rows(selected_key)
+        if updated or selected_unit:
+            self._display_unit_rows(selected_unit)
 
     def _compute_agreement(self) -> None:
         if not self.current_round:
