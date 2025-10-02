@@ -114,37 +114,112 @@ LABEL_RULES = {
         "Leave blank or mark N/A if not provided."
     ),
     "Notes": "Add any clarifying comments for adjudication or context.",
+    "HTN_Has_phenotype": (
+        "Mark Yes when hypertension or elevated blood pressure management is evident. "
+        "Choose No when hypertension is ruled out and Unknown when information is insufficient."
+    ),
+    "HTN_Controlled": (
+        "Select the best description of blood pressure control. Controlled = goals met; Uncontrolled = persistently high; Unknown = not documented."
+    ),
+    "HTN_Notes": "Optional comments specific to hypertension findings.",
 }
 
-ROUND_CONFIG = {
-    "pheno_id": "ph_diabetes",
-    "labelset_id": "ls_diabetes_v1",
-    "round_number": 1,
-    "round_id": "ph_diabetes_r1",
-    "created_by": "toy_seed",
-    "filters": {
-        "patient": {
-            "year_range": [2018, 2024],
-            "sta3n_in": ["506", "515"],
+ROUND_CONFIGS = [
+    {
+        "pheno_id": "ph_diabetes",
+        "labelset_id": "ls_diabetes_v1",
+        "round_number": 1,
+        "round_id": "ph_diabetes_r1",
+        "created_by": "toy_seed",
+        "filters": {
+            "patient": {
+                "year_range": [2018, 2024],
+                "sta3n_in": ["506", "515"],
+            },
+            "note": {
+                "notetype_in": ["PRIMARY CARE NOTE", "ENDOCRINOLOGY NOTE"],
+                "regex": r"(metformin|insulin|hba1c\\s*\\d+(\\.\\d+)?)",
+                "regex_flags": "i",
+            },
         },
-        "note": {
-            "notetype_in": ["PRIMARY CARE NOTE", "ENDOCRINOLOGY NOTE"],
-            "regex": r"(metformin|insulin|hba1c\\s*\\d+(\\.\\d+)?)",
-            "regex_flags": "i",
+        "stratification": {"keys": ["note_year"], "sample_per_stratum": 2},
+        "reviewers": [
+            {"id": "r_alex", "name": "Alex Reviewer"},
+            {"id": "r_blake", "name": "Blake Reviewer"},
+        ],
+        "overlap_n": 1,
+        "independent": True,
+        "rng_seed": 133742,
+    },
+    {
+        "pheno_id": "ph_diabetes",
+        "labelset_id": "ls_diabetes_v1",
+        "round_number": 2,
+        "round_id": "ph_diabetes_r2",
+        "created_by": "toy_seed",
+        "filters": {
+            "patient": {"sta3n_in": ["506", "515"]},
+            "note": {
+                "notetype_in": ["PHARMACY NOTE", "ENDOCRINOLOGY NOTE"],
+                "note_year": [2016, 2020],
+            },
         },
+        "stratification": {"keys": ["sta3n"], "sample_per_stratum": 3},
+        "reviewers": [
+            {"id": "r_alex", "name": "Alex Reviewer"},
+            {"id": "r_blake", "name": "Blake Reviewer"},
+        ],
+        "overlap_n": 1,
+        "independent": True,
+        "rng_seed": 133743,
     },
-    "stratification": {
-        "keys": ["note_year"],
-        "sample_per_stratum": 2,
+    {
+        "pheno_id": "ph_diabetes",
+        "labelset_id": "ls_diabetes_v1",
+        "round_number": 3,
+        "round_id": "ph_diabetes_r3",
+        "created_by": "toy_seed",
+        "filters": {
+            "patient": {
+                "year_range": [2015, 2022],
+            },
+            "note": {
+                "notetype_in": ["PRIMARY CARE NOTE", "TELEHEALTH NOTE"],
+            },
+        },
+        "stratification": {"keys": ["note_year", "sta3n"], "sample_per_stratum": 2},
+        "reviewers": [
+            {"id": "r_alex", "name": "Alex Reviewer"},
+            {"id": "r_blake", "name": "Blake Reviewer"},
+        ],
+        "overlap_n": 1,
+        "independent": True,
+        "rng_seed": 133744,
     },
-    "reviewers": [
-        {"id": "r_alex", "name": "Alex Reviewer"},
-        {"id": "r_blake", "name": "Blake Reviewer"},
-    ],
-    "overlap_n": 1,
-    "independent": True,
-    "rng_seed": 133742,
-}
+    {
+        "pheno_id": "ph_hypertension",
+        "labelset_id": "ls_htn_v1",
+        "round_number": 1,
+        "round_id": "ph_hypertension_r1",
+        "created_by": "toy_seed",
+        "filters": {
+            "patient": {"sta3n_in": ["506", "515"]},
+            "note": {
+                "notetype_in": ["PRIMARY CARE NOTE", "PHARMACY NOTE"],
+                "regex": r"blood pressure|bp\\s*:?\\s*\\d{2,3}/\\d{2,3}",
+                "regex_flags": "i",
+            },
+        },
+        "stratification": {"keys": ["note_year"], "sample_per_stratum": 3},
+        "reviewers": [
+            {"id": "r_alex", "name": "Alex Reviewer"},
+            {"id": "r_blake", "name": "Blake Reviewer"},
+        ],
+        "overlap_n": 1,
+        "independent": True,
+        "rng_seed": 133750,
+    },
+]
 
 
 def normalize_text(text: str) -> str:
@@ -254,6 +329,60 @@ def seed_metadata(project_db: Path) -> None:
                     "required": False,
                     "order_index": 3,
                     "rules": LABEL_RULES["Notes"],
+                    "na_allowed": False,
+                },
+            ],
+        )
+        add_phenotype(
+            conn,
+            pheno_id="ph_hypertension",
+            project_id="Project_Toy",
+            name="Hypertension Phenotyping",
+            level="single_doc",
+            description="Toy hypertension phenotype for demonstrations",
+        )
+        add_labelset(
+            conn,
+            labelset_id="ls_htn_v1",
+            pheno_id="ph_hypertension",
+            version=1,
+            created_by="toy_seed",
+            notes="Initial hypertension labelset for toy project",
+            labels=[
+                {
+                    "label_id": "HTN_Has_phenotype",
+                    "name": "Has hypertension",
+                    "type": "categorical_single",
+                    "required": True,
+                    "order_index": 0,
+                    "rules": LABEL_RULES["HTN_Has_phenotype"],
+                    "options": [
+                        {"value": "yes", "display": "Yes"},
+                        {"value": "no", "display": "No"},
+                        {"value": "unknown", "display": "Unknown"},
+                    ],
+                },
+                {
+                    "label_id": "HTN_Controlled",
+                    "name": "Blood pressure control",
+                    "type": "categorical_single",
+                    "required": False,
+                    "order_index": 1,
+                    "rules": LABEL_RULES["HTN_Controlled"],
+                    "gating_expr": "HTN_Has_phenotype == 'yes'",
+                    "options": [
+                        {"value": "controlled", "display": "Controlled"},
+                        {"value": "uncontrolled", "display": "Uncontrolled"},
+                        {"value": "unknown", "display": "Unknown"},
+                    ],
+                },
+                {
+                    "label_id": "HTN_Notes",
+                    "name": "Hypertension notes",
+                    "type": "text",
+                    "required": False,
+                    "order_index": 2,
+                    "rules": LABEL_RULES["HTN_Notes"],
                     "na_allowed": False,
                 },
             ],
@@ -385,6 +514,24 @@ def load_patient_docs(corpus_db: Path) -> Dict[str, List[sqlite3.Row]]:
     return mapping
 
 
+def find_overlap_unit(manifest_path: Path) -> str | None:
+    if not manifest_path.exists():
+        return None
+    with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            flag = row.get("is_overlap", "")
+            if str(flag) in {"1", "true", "True"}:
+                return row.get("unit_id")
+    return None
+
+
+def mark_round_final(project_db: Path, round_id: str) -> None:
+    with get_connection(project_db) as conn:
+        conn.execute("UPDATE rounds SET status='finalized' WHERE round_id=?", (round_id,))
+        conn.commit()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Seed the demo toy project")
     parser.add_argument("--project", default="demo/Project_Toy", help="Relative path to project root")
@@ -399,37 +546,34 @@ def main() -> None:
     seed_corpus(paths.corpus_db, NOTES)
     seed_metadata(paths.project_db)
 
-    pheno_dir = ensure_dir(project_root / "phenotypes" / ROUND_CONFIG["pheno_id"])
-    ensure_dir(pheno_dir / "rounds")
-
-    config_path = ensure_dir(project_root / "config" ) / "round_1_config.json"
-    config_path.write_text(canonical_json(ROUND_CONFIG), encoding="utf-8")
-
     builder = RoundBuilder(project_root)
-    builder.generate_round(ROUND_CONFIG["pheno_id"], config_path, created_by="toy_seed")
-
     patient_docs = load_patient_docs(paths.corpus_db)
-    round_dir = project_root / "phenotypes" / ROUND_CONFIG["pheno_id"] / "rounds" / "round_1"
-
-    overlap_unit_id = None
-    manifest_path = round_dir / "manifest.csv"
-    if manifest_path.exists():
-        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                if row.get("is_overlap") == "1":
-                    overlap_unit_id = row["unit_id"]
-                    break
-
-    for reviewer in ROUND_CONFIG["reviewers"]:
-        assign_dir = round_dir / "assignments" / reviewer["id"]
-        assignment_db = assign_dir / "assignment.db"
-        augment_assignment_db(assignment_db, patient_docs)
-        write_label_schema(paths.project_db, assign_dir, ROUND_CONFIG["labelset_id"])
-        copy_client_binary(repo_root, assign_dir)
-        copy_client_script(repo_root, assign_dir)
-        if overlap_unit_id:
-            seed_disagreement(assignment_db, overlap_unit_id, reviewer["id"])
+    config_dir = ensure_dir(project_root / "config")
+    for config in ROUND_CONFIGS:
+        pheno_dir = ensure_dir(project_root / "phenotypes" / config["pheno_id"])
+        ensure_dir(pheno_dir / "rounds")
+        config_path = config_dir / f"{config['round_id']}.json"
+        config_path.write_text(canonical_json(config), encoding="utf-8")
+        result = builder.generate_round(config["pheno_id"], config_path, created_by=config.get("created_by", "toy_seed"))
+        round_dir = Path(result["round_dir"])
+        overlap_unit_id = find_overlap_unit(round_dir / "manifest.csv")
+        for reviewer in config["reviewers"]:
+            assign_dir = round_dir / "assignments" / reviewer["id"]
+            assignment_db = assign_dir / "assignment.db"
+            augment_assignment_db(assignment_db, patient_docs)
+            write_label_schema(paths.project_db, assign_dir, config["labelset_id"])
+            copy_client_binary(repo_root, assign_dir)
+            copy_client_script(repo_root, assign_dir)
+            if (
+                overlap_unit_id
+                and config["pheno_id"] == "ph_diabetes"
+                and config["round_number"] == 1
+            ):
+                seed_disagreement(assignment_db, overlap_unit_id, reviewer["id"])
+        for reviewer in config["reviewers"]:
+            builder.import_assignment(config["pheno_id"], config["round_number"], reviewer["id"])
+        builder.build_round_aggregate(config["pheno_id"], config["round_number"])
+        mark_round_final(paths.project_db, config["round_id"])
 
     print(f"Seeded toy project at {project_root}")
 
