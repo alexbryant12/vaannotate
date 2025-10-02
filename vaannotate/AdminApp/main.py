@@ -1151,6 +1151,8 @@ class IaaWidget(QtWidgets.QWidget):
         self.import_status_label = QtWidgets.QLabel()
         self.import_status_label.setWordWrap(True)
         layout.addWidget(self.import_status_label)
+        self._import_summary: str = ""
+        self._waiting_summary: str = ""
 
         self.round_summary = QtWidgets.QLabel("Select a round to review agreement metrics")
         self.round_summary.setWordWrap(True)
@@ -1214,7 +1216,8 @@ class IaaWidget(QtWidgets.QWidget):
         self.manual_reviewer_combo.clear()
         self.manual_import_btn.setEnabled(False)
         self.auto_import_btn.setEnabled(False)
-        self.import_status_label.clear()
+        self._set_import_summary("")
+        self._set_waiting_summary("")
         self.round_summary.setText("Select a round to review agreement metrics")
 
     def set_phenotype(self, pheno: Optional[Dict[str, object]]) -> None:
@@ -1294,7 +1297,7 @@ class IaaWidget(QtWidgets.QWidget):
         for reviewer in reviewers:
             self.manual_reviewer_combo.addItem(reviewer["name"], reviewer["reviewer_id"])
         self.manual_import_btn.setEnabled(bool(reviewers))
-        self.auto_import_btn.setEnabled(True)
+        self.auto_import_btn.setEnabled(False)
         self.label_selector.clear()
         self.label_lookup = {row["label_id"]: row["name"] for row in labels}
         self.label_order = [row["label_id"] for row in labels]
@@ -1304,10 +1307,12 @@ class IaaWidget(QtWidgets.QWidget):
         self.unit_rows = []
         self.round_manifest = {}
         self.reviewer_column_order = []
-        self.import_status_label.clear()
+        self._set_import_summary("")
+        self._set_waiting_summary("")
         self.round_summary.setText("Assignments not yet imported for this round.")
         self._auto_discover_imports()
         self._refresh_units_table()
+        self._update_auto_import_state()
 
     def _auto_discover_imports(self) -> None:
         round_dir = self._resolve_round_dir()
@@ -1315,7 +1320,7 @@ class IaaWidget(QtWidgets.QWidget):
             return
         self._discover_existing_imports(round_dir)
         if self.assignment_paths:
-            self.import_status_label.setText("Detected existing assignment imports.")
+            self._set_import_summary("Detected existing assignment imports.")
 
     def _on_auto_import_clicked(self) -> None:
         if not self.current_round:
@@ -1325,9 +1330,37 @@ class IaaWidget(QtWidgets.QWidget):
         if not round_dir:
             QtWidgets.QMessageBox.warning(self, "Assignment import", "Round directory unavailable.")
             return
-        self._import_round_assignments(round_dir, silent=False)
+        sources, problems = self._collect_submission_sources(round_dir)
+        if problems:
+            issues = [
+                f"- {self.current_reviewer_names.get(rid, rid)}: {reason}"
+                for rid, reason in sorted(
+                    problems.items(), key=lambda item: self.current_reviewer_names.get(item[0], item[0])
+                )
+            ]
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Assignment import",
+                "Cannot import submissions until all reviewers have submitted receipts:\n" + "\n".join(issues),
+            )
+            self._update_auto_import_state()
+            return
+        if not sources:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Assignment import",
+                "No reviewer submissions were detected.",
+            )
+            self._update_auto_import_state()
+            return
+        self._import_round_assignments(round_dir, silent=False, sources=sources)
 
-    def _import_round_assignments(self, round_dir: Path, silent: bool = False) -> None:
+    def _import_round_assignments(
+        self,
+        round_dir: Path,
+        silent: bool = False,
+        sources: Optional[Dict[str, Path]] = None,
+    ) -> None:
         statuses: List[str] = []
         errors = 0
         for reviewer in self.current_round.get("reviewers", []):
@@ -1335,8 +1368,11 @@ class IaaWidget(QtWidgets.QWidget):
             if not reviewer_id:
                 continue
             display_name = reviewer.get("name", reviewer_id)
-            src = round_dir / "imports" / f"{reviewer_id}_assignment.db"
-            if not src.exists():
+            if sources is None:
+                src = round_dir / "imports" / f"{reviewer_id}_assignment.db"
+            else:
+                src = sources.get(reviewer_id)
+            if not src or not src.exists():
                 statuses.append(f"{display_name}: no submission found")
                 continue
             try:
@@ -1348,13 +1384,14 @@ class IaaWidget(QtWidgets.QWidget):
                 self.assignment_paths[reviewer_id] = target_path
                 statuses.append(f"{display_name}: imported")
         summary = "\n".join(statuses) if statuses else "No reviewers for this round."
-        self.import_status_label.setText(summary)
+        self._set_import_summary(summary)
         if not silent:
             if errors:
                 QtWidgets.QMessageBox.warning(self, "Assignment import", summary)
             else:
                 QtWidgets.QMessageBox.information(self, "Assignment import", summary)
         self._refresh_units_table()
+        self._update_auto_import_state()
 
     def _manual_import_assignment(self) -> None:
         if not self.current_round:
@@ -1384,13 +1421,14 @@ class IaaWidget(QtWidgets.QWidget):
             )
             return
         self.assignment_paths[reviewer_id] = target_path
-        self.import_status_label.setText(f"{display_name}: imported from manual selection")
+        self._set_import_summary(f"{display_name}: imported from manual selection")
         QtWidgets.QMessageBox.information(
             self,
             "Assignment import",
             f"Imported assignment for {display_name}.",
         )
         self._refresh_units_table()
+        self._update_auto_import_state()
 
     def _copy_assignment_to_imports(self, reviewer_id: str, source: Path) -> Path:
         if not self.current_round:
@@ -1458,6 +1496,62 @@ class IaaWidget(QtWidgets.QWidget):
             candidate = imports_dir / f"{reviewer_id}_assignment.db"
             if candidate.exists():
                 self.assignment_paths[reviewer_id] = candidate
+
+    def _collect_submission_sources(self, round_dir: Path) -> tuple[Dict[str, Path], Dict[str, str]]:
+        sources: Dict[str, Path] = {}
+        problems: Dict[str, str] = {}
+        if not self.current_round:
+            return sources, problems
+        for reviewer in self.current_round.get("reviewers", []):
+            reviewer_id = reviewer.get("reviewer_id")
+            if not reviewer_id:
+                continue
+            assignment_dir = round_dir / "assignments" / reviewer_id
+            receipt = assignment_dir / "submitted.json"
+            assignment_db = assignment_dir / "assignment.db"
+            if not receipt.exists():
+                problems[reviewer_id] = "submission receipt not found"
+                continue
+            if not assignment_db.exists():
+                problems[reviewer_id] = "assignment.db not found"
+                continue
+            sources[reviewer_id] = assignment_db
+        return sources, problems
+
+    def _update_auto_import_state(self) -> None:
+        round_dir = self._resolve_round_dir()
+        if not round_dir or not self.current_round:
+            self.auto_import_btn.setEnabled(False)
+            self._set_waiting_summary("")
+            return
+        sources, problems = self._collect_submission_sources(round_dir)
+        self.auto_import_btn.setEnabled(bool(sources) and not problems)
+        if problems:
+            waiting_parts = [
+                f"{self.current_reviewer_names.get(rid, rid)} ({reason})"
+                for rid, reason in sorted(
+                    problems.items(), key=lambda item: self.current_reviewer_names.get(item[0], item[0])
+                )
+            ]
+            self._set_waiting_summary("Waiting for submissions from: " + ", ".join(waiting_parts))
+        else:
+            self._set_waiting_summary("")
+
+    def _set_import_summary(self, summary: str) -> None:
+        self._import_summary = summary.strip()
+        self._update_import_status_label()
+
+    def _set_waiting_summary(self, waiting: str) -> None:
+        self._waiting_summary = waiting.strip()
+        self._update_import_status_label()
+
+    def _update_import_status_label(self) -> None:
+        lines = []
+        if self._import_summary:
+            lines.append(self._import_summary)
+        if self._waiting_summary:
+            lines.append(self._waiting_summary)
+        self.import_status_label.setText("\n".join(lines))
 
     def _update_unit_table_headers(self, reviewer_ids: Optional[List[str]] = None) -> None:
         if reviewer_ids is None:
@@ -1898,10 +1992,10 @@ class IaaWidget(QtWidgets.QWidget):
     def _format_value(row: sqlite3.Row) -> str:
         if row["na"]:
             return "N/A"
+        if row["value_num"] is not None:
+            return format(row["value_num"], "g")
         if row["value"] is not None and row["value"] != "":
             return str(row["value"])
-        if row["value_num"] is not None:
-            return str(row["value_num"])
         if row["value_date"]:
             return row["value_date"]
         return ""
