@@ -9,7 +9,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Mapping
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -760,6 +760,25 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ctx.project_changed.connect(self._refresh_labelset_options)
         self._setup_ui()
 
+    @staticmethod
+    def _safe_mapping_get(
+        mapping: Optional[sqlite3.Row | Mapping[str, object]],
+        key: str,
+        default: object = None,
+    ) -> object:
+        if mapping is None:
+            return default
+        if isinstance(mapping, sqlite3.Row):
+            if key in mapping.keys():
+                return mapping[key]
+            return default
+        if isinstance(mapping, Mapping):
+            return mapping.get(key, default)
+        try:
+            return mapping[key]  # type: ignore[index]
+        except Exception:
+            return default
+
     def _setup_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         scroll = QtWidgets.QScrollArea()
@@ -932,25 +951,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _load_reviewed_unit_ids(self) -> Set[str]:
         pheno_id = self.pheno_row["pheno_id"]
-        if isinstance(self.pheno_row, sqlite3.Row):
-            level_value: Optional[object] = None
-            try:
-                if "level" in self.pheno_row.keys():
-                    level_value = self.pheno_row["level"]
-            except Exception:
-                level_value = None
-        else:
-            level_value = self.pheno_row.get("level")
-        if not level_value:
-            level_value = "single_doc"
-        level = str(level_value)
+        level_value = self._safe_mapping_get(self.pheno_row, "level", "single_doc")
+        level = str(level_value or "single_doc")
         reviewed: Set[str] = set()
         try:
             rounds = self.ctx.list_rounds(pheno_id)
         except Exception:
             return reviewed
         for round_row in rounds:
-            round_number = round_row.get("round_number")
+            round_number = self._safe_mapping_get(round_row, "round_number")
             if round_number is None:
                 continue
             try:
