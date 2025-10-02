@@ -51,6 +51,7 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
         add_labelset(
             conn,
             labelset_id="ls_test",
+            project_id="proj",
             pheno_id="ph_test",
             version=1,
             created_by="tester",
@@ -148,6 +149,7 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
         add_labelset(
             conn,
             labelset_id="ls_multi",
+            project_id="proj",
             pheno_id="ph_multi",
             version=1,
             created_by="tester",

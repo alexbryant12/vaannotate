@@ -82,7 +82,8 @@ def add_labelset(
     conn: sqlite3.Connection,
     *,
     labelset_id: str,
-    pheno_id: str,
+    project_id: str,
+    pheno_id: str | None,
     version: int,
     created_by: str,
     notes: str | None,
@@ -90,8 +91,12 @@ def add_labelset(
 ) -> None:
     created_at = datetime.utcnow().isoformat()
     conn.execute(
-        "INSERT OR REPLACE INTO label_sets(labelset_id, pheno_id, version, created_at, created_by, notes) VALUES (?,?,?,?,?,?)",
-        (labelset_id, pheno_id, version, created_at, created_by, notes),
+        """
+        INSERT OR REPLACE INTO label_sets(
+            labelset_id, project_id, pheno_id, version, created_at, created_by, notes
+        ) VALUES (?,?,?,?,?,?,?)
+        """,
+        (labelset_id, project_id, pheno_id, version, created_at, created_by, notes),
     )
     for idx, label in enumerate(labels):
         label_id = label["label_id"]

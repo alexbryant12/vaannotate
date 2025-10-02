@@ -72,7 +72,8 @@ class RoundBuilder:
             round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
             rng_seed = config.get("rng_seed", 0)
             config_hash = stable_hash(canonical_json(config))
-            round_dir = self.project_root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}"
+            phenotype_dir = (self.project_root / pheno["corpus_path"]).resolve().parent.parent
+            round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
             ensure_dir(round_dir)
             ensure_dir(round_dir / "assignments")
             ensure_dir(round_dir / "imports")
@@ -377,13 +378,20 @@ class RoundBuilder:
 
     # Aggregation & import helpers
     def import_assignment(self, pheno_id: str, round_number: int, reviewer_id: str) -> Path:
-        round_dir = self.project_root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}"
-        assignment_dir = round_dir / "assignments" / reviewer_id
-        assignment_db = assignment_dir / "assignment.db"
-        imports_dir = ensure_dir(round_dir / "imports")
-        target_path = imports_dir / f"{reviewer_id}_assignment.db"
-        copy_sqlite_database(assignment_db, target_path)
         with self._connect_project() as conn:
+            pheno = conn.execute(
+                "SELECT corpus_path FROM phenotypes WHERE pheno_id=?",
+                (pheno_id,),
+            ).fetchone()
+            if not pheno:
+                raise ValueError(f"Phenotype {pheno_id} not found")
+            phenotype_dir = (self.project_root / pheno["corpus_path"]).resolve().parent.parent
+            round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
+            assignment_dir = round_dir / "assignments" / reviewer_id
+            assignment_db = assignment_dir / "assignment.db"
+            imports_dir = ensure_dir(round_dir / "imports")
+            target_path = imports_dir / f"{reviewer_id}_assignment.db"
+            copy_sqlite_database(assignment_db, target_path)
             round_id = conn.execute(
                 "SELECT round_id FROM rounds WHERE pheno_id=? AND round_number=?",
                 (pheno_id, round_number),
@@ -398,7 +406,15 @@ class RoundBuilder:
         return target_path
 
     def build_round_aggregate(self, pheno_id: str, round_number: int) -> Path:
-        round_dir = self.project_root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}"
+        with self._connect_project() as conn:
+            pheno = conn.execute(
+                "SELECT corpus_path FROM phenotypes WHERE pheno_id=?",
+                (pheno_id,),
+            ).fetchone()
+            if not pheno:
+                raise ValueError(f"Phenotype {pheno_id} not found")
+            phenotype_dir = (self.project_root / pheno["corpus_path"]).resolve().parent.parent
+        round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
         imports_dir = ensure_dir(round_dir / "imports")
         aggregate_db = round_dir / "round_aggregate.db"
         with initialize_round_aggregate_db(aggregate_db) as agg_conn:
