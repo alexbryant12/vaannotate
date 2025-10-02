@@ -1,7 +1,6 @@
 """PySide6 based Admin application for VAAnnotate."""
 from __future__ import annotations
 
-import copy
 import csv
 import json
 import re
@@ -59,18 +58,6 @@ class ProjectContext(QtCore.QObject):
         self.project_db: Optional[Database] = None
         self.project_row: Optional[Dict[str, object]] = None
         self._corpus_cache: Dict[str, Database] = {}
-        self._phenotypes: Dict[str, Dict[str, object]] = {}
-        self._rounds: Dict[str, Dict[str, object]] = {}
-        self._round_ids_by_pheno: Dict[str, List[str]] = {}
-        self._label_sets: Dict[str, Dict[str, object]] = {}
-        self._labels: Dict[str, Dict[str, object]] = {}
-        self._labels_by_labelset: Dict[str, List[str]] = {}
-        self._label_options: Dict[str, List[Dict[str, object]]] = {}
-        self._round_configs: Dict[str, Optional[Dict[str, object]]] = {}
-        self._round_configs_json: Dict[str, str] = {}
-        self._reviewers: Dict[str, Dict[str, object]] = {}
-        self._assignments_by_round: Dict[str, List[Dict[str, object]]] = {}
-        self._is_loaded = False
 
     def open_project(self, directory: Path) -> None:
         directory = directory.resolve()
@@ -80,85 +67,19 @@ class ProjectContext(QtCore.QObject):
         self.project_root = directory
         self.project_db = project_db
         self._corpus_cache.clear()
-        self._load_all_project_data()
+        self.project_row = self._load_project_row()
         self.project_changed.emit()
 
     def _load_project_row(self) -> Optional[Dict[str, object]]:
-        if not self._is_loaded:
-            self._load_all_project_data()
-        return self.project_row
-
-    def _ensure_loaded(self) -> None:
-        if not self._is_loaded:
-            self._load_all_project_data()
-
-    def _load_all_project_data(self) -> None:
-        if not self.project_db:
-            raise RuntimeError("Project database not initialized")
-        self._phenotypes.clear()
-        self._rounds.clear()
-        self._round_ids_by_pheno.clear()
-        self._label_sets.clear()
-        self._labels.clear()
-        self._labels_by_labelset.clear()
-        self._label_options.clear()
-        self._round_configs.clear()
-        self._round_configs_json.clear()
-        self._reviewers.clear()
-        self._assignments_by_round.clear()
-        with self.project_db.connect() as conn:
-            project_row = conn.execute(
+        try:
+            db = self.require_db()
+        except RuntimeError:
+            return None
+        with db.connect() as conn:
+            row = conn.execute(
                 "SELECT * FROM projects ORDER BY created_at ASC LIMIT 1"
             ).fetchone()
-            self.project_row = dict(project_row) if project_row else None
-            for row in conn.execute("SELECT * FROM phenotypes"):
-                data = dict(row)
-                pheno_id = str(data["pheno_id"])
-                self._phenotypes[pheno_id] = data
-            for row in conn.execute("SELECT * FROM rounds"):
-                data = dict(row)
-                round_id = str(data["round_id"])
-                pheno_id = str(data["pheno_id"])
-                self._rounds[round_id] = data
-                self._round_ids_by_pheno.setdefault(pheno_id, []).append(round_id)
-            for pheno_id, round_ids in self._round_ids_by_pheno.items():
-                round_ids.sort(key=lambda rid: (self._rounds[rid].get("round_number"), rid))
-            for row in conn.execute("SELECT * FROM label_sets"):
-                data = dict(row)
-                self._label_sets[str(data["labelset_id"])] = data
-            for row in conn.execute("SELECT * FROM labels"):
-                data = dict(row)
-                label_id = str(data["label_id"])
-                labelset_id = str(data["labelset_id"])
-                self._labels[label_id] = data
-                self._labels_by_labelset.setdefault(labelset_id, []).append(label_id)
-            for labelset_id, label_ids in self._labels_by_labelset.items():
-                label_ids.sort(key=lambda lid: self._labels[lid].get("order_index", 0))
-            for row in conn.execute("SELECT * FROM label_options"):
-                data = dict(row)
-                label_id = str(data["label_id"])
-                self._label_options.setdefault(label_id, []).append(data)
-            for options in self._label_options.values():
-                options.sort(key=lambda opt: opt.get("order_index", 0))
-            for row in conn.execute("SELECT * FROM round_configs"):
-                round_id = str(row["round_id"])
-                config_json = str(row["config_json"])
-                self._round_configs_json[round_id] = config_json
-                try:
-                    payload = json.loads(config_json)
-                except json.JSONDecodeError:
-                    payload = None
-                self._round_configs[round_id] = payload
-            for row in conn.execute("SELECT * FROM reviewers"):
-                data = dict(row)
-                self._reviewers[str(data["reviewer_id"])] = data
-            for row in conn.execute("SELECT * FROM assignments"):
-                data = dict(row)
-                round_id = str(data["round_id"])
-                self._assignments_by_round.setdefault(round_id, []).append(data)
-            for assignments in self._assignments_by_round.values():
-                assignments.sort(key=lambda entry: (entry.get("created_at", ""), entry.get("assign_id", "")))
-        self._is_loaded = True
+        return dict(row) if row else None
 
     def require_project(self) -> Path:
         if not self.project_root:
@@ -171,188 +92,87 @@ class ProjectContext(QtCore.QObject):
         return self.project_db
 
     def reload(self) -> None:
-        self._load_all_project_data()
+        self.project_row = self._load_project_row()
         self._corpus_cache.clear()
         self.project_changed.emit()
 
     def current_project_id(self) -> Optional[str]:
-        self._ensure_loaded()
+        if not self.project_row:
+            self.project_row = self._load_project_row()
         if not self.project_row:
             return None
         return str(self.project_row.get("project_id"))
 
-    def list_phenotypes(self) -> List[Dict[str, object]]:
-        self._ensure_loaded()
-        phenotypes = list(self._phenotypes.values())
-        phenotypes.sort(key=lambda row: (str(row.get("name", "")).lower(), str(row.get("pheno_id"))))
-        return [dict(row) for row in phenotypes]
+    def list_phenotypes(self) -> List[sqlite3.Row]:
+        db = self.require_db()
+        params: List[object] = []
+        sql = "SELECT * FROM phenotypes"
+        project_id = self.current_project_id()
+        if project_id:
+            sql += " WHERE project_id=?"
+            params.append(project_id)
+        sql += " ORDER BY name"
+        with db.connect() as conn:
+            return conn.execute(sql, params).fetchall()
 
-    def get_phenotype(self, pheno_id: str) -> Optional[Dict[str, object]]:
-        self._ensure_loaded()
-        row = self._phenotypes.get(pheno_id)
-        return dict(row) if row else None
+    def get_phenotype(self, pheno_id: str) -> Optional[sqlite3.Row]:
+        db = self.require_db()
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM phenotypes WHERE pheno_id=?",
+                (pheno_id,),
+            ).fetchone()
+        return row
 
-    def list_rounds(self, pheno_id: str) -> List[Dict[str, object]]:
-        self._ensure_loaded()
-        round_ids = self._round_ids_by_pheno.get(pheno_id, [])
-        rounds = [self._rounds[rid] for rid in round_ids]
-        rounds.sort(key=lambda row: (row.get("round_number"), row.get("round_id")))
-        return [dict(row) for row in rounds]
+    def list_rounds(self, pheno_id: str) -> List[sqlite3.Row]:
+        db = self.require_db()
+        with db.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM rounds WHERE pheno_id=? ORDER BY round_number",
+                (pheno_id,),
+            ).fetchall()
 
-    def list_label_sets(self) -> List[Dict[str, object]]:
-        self._ensure_loaded()
-        labelsets = [row for row in self._label_sets.values() if row.get("project_id") == self.current_project_id()]
-        labelsets.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
-        return [dict(row) for row in labelsets]
+    def list_label_sets(self) -> List[sqlite3.Row]:
+        db = self.require_db()
+        project_id = self.current_project_id()
+        if not project_id:
+            return []
+        with db.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM label_sets WHERE project_id=? ORDER BY created_at DESC",
+                (project_id,),
+            ).fetchall()
 
-    def get_labelset(self, labelset_id: str) -> Optional[Dict[str, object]]:
-        self._ensure_loaded()
-        row = self._label_sets.get(labelset_id)
-        return dict(row) if row else None
+    def get_labelset(self, labelset_id: str) -> Optional[sqlite3.Row]:
+        db = self.require_db()
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM label_sets WHERE labelset_id=?",
+                (labelset_id,),
+            ).fetchone()
+        return row
 
-    def get_round(self, round_id: str) -> Optional[Dict[str, object]]:
-        self._ensure_loaded()
-        row = self._rounds.get(round_id)
-        return dict(row) if row else None
+    def get_round(self, round_id: str) -> Optional[sqlite3.Row]:
+        db = self.require_db()
+        with db.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM rounds WHERE round_id=?",
+                (round_id,),
+            ).fetchone()
 
     def get_round_config(self, round_id: str) -> Optional[Dict[str, object]]:
-        self._ensure_loaded()
-        payload = self._round_configs.get(round_id)
-        if payload is None:
+        db = self.require_db()
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT config_json FROM round_configs WHERE round_id=?",
+                (round_id,),
+            ).fetchone()
+        if not row:
             return None
-        return copy.deepcopy(payload)
-
-    def get_label_schema(self, labelset_id: str) -> Optional[Dict[str, object]]:
-        self._ensure_loaded()
-        labelset = self._label_sets.get(labelset_id)
-        if not labelset:
+        try:
+            return json.loads(row["config_json"])
+        except json.JSONDecodeError:
             return None
-        label_ids = self._labels_by_labelset.get(labelset_id, [])
-        labels = [self._labels[label_id] for label_id in label_ids]
-        option_map = {
-            label_id: [dict(opt) for opt in self._label_options.get(label_id, [])]
-            for label_id in label_ids
-        }
-        schema = self.compose_label_schema(labelset_id, labelset, labels, option_map)
-        return schema
-
-    def compose_label_schema(
-        self,
-        labelset_id: str,
-        labelset_row: Optional[Dict[str, object]],
-        labels: Iterable[Dict[str, object]],
-        option_map: Dict[str, List[Dict[str, object]]],
-    ) -> Dict[str, object]:
-        schema_labels = []
-        for label in sorted(labels, key=lambda row: row.get("order_index", 0)):
-            label_id = str(label.get("label_id"))
-            options = option_map.get(label_id, [])
-            schema_labels.append(
-                {
-                    "label_id": label_id,
-                    "name": label.get("name"),
-                    "type": label.get("type"),
-                    "required": bool(label.get("required")),
-                    "na_allowed": bool(label.get("na_allowed")),
-                    "rules": label.get("rules"),
-                    "unit": label.get("unit"),
-                    "range": {"min": label.get("min"), "max": label.get("max")},
-                    "gating_expr": label.get("gating_expr"),
-                    "options": [copy.deepcopy(option) for option in options],
-                }
-            )
-        payload: Dict[str, object] = {"labelset_id": labelset_id, "labels": schema_labels}
-        if labelset_row:
-            payload["labelset_name"] = labelset_row.get("labelset_id")
-            payload["created_by"] = labelset_row.get("created_by")
-            payload["created_at"] = labelset_row.get("created_at")
-            payload["notes"] = labelset_row.get("notes")
-        return payload
-
-    def list_reviewers(self) -> List[Dict[str, object]]:
-        self._ensure_loaded()
-        reviewers = list(self._reviewers.values())
-        reviewers.sort(key=lambda row: (str(row.get("name", "")).lower(), str(row.get("reviewer_id"))))
-        return [dict(row) for row in reviewers]
-
-    def get_reviewer(self, reviewer_id: str) -> Optional[Dict[str, object]]:
-        self._ensure_loaded()
-        row = self._reviewers.get(reviewer_id)
-        return dict(row) if row else None
-
-    def list_assignments_for_round(self, round_id: str) -> List[Dict[str, object]]:
-        self._ensure_loaded()
-        assignments = self._assignments_by_round.get(round_id, [])
-        return [dict(entry) for entry in assignments]
-
-    def find_round_id(self, pheno_id: str, round_number: int) -> Optional[str]:
-        self._ensure_loaded()
-        for round_id in self._round_ids_by_pheno.get(pheno_id, []):
-            round_row = self._rounds.get(round_id)
-            if not round_row:
-                continue
-            try:
-                number = int(round_row.get("round_number"))
-            except (TypeError, ValueError):
-                continue
-            if number == round_number:
-                return round_id
-        return None
-
-    def _register_phenotype(self, phenotype: models.Phenotype) -> None:
-        data = phenotype.to_row()
-        self._phenotypes[str(phenotype.pheno_id)] = data
-
-    def _register_labelset(
-        self,
-        labelset: models.LabelSet,
-        labels: Iterable[models.Label],
-        options: Dict[str, List[models.LabelOption]],
-    ) -> None:
-        labelset_data = labelset.to_row()
-        labelset_id = str(labelset.labelset_id)
-        self._label_sets[labelset_id] = labelset_data
-        label_ids: List[str] = []
-        for label in labels:
-            label_data = label.to_row()
-            label_id = str(label.label_id)
-            label_ids.append(label_id)
-            self._labels[label_id] = label_data
-            option_records = [opt.to_row() for opt in options.get(label_id, [])]
-            option_records.sort(key=lambda row: row.get("order_index", 0))
-            self._label_options[label_id] = option_records
-        label_ids.sort(key=lambda lid: self._labels[lid].get("order_index", 0))
-        self._labels_by_labelset[labelset_id] = label_ids
-
-    def _register_round(
-        self,
-        round_record: models.Round,
-        config_payload: Dict[str, object],
-        assignments: Iterable[models.Assignment],
-        reviewers: Iterable[models.Reviewer],
-    ) -> None:
-        round_data = round_record.to_row()
-        round_id = str(round_record.round_id)
-        pheno_id = str(round_record.pheno_id)
-        self._rounds[round_id] = round_data
-        round_ids = self._round_ids_by_pheno.setdefault(pheno_id, [])
-        if round_id not in round_ids:
-            round_ids.append(round_id)
-        round_ids.sort(key=lambda rid: self._rounds[rid].get("round_number", 0))
-        config_json = json.dumps(config_payload, indent=2)
-        self._round_configs[round_id] = copy.deepcopy(config_payload)
-        self._round_configs_json[round_id] = config_json
-        assignment_rows = [assignment.to_row() for assignment in assignments]
-        assignment_rows.sort(key=lambda row: row.get("reviewer_id"))
-        self._assignments_by_round[round_id] = assignment_rows
-        for reviewer in reviewers:
-            self._reviewers[str(reviewer.reviewer_id)] = reviewer.to_row()
-
-    def mark_assignment_status(self, round_id: str, reviewer_id: str, status: str) -> None:
-        assignments = self._assignments_by_round.get(round_id, [])
-        for entry in assignments:
-            if str(entry.get("reviewer_id")) == reviewer_id:
-                entry["status"] = status
 
     def resolve_project_path(self, relative: str) -> Path:
         root = self.require_project()
@@ -412,7 +232,6 @@ class ProjectContext(QtCore.QObject):
         db = self.require_db()
         with db.transaction() as conn:
             record.save(conn)
-        self._register_phenotype(record)
         self.project_changed.emit()
         return record
 
@@ -439,8 +258,6 @@ class ProjectContext(QtCore.QObject):
             notes=notes,
         )
         db = self.require_db()
-        created_labels: List[models.Label] = []
-        option_map: Dict[str, List[models.LabelOption]] = {}
         with db.transaction() as conn:
             record.save(conn)
             for order_index, label in enumerate(labels):
@@ -459,8 +276,6 @@ class ProjectContext(QtCore.QObject):
                     max=label.get("max"),
                 )
                 label_record.save(conn)
-                created_labels.append(label_record)
-                option_records: List[models.LabelOption] = []
                 for opt_index, option in enumerate(label.get("options", [])):
                     option_record = models.LabelOption(
                         option_id=option.get("option_id") or str(uuid.uuid4()),
@@ -471,9 +286,6 @@ class ProjectContext(QtCore.QObject):
                         weight=option.get("weight"),
                     )
                     option_record.save(conn)
-                    option_records.append(option_record)
-                option_map[label_record.label_id] = option_records
-        self._register_labelset(record, created_labels, option_map)
         self.project_changed.emit()
         return record
 
@@ -513,29 +325,29 @@ class ProjectContext(QtCore.QObject):
         valid_statuses = {"draft", "active", "closed", "adjudicating", "finalized"}
         if status not in valid_statuses:
             raise ValueError(f"Invalid round status: {status}")
-        round_row = self._rounds.get(round_id)
-        if not round_row:
-            raise ValueError(f"Round {round_id} not found")
-        round_row["status"] = status
         db = self.require_db()
-        config_payload = copy.deepcopy(self._round_configs.get(round_id))
-        config_json: Optional[str] = None
-        if isinstance(config_payload, dict):
-            config_payload["status"] = status
-            config_json = json.dumps(config_payload, indent=2)
         with db.transaction() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE rounds SET status=? WHERE round_id=?",
                 (status, round_id),
             )
-            if config_json is not None:
-                conn.execute(
-                    "UPDATE round_configs SET config_json=? WHERE round_id=?",
-                    (config_json, round_id),
-                )
-        if config_json is not None and isinstance(config_payload, dict):
-            self._round_configs[round_id] = config_payload
-            self._round_configs_json[round_id] = config_json
+            if cursor.rowcount == 0:
+                raise ValueError(f"Round {round_id} not found")
+            config_row = conn.execute(
+                "SELECT config_json FROM round_configs WHERE round_id=?",
+                (round_id,),
+            ).fetchone()
+            if config_row:
+                try:
+                    config_payload = json.loads(config_row["config_json"])
+                except json.JSONDecodeError:
+                    config_payload = None
+                if isinstance(config_payload, dict):
+                    config_payload["status"] = status
+                    conn.execute(
+                        "UPDATE round_configs SET config_json=? WHERE round_id=?",
+                        (json.dumps(config_payload, indent=2), round_id),
+                    )
         self.project_changed.emit()
 
 
@@ -1258,13 +1070,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         return [str(row["labelset_id"]) for row in rows]
 
     def _load_existing_reviewers(self) -> List[Dict[str, str]]:
+        db = self.ctx.require_db()
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT reviewer_id, name, email FROM reviewers ORDER BY name",
+            ).fetchall()
         reviewers: List[Dict[str, str]] = []
-        for row in self.ctx.list_reviewers():
+        for row in rows:
             reviewers.append(
                 {
-                    "id": str(row.get("reviewer_id", "")),
-                    "name": str(row.get("name", "")),
-                    "email": str(row.get("email", "")),
+                    "id": str(row["reviewer_id"]),
+                    "name": str(row["name"]),
+                    "email": str(row["email"] or ""),
                 }
             )
         return reviewers
@@ -1328,27 +1145,71 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _next_round_number(self) -> int:
         pheno_id = self.pheno_row["pheno_id"]
-        rounds = self.ctx.list_rounds(pheno_id)
-        numbers: List[int] = []
-        for round_row in rounds:
-            try:
-                numbers.append(int(round_row.get("round_number", 0)))
-            except (TypeError, ValueError):
-                continue
-        return (max(numbers) if numbers else 0) + 1
+        db = self.ctx.require_db()
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(round_number) FROM rounds WHERE pheno_id=?",
+                (pheno_id,),
+            ).fetchone()
+        return (row[0] or 0) + 1
 
     def _build_label_schema(
         self,
         labelset_id: str,
-        *,
-        labelset_row: Optional[Dict[str, object]] = None,
-        labels: Optional[List[Dict[str, object]]] = None,
-        option_map: Optional[Dict[str, List[Dict[str, object]]]] = None,
-    ) -> Optional[Dict[str, object]]:
-        if labelset_row is not None and labels is not None and option_map is not None:
-            return self.ctx.compose_label_schema(labelset_id, labelset_row, labels, option_map)
-        schema = self.ctx.get_label_schema(labelset_id)
-        return copy.deepcopy(schema) if schema else None
+        db: Database,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> Dict[str, object]:
+        def fetch(connection: sqlite3.Connection) -> Dict[str, object]:
+            labelset_row = connection.execute(
+                "SELECT * FROM label_sets WHERE labelset_id=?",
+                (labelset_id,),
+            ).fetchone()
+            labels = connection.execute(
+                "SELECT * FROM labels WHERE labelset_id=? ORDER BY order_index",
+                (labelset_id,),
+            ).fetchall()
+            options = connection.execute(
+                "SELECT * FROM label_options WHERE label_id IN (SELECT label_id FROM labels WHERE labelset_id=?)",
+                (labelset_id,),
+            ).fetchall()
+            option_map: Dict[str, List[Dict[str, object]]] = {}
+            for opt in options:
+                option_map.setdefault(opt["label_id"], []).append(
+                    {
+                        "value": opt["value"],
+                        "display": opt["display"],
+                        "order_index": opt["order_index"],
+                        "weight": opt["weight"],
+                    }
+                )
+            schema_labels = []
+            for label in labels:
+                schema_labels.append(
+                    {
+                        "label_id": label["label_id"],
+                        "name": label["name"],
+                        "type": label["type"],
+                        "required": bool(label["required"]),
+                        "na_allowed": bool(label["na_allowed"]),
+                        "rules": label["rules"],
+                        "unit": label["unit"],
+                        "range": {"min": label["min"], "max": label["max"]},
+                        "gating_expr": label["gating_expr"],
+                        "options": sorted(option_map.get(label["label_id"], []), key=lambda o: o["order_index"]),
+                    }
+                )
+            payload: Dict[str, object] = {"labelset_id": labelset_id, "labels": schema_labels}
+            if labelset_row:
+                payload["labelset_name"] = labelset_row["labelset_id"]
+                payload["created_by"] = labelset_row["created_by"]
+                payload["created_at"] = labelset_row["created_at"]
+                payload["notes"] = labelset_row["notes"]
+            return payload
+
+        if conn is not None:
+            return fetch(conn)
+        with db.connect() as connection:
+            return fetch(connection)
 
     def accept(self) -> None:  # noqa: D401 - Qt override
         if not self._create_round():
@@ -1374,8 +1235,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         labelset_id = self.labelset_combo.currentText().strip() or f"auto_{pheno_id}"
         created_at = QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate)
         default_labels: List[Dict[str, object]] = []
-        label_schema = self.ctx.get_label_schema(labelset_id)
-        if not self.ctx.get_labelset(labelset_id):
+        with db.connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM label_sets WHERE labelset_id=?",
+                (labelset_id,),
+            ).fetchone()
+        if not exists:
             default_labels.append(
                 {
                     "label_id": str(uuid.uuid4()),
@@ -1484,15 +1349,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         )
         round_dir = ensure_dir(ctx.resolve_round_dir(pheno_id, round_number))
         write_manifest(round_dir / "manifest.csv", assignments)
-        created_labelset: Optional[models.LabelSet] = None
-        created_labels: List[models.Label] = []
-        created_options: Dict[str, List[models.LabelOption]] = {}
-        reviewer_records: List[models.Reviewer] = []
-        assignment_records: List[models.Assignment] = []
-        config_payload: Dict[str, object] = {}
+        label_schema: Optional[Dict[str, object]] = None
         with db.transaction() as conn:
             if default_labels:
-                created_labelset = models.LabelSet(
+                labelset = models.LabelSet(
                     labelset_id=labelset_id,
                     project_id=project_id,
                     pheno_id=pheno_id,
@@ -1501,52 +1361,36 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     created_by="system",
                     notes="Auto-generated",
                 )
-                created_labelset.save(conn)
-                for order_index, label in enumerate(default_labels):
+                labelset.save(conn)
+                for label in default_labels:
                     label_record = models.Label(
                         label_id=label["label_id"],
                         labelset_id=labelset_id,
                         name=label["name"],
                         type=label["type"],
-                        required=1 if label.get("required") else 0,
-                        order_index=order_index,
-                        rules=label.get("rules", ""),
-                        gating_expr=label.get("gating_expr"),
-                        na_allowed=1 if label.get("na_allowed") else 0,
-                        unit=label.get("unit"),
-                        min=label.get("min"),
-                        max=label.get("max"),
+                        required=label["required"],
+                        order_index=0,
+                        rules="",
+                        gating_expr=None,
+                        na_allowed=0,
+                        unit=None,
+                        min=None,
+                        max=None,
                     )
                     label_record.save(conn)
-                    created_labels.append(label_record)
-                    option_records: List[models.LabelOption] = []
-                    for idx, option in enumerate(label.get("options", [])):
+                    for idx, option in enumerate(label["options"]):
                         option_record = models.LabelOption(
                             option_id=str(uuid.uuid4()),
                             label_id=label_record.label_id,
-                            value=str(option.get("value", "")),
-                            display=str(option.get("display", option.get("value", ""))),
+                            value=option["value"],
+                            display=option["display"],
                             order_index=idx,
-                            weight=option.get("weight"),
+                            weight=None,
                         )
                         option_record.save(conn)
-                        option_records.append(option_record)
-                    created_options[label_record.label_id] = option_records
-                label_rows = [label.to_row() for label in created_labels]
-                option_rows = {
-                    str(label.label_id): [opt.to_row() for opt in created_options.get(label.label_id, [])]
-                    for label in created_labels
-                }
-                label_schema = self._build_label_schema(
-                    labelset_id,
-                    labelset_row=created_labelset.to_row(),
-                    labels=label_rows,
-                    option_map=option_rows,
-                )
             round_record.save(conn)
-            if label_schema is None:
-                label_schema = self._build_label_schema(labelset_id)
-            config_payload = {
+            label_schema = self._build_label_schema(labelset_id, db, conn)
+            config_payload: Dict[str, object] = {
                 "pheno_id": pheno_id,
                 "labelset_id": labelset_id,
                 "round_number": round_number,
@@ -1580,7 +1424,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     windows_account=None,
                 )
                 reviewer_record.save(conn)
-                reviewer_records.append(reviewer_record)
             for reviewer in reviewers:
                 assignment = models.Assignment(
                     assign_id=str(uuid.uuid4()),
@@ -1592,20 +1435,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     status="open",
                 )
                 assignment.save(conn)
-                assignment_records.append(assignment)
-        if created_labelset is not None:
-            self.ctx._register_labelset(created_labelset, created_labels, created_options)
-        self.ctx._register_round(round_record, config_payload, assignment_records, reviewer_records)
         if label_schema is None:
-            label_schema = self._build_label_schema(labelset_id)
+            label_schema = self._build_label_schema(labelset_id, db)
         for reviewer in reviewers:
             assignment_dir = ensure_dir(round_dir / "assignments" / reviewer["id"])
             db_path = assignment_dir / "assignment.db"
             assignment_db = initialize_assignment_db(db_path)
             populate_assignment_db(assignment_db, reviewer["id"], assignments[reviewer["id"]].units)
             schema_path = assignment_dir / "label_schema.json"
-            schema_payload = label_schema or {}
-            schema_path.write_text(json.dumps(schema_payload, indent=2), encoding="utf-8")
+            schema_path.write_text(json.dumps(label_schema, indent=2), encoding="utf-8")
         self.created_round_id = round_id
         self.created_round_number = round_number
         return True
@@ -1647,7 +1485,7 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
         else:
             self.setCurrentItem(project_item)
 
-    def _build_phenotype_item(self, pheno: Dict[str, object]) -> QtWidgets.QTreeWidgetItem:
+    def _build_phenotype_item(self, pheno: sqlite3.Row) -> QtWidgets.QTreeWidgetItem:
         pheno_item = QtWidgets.QTreeWidgetItem([f"{pheno['name']} ({pheno['level']})"])
         pheno_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "phenotype", "pheno": dict(pheno)})
         rounds = self.ctx.list_rounds(pheno["pheno_id"])
@@ -2284,18 +2122,19 @@ class IaaWidget(QtWidgets.QWidget):
         pheno_id = self.current_pheno.get("pheno_id")
         if not pheno_id:
             return
-        rounds = list(self.ctx.list_rounds(str(pheno_id)))
-        rounds.sort(key=lambda row: row.get("round_number", 0), reverse=True)
+        db = self.ctx.require_db()
+        with db.connect() as conn:
+            rounds = conn.execute(
+                "SELECT round_id, round_number, status, labelset_id FROM rounds WHERE pheno_id=? ORDER BY round_number DESC",
+                (pheno_id,),
+            ).fetchall()
         self.round_table.setRowCount(len(rounds))
         for row_idx, round_row in enumerate(rounds):
-            display = f"Round {round_row.get('round_number')}"
-            item = QtWidgets.QTableWidgetItem(display)
+            item = QtWidgets.QTableWidgetItem(f"Round {round_row['round_number']}")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, dict(round_row))
             self.round_table.setItem(row_idx, 0, item)
-            status_text = str(round_row.get("status", ""))
-            self.round_table.setItem(row_idx, 1, QtWidgets.QTableWidgetItem(status_text))
-            labelset_text = str(round_row.get("labelset_id", ""))
-            self.round_table.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(labelset_text))
+            self.round_table.setItem(row_idx, 1, QtWidgets.QTableWidgetItem(round_row["status"]))
+            self.round_table.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(round_row["labelset_id"]))
         if rounds:
             self.round_table.selectRow(0)
         else:
@@ -2328,37 +2167,31 @@ class IaaWidget(QtWidgets.QWidget):
         round_id = self.current_round.get("round_id")
         if not round_id:
             return
-        assignments = self.ctx.list_assignments_for_round(str(round_id))
-        reviewer_ids: List[str] = []
-        for assignment in assignments:
-            reviewer_id = str(assignment.get("reviewer_id", ""))
-            if reviewer_id and reviewer_id not in reviewer_ids:
-                reviewer_ids.append(reviewer_id)
-        reviewers: List[Dict[str, object]] = []
-        reviewer_names: Dict[str, str] = {}
-        for reviewer_id in reviewer_ids:
-            reviewer_row = self.ctx.get_reviewer(reviewer_id) or {}
-            name = str((reviewer_row.get("name") if reviewer_row else "") or reviewer_id)
-            reviewers.append({"reviewer_id": reviewer_id, "name": name})
-            reviewer_names[reviewer_id] = name
-        self.current_reviewer_names = reviewer_names
-        self.current_round["reviewers"] = reviewers
+        db = self.ctx.require_db()
+        with db.connect() as conn:
+            reviewers = conn.execute(
+                "SELECT reviewer_id, name FROM reviewers WHERE reviewer_id IN (SELECT reviewer_id FROM assignments WHERE round_id=?)",
+                (round_id,),
+            ).fetchall()
+            labels = conn.execute(
+                "SELECT labels.label_id, labels.name FROM labels JOIN label_sets ON label_sets.labelset_id = labels.labelset_id "
+                "WHERE label_sets.labelset_id=? ORDER BY labels.order_index",
+                (self.current_round.get("labelset_id"),),
+            ).fetchall()
+        self.current_reviewer_names = {row["reviewer_id"]: row["name"] for row in reviewers}
+        self.current_round["reviewers"] = [
+            {"reviewer_id": row["reviewer_id"], "name": row["name"]} for row in reviewers
+        ]
         self.manual_reviewer_combo.clear()
         for reviewer in reviewers:
-            self.manual_reviewer_combo.addItem(str(reviewer.get("name", "")), reviewer.get("reviewer_id"))
+            self.manual_reviewer_combo.addItem(reviewer["name"], reviewer["reviewer_id"])
         self.manual_import_btn.setEnabled(bool(reviewers))
         self.auto_import_btn.setEnabled(False)
         self.label_selector.clear()
-        schema = self.ctx.get_label_schema(str(self.current_round.get("labelset_id", "")))
-        label_entries = schema.get("labels", []) if isinstance(schema, dict) else []
-        self.label_lookup = {
-            str(entry.get("label_id")): str(entry.get("name", "")) for entry in label_entries
-        }
-        self.label_order = [str(entry.get("label_id")) for entry in label_entries]
-        for entry in label_entries:
-            label_id = str(entry.get("label_id"))
-            label_name = str(entry.get("name", label_id))
-            self.label_selector.addItem(label_name, label_id)
+        self.label_lookup = {row["label_id"]: row["name"] for row in labels}
+        self.label_order = [row["label_id"] for row in labels]
+        for row in labels:
+            self.label_selector.addItem(row["name"], row["label_id"])
         self.assignment_paths = {}
         self.unit_rows = []
         self.round_manifest = {}
@@ -2533,19 +2366,18 @@ class IaaWidget(QtWidgets.QWidget):
         imports_dir = ensure_dir(round_dir / "imports")
         target_path = imports_dir / f"{reviewer_id}_assignment.db"
         copy_sqlite_database(source, target_path)
-        round_id = self.current_round.get("round_id")
-        if not round_id:
-            found = self.ctx.find_round_id(str(pheno_id), int(round_number))
-            if not found:
-                raise RuntimeError("Round metadata missing in project database")
-            round_id = found
         db = self.ctx.require_db()
         with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT round_id FROM rounds WHERE pheno_id=? AND round_number=?",
+                (pheno_id, round_number),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("Round metadata missing in project database")
             conn.execute(
                 "UPDATE assignments SET status='imported' WHERE round_id=? AND reviewer_id=?",
-                (round_id, reviewer_id),
+                (row["round_id"], reviewer_id),
             )
-        self.ctx.mark_assignment_status(round_id, reviewer_id, "imported")
         return target_path
 
     def _resolve_round_dir(self) -> Optional[Path]:
