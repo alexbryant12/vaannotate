@@ -22,6 +22,14 @@ from vaannotate.project import (
 )
 from vaannotate.rounds import RoundBuilder
 from vaannotate.schema import initialize_corpus_db
+from vaannotate.shared.database import Database
+from vaannotate.shared.sampling import (
+    SamplingFilters,
+    allocate_units,
+    candidate_documents,
+    initialize_assignment_db,
+    populate_assignment_db,
+)
 
 
 @pytest.fixture()
@@ -242,6 +250,78 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
                 assert doc_row is not None
                 assert doc_row["text"]
 
+
+def test_admin_sampling_creates_multi_doc_units(tmp_path: Path) -> None:
+    corpus_path = tmp_path / "corpus.db"
+    docs_by_patient: dict[str, list[tuple[str, str]]] = {
+        "p1": [("p1_doc1", "P1 doc one"), ("p1_doc2", "P1 doc two")],
+        "p2": [("p2_doc1", "P2 doc one"), ("p2_doc2", "P2 doc two")],
+    }
+    with initialize_corpus_db(corpus_path) as corpus_conn:
+        for patient_icn, docs in docs_by_patient.items():
+            corpus_conn.execute(
+                "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
+                (patient_icn, "506", None, None),
+            )
+            for order_idx, (doc_id, text) in enumerate(docs):
+                corpus_conn.execute(
+                    """
+                    INSERT INTO documents(
+                        doc_id, patient_icn, notetype, note_year, date_note,
+                        cptname, sta3n, hash, text
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        doc_id,
+                        patient_icn,
+                        "NOTE",
+                        2020 + order_idx,
+                        f"202{order_idx}-01-01",
+                        "",
+                        "506",
+                        f"hash_{doc_id}",
+                        text,
+                    ),
+                )
+        corpus_conn.commit()
+
+    corpus_db = Database(corpus_path)
+    filters = SamplingFilters({}, {})
+    candidates = candidate_documents(corpus_db, "multi_doc", filters)
+    assert len(candidates) == len(docs_by_patient)
+
+    reviewers = [{"id": "rev_a", "name": "Reviewer"}]
+    assignments = allocate_units(candidates, reviewers, overlap_n=0, seed=7)
+
+    assignment_db = initialize_assignment_db(tmp_path / "assignment.db")
+    populate_assignment_db(assignment_db, "rev_a", assignments["rev_a"].units)
+
+    with assignment_db.connect() as conn:
+        conn.row_factory = sqlite3.Row
+        unit_rows = conn.execute(
+            "SELECT unit_id, patient_icn, doc_id, note_count FROM units ORDER BY display_rank"
+        ).fetchall()
+        assert len(unit_rows) == len(docs_by_patient)
+        for unit in unit_rows:
+            unit_id = unit["unit_id"]
+            assert unit["patient_icn"] == unit_id
+            assert unit["doc_id"] is None
+            expected_docs = docs_by_patient[unit_id]
+            assert unit["note_count"] == len(expected_docs)
+            doc_rows = conn.execute(
+                "SELECT doc_id FROM unit_notes WHERE unit_id=? ORDER BY order_index",
+                (unit_id,),
+            ).fetchall()
+            observed = [row["doc_id"] for row in doc_rows]
+            assert observed == [doc_id for doc_id, _ in expected_docs]
+            text_map = {doc_id: text for doc_id, text in expected_docs}
+            for doc_id in observed:
+                doc_row = conn.execute(
+                    "SELECT text FROM documents WHERE doc_id=?",
+                    (doc_id,),
+                ).fetchone()
+                assert doc_row is not None
+                assert doc_row["text"] == text_map[doc_id]
 
 def _annotate_assignment(db_path: Path, flag_value: str | None, score_factory) -> list[str]:
     with sqlite3.connect(db_path) as conn:

@@ -72,9 +72,41 @@ def candidate_documents(corpus_db: Database, level: str, filters: SamplingFilter
         conn.create_function("REGEXP", 2, lambda pattern, text: 1 if pattern and text and re.search(pattern, text) else 0)
         rows = conn.execute(sql, params).fetchall()
     if level == "multi_doc":
-        # for the MVP we treat documents as units for both levels; multi doc
-        # callers aggregate downstream.
-        return rows
+        grouped: Dict[str, List[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(row["patient_icn"], []).append(row)
+        aggregated: List[Dict[str, object]] = []
+        for patient_icn, docs in grouped.items():
+            ordered_docs = sorted(
+                docs,
+                key=lambda item: (item["note_year"], item["doc_id"]),
+            )
+            primary = ordered_docs[0]
+            doc_payloads = [
+                {
+                    "doc_id": doc["doc_id"],
+                    "hash": doc["hash"],
+                    "text": doc["text"],
+                    "note_year": doc["note_year"],
+                    "notetype": doc["notetype"],
+                    "sta3n": doc["sta3n"],
+                    "order_index": idx,
+                }
+                for idx, doc in enumerate(ordered_docs)
+            ]
+            aggregated.append(
+                {
+                    "unit_id": patient_icn,
+                    "patient_icn": patient_icn,
+                    "doc_id": None,
+                    "note_year": primary["note_year"],
+                    "notetype": primary["notetype"],
+                    "sta3n": primary["sta3n"],
+                    "note_count": len(ordered_docs),
+                    "documents": doc_payloads,
+                }
+            )
+        return aggregated
     return rows
 
 
@@ -110,28 +142,12 @@ def allocate_units(
         remainder = items[overlap_size:]
         for reviewer in reviewer_units.values():
             for row in overlap_pool:
-                row_keys = row.keys()
-                reviewer.units.append({
-                    "unit_id": row["doc_id"],
-                    "patient_icn": row["patient_icn"],
-                    "doc_id": row["doc_id"],
-                    "strata_key": strata_key,
-                    "is_overlap": 1,
-                    "hash": row["hash"] if "hash" in row_keys else "",
-                    "text": row["text"] if "text" in row_keys else "",
-                })
+                payload = _build_unit_payload(row, strata_key, is_overlap=True)
+                reviewer.units.append(payload)
         for idx, row in enumerate(remainder):
             reviewer = reviewers[idx % len(reviewers)]["id"]
-            row_keys = row.keys()
-            reviewer_units[reviewer].units.append({
-                "unit_id": row["doc_id"],
-                "patient_icn": row["patient_icn"],
-                "doc_id": row["doc_id"],
-                "strata_key": strata_key,
-                "is_overlap": 0,
-                "hash": row["hash"] if "hash" in row_keys else "",
-                "text": row["text"] if "text" in row_keys else "",
-            })
+            payload = _build_unit_payload(row, strata_key, is_overlap=False)
+            reviewer_units[reviewer].units.append(payload)
     # randomize display order per reviewer deterministically
     for reviewer in reviewer_units.values():
         rng = random.Random(_hash_seed(seed, reviewer.reviewer_id))
@@ -139,6 +155,38 @@ def allocate_units(
         for rank, unit in enumerate(reviewer.units, start=1):
             unit["display_rank"] = rank
     return reviewer_units
+
+
+def _build_unit_payload(row: sqlite3.Row | Dict[str, object], strata_key: str, is_overlap: bool) -> Dict[str, object]:
+    if isinstance(row, dict):
+        data = dict(row)
+    else:
+        data = {key: row[key] for key in row.keys()}
+    documents = data.get("documents")
+    if documents:
+        doc_payloads = [dict(doc) for doc in documents]  # shallow copy
+    else:
+        doc_payloads = [
+            {
+                "doc_id": data.get("doc_id"),
+                "hash": data.get("hash", ""),
+                "text": data.get("text", ""),
+                "order_index": 0,
+            }
+        ] if data.get("doc_id") else []
+    unit_id = data.get("unit_id") or data.get("doc_id")
+    payload = {
+        "unit_id": unit_id,
+        "patient_icn": data.get("patient_icn"),
+        "doc_id": data.get("doc_id"),
+        "strata_key": strata_key,
+        "is_overlap": 1 if is_overlap else 0,
+        "hash": data.get("hash", ""),
+        "text": data.get("text", ""),
+        "note_count": data.get("note_count"),
+        "documents": doc_payloads,
+    }
+    return payload
 
 
 def write_manifest(path: Path, assignments: Dict[str, ReviewerAssignment]) -> None:
@@ -174,29 +222,50 @@ def populate_assignment_db(db: Database, reviewer: str, units: Sequence[Dict[str
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ")
     with db.transaction() as conn:
         for order, unit in enumerate(units):
+            doc_id_value = unit.get("doc_id")
+            note_count = unit.get("note_count")
             record = models.AssignmentUnit(
                 unit_id=str(unit["unit_id"]),
                 display_rank=int(unit["display_rank"]),
                 patient_icn=str(unit["patient_icn"]),
-                doc_id=str(unit["doc_id"]),
-                note_count=None,
+                doc_id=str(doc_id_value) if doc_id_value is not None else None,
+                note_count=int(note_count) if isinstance(note_count, int) else None,
                 complete=0,
                 opened_at=None,
                 completed_at=None,
             )
             record.save(conn)
-            note = models.AssignmentUnitNote(
-                unit_id=str(unit["unit_id"]),
-                doc_id=str(unit["doc_id"]),
-                order_index=order,
-            )
-            note.save(conn)
-            doc = models.AssignmentDocument(
-                doc_id=str(unit["doc_id"]),
-                hash=str(unit.get("hash", "")),
-                text=str(unit.get("text", "")),
-            )
-            doc.save(conn)
+            documents = unit.get("documents") or []
+            if documents:
+                for doc in documents:
+                    doc_id = doc.get("doc_id")
+                    if not doc_id:
+                        continue
+                    note = models.AssignmentUnitNote(
+                        unit_id=str(unit["unit_id"]),
+                        doc_id=str(doc_id),
+                        order_index=int(doc.get("order_index", 0)),
+                    )
+                    note.save(conn)
+                    doc_record = models.AssignmentDocument(
+                        doc_id=str(doc_id),
+                        hash=str(doc.get("hash", "")),
+                        text=str(doc.get("text", "")),
+                    )
+                    doc_record.save(conn)
+            elif doc_id_value:
+                note = models.AssignmentUnitNote(
+                    unit_id=str(unit["unit_id"]),
+                    doc_id=str(doc_id_value),
+                    order_index=order,
+                )
+                note.save(conn)
+                doc = models.AssignmentDocument(
+                    doc_id=str(doc_id_value),
+                    hash=str(unit.get("hash", "")),
+                    text=str(unit.get("text", "")),
+                )
+                doc.save(conn)
         event = models.Event(
             event_id=f"init:{reviewer}:{timestamp}",
             ts=timestamp,
