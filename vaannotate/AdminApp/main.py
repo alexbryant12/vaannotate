@@ -1,14 +1,15 @@
 """PySide6 based Admin application for VAAnnotate."""
 from __future__ import annotations
 
+import csv
 import json
 import sqlite3
 import sys
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..shared import models
 from ..shared.database import Database, ensure_schema
@@ -746,6 +747,9 @@ class IaaPage(QtWidgets.QWidget):
         self.ctx = ctx
         self.current_round: Optional[Dict[str, object]] = None
         self.current_reviewer_names: Dict[str, str] = {}
+        self.assignment_paths: Dict[str, Path] = {}
+        self.unit_rows: List[Dict[str, object]] = []
+        self.round_manifest: Dict[str, Dict[str, bool]] = {}
         self._setup_ui()
         self.ctx.project_changed.connect(self.refresh)
 
@@ -814,26 +818,47 @@ class IaaPage(QtWidgets.QWidget):
         self.round_summary.setWordWrap(True)
         right_layout.addWidget(self.round_summary)
 
-        self.results_view = QtWidgets.QTextEdit()
-        self.results_view.setReadOnly(True)
-        self.results_view.setPlaceholderText("Agreement results will appear here once calculated")
-        right_layout.addWidget(self.results_view)
+        units_label = QtWidgets.QLabel("Imported units (overlapping assignments shown first)")
+        units_label.setWordWrap(True)
+        right_layout.addWidget(units_label)
 
-        discord_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        self.discord_table = QtWidgets.QTableWidget()
-        self.discord_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.discord_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.discord_table.itemSelectionChanged.connect(self._on_discord_selected)
-        discord_splitter.addWidget(self.discord_table)
+        self.unit_table = QtWidgets.QTableWidget()
+        self.unit_table.setColumnCount(6)
+        self.unit_table.setHorizontalHeaderLabels(
+            ["Reviewer", "Unit", "Patient", "Document", "Overlap", "Status"]
+        )
+        self.unit_table.verticalHeader().setVisible(False)
+        self.unit_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.unit_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.unit_table.itemSelectionChanged.connect(self._on_unit_selected)
+        self.unit_table.horizontalHeader().setStretchLastSection(True)
+        right_layout.addWidget(self.unit_table)
 
-        self.discord_note = QtWidgets.QTextEdit()
-        self.discord_note.setReadOnly(True)
-        self.discord_note.setPlaceholderText("Select a discordant unit to review the source note text")
-        discord_splitter.addWidget(self.discord_note)
-        discord_splitter.setStretchFactor(0, 3)
-        discord_splitter.setStretchFactor(1, 2)
+        doc_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
 
-        right_layout.addWidget(discord_splitter)
+        doc_panel = QtWidgets.QWidget()
+        doc_layout = QtWidgets.QVBoxLayout(doc_panel)
+        doc_layout.setContentsMargins(0, 0, 0, 0)
+        doc_layout.addWidget(QtWidgets.QLabel("Documents"))
+        self.document_table = QtWidgets.QTableWidget()
+        self.document_table.setColumnCount(4)
+        self.document_table.setHorizontalHeaderLabels(["Document", "Type", "Date", "Facility"])
+        self.document_table.verticalHeader().setVisible(False)
+        self.document_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.document_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.document_table.itemSelectionChanged.connect(self._on_document_selected)
+        self.document_table.horizontalHeader().setStretchLastSection(True)
+        doc_layout.addWidget(self.document_table)
+        doc_splitter.addWidget(doc_panel)
+
+        self.document_preview = QtWidgets.QTextEdit()
+        self.document_preview.setReadOnly(True)
+        self.document_preview.setPlaceholderText("Select a document to preview text")
+        doc_splitter.addWidget(self.document_preview)
+        doc_splitter.setStretchFactor(0, 1)
+        doc_splitter.setStretchFactor(1, 2)
+
+        right_layout.addWidget(doc_splitter)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(1, 3)
 
@@ -841,15 +866,18 @@ class IaaPage(QtWidgets.QWidget):
         self.pheno_list.clear()
         self.round_table.setRowCount(0)
         self.label_selector.clear()
-        self.results_view.clear()
-        self.discord_table.setRowCount(0)
-        self.discord_note.clear()
+        self.unit_table.setRowCount(0)
+        self.document_table.setRowCount(0)
+        self.document_preview.clear()
         self.manual_reviewer_combo.clear()
         self.manual_import_btn.setEnabled(False)
         self.auto_import_btn.setEnabled(False)
         self.import_status_label.clear()
         self.current_round = None
         self.current_reviewer_names = {}
+        self.assignment_paths = {}
+        self.unit_rows = []
+        self.round_manifest = {}
         self.round_summary.setText("Select a round to review agreement metrics")
         try:
             db = self.ctx.require_db()
@@ -866,15 +894,18 @@ class IaaPage(QtWidgets.QWidget):
         items = self.pheno_list.selectedItems()
         self.round_table.setRowCount(0)
         self.label_selector.clear()
-        self.results_view.clear()
-        self.discord_table.setRowCount(0)
-        self.discord_note.clear()
+        self.unit_table.setRowCount(0)
+        self.document_table.setRowCount(0)
+        self.document_preview.clear()
         self.manual_reviewer_combo.clear()
         self.manual_import_btn.setEnabled(False)
         self.auto_import_btn.setEnabled(False)
         self.import_status_label.clear()
         self.current_round = None
         self.current_reviewer_names = {}
+        self.assignment_paths = {}
+        self.unit_rows = []
+        self.round_manifest = {}
         if not items:
             return
         pheno = items[0].data(QtCore.Qt.ItemDataRole.UserRole) or {}
@@ -925,9 +956,12 @@ class IaaPage(QtWidgets.QWidget):
     def _on_round_selected(self) -> None:
         items = self.round_table.selectedItems()
         self.label_selector.clear()
-        self.results_view.clear()
-        self.discord_table.setRowCount(0)
-        self.discord_note.clear()
+        self.unit_table.setRowCount(0)
+        self.document_table.setRowCount(0)
+        self.document_preview.clear()
+        self.assignment_paths = {}
+        self.unit_rows = []
+        self.round_manifest = {}
         if not items:
             self.current_round = None
             self.round_summary.setText("Select a round to review agreement metrics")
@@ -967,6 +1001,11 @@ class IaaPage(QtWidgets.QWidget):
             self.label_selector.addItem(display, label["label_id"])
         if self.label_selector.count():
             self.label_selector.setCurrentIndex(0)
+        round_dir = self._resolve_round_dir()
+        if round_dir:
+            self.round_manifest = self._load_manifest(round_dir)
+            self._discover_existing_imports(round_dir)
+        self._refresh_units_table()
         if has_reviewers:
             self._auto_import_submissions(silent=True)
 
@@ -1024,11 +1063,12 @@ class IaaPage(QtWidgets.QWidget):
                 errors += 1
                 continue
             try:
-                self._copy_assignment_to_imports(reviewer_id, assignment_db)
+                target_path = self._copy_assignment_to_imports(reviewer_id, assignment_db)
             except Exception as exc:  # noqa: BLE001
                 statuses.append(f"{display_name}: import failed ({exc})")
                 errors += 1
             else:
+                self.assignment_paths[reviewer_id] = target_path
                 statuses.append(f"{display_name}: imported")
         summary = "\n".join(statuses) if statuses else "No reviewers for this round."
         self.import_status_label.setText(summary)
@@ -1037,6 +1077,7 @@ class IaaPage(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.warning(self, "Assignment import", summary)
             else:
                 QtWidgets.QMessageBox.information(self, "Assignment import", summary)
+        self._refresh_units_table()
 
     def _manual_import_assignment(self) -> None:
         if not self.current_round:
@@ -1061,7 +1102,7 @@ class IaaPage(QtWidgets.QWidget):
             return
         display_name = self.current_reviewer_names.get(reviewer_id, reviewer_id)
         try:
-            self._copy_assignment_to_imports(reviewer_id, Path(path_str))
+            target_path = self._copy_assignment_to_imports(reviewer_id, Path(path_str))
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(
                 self,
@@ -1069,13 +1110,14 @@ class IaaPage(QtWidgets.QWidget):
                 f"Failed to import assignment for {display_name}: {exc}",
             )
             return
+        self.assignment_paths[reviewer_id] = target_path
         self.import_status_label.setText(f"{display_name}: imported from manual selection")
         QtWidgets.QMessageBox.information(
             self,
             "Assignment import",
             f"Imported assignment for {display_name}.",
         )
-        self._auto_import_submissions(silent=True)
+        self._refresh_units_table()
 
     def _copy_assignment_to_imports(self, reviewer_id: str, source: Path) -> Path:
         if not self.current_round:
@@ -1103,6 +1145,257 @@ class IaaPage(QtWidgets.QWidget):
             )
         return target_path
 
+    def _resolve_round_dir(self) -> Optional[Path]:
+        if not self.current_round:
+            return None
+        try:
+            project_root = self.ctx.require_project()
+        except RuntimeError:
+            return None
+        pheno_id = self.current_round.get("pheno_id")
+        round_number = self.current_round.get("round_number")
+        if not pheno_id or round_number is None:
+            return None
+        return project_root / "phenotypes" / pheno_id / f"rounds/round_{round_number}"
+
+    def _load_manifest(self, round_dir: Path) -> Dict[str, Dict[str, bool]]:
+        manifest: Dict[str, Dict[str, bool]] = {}
+        manifest_path = round_dir / "manifest.csv"
+        if not manifest_path.exists():
+            return manifest
+        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                unit_id = row.get("unit_id")
+                reviewer_id = row.get("assigned_to")
+                if not unit_id or not reviewer_id:
+                    continue
+                flag = str(row.get("is_overlap", "")).strip().lower() in {"1", "true", "yes"}
+                manifest.setdefault(unit_id, {})[reviewer_id] = flag
+        return manifest
+
+    def _discover_existing_imports(self, round_dir: Path) -> None:
+        imports_dir = round_dir / "imports"
+        if not imports_dir.exists():
+            return
+        for reviewer in self.current_round.get("reviewers", []):
+            reviewer_id = reviewer.get("reviewer_id")
+            if not reviewer_id:
+                continue
+            candidate = imports_dir / f"{reviewer_id}_assignment.db"
+            if candidate.exists():
+                self.assignment_paths[reviewer_id] = candidate
+
+    def _selected_unit_index(self) -> Optional[int]:
+        current_row = self.unit_table.currentRow()
+        if current_row < 0:
+            return None
+        item = self.unit_table.item(current_row, 0)
+        if not item:
+            return None
+        data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if isinstance(data, int):
+            return data
+        try:
+            return int(data)
+        except (TypeError, ValueError):
+            return None
+
+    def _selected_unit_key(self) -> Optional[Tuple[str, str]]:
+        index = self._selected_unit_index()
+        if index is None or index >= len(self.unit_rows):
+            return None
+        row = self.unit_rows[index]
+        return (row["reviewer_id"], row["unit_id"])
+
+    def _clear_document_panel(self) -> None:
+        self.document_table.clearContents()
+        self.document_table.setRowCount(0)
+        self.document_preview.clear()
+
+    def _refresh_units_table(self) -> None:
+        selected_key = self._selected_unit_key()
+        existing_discord = {row["unit_id"] for row in self.unit_rows if row.get("discord")}
+        self.unit_rows = []
+        self.unit_table.clearContents()
+        self.unit_table.setRowCount(0)
+        self._clear_document_panel()
+        if not self.assignment_paths:
+            return
+        for reviewer_id, path in sorted(self.assignment_paths.items()):
+            if not path.exists():
+                continue
+            with sqlite3.connect(path) as conn:
+                conn.row_factory = sqlite3.Row
+                units = conn.execute(
+                    "SELECT unit_id, patient_icn, doc_id FROM units ORDER BY display_rank"
+                ).fetchall()
+            for unit_row in units:
+                unit_id = unit_row["unit_id"]
+                record = {
+                    "unit_id": unit_id,
+                    "patient_icn": unit_row["patient_icn"],
+                    "doc_id": unit_row["doc_id"],
+                    "reviewer_id": reviewer_id,
+                    "reviewer_name": self.current_reviewer_names.get(reviewer_id, reviewer_id),
+                    "is_overlap": bool(self.round_manifest.get(unit_id, {}).get(reviewer_id)),
+                    "discord": unit_id in existing_discord,
+                }
+                self.unit_rows.append(record)
+        for index, row in enumerate(self.unit_rows):
+            row["index"] = index
+        self._display_unit_rows(selected_key)
+
+    def _display_unit_rows(self, selected_key: Optional[Tuple[str, str]] = None) -> None:
+        self.unit_table.clearContents()
+        if not self.unit_rows:
+            self.unit_table.setRowCount(0)
+            return
+        sorted_rows = sorted(
+            self.unit_rows,
+            key=lambda row: (not row["is_overlap"], row["reviewer_name"], row["unit_id"]),
+        )
+        self.unit_table.setRowCount(len(sorted_rows))
+        highlight = QtGui.QColor("#ffebee")
+        for row_index, row in enumerate(sorted_rows):
+            items: List[QtWidgets.QTableWidgetItem] = []
+            reviewer_item = QtWidgets.QTableWidgetItem(row["reviewer_name"])
+            reviewer_item.setData(QtCore.Qt.ItemDataRole.UserRole, row["index"])
+            items.append(reviewer_item)
+            unit_item = QtWidgets.QTableWidgetItem(row["unit_id"])
+            items.append(unit_item)
+            patient_item = QtWidgets.QTableWidgetItem(row.get("patient_icn") or "")
+            items.append(patient_item)
+            doc_item = QtWidgets.QTableWidgetItem(row.get("doc_id") or "—")
+            items.append(doc_item)
+            overlap_item = QtWidgets.QTableWidgetItem("Yes" if row["is_overlap"] else "No")
+            items.append(overlap_item)
+            status_item = QtWidgets.QTableWidgetItem("Discordant" if row.get("discord") else "")
+            items.append(status_item)
+            for column, item in enumerate(items):
+                self.unit_table.setItem(row_index, column, item)
+            if row["is_overlap"]:
+                for item in items:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+            if row.get("discord"):
+                for item in items:
+                    item.setBackground(highlight)
+            if selected_key and (row["reviewer_id"], row["unit_id"]) == selected_key:
+                self.unit_table.selectRow(row_index)
+        self.unit_table.resizeColumnsToContents()
+
+    def _on_unit_selected(self) -> None:
+        index = self._selected_unit_index()
+        if index is None or index >= len(self.unit_rows):
+            self._clear_document_panel()
+            return
+        row = self.unit_rows[index]
+        self._populate_document_table(row)
+
+    def _populate_document_table(self, unit_row: Dict[str, object]) -> None:
+        self.document_table.clearContents()
+        self.document_table.setRowCount(0)
+        self.document_preview.clear()
+        reviewer_id = unit_row.get("reviewer_id")
+        unit_id = unit_row.get("unit_id")
+        if not reviewer_id or not unit_id:
+            return
+        assignment_path = self.assignment_paths.get(reviewer_id)
+        if not assignment_path or not assignment_path.exists():
+            return
+        with sqlite3.connect(assignment_path) as conn:
+            conn.row_factory = sqlite3.Row
+            doc_rows = conn.execute(
+                """
+                SELECT unit_notes.doc_id, unit_notes.order_index, documents.text
+                FROM unit_notes
+                LEFT JOIN documents ON documents.doc_id = unit_notes.doc_id
+                WHERE unit_notes.unit_id=?
+                ORDER BY unit_notes.order_index
+                """,
+                (unit_id,),
+            ).fetchall()
+        if not doc_rows:
+            return
+        metadata: Dict[str, sqlite3.Row] = {}
+        try:
+            corpus_db = self.ctx.require_corpus_db()
+        except RuntimeError:
+            corpus_db = None
+        if corpus_db:
+            with corpus_db.connect() as conn:
+                for doc_row in doc_rows:
+                    doc_id = doc_row["doc_id"]
+                    if not doc_id or doc_id in metadata:
+                        continue
+                    metadata[doc_id] = conn.execute(
+                        "SELECT doc_id, notetype, date_note, sta3n FROM documents WHERE doc_id=?",
+                        (doc_id,),
+                    ).fetchone()
+        self.document_table.setRowCount(len(doc_rows))
+        for row_index, doc_row in enumerate(doc_rows):
+            doc_id = doc_row["doc_id"] or ""
+            meta = metadata.get(doc_row["doc_id"])
+            payload = {
+                "doc_id": doc_id,
+                "text": doc_row["text"] or "",
+            }
+            if meta:
+                payload.update(
+                    {
+                        "notetype": meta["notetype"],
+                        "date_note": meta["date_note"],
+                        "sta3n": meta["sta3n"],
+                    }
+                )
+            doc_item = QtWidgets.QTableWidgetItem(doc_id or "—")
+            doc_item.setData(QtCore.Qt.ItemDataRole.UserRole, payload)
+            type_item = QtWidgets.QTableWidgetItem(meta["notetype"] if meta else "")
+            date_item = QtWidgets.QTableWidgetItem(meta["date_note"] if meta else "")
+            facility_item = QtWidgets.QTableWidgetItem(meta["sta3n"] if meta else "")
+            self.document_table.setItem(row_index, 0, doc_item)
+            self.document_table.setItem(row_index, 1, type_item)
+            self.document_table.setItem(row_index, 2, date_item)
+            self.document_table.setItem(row_index, 3, facility_item)
+        self.document_table.resizeColumnsToContents()
+        if self.document_table.rowCount():
+            self.document_table.selectRow(0)
+            self._on_document_selected()
+
+    def _on_document_selected(self) -> None:
+        row = self.document_table.currentRow()
+        if row < 0:
+            self.document_preview.clear()
+            return
+        item = self.document_table.item(row, 0)
+        if not item:
+            self.document_preview.clear()
+            return
+        payload = item.data(QtCore.Qt.ItemDataRole.UserRole) or {}
+        text = payload.get("text") or ""
+        self.document_preview.setPlainText(text if text else "Document text not found.")
+
+    def _is_overlap_unit(self, unit_id: str, reviewer_ids: List[str]) -> bool:
+        manifest_entry = self.round_manifest.get(unit_id)
+        if not manifest_entry:
+            return False
+        return all(manifest_entry.get(reviewer_id) for reviewer_id in reviewer_ids)
+
+    def _apply_discord_flags(self, discordant_units: Set[str]) -> None:
+        selected_key = self._selected_unit_key()
+        updated = False
+        for row in self.unit_rows:
+            flag = row["unit_id"] in discordant_units
+            if row.get("discord") != flag:
+                row["discord"] = flag
+                updated = True
+        if updated:
+            self._display_unit_rows(selected_key)
+        elif selected_key:
+            self._display_unit_rows(selected_key)
+
     def _compute_agreement(self) -> None:
         if not self.current_round:
             QtWidgets.QMessageBox.information(self, "IAA", "Select a round before calculating agreement")
@@ -1111,10 +1404,10 @@ class IaaPage(QtWidgets.QWidget):
         if not label_id:
             QtWidgets.QMessageBox.information(self, "IAA", "Select a label to evaluate")
             return
-        project_root = self.ctx.require_project()
-        pheno_id = self.current_round["pheno_id"]
-        round_number = self.current_round["round_number"]
-        round_dir = project_root / "phenotypes" / pheno_id / f"rounds/round_{round_number}"
+        round_dir = self._resolve_round_dir()
+        if not round_dir:
+            QtWidgets.QMessageBox.warning(self, "IAA", "Round directory is unavailable.")
+            return
         aggregate_path = round_dir / "round_aggregate.db"
         if not aggregate_path.exists():
             QtWidgets.QMessageBox.warning(
@@ -1123,7 +1416,8 @@ class IaaPage(QtWidgets.QWidget):
                 "Round aggregate not found. Import assignments and build the aggregate before calculating agreement.",
             )
             return
-        round_key = f"{pheno_id}_r{round_number}"
+        self.round_manifest = self._load_manifest(round_dir)
+        round_id = self.current_round["round_id"]
         with sqlite3.connect(aggregate_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
@@ -1133,16 +1427,15 @@ class IaaPage(QtWidgets.QWidget):
                 WHERE round_id=? AND label_id=?
                 ORDER BY unit_id, reviewer_id
                 """,
-                (round_key, label_id),
+                (round_id, label_id),
             ).fetchall()
-            summaries = conn.execute(
-                "SELECT unit_id, patient_icn, doc_id FROM unit_summary WHERE round_id=?",
-                (round_key,),
-            ).fetchall()
-        summary_map = {row["unit_id"]: dict(row) for row in summaries}
         if not rows:
-            self.results_view.setPlainText("No annotations found for the selected label.")
-            self.discord_table.setRowCount(0)
+            QtWidgets.QMessageBox.information(
+                self,
+                "IAA",
+                "No annotations found for the selected label.",
+            )
+            self._apply_discord_flags(set())
             return
         values_by_unit: Dict[str, Dict[str, str]] = {}
         for row in rows:
@@ -1151,22 +1444,38 @@ class IaaPage(QtWidgets.QWidget):
             value = self._format_value(row)
             values_by_unit.setdefault(unit_id, {})[reviewer_id] = value
         reviewer_ids = sorted({rid for ratings in values_by_unit.values() for rid in ratings.keys()})
-        complete_samples = []
+        complete_samples: List[List[str]] = []
+        discordant_ids: Set[str] = set()
         for unit_id, ratings in values_by_unit.items():
-            sample_row = []
+            if not self._is_overlap_unit(unit_id, reviewer_ids):
+                continue
+            sample_row: List[str] = []
             missing = False
             for reviewer_id in reviewer_ids:
                 if reviewer_id not in ratings:
                     missing = True
                     break
                 sample_row.append(ratings[reviewer_id])
-            if not missing and len(sample_row) >= 2:
-                complete_samples.append(sample_row)
+            if missing or len(sample_row) < 2:
+                continue
+            complete_samples.append(sample_row)
+            if len(set(sample_row)) > 1:
+                discordant_ids.add(unit_id)
+        if not complete_samples:
+            QtWidgets.QMessageBox.information(
+                self,
+                "IAA",
+                "No overlapping units with complete annotations were found.",
+            )
+            self._apply_discord_flags(set())
+            return
         metric = self.metric_selector.currentText()
-        result_lines = []
+        result_lines: List[str] = []
         if metric == "Percent agreement":
             value = percent_agreement(complete_samples)
-            result_lines.append(f"Percent agreement: {value:.3%} across {len(complete_samples)} overlapped units")
+            result_lines.append(
+                f"Percent agreement: {value:.3%} across {len(complete_samples)} overlapped units"
+            )
         elif metric == "Cohen's kappa":
             if len(reviewer_ids) != 2:
                 QtWidgets.QMessageBox.warning(self, "IAA", "Cohen's kappa requires exactly two reviewers")
@@ -1174,71 +1483,22 @@ class IaaPage(QtWidgets.QWidget):
             rater_a = [row[0] for row in complete_samples]
             rater_b = [row[1] for row in complete_samples]
             value = cohens_kappa(rater_a, rater_b)
-            result_lines.append(f"Cohen's kappa: {value:.3f} across {len(complete_samples)} overlapped units")
+            result_lines.append(
+                f"Cohen's kappa: {value:.3f} across {len(complete_samples)} overlapped units"
+            )
         else:
-            categories = sorted({val for ratings in values_by_unit.values() for val in ratings.values()})
-            matrix = []
-            for ratings in values_by_unit.values():
-                if len(ratings) < 2:
-                    continue
-                counts = [sum(1 for val in ratings.values() if val == category) for category in categories]
+            categories = sorted({value for sample in complete_samples for value in sample})
+            matrix: List[List[int]] = []
+            for sample in complete_samples:
+                counts = [sample.count(category) for category in categories]
                 matrix.append(counts)
             value = fleiss_kappa(matrix)
-            result_lines.append(f"Fleiss' kappa: {value:.3f} across {len(matrix)} overlapped units")
-        discordant_units = []
-        for unit_id, ratings in values_by_unit.items():
-            if len(ratings) < 2:
-                continue
-            if len(set(ratings.values())) > 1:
-                discordant_units.append((unit_id, summary_map.get(unit_id, {}), ratings))
-        result_lines.append(f"Discordant units: {len(discordant_units)}")
-        self.results_view.setPlainText("\n".join(result_lines))
-        self._populate_discord_table(discordant_units, reviewer_ids)
-
-    def _populate_discord_table(
-        self,
-        rows: List[Tuple[str, Dict[str, object], Dict[str, str]]],
-        reviewer_ids: List[str],
-    ) -> None:
-        headers = ["Unit", "Patient", "Document"] + [self.current_reviewer_names.get(rid, rid) for rid in reviewer_ids]
-        self.discord_table.clear()
-        self.discord_table.setColumnCount(len(headers))
-        self.discord_table.setHorizontalHeaderLabels(headers)
-        self.discord_table.setRowCount(len(rows))
-        for row_index, (unit_id, summary, ratings) in enumerate(rows):
-            unit_item = QtWidgets.QTableWidgetItem(unit_id)
-            unit_item.setData(QtCore.Qt.ItemDataRole.UserRole, {"doc_id": summary.get("doc_id"), "unit_id": unit_id})
-            patient_item = QtWidgets.QTableWidgetItem(str(summary.get("patient_icn", "")))
-            doc_item = QtWidgets.QTableWidgetItem(str(summary.get("doc_id", "")))
-            self.discord_table.setItem(row_index, 0, unit_item)
-            self.discord_table.setItem(row_index, 1, patient_item)
-            self.discord_table.setItem(row_index, 2, doc_item)
-            for col_offset, reviewer_id in enumerate(reviewer_ids, start=3):
-                value = ratings.get(reviewer_id, "—")
-                self.discord_table.setItem(row_index, col_offset, QtWidgets.QTableWidgetItem(value))
-        self.discord_table.resizeColumnsToContents()
-
-    def _on_discord_selected(self) -> None:
-        items = self.discord_table.selectedItems()
-        if not items:
-            self.discord_note.clear()
-            return
-        payload = items[0].data(QtCore.Qt.ItemDataRole.UserRole) or {}
-        doc_id = payload.get("doc_id")
-        if not doc_id:
-            self.discord_note.clear()
-            return
-        try:
-            corpus_db = self.ctx.require_corpus_db()
-        except RuntimeError:
-            self.discord_note.setPlainText("Corpus database is not available.")
-            return
-        with corpus_db.connect() as conn:
-            row = conn.execute("SELECT text FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
-        if row and row["text"]:
-            self.discord_note.setPlainText(row["text"])
-        else:
-            self.discord_note.setPlainText("Document text not found in corpus.")
+            result_lines.append(
+                f"Fleiss' kappa: {value:.3f} across {len(matrix)} overlapped units"
+            )
+        result_lines.append(f"Discordant units: {len(discordant_ids)}")
+        QtWidgets.QMessageBox.information(self, "IAA results", "\n".join(result_lines))
+        self._apply_discord_flags(discordant_ids)
 
     @staticmethod
     def _format_value(row: sqlite3.Row) -> str:
