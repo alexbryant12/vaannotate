@@ -7,12 +7,13 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from vaannotate.shared import models
 from vaannotate.shared.database import Database, ensure_schema
+from vaannotate.project import get_connection
 
 
 @dataclass
@@ -28,6 +29,239 @@ class LabelDefinition:
     gating_expr: Optional[str]
     options: List[Dict[str, object]]
 
+
+@dataclass
+class ReviewerInfo:
+    reviewer_id: str
+    name: str
+    email: Optional[str]
+
+    def display_label(self) -> str:
+        display_name = (self.name or "").strip()
+        if display_name and display_name != self.reviewer_id:
+            return f"{display_name} ({self.reviewer_id})"
+        return self.reviewer_id
+
+
+@dataclass
+class AssignmentSummary:
+    round_id: str
+    phenotype_id: str
+    phenotype_name: str
+    round_number: Optional[int]
+    assignment_dir: Path
+    submitted: bool
+
+    def round_label(self) -> str:
+        if self.round_number is None:
+            return self.round_id
+        return f"Round {self.round_number}"
+
+
+class ProjectBrowser:
+    def __init__(self, project_root: Path):
+        self.project_root = project_root.resolve()
+        self.project_db = self.project_root / "project.db"
+        if not self.project_db.exists():
+            raise FileNotFoundError(self.project_db)
+
+    def list_reviewers(self) -> List[ReviewerInfo]:
+        with get_connection(self.project_db) as conn:
+            rows = conn.execute(
+                "SELECT reviewer_id, name, email FROM reviewers ORDER BY name COLLATE NOCASE, reviewer_id"
+            ).fetchall()
+        return [
+            ReviewerInfo(
+                reviewer_id=str(row["reviewer_id"]),
+                name=str(row["name"] or ""),
+                email=str(row["email"]) if row["email"] is not None else None,
+            )
+            for row in rows
+        ]
+
+    def list_assignments(self, reviewer_id: str) -> Tuple[List[AssignmentSummary], List[str]]:
+        assignments: List[AssignmentSummary] = []
+        warnings: List[str] = []
+        with get_connection(self.project_db) as conn:
+            rows = conn.execute(
+                """
+                SELECT a.round_id, r.pheno_id, r.round_number, p.name AS phenotype_name
+                FROM assignments AS a
+                JOIN rounds AS r ON a.round_id = r.round_id
+                JOIN phenotypes AS p ON r.pheno_id = p.pheno_id
+                WHERE a.reviewer_id = ?
+                ORDER BY p.name COLLATE NOCASE, r.round_number
+                """,
+                (reviewer_id,),
+            ).fetchall()
+        for row in rows:
+            pheno_id = str(row["pheno_id"])
+            round_id = str(row["round_id"])
+            round_number_raw = row["round_number"]
+            round_number: Optional[int]
+            try:
+                round_number = int(round_number_raw)
+            except (TypeError, ValueError):
+                round_number = None
+            round_dir = self._resolve_round_dir(pheno_id, round_number, round_id)
+            if not round_dir:
+                warnings.append(
+                    f"Round directory not found for {pheno_id} ({round_id})."
+                )
+                continue
+            assignment_dir = round_dir / "assignments" / reviewer_id
+            assignment_db = assignment_dir / "assignment.db"
+            if not assignment_db.exists():
+                warnings.append(
+                    f"Assignment database missing for {pheno_id} {round_dir.name}."
+                )
+                continue
+            submitted = (assignment_dir / "submitted.json").exists()
+            assignments.append(
+                AssignmentSummary(
+                    round_id=round_id,
+                    phenotype_id=pheno_id,
+                    phenotype_name=str(row["phenotype_name"] or pheno_id),
+                    round_number=round_number,
+                    assignment_dir=assignment_dir,
+                    submitted=submitted,
+                )
+            )
+        return assignments, warnings
+
+    def _resolve_round_dir(
+        self, pheno_id: str, round_number: Optional[int], round_id: str
+    ) -> Optional[Path]:
+        rounds_root = self.project_root / "phenotypes" / pheno_id / "rounds"
+        if round_number is not None:
+            default_dir = rounds_root / f"round_{round_number}"
+            if default_dir.exists():
+                return default_dir
+        if not rounds_root.exists():
+            return None
+        for candidate in sorted(rounds_root.iterdir()):
+            if not candidate.is_dir():
+                continue
+            config_path = candidate / "round_config.json"
+            if not config_path.exists():
+                continue
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            config_round_id = str(config.get("round_id") or "")
+            if config_round_id == round_id:
+                return candidate
+        return None
+
+
+class AssignmentPickerDialog(QtWidgets.QDialog):
+    def __init__(self, browser: ProjectBrowser, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.browser = browser
+        self.setWindowTitle("Open project assignment")
+        self.resize(500, 400)
+        self.reviewers: List[ReviewerInfo] = self.browser.list_reviewers()
+        self._current_assignments: List[AssignmentSummary] = []
+        self._current_warnings: List[str] = []
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        reviewer_row = QtWidgets.QHBoxLayout()
+        reviewer_label = QtWidgets.QLabel("Reviewer:")
+        reviewer_row.addWidget(reviewer_label)
+        self.reviewer_combo = QtWidgets.QComboBox()
+        for reviewer in self.reviewers:
+            self.reviewer_combo.addItem(reviewer.display_label(), reviewer.reviewer_id)
+        reviewer_row.addWidget(self.reviewer_combo, 1)
+        layout.addLayout(reviewer_row)
+
+        self.assignment_tree = QtWidgets.QTreeWidget()
+        self.assignment_tree.setColumnCount(3)
+        self.assignment_tree.setHeaderLabels(["Phenotype", "Round", "Submission"])
+        self.assignment_tree.setRootIsDecorated(False)
+        self.assignment_tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.assignment_tree.itemSelectionChanged.connect(self._update_button_state)
+        self.assignment_tree.itemActivated.connect(lambda _item, _column: self.accept())
+        layout.addWidget(self.assignment_tree, 1)
+
+        self.status_label = QtWidgets.QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        if self.reviewers:
+            self.reviewer_combo.currentIndexChanged.connect(self._refresh_assignments)
+            self._refresh_assignments()
+        else:
+            self.reviewer_combo.setEnabled(False)
+            ok_button = self.button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+            if ok_button:
+                ok_button.setEnabled(False)
+            self.status_label.setText("No reviewers found in this project.")
+
+    def selected_assignment(self) -> Optional[AssignmentSummary]:
+        item = self.assignment_tree.currentItem()
+        if not item:
+            return None
+        assignment = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        return assignment if isinstance(assignment, AssignmentSummary) else None
+
+    def selected_reviewer(self) -> Optional[ReviewerInfo]:
+        index = self.reviewer_combo.currentIndex()
+        if index < 0 or index >= len(self.reviewers):
+            return None
+        return self.reviewers[index]
+
+    def _refresh_assignments(self) -> None:
+        reviewer_id = self.reviewer_combo.currentData()
+        self.assignment_tree.clear()
+        self._current_assignments = []
+        self._current_warnings = []
+        if not reviewer_id:
+            self._update_button_state()
+            return
+        assignments, warnings = self.browser.list_assignments(str(reviewer_id))
+        self._current_assignments = assignments
+        self._current_warnings = warnings
+        for assignment in assignments:
+            submission_text = "Submitted" if assignment.submitted else "In progress"
+            item = QtWidgets.QTreeWidgetItem(
+                [assignment.phenotype_name, assignment.round_label(), submission_text]
+            )
+            if assignment.submitted:
+                item.setIcon(
+                    0,
+                    self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton),
+                )
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, assignment)
+            self.assignment_tree.addTopLevelItem(item)
+        if assignments:
+            self.assignment_tree.setCurrentItem(self.assignment_tree.topLevelItem(0))
+        self._update_status_label()
+        self._update_button_state()
+
+    def _update_status_label(self) -> None:
+        if self._current_assignments:
+            warning_text = "\n".join(self._current_warnings)
+            self.status_label.setText(warning_text)
+        else:
+            if self._current_warnings:
+                message = "\n".join(self._current_warnings)
+            else:
+                message = "No assignments found for the selected reviewer."
+            self.status_label.setText(message)
+
+    def _update_button_state(self) -> None:
+        ok_button = self.button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        if ok_button:
+            ok_button.setEnabled(bool(self.assignment_tree.currentItem()))
 
 class AssignmentContext(QtCore.QObject):
     assignment_loaded = QtCore.Signal()
@@ -626,6 +860,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self.resize(1400, 900)
         self.current_documents: List[Dict[str, object]] = []
         self.active_doc_id: Optional[str] = None
+        self._last_project_dir: Optional[Path] = None
         self._setup_menu()
         self._setup_ui()
         self.ctx.assignment_loaded.connect(self._on_assignment_loaded)
@@ -635,8 +870,8 @@ class ClientMainWindow(QtWidgets.QMainWindow):
     def _setup_menu(self) -> None:
         bar = self.menuBar()
         file_menu = bar.addMenu("File")
-        open_action = file_menu.addAction("Open assignment…")
-        open_action.triggered.connect(self._open_assignment)
+        open_action = file_menu.addAction("Open project…")
+        open_action.triggered.connect(self._open_project)
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
 
@@ -697,11 +932,47 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         nav_toolbar.addAction(next_action)
         nav_toolbar.addAction(submit_action)
 
-    def _open_assignment(self) -> None:
-        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select assignment folder")
+    def _open_project(self) -> None:
+        start_dir = str(self._last_project_dir) if self._last_project_dir else str(Path.home())
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select project folder",
+            start_dir,
+        )
         if not directory:
             return
-        self.ctx.open_assignment(Path(directory))
+        project_root = Path(directory)
+        try:
+            browser = ProjectBrowser(project_root)
+        except FileNotFoundError:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Open project",
+                "The selected folder does not appear to be a VAAnnotate project (project.db not found).",
+            )
+            return
+        picker = AssignmentPickerDialog(browser, self)
+        if picker.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        assignment = picker.selected_assignment()
+        if not assignment:
+            return
+        try:
+            self.ctx.open_assignment(assignment.assignment_dir)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Open assignment",
+                f"Failed to open assignment: {exc}",
+            )
+            return
+        self._last_project_dir = project_root
+        reviewer = picker.selected_reviewer()
+        reviewer_label = reviewer.display_label() if reviewer else ""
+        status_parts = [assignment.phenotype_name, assignment.round_label()]
+        if reviewer_label:
+            status_parts.append(f"Reviewer: {reviewer_label}")
+        self.statusBar().showMessage(" – ".join(status_parts))
 
     def _format_unit_label(self, unit: Dict[str, object]) -> str:
         doc_id = str(unit.get("doc_id") or "").strip()
