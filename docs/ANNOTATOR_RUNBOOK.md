@@ -1,11 +1,12 @@
 # Annotator Runbook — Project Toy
 
-> Admins prepare your folder by running `python tools\seed_toy_project.py` (or `scripts\new_toy_project.ps1`).
+> Admins prepare your folder by running `python tools\seed_toy_project.py` from an activated Conda prompt.
 
 1. Navigate to your assignment folder on the shared drive:
    `.../phenotypes/ph_diabetes/rounds/round_1/assignments/<your_id>/`.
-2. Inside the folder, open `scripts` and double-click `run_client.ps1`.
-   - Alternatively, double-click `client.exe` directly.
+2. Open an Anaconda Prompt, activate the environment with `conda activate vaannotate`,
+   change into your assignment folder, and run `python -m vaannotate.ClientApp.main`.
+   - Alternatively, double-click `client.exe` if a standalone build is provided.
 3. The client opens with three panes:
    - **Left**: list of notes/patients (bold = not yet viewed).
    - **Middle**: note text. Scroll to read the entire document.

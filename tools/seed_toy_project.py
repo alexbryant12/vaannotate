@@ -44,80 +44,56 @@ class Note:
         return int(self.date.split("-")[0])
 
 
-PATIENTS = [
-    {"patient_icn": "1001", "sta3n": "506"},
-    {"patient_icn": "1002", "sta3n": "515"},
-    {"patient_icn": "1003", "sta3n": "506"},
+PATIENTS: List[Dict[str, str]] = [
+    {"patient_icn": f"20{index:02d}", "sta3n": "506" if index % 2 else "515"}
+    for index in range(1, 11)
 ]
 
-NOTES: List[Note] = [
-    Note(
-        doc_id="1001_2018_primary",
-        patient_icn="1001",
-        sta3n="506",
-        notetype="PRIMARY CARE NOTE",
-        date="2018-02-14",
-        text="""
-        Patient started metformin. HbA1c 7.9.
-        Lifestyle adjustments discussed and follow up arranged.
-        """,
-    ),
-    Note(
-        doc_id="1001_2020_endo",
-        patient_icn="1001",
-        sta3n="506",
-        notetype="ENDOCRINOLOGY NOTE",
-        date="2020-08-01",
-        text="""
-        Insulin initiated; prior HbA1c 8.2.
-        Patient counseled on self monitoring.
-        """,
-    ),
-    Note(
-        doc_id="1002_2019_primary",
-        patient_icn="1002",
-        sta3n="515",
-        notetype="PRIMARY CARE NOTE",
-        date="2019-04-22",
-        text="""
-        No evidence of diabetes; lifestyle discussed.
-        Annual lab review pending.
-        """,
-    ),
-    Note(
-        doc_id="1002_2021_endo",
-        patient_icn="1002",
-        sta3n="515",
-        notetype="ENDOCRINOLOGY NOTE",
-        date="2021-11-10",
-        text="""
-        Lab today: HBA1C 6.4; continue metformin.
-        No medication changes required.
-        """,
-    ),
-    Note(
-        doc_id="1003_2023_primary",
-        patient_icn="1003",
-        sta3n="506",
-        notetype="PRIMARY CARE NOTE",
-        date="2023-05-19",
-        text="""
-        Patient started metformin. HbA1c 8.1.
-        Nutrition counseling reinforced.
-        """,
-    ),
-    Note(
-        doc_id="1003_2024_endo",
-        patient_icn="1003",
-        sta3n="506",
-        notetype="ENDOCRINOLOGY NOTE",
-        date="2024-01-09",
-        text="""
-        Insulin initiated; prior HbA1c 8.2.
-        Basal dose titrated; follow-up scheduled.
-        """,
-    ),
+NOTE_THEMES = [
+    ("PRIMARY CARE NOTE", "Primary care follow-up summarizing comprehensive chronic disease management."),
+    ("ENDOCRINOLOGY NOTE", "Endocrinology consultation focused on medication titration and long-term planning."),
+    ("PHARMACY NOTE", "Pharmacy medication therapy management review concentrating on adherence and refills."),
+    ("NUTRITION NOTE", "Nutrition counseling session highlighting meal planning and lifestyle reinforcement."),
+    ("TELEHEALTH NOTE", "Telehealth touchpoint documenting remote symptom monitoring and coaching."),
 ]
+
+
+def generate_notes(patients: Sequence[Dict[str, str]], total_notes: int) -> List[Note]:
+    notes: List[Note] = []
+    theme_count = len(NOTE_THEMES)
+    for index in range(total_notes):
+        patient = patients[index % len(patients)]
+        notetype, theme = NOTE_THEMES[index % theme_count]
+        year = 2015 + (index % 10)
+        month = (index % 12) + 1
+        day = (index % 28) + 1
+        date = f"{year}-{month:02d}-{day:02d}"
+        doc_id = f"{patient['patient_icn']}_{date.replace('-', '')}_{index:03d}"
+        paragraphs = [
+            f"{theme} Visit date {date} at facility {patient['sta3n']}. Clinicians reviewed vitals, symptoms, and chart history while confirming medication reconciliation for patient {patient['patient_icn']}.",
+            (
+                "Medication adjustments included refreshed metformin guidance, individualized insulin teaching, and"
+                f" reinforcement of home glucose monitoring. Documented HbA1c trend measured {6.4 + (index % 9) * 0.2:.1f}"
+                " with comparison to prior labs to demonstrate progress."
+            ),
+            "Care planning emphasized social support, nutrition, and physical activity goals. The note records resources offered for transportation, pharmacy follow-up, and nursing outreach to close care gaps.",
+            "Structured assessment captured review of systems, motivational interviewing highlights, and next steps for laboratory surveillance with clear thresholds for escalation.",
+        ]
+        text = "\n\n".join(paragraphs)
+        notes.append(
+            Note(
+                doc_id=doc_id,
+                patient_icn=patient["patient_icn"],
+                sta3n=patient["sta3n"],
+                notetype=notetype,
+                date=date,
+                text=text,
+            )
+        )
+    return notes
+
+
+NOTES: List[Note] = generate_notes(PATIENTS, 100)
 
 REVIEWERS = [
     {"reviewer_id": "r_alex", "name": "Alex Reviewer", "email": "alex@example.test"},

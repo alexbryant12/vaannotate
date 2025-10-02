@@ -1,33 +1,32 @@
 # Building Portable Windows Executables
 
-> After cloning, run `python tools\seed_toy_project.py` (or `scripts\new_toy_project.ps1`) to regenerate `demo/Project_Toy/` and placeholders — binaries are not committed to Git.
+> After cloning, run `python tools\seed_toy_project.py` from an activated Conda prompt to regenerate `demo/Project_Toy/` and placeholders — binaries are not committed to Git.
 
 1. **Prerequisites**
    - Windows 10 or later
-   - Python 3.11 installed (`py -3.11`)
-2. **Create a virtual environment**
-   ```powershell
-   py -3.11 -m venv .venv
+   - Anaconda or Miniconda with Python 3.11 available
+2. **Create a Conda environment**
+   ```
+   conda create -n vaannotate python=3.11
    ```
 3. **Activate the environment**
-   ```powershell
-   .venv\Scripts\activate
+   ```
+   conda activate vaannotate
    ```
 4. **Install dependencies**
-   ```powershell
+   ```
    pip install -r requirements.txt
+   pip install pyinstaller
    ```
 5. **Build AdminApp**
-   ```powershell
-   pyinstaller --noconfirm --clean --name AdminApp --onefile --windowed ^
-     --add-data "Shared;Shared" --add-data "DataAccess;DataAccess" ^
-     AdminApp\main.py
+   ```
+   pyinstaller --noconfirm --clean --name AdminApp --onefile --windowed \
+     vaannotate/AdminApp/main.py
    ```
 6. **Build ClientApp**
-   ```powershell
-   pyinstaller --noconfirm --clean --name ClientApp --onefile --windowed ^
-     --add-data "Shared;Shared" --add-data "DataAccess;DataAccess" ^
-     ClientApp\main.py
+   ```
+   pyinstaller --noconfirm --clean --name ClientApp --onefile --windowed \
+     vaannotate/ClientApp/main.py
    ```
 7. **Locate the outputs**
    - Executables are written to `dist\AdminApp.exe` and `dist\ClientApp.exe`.
