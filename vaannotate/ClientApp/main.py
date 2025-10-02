@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -290,8 +291,9 @@ class AnnotationForm(QtWidgets.QScrollArea):
     def load_unit(self, unit_id: str, annotations: Dict[str, Dict[str, object]]) -> None:
         self.current_unit_id = unit_id
         self.current_annotations = annotations
-        for label_id, widgets in self.label_widgets.items():
-            self._apply_annotation(label_id, widgets, annotations.get(label_id, {}))
+        with self._suspend_widget_signals():
+            for label_id, widgets in self.label_widgets.items():
+                self._apply_annotation(label_id, widgets, annotations.get(label_id, {}))
         self._update_gating()
         self._update_completion()
 
@@ -418,6 +420,40 @@ class AnnotationForm(QtWidgets.QScrollArea):
             widgets["na_box"].setChecked(False)  # type: ignore[index]
         if "notes" in widgets:
             widgets["notes"].clear()  # type: ignore[index]
+
+    @contextmanager
+    def _suspend_widget_signals(self):
+        widgets: List[QtCore.QObject] = []
+        for state in self.label_widgets.values():
+            group = state.get("button_group")
+            if isinstance(group, QtWidgets.QButtonGroup):
+                widgets.append(group)
+                widgets.extend(group.buttons())
+            checkbox_list = state.get("checkboxes")
+            if isinstance(checkbox_list, list):
+                widgets.extend(cb for cb in checkbox_list if isinstance(cb, QtWidgets.QCheckBox))
+            line_edit = state.get("line_edit")
+            if isinstance(line_edit, QtWidgets.QLineEdit):
+                widgets.append(line_edit)
+            date_edit = state.get("date_edit")
+            if isinstance(date_edit, QtWidgets.QDateEdit):
+                widgets.append(date_edit)
+            text_edit = state.get("text_edit")
+            if isinstance(text_edit, QtWidgets.QTextEdit):
+                widgets.append(text_edit)
+            na_box = state.get("na_box")
+            if isinstance(na_box, QtWidgets.QCheckBox):
+                widgets.append(na_box)
+            notes = state.get("notes")
+            if isinstance(notes, QtWidgets.QLineEdit):
+                widgets.append(notes)
+        try:
+            for widget in widgets:
+                widget.blockSignals(True)
+            yield
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
 
     # value change handlers ------------------------------------------------
 
