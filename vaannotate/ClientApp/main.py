@@ -123,25 +123,76 @@ class AssignmentContext(QtCore.QObject):
     def save_annotation(self, unit_id: str, label_id: str, payload: Dict[str, object]) -> None:
         if not self.assignment_db:
             return
-        record = models.Annotation(
-            unit_id=unit_id,
-            label_id=label_id,
-            value=payload.get("value"),
-            value_num=payload.get("value_num"),
-            value_date=payload.get("value_date"),
-            na=1 if payload.get("na") else 0,
-            notes=payload.get("notes"),
-        )
+        def _normalized_state(data: Dict[str, object]) -> Dict[str, object]:
+            """Prepare a dictionary that mirrors the annotation schema."""
+
+            state: Dict[str, object] = {}
+            if "value" in data:
+                state["value"] = data.get("value")
+            if "value_num" in data:
+                state["value_num"] = data.get("value_num")
+            if "value_date" in data:
+                state["value_date"] = data.get("value_date")
+            if "na" in data:
+                state["na"] = bool(data.get("na"))
+            if "notes" in data:
+                notes = data.get("notes")
+                state["notes"] = notes if notes is None else str(notes)
+            return state
+
         with self.assignment_db.transaction() as conn:
+            row = conn.execute(
+                "SELECT value, value_num, value_date, na, notes FROM annotations WHERE unit_id=? AND label_id=?",
+                (unit_id, label_id),
+            ).fetchone()
+            base_state: Dict[str, object] = {
+                "value": row["value"] if row else None,
+                "value_num": row["value_num"] if row else None,
+                "value_date": row["value_date"] if row else None,
+                "na": bool(row["na"]) if row else False,
+                "notes": row["notes"] if row else None,
+            }
+            base_state.update(_normalized_state(payload))
+            record = models.Annotation(
+                unit_id=unit_id,
+                label_id=label_id,
+                value=base_state.get("value"),
+                value_num=base_state.get("value_num"),
+                value_date=base_state.get("value_date"),
+                na=1 if base_state.get("na") else 0,
+                notes=base_state.get("notes"),
+            )
             record.save(conn)
             event = models.Event(
                 event_id=str(uuid.uuid4()),
                 ts=QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate),
                 actor="annotator",
                 event_type="annotation_saved",
-                payload_json=json.dumps({"unit_id": unit_id, "label_id": label_id, "payload": payload}),
+                payload_json=json.dumps(
+                    {
+                        "unit_id": unit_id,
+                        "label_id": label_id,
+                        "payload": {
+                            "value": record.value,
+                            "value_num": record.value_num,
+                            "value_date": record.value_date,
+                            "na": bool(record.na),
+                            "notes": record.notes,
+                        },
+                    }
+                ),
             )
             event.save(conn)
+        if self.current_unit_id == unit_id:
+            self.current_annotations[label_id] = {
+                "unit_id": unit_id,
+                "label_id": label_id,
+                "value": record.value,
+                "value_num": record.value_num,
+                "value_date": record.value_date,
+                "na": record.na,
+                "notes": record.notes,
+            }
         self.save_state_changed.emit("Saved")
 
     def save_rationale(self, unit_id: str, label_id: str, doc_id: str, start: int, end: int, snippet: str) -> None:

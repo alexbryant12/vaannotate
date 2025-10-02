@@ -1165,9 +1165,12 @@ class IaaWidget(QtWidgets.QWidget):
         self.unit_table.verticalHeader().setVisible(False)
         self.unit_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.unit_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.unit_table.setWordWrap(True)
         self.unit_table.itemSelectionChanged.connect(self._on_unit_selected)
         self.unit_table.horizontalHeader().setStretchLastSection(True)
+        self.unit_table.cellDoubleClicked.connect(self._show_annotation_dialog)
         layout.addWidget(self.unit_table)
+        self._unit_metadata_column_count = 5
 
         doc_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         doc_panel = QtWidgets.QWidget()
@@ -1465,7 +1468,7 @@ class IaaWidget(QtWidgets.QWidget):
         self.unit_table.setColumnCount(len(headers))
         self.unit_table.setHorizontalHeaderLabels(headers)
 
-    def _format_annotation_summary(self, annotations: Dict[str, str]) -> str:
+    def _format_annotation_summary(self, annotations: Dict[str, object]) -> str:
         if not annotations:
             return ""
         lines: List[str] = []
@@ -1474,16 +1477,30 @@ class IaaWidget(QtWidgets.QWidget):
             if label_id not in annotations:
                 continue
             seen.add(label_id)
-            value = annotations[label_id]
-            label_name = self.label_lookup.get(label_id, label_id)
-            display_value = value if value else "—"
-            lines.append(f"{label_name}: {display_value}")
-        for label_id in sorted(annotations.keys() - seen):
-            value = annotations[label_id]
-            label_name = self.label_lookup.get(label_id, label_id)
-            display_value = value if value else "—"
-            lines.append(f"{label_name}: {display_value}")
-        return "\n".join(lines)
+            lines.append(self._format_annotation_line(label_id, annotations[label_id]))
+        remaining = set(annotations.keys()) - seen
+        for label_id in sorted(remaining):
+            lines.append(self._format_annotation_line(label_id, annotations[label_id]))
+        return "\n".join(line for line in lines if line)
+
+    def _format_annotation_line(self, label_id: str, entry: object) -> str:
+        label_name = self.label_lookup.get(label_id, label_id)
+        display_value = ""
+        notes_value = ""
+        if isinstance(entry, dict):
+            display_value = str(entry.get("display") or "")
+            raw_notes = entry.get("notes")
+            notes_value = str(raw_notes).strip() if raw_notes else ""
+        else:
+            display_value = str(entry) if entry is not None else ""
+        parts: List[str] = []
+        if display_value:
+            parts.append(display_value)
+        if notes_value:
+            parts.append(f"Notes: {notes_value}")
+        if not parts:
+            parts.append("—")
+        return f"{label_name}: {'; '.join(parts)}"
 
     def _selected_unit_index(self) -> Optional[int]:
         current_row = self.unit_table.currentRow()
@@ -1537,13 +1554,20 @@ class IaaWidget(QtWidgets.QWidget):
                     "SELECT unit_id, patient_icn, doc_id FROM units ORDER BY display_rank"
                 ).fetchall()
                 annotations = conn.execute(
-                    "SELECT unit_id, label_id, value, value_num, value_date, na FROM annotations"
+                    "SELECT unit_id, label_id, value, value_num, value_date, na, notes FROM annotations"
                 ).fetchall()
-            ann_map: Dict[str, Dict[str, str]] = {}
+            ann_map: Dict[str, Dict[str, Dict[str, object]]] = {}
             for ann_row in annotations:
                 unit_id = ann_row["unit_id"]
                 formatted = self._format_value(ann_row)
-                ann_map.setdefault(unit_id, {})[ann_row["label_id"]] = formatted
+                ann_map.setdefault(unit_id, {})[ann_row["label_id"]] = {
+                    "display": formatted,
+                    "notes": ann_row["notes"] or "",
+                    "value": ann_row["value"],
+                    "value_num": ann_row["value_num"],
+                    "value_date": ann_row["value_date"],
+                    "na": ann_row["na"],
+                }
             for unit_row in units:
                 unit_id = unit_row["unit_id"]
                 entry = unit_map.setdefault(
@@ -1602,7 +1626,9 @@ class IaaWidget(QtWidgets.QWidget):
             items.append(status_item)
             for reviewer_id in self.reviewer_column_order:
                 summary = row["reviewer_summaries"].get(reviewer_id, "")
-                items.append(QtWidgets.QTableWidgetItem(summary))
+                summary_item = QtWidgets.QTableWidgetItem(summary)
+                summary_item.setToolTip(summary)
+                items.append(summary_item)
             for column, item in enumerate(items):
                 self.unit_table.setItem(row_index, column, item)
             if row["is_overlap"]:
@@ -1615,6 +1641,7 @@ class IaaWidget(QtWidgets.QWidget):
                     item.setBackground(highlight)
             if selected_unit and row["unit_id"] == selected_unit:
                 self.unit_table.selectRow(row_index)
+            self.unit_table.resizeRowToContents(row_index)
         self.unit_table.resizeColumnsToContents()
 
     def _on_unit_selected(self) -> None:
@@ -1624,6 +1651,36 @@ class IaaWidget(QtWidgets.QWidget):
             return
         row = self.unit_rows[index]
         self._populate_document_table(row)
+
+    def _show_annotation_dialog(self, row: int, column: int) -> None:
+        if column < self._unit_metadata_column_count:
+            return
+        item = self.unit_table.item(row, 0)
+        if not item:
+            return
+        data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        try:
+            index = int(data)
+        except (TypeError, ValueError):
+            return
+        if index < 0 or index >= len(self.unit_rows):
+            return
+        reviewer_offset = column - self._unit_metadata_column_count
+        if reviewer_offset < 0 or reviewer_offset >= len(self.reviewer_column_order):
+            return
+        reviewer_id = self.reviewer_column_order[reviewer_offset]
+        row_data = self.unit_rows[index]
+        annotations = row_data.get("reviewer_annotations", {}).get(reviewer_id, {})
+        detail = self._format_annotation_summary(annotations)
+        if not detail:
+            detail = "No annotations submitted."
+        reviewer_name = self.current_reviewer_names.get(reviewer_id, reviewer_id)
+        unit_id = row_data.get("unit_id", "")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Annotation details",
+            f"Reviewer: {reviewer_name}\nUnit: {unit_id}\n\n{detail}",
+        )
 
     def _populate_document_table(self, unit_row: Dict[str, object]) -> None:
         self.document_table.clearContents()
