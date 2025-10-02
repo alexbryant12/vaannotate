@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -147,7 +148,15 @@ LABEL_RULES = {
 }
 
 
-def build_label_schema_payload(labelset_id: str, labels: Sequence[Dict[str, object]]) -> Dict[str, object]:
+def build_label_schema_payload(
+    labelset_id: str,
+    labels: Sequence[Dict[str, object]],
+    *,
+    labelset_name: str | None = None,
+    notes: str | None = None,
+    created_by: str = "toy_seed",
+    created_at: str | None = None,
+) -> Dict[str, object]:
     schema_labels: List[Dict[str, object]] = []
     for label in labels:
         options_payload = [
@@ -173,7 +182,15 @@ def build_label_schema_payload(labelset_id: str, labels: Sequence[Dict[str, obje
                 "options": options_payload,
             }
         )
-    return {"labelset_id": labelset_id, "labels": schema_labels}
+    payload: Dict[str, object] = {
+        "labelset_id": labelset_id,
+        "labelset_name": labelset_name or labelset_id,
+        "notes": notes,
+        "created_by": created_by,
+        "created_at": created_at or datetime.utcnow().isoformat(),
+        "labels": schema_labels,
+    }
+    return payload
 
 
 DIABETES_LABELS: List[Dict[str, object]] = [
@@ -269,8 +286,18 @@ HYPERTENSION_LABELS: List[Dict[str, object]] = [
 
 
 LABELSET_SCHEMAS = {
-    "ls_diabetes_v1": build_label_schema_payload("ls_diabetes_v1", DIABETES_LABELS),
-    "ls_htn_v1": build_label_schema_payload("ls_htn_v1", HYPERTENSION_LABELS),
+    "ls_diabetes_v1": build_label_schema_payload(
+        "ls_diabetes_v1",
+        DIABETES_LABELS,
+        labelset_name="Diabetes phenotype v1",
+        notes="Demonstration labels for the diabetes phenotype.",
+    ),
+    "ls_htn_v1": build_label_schema_payload(
+        "ls_htn_v1",
+        HYPERTENSION_LABELS,
+        labelset_name="Hypertension phenotype v1",
+        notes="Demonstration labels for the hypertension phenotype.",
+    ),
 }
 
 ROUND_CONFIGS = [
@@ -292,7 +319,7 @@ ROUND_CONFIGS = [
                 "regex_flags": "i",
             },
         },
-        "stratification": {"keys": ["note_year"], "sample_per_stratum": 2},
+        "stratification": {"keys": ["note_year"]},
         "reviewers": [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
@@ -315,7 +342,7 @@ ROUND_CONFIGS = [
                 "note_year": [2016, 2020],
             },
         },
-        "stratification": {"keys": ["sta3n"], "sample_per_stratum": 3},
+        "stratification": {"keys": ["sta3n"]},
         "reviewers": [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
@@ -339,7 +366,7 @@ ROUND_CONFIGS = [
                 "notetype_in": ["PRIMARY CARE NOTE", "TELEHEALTH NOTE"],
             },
         },
-        "stratification": {"keys": ["note_year", "sta3n"], "sample_per_stratum": 2},
+        "stratification": {"keys": ["note_year", "sta3n"]},
         "reviewers": [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
@@ -363,7 +390,7 @@ ROUND_CONFIGS = [
                 "regex_flags": "i",
             },
         },
-        "stratification": {"keys": ["note_year"], "sample_per_stratum": 3},
+        "stratification": {"keys": ["note_year"]},
         "reviewers": [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},

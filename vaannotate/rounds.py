@@ -102,6 +102,7 @@ class RoundBuilder:
                 reviewer_ids,
                 rng_seed,
                 config.get("overlap_n", 0),
+                config.get("total_n"),
                 config.get("stratification"),
             )
 
@@ -326,22 +327,50 @@ class RoundBuilder:
         reviewers: list[str],
         rng_seed: int,
         overlap_n: int,
+        total_n: int | None,
         strat_config: dict | None,
     ) -> dict[str, list[AssignmentUnit]]:
         by_strata: dict[str, list[CandidateUnit]] = defaultdict(list)
         for candidate in candidates:
             by_strata[candidate.strata_key].append(candidate)
         assignments: dict[str, list[AssignmentUnit]] = {rid: [] for rid in reviewers}
-        for strata_key, strata_candidates in by_strata.items():
-            sample_size = strat_config.get("sample_per_stratum") if strat_config else None
-            selected = list(strata_candidates)
-            if sample_size is not None:
-                seed_value = stable_hash(rng_seed, strata_key)
-                shuffled = deterministic_choice(selected, int(seed_value[:8], 16))
-                selected = shuffled[:sample_size] if sample_size > 0 else []
-            else:
-                shuffled = deterministic_choice(selected, stable_hash(rng_seed, strata_key))
-                selected = shuffled
+        if strat_config and strat_config.get("keys") and total_n is not None and len(by_strata) > total_n:
+            raise ValueError(
+                "The requested sample size is smaller than the number of strata. "
+                "Increase the total units or adjust the stratification keys."
+            )
+        total_available = sum(len(items) for items in by_strata.values())
+        target_total = total_available if total_n is None else min(total_n, total_available)
+        if total_n is None:
+            allocations = {key: len(items) for key, items in by_strata.items()}
+        else:
+            allocations = {key: 0 for key in by_strata}
+            remaining = target_total
+            active = [key for key, items in by_strata.items() if items]
+            while remaining > 0 and active:
+                share = max(1, remaining // len(active))
+                next_active: list[str] = []
+                for strata_key in list(active):
+                    capacity = len(by_strata[strata_key]) - allocations[strata_key]
+                    if capacity <= 0:
+                        continue
+                    take = min(share, capacity, remaining)
+                    allocations[strata_key] += take
+                    remaining -= take
+                    if allocations[strata_key] < len(by_strata[strata_key]):
+                        next_active.append(strata_key)
+                    if remaining == 0:
+                        break
+                active = next_active if remaining > 0 else []
+        assigned_total = 0
+        for strata_key in sorted(by_strata.keys()):
+            strata_candidates = by_strata[strata_key]
+            shuffled = deterministic_choice(strata_candidates, stable_hash(rng_seed, strata_key))
+            take = allocations.get(strata_key, len(strata_candidates))
+            if total_n is not None and assigned_total + take > target_total:
+                take = max(0, target_total - assigned_total)
+            selected = list(shuffled[:take])
+            assigned_total += len(selected)
             overlap_units = selected[: min(overlap_n, len(selected))] if overlap_n else []
             remainder = selected[len(overlap_units) :]
             per_reviewer = self._split_among_reviewers(remainder, reviewers, rng_seed, strata_key)
