@@ -403,10 +403,11 @@ class AnnotationForm(QtWidgets.QScrollArea):
     def _reset_widgets(self, widgets: Dict[str, object]) -> None:
         if "button_group" in widgets:
             group: QtWidgets.QButtonGroup = widgets["button_group"]  # type: ignore[assignment]
+            was_exclusive = group.exclusive()
+            group.setExclusive(False)
             for button in group.buttons():
-                button.setAutoExclusive(False)
                 button.setChecked(False)
-                button.setAutoExclusive(True)
+            group.setExclusive(was_exclusive)
         if "checkboxes" in widgets:
             for cb in widgets["checkboxes"]:  # type: ignore[index]
                 cb.setChecked(False)
