@@ -147,7 +147,7 @@ ROUND_CONFIGS = [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
         ],
-        "overlap_n": 1,
+        "overlap_n": 2,
         "independent": True,
         "rng_seed": 133742,
     },
@@ -169,7 +169,7 @@ ROUND_CONFIGS = [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
         ],
-        "overlap_n": 1,
+        "overlap_n": 2,
         "independent": True,
         "rng_seed": 133743,
     },
@@ -192,7 +192,7 @@ ROUND_CONFIGS = [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
         ],
-        "overlap_n": 1,
+        "overlap_n": 2,
         "independent": True,
         "rng_seed": 133744,
     },
@@ -215,7 +215,7 @@ ROUND_CONFIGS = [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
         ],
-        "overlap_n": 1,
+        "overlap_n": 2,
         "independent": True,
         "rng_seed": 133750,
     },
@@ -514,16 +514,19 @@ def load_patient_docs(corpus_db: Path) -> Dict[str, List[sqlite3.Row]]:
     return mapping
 
 
-def find_overlap_unit(manifest_path: Path) -> str | None:
+def find_overlap_units(manifest_path: Path) -> List[str]:
+    units: List[str] = []
     if not manifest_path.exists():
-        return None
+        return units
     with manifest_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
             flag = row.get("is_overlap", "")
             if str(flag) in {"1", "true", "True"}:
-                return row.get("unit_id")
-    return None
+                unit_id = row.get("unit_id")
+                if unit_id and unit_id not in units:
+                    units.append(unit_id)
+    return units
 
 
 def mark_round_final(project_db: Path, round_id: str) -> None:
@@ -556,7 +559,12 @@ def main() -> None:
         config_path.write_text(canonical_json(config), encoding="utf-8")
         result = builder.generate_round(config["pheno_id"], config_path, created_by=config.get("created_by", "toy_seed"))
         round_dir = Path(result["round_dir"])
-        overlap_unit_id = find_overlap_unit(round_dir / "manifest.csv")
+        overlap_unit_ids = find_overlap_units(round_dir / "manifest.csv")
+        if len(overlap_unit_ids) < 2:
+            raise RuntimeError(
+                f"Round {config['round_id']} generated only {len(overlap_unit_ids)} overlapping units;"
+                " expected at least two for the toy example."
+            )
         for reviewer in config["reviewers"]:
             assign_dir = round_dir / "assignments" / reviewer["id"]
             assignment_db = assign_dir / "assignment.db"
@@ -565,11 +573,11 @@ def main() -> None:
             copy_client_binary(repo_root, assign_dir)
             copy_client_script(repo_root, assign_dir)
             if (
-                overlap_unit_id
+                overlap_unit_ids
                 and config["pheno_id"] == "ph_diabetes"
                 and config["round_number"] == 1
             ):
-                seed_disagreement(assignment_db, overlap_unit_id, reviewer["id"])
+                seed_disagreement(assignment_db, overlap_unit_ids[0], reviewer["id"])
         for reviewer in config["reviewers"]:
             builder.import_assignment(config["pheno_id"], config["round_number"], reviewer["id"])
         builder.build_round_aggregate(config["pheno_id"], config["round_number"])
