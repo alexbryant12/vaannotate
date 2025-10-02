@@ -1115,6 +1115,14 @@ class IaaWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
 
+        content_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        layout.addWidget(content_splitter)
+
+        left_panel = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+
         self.round_table = QtWidgets.QTableWidget()
         self.round_table.setColumnCount(3)
         self.round_table.setHorizontalHeaderLabels(["Round", "Status", "Reviewers"])
@@ -1123,7 +1131,7 @@ class IaaWidget(QtWidgets.QWidget):
         self.round_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.round_table.itemSelectionChanged.connect(self._on_round_selected)
         self.round_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.round_table)
+        left_layout.addWidget(self.round_table)
 
         controls = QtWidgets.QHBoxLayout()
         self.metric_selector = QtWidgets.QComboBox()
@@ -1137,7 +1145,7 @@ class IaaWidget(QtWidgets.QWidget):
         controls.addWidget(QtWidgets.QLabel("Metric:"))
         controls.addWidget(self.metric_selector)
         controls.addWidget(self.compute_btn)
-        layout.addLayout(controls)
+        left_layout.addLayout(controls)
 
         import_layout = QtWidgets.QHBoxLayout()
         self.auto_import_btn = QtWidgets.QPushButton("Import submitted assignments")
@@ -1153,24 +1161,21 @@ class IaaWidget(QtWidgets.QWidget):
         import_layout.addWidget(QtWidgets.QLabel("Reviewer:"))
         import_layout.addWidget(self.manual_reviewer_combo)
         import_layout.addWidget(self.manual_import_btn)
-        layout.addLayout(import_layout)
+        left_layout.addLayout(import_layout)
 
         self.import_status_label = QtWidgets.QLabel()
         self.import_status_label.setWordWrap(True)
-        layout.addWidget(self.import_status_label)
+        left_layout.addWidget(self.import_status_label)
         self._import_summary: str = ""
         self._waiting_summary: str = ""
 
         self.round_summary = QtWidgets.QLabel("Select a round to review agreement metrics")
         self.round_summary.setWordWrap(True)
-        layout.addWidget(self.round_summary)
+        left_layout.addWidget(self.round_summary)
 
-        units_panel = QtWidgets.QWidget()
-        units_layout = QtWidgets.QVBoxLayout(units_panel)
-        units_layout.setContentsMargins(0, 0, 0, 0)
         units_label = QtWidgets.QLabel("Imported units (overlapping assignments shown first)")
         units_label.setWordWrap(True)
-        units_layout.addWidget(units_label)
+        left_layout.addWidget(units_label)
 
         self.unit_table = QtWidgets.QTableWidget()
         self._update_unit_table_headers()
@@ -1181,12 +1186,13 @@ class IaaWidget(QtWidgets.QWidget):
         self.unit_table.itemSelectionChanged.connect(self._on_unit_selected)
         self.unit_table.horizontalHeader().setStretchLastSection(True)
         self.unit_table.cellDoubleClicked.connect(self._show_annotation_dialog)
-        units_layout.addWidget(self.unit_table)
+        left_layout.addWidget(self.unit_table, 1)
         self._unit_metadata_column_count = 5
 
         doc_panel = QtWidgets.QWidget()
         doc_panel_layout = QtWidgets.QVBoxLayout(doc_panel)
         doc_panel_layout.setContentsMargins(0, 0, 0, 0)
+        doc_panel_layout.setSpacing(8)
         doc_panel_layout.addWidget(QtWidgets.QLabel("Documents"))
 
         doc_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -1212,12 +1218,10 @@ class IaaWidget(QtWidgets.QWidget):
         doc_splitter.setStretchFactor(1, 2)
         doc_panel_layout.addWidget(doc_splitter)
 
-        content_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        content_splitter.addWidget(units_panel)
+        content_splitter.addWidget(left_panel)
         content_splitter.addWidget(doc_panel)
         content_splitter.setStretchFactor(0, 3)
         content_splitter.setStretchFactor(1, 2)
-        layout.addWidget(content_splitter)
 
     def reset(self) -> None:
         self.current_pheno = None
@@ -1912,6 +1916,17 @@ class IaaWidget(QtWidgets.QWidget):
             row["discord"] = row["unit_id"] in discordant_ids
         self._display_unit_rows()
 
+    def _scroll_to_first_discordant(self, discordant_ids: Set[str]) -> None:
+        if not discordant_ids:
+            return
+        for row_index in range(self.unit_table.rowCount()):
+            item = self.unit_table.item(row_index, 0)
+            if item and item.text() in discordant_ids:
+                self.unit_table.scrollToItem(
+                    item, QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter
+                )
+                break
+
     def _prepare_agreement_samples(
         self, values_by_unit: Dict[str, Dict[str, str]]
     ) -> tuple[List[AgreementSample], Set[str], List[str]]:
@@ -1941,6 +1956,7 @@ class IaaWidget(QtWidgets.QWidget):
         if not label_id:
             QtWidgets.QMessageBox.information(self, "IAA", "Select a label to evaluate")
             return
+        label_id = str(label_id)
         round_dir = self._resolve_round_dir()
         if not round_dir:
             QtWidgets.QMessageBox.warning(self, "IAA", "Round directory is unavailable.")
@@ -1991,6 +2007,7 @@ class IaaWidget(QtWidgets.QWidget):
             return
         metric = self.metric_selector.currentText()
         result_lines: List[str] = []
+        label_name = self.label_lookup.get(label_id, self.label_selector.currentText() or label_id)
         if metric == "Percent agreement":
             value = percent_agreement([list(sample.values) for sample in samples])
             result_lines.append(
@@ -2037,9 +2054,15 @@ class IaaWidget(QtWidgets.QWidget):
             result_lines.append(
                 f"Fleiss' kappa: {value:.3f} across {len(matrix)} overlapped units"
             )
-        result_lines.append(f"Discordant units: {len(discordant_ids)}")
-        QtWidgets.QMessageBox.information(self, "IAA results", "\n".join(result_lines))
-        self._apply_discord_flags(discordant_ids)
+        known_units = {row.get("unit_id") for row in self.unit_rows}
+        filtered_discordant = {unit_id for unit_id in discordant_ids if unit_id in known_units}
+        result_lines.append(f"Discordant units: {len(filtered_discordant)}")
+        heading = f"Agreement for {label_name}"
+        result_text = "\n".join([heading, *result_lines])
+        QtWidgets.QMessageBox.information(self, "IAA results", result_text)
+        self.round_summary.setText(result_text)
+        self._apply_discord_flags(filtered_discordant)
+        self._scroll_to_first_discordant(filtered_discordant)
 
     @staticmethod
     def _format_value(row: sqlite3.Row) -> str:
