@@ -148,7 +148,7 @@ def write_manifest(path: Path, assignments: Dict[str, ReviewerAssignment]) -> No
         writer.writeheader()
         for reviewer_id, assignment in assignments.items():
             for unit in assignment.units:
-                row = dict(unit)
+                row = {key: unit.get(key, "") for key in fieldnames}
                 row["assigned_to"] = reviewer_id
                 writer.writerow(row)
 

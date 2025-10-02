@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import shutil
@@ -143,6 +144,133 @@ LABEL_RULES = {
     "HTN_Notes": "Optional comments specific to hypertension findings.",
 }
 
+
+def build_label_schema_payload(labelset_id: str, labels: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    schema_labels: List[Dict[str, object]] = []
+    for label in labels:
+        options_payload = [
+            {
+                "value": option["value"],
+                "display": option.get("display", option["value"]),
+                "order_index": option.get("order_index", idx),
+                "weight": option.get("weight"),
+            }
+            for idx, option in enumerate(label.get("options", []))
+        ]
+        schema_labels.append(
+            {
+                "label_id": label["label_id"],
+                "name": label["name"],
+                "type": label["type"],
+                "required": bool(label.get("required")),
+                "na_allowed": bool(label.get("na_allowed")),
+                "rules": label.get("rules"),
+                "unit": label.get("unit"),
+                "range": {"min": label.get("min"), "max": label.get("max")},
+                "gating_expr": label.get("gating_expr"),
+                "options": options_payload,
+            }
+        )
+    return {"labelset_id": labelset_id, "labels": schema_labels}
+
+
+DIABETES_LABELS: List[Dict[str, object]] = [
+    {
+        "label_id": "Has_phenotype",
+        "name": "Has phenotype",
+        "type": "categorical_single",
+        "required": True,
+        "order_index": 0,
+        "rules": LABEL_RULES["Has_phenotype"],
+        "options": [
+            {"value": "yes", "display": "Yes"},
+            {"value": "no", "display": "No"},
+            {"value": "unknown", "display": "Unknown"},
+        ],
+    },
+    {
+        "label_id": "Evidence_type",
+        "name": "Evidence type",
+        "type": "categorical_multi",
+        "required": False,
+        "order_index": 1,
+        "rules": LABEL_RULES["Evidence_type"],
+        "gating_expr": "Has_phenotype == 'yes'",
+        "options": [
+            {"value": "Medication", "display": "Medication"},
+            {"value": "Lab", "display": "Lab"},
+            {"value": "Radiology", "display": "Radiology"},
+        ],
+    },
+    {
+        "label_id": "HbA1c_value",
+        "name": "HbA1c value",
+        "type": "float",
+        "required": False,
+        "order_index": 2,
+        "rules": LABEL_RULES["HbA1c_value"],
+        "min": 3.0,
+        "max": 20.0,
+        "na_allowed": True,
+        "unit": None,
+    },
+    {
+        "label_id": "Notes",
+        "name": "Notes",
+        "type": "text",
+        "required": False,
+        "order_index": 3,
+        "rules": LABEL_RULES["Notes"],
+        "na_allowed": False,
+    },
+]
+
+
+HYPERTENSION_LABELS: List[Dict[str, object]] = [
+    {
+        "label_id": "HTN_Has_phenotype",
+        "name": "Has hypertension",
+        "type": "categorical_single",
+        "required": True,
+        "order_index": 0,
+        "rules": LABEL_RULES["HTN_Has_phenotype"],
+        "options": [
+            {"value": "yes", "display": "Yes"},
+            {"value": "no", "display": "No"},
+            {"value": "unknown", "display": "Unknown"},
+        ],
+    },
+    {
+        "label_id": "HTN_Controlled",
+        "name": "Blood pressure control",
+        "type": "categorical_single",
+        "required": False,
+        "order_index": 1,
+        "rules": LABEL_RULES["HTN_Controlled"],
+        "gating_expr": "HTN_Has_phenotype == 'yes'",
+        "options": [
+            {"value": "controlled", "display": "Controlled"},
+            {"value": "uncontrolled", "display": "Uncontrolled"},
+            {"value": "unknown", "display": "Unknown"},
+        ],
+    },
+    {
+        "label_id": "HTN_Notes",
+        "name": "Hypertension notes",
+        "type": "text",
+        "required": False,
+        "order_index": 2,
+        "rules": LABEL_RULES["HTN_Notes"],
+        "na_allowed": False,
+    },
+]
+
+
+LABELSET_SCHEMAS = {
+    "ls_diabetes_v1": build_label_schema_payload("ls_diabetes_v1", DIABETES_LABELS),
+    "ls_htn_v1": build_label_schema_payload("ls_htn_v1", HYPERTENSION_LABELS),
+}
+
 ROUND_CONFIGS = [
     {
         "pheno_id": "ph_diabetes",
@@ -150,6 +278,7 @@ ROUND_CONFIGS = [
         "round_number": 1,
         "round_id": "ph_diabetes_r1",
         "created_by": "toy_seed",
+        "label_schema": copy.deepcopy(LABELSET_SCHEMAS["ls_diabetes_v1"]),
         "filters": {
             "patient": {
                 "year_range": [2018, 2024],
@@ -176,6 +305,7 @@ ROUND_CONFIGS = [
         "round_number": 2,
         "round_id": "ph_diabetes_r2",
         "created_by": "toy_seed",
+        "label_schema": copy.deepcopy(LABELSET_SCHEMAS["ls_diabetes_v1"]),
         "filters": {
             "patient": {"sta3n_in": ["506", "515"]},
             "note": {
@@ -198,6 +328,7 @@ ROUND_CONFIGS = [
         "round_number": 3,
         "round_id": "ph_diabetes_r3",
         "created_by": "toy_seed",
+        "label_schema": copy.deepcopy(LABELSET_SCHEMAS["ls_diabetes_v1"]),
         "filters": {
             "patient": {
                 "year_range": [2015, 2022],
@@ -221,6 +352,7 @@ ROUND_CONFIGS = [
         "round_number": 1,
         "round_id": "ph_hypertension_r1",
         "created_by": "toy_seed",
+        "label_schema": copy.deepcopy(LABELSET_SCHEMAS["ls_htn_v1"]),
         "filters": {
             "patient": {"sta3n_in": ["506", "515"]},
             "note": {
@@ -297,56 +429,7 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
             version=1,
             created_by="toy_seed",
             notes="Initial diabetes labelset for toy project",
-            labels=[
-                {
-                    "label_id": "Has_phenotype",
-                    "name": "Has phenotype",
-                    "type": "categorical_single",
-                    "required": True,
-                    "order_index": 0,
-                    "rules": LABEL_RULES["Has_phenotype"],
-                    "options": [
-                        {"value": "yes", "display": "Yes"},
-                        {"value": "no", "display": "No"},
-                        {"value": "unknown", "display": "Unknown"},
-                    ],
-                },
-                {
-                    "label_id": "Evidence_type",
-                    "name": "Evidence type",
-                    "type": "categorical_multi",
-                    "required": False,
-                    "order_index": 1,
-                    "rules": LABEL_RULES["Evidence_type"],
-                    "gating_expr": "Has_phenotype == 'yes'",
-                    "options": [
-                        {"value": "Medication", "display": "Medication"},
-                        {"value": "Lab", "display": "Lab"},
-                        {"value": "Radiology", "display": "Radiology"},
-                    ],
-                },
-                {
-                    "label_id": "HbA1c_value",
-                    "name": "HbA1c value",
-                    "type": "float",
-                    "required": False,
-                    "order_index": 2,
-                    "rules": LABEL_RULES["HbA1c_value"],
-                    "min": 3.0,
-                    "max": 20.0,
-                    "na_allowed": True,
-                    "unit": None,
-                },
-                {
-                    "label_id": "Notes",
-                    "name": "Notes",
-                    "type": "text",
-                    "required": False,
-                    "order_index": 3,
-                    "rules": LABEL_RULES["Notes"],
-                    "na_allowed": False,
-                },
-            ],
+            labels=DIABETES_LABELS,
         )
         add_phenotype(
             conn,
@@ -364,44 +447,7 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
             version=1,
             created_by="toy_seed",
             notes="Initial hypertension labelset for toy project",
-            labels=[
-                {
-                    "label_id": "HTN_Has_phenotype",
-                    "name": "Has hypertension",
-                    "type": "categorical_single",
-                    "required": True,
-                    "order_index": 0,
-                    "rules": LABEL_RULES["HTN_Has_phenotype"],
-                    "options": [
-                        {"value": "yes", "display": "Yes"},
-                        {"value": "no", "display": "No"},
-                        {"value": "unknown", "display": "Unknown"},
-                    ],
-                },
-                {
-                    "label_id": "HTN_Controlled",
-                    "name": "Blood pressure control",
-                    "type": "categorical_single",
-                    "required": False,
-                    "order_index": 1,
-                    "rules": LABEL_RULES["HTN_Controlled"],
-                    "gating_expr": "HTN_Has_phenotype == 'yes'",
-                    "options": [
-                        {"value": "controlled", "display": "Controlled"},
-                        {"value": "uncontrolled", "display": "Uncontrolled"},
-                        {"value": "unknown", "display": "Unknown"},
-                    ],
-                },
-                {
-                    "label_id": "HTN_Notes",
-                    "name": "Hypertension notes",
-                    "type": "text",
-                    "required": False,
-                    "order_index": 2,
-                    "rules": LABEL_RULES["HTN_Notes"],
-                    "na_allowed": False,
-                },
-            ],
+            labels=HYPERTENSION_LABELS,
         )
         conn.commit()
 
