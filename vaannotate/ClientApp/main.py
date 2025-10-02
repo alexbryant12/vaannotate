@@ -313,6 +313,7 @@ class AssignmentContext(QtCore.QObject):
         self._pending_events: List[models.Event] = []
         self._pending_completion: Dict[str, Dict[str, object]] = {}
         self._dirty: bool = False
+        self._document_cache: Dict[str, Dict[str, object]] = {}
         self._unit_document_cache: Dict[str, List[Dict[str, object]]] = {}
 
     def open_assignment(self, directory: Path) -> None:
@@ -332,6 +333,7 @@ class AssignmentContext(QtCore.QObject):
         self._pending_rationales.clear()
         self._pending_events.clear()
         self._pending_completion.clear()
+        self._document_cache = {}
         self._unit_document_cache = {}
         with self.assignment_db.connect() as conn:
             ensure_schema(
@@ -345,7 +347,8 @@ class AssignmentContext(QtCore.QObject):
                     models.Event,
                 ],
             )
-            self.units = [dict(row) for row in conn.execute("SELECT * FROM units ORDER BY display_rank").fetchall()]
+            unit_rows = conn.execute("SELECT * FROM units ORDER BY display_rank").fetchall()
+            self.units = [dict(row) for row in unit_rows]
             self._unit_completion_baseline = {
                 str(unit["unit_id"]): {
                     "complete": bool(unit.get("complete")),
@@ -353,6 +356,56 @@ class AssignmentContext(QtCore.QObject):
                 }
                 for unit in self.units
             }
+            document_rows = conn.execute("SELECT * FROM documents").fetchall()
+            self._document_cache = {
+                str(row["doc_id"]): dict(row)
+                for row in document_rows
+            }
+            note_rows = conn.execute(
+                "SELECT unit_id, doc_id, order_index FROM unit_notes ORDER BY unit_id, order_index"
+            ).fetchall()
+            unit_documents: Dict[str, List[Dict[str, object]]] = {}
+            for row in note_rows:
+                unit_id = str(row["unit_id"])
+                doc_id = str(row["doc_id"])
+                order_index_raw = row["order_index"]
+                try:
+                    order_index = int(order_index_raw)
+                except (TypeError, ValueError):
+                    order_index = 0
+                doc_record = self._document_cache.get(doc_id, {})
+                text = str(doc_record.get("text", ""))
+                unit_documents.setdefault(unit_id, []).append(
+                    {
+                        "order_index": order_index,
+                        "doc_id": doc_id,
+                        "text": text,
+                    }
+                )
+            for unit_id, docs in unit_documents.items():
+                docs.sort(key=lambda entry: (entry.get("order_index", 0), entry.get("doc_id")))
+            self._unit_document_cache = {
+                unit_id: [dict(doc) for doc in docs]
+                for unit_id, docs in unit_documents.items()
+            }
+            annotation_rows = conn.execute("SELECT * FROM annotations").fetchall()
+            baseline_annotations: Dict[str, Dict[str, Dict[str, object]]] = {}
+            for row in annotation_rows:
+                unit_id = str(row["unit_id"])
+                label_id = str(row["label_id"])
+                baseline_annotations.setdefault(unit_id, {})[label_id] = dict(row)
+            self._annotation_baseline = {
+                unit_id: {label_id: dict(data) for label_id, data in labels.items()}
+                for unit_id, labels in baseline_annotations.items()
+            }
+            self._annotation_cache = {
+                unit_id: {label_id: dict(data) for label_id, data in labels.items()}
+                for unit_id, labels in self._annotation_baseline.items()
+            }
+            for unit in self.units:
+                unit_id = str(unit.get("unit_id"))
+                self._annotation_baseline.setdefault(unit_id, {})
+                self._annotation_cache.setdefault(unit_id, {})
         schema_path = directory / "label_schema.json"
         if schema_path.exists():
             raw_schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -396,11 +449,8 @@ class AssignmentContext(QtCore.QObject):
                 for doc in cached_docs:
                     if str(doc.get("doc_id")) == doc_id:
                         return str(doc.get("text", ""))
-        if not self.assignment_db:
-            return ""
-        with self.assignment_db.connect() as conn:
-            row = conn.execute("SELECT text FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
-        text = row[0] if row else ""
+        doc_record = self._document_cache.get(doc_id)
+        text = str(doc_record.get("text", "")) if doc_record else ""
         if unit_id:
             existing_docs = self._unit_document_cache.get(unit_id)
             if not existing_docs:
@@ -425,18 +475,7 @@ class AssignmentContext(QtCore.QObject):
         cached = self._unit_document_cache.get(unit_id)
         if cached is not None:
             return [dict(doc) for doc in cached]
-        if not self.assignment_db:
-            return []
-        with self.assignment_db.connect() as conn:
-            rows = conn.execute(
-                "SELECT unit_notes.order_index, documents.doc_id, documents.text FROM unit_notes "
-                "JOIN documents ON documents.doc_id = unit_notes.doc_id "
-                "WHERE unit_notes.unit_id=? ORDER BY unit_notes.order_index",
-                (unit_id,),
-            ).fetchall()
-        documents = [dict(row) for row in rows]
-        self.cache_unit_documents(unit_id, documents)
-        return [dict(doc) for doc in self._unit_document_cache.get(unit_id, [])]
+        return []
 
     def invalidate_unit_documents(self, unit_id: str) -> None:
         self._unit_document_cache.pop(unit_id, None)
@@ -444,25 +483,23 @@ class AssignmentContext(QtCore.QObject):
     def cache_unit_documents(
         self, unit_id: str, documents: List[Dict[str, object]]
     ) -> None:
-        self._unit_document_cache[unit_id] = [dict(doc) for doc in documents]
+        cached_docs: List[Dict[str, object]] = []
+        for doc in documents:
+            doc_copy = dict(doc)
+            doc_id = str(doc_copy.get("doc_id", ""))
+            if doc_id:
+                existing = dict(self._document_cache.get(doc_id, {}))
+                existing.setdefault("doc_id", doc_id)
+                if "text" in doc_copy:
+                    existing["text"] = doc_copy["text"]
+                self._document_cache[doc_id] = existing
+            cached_docs.append(doc_copy)
+        self._unit_document_cache[unit_id] = cached_docs
 
     def load_annotations(self, unit_id: str) -> Dict[str, Dict[str, object]]:
-        if not self.assignment_db:
-            return {}
-        with self.assignment_db.connect() as conn:
-            rows = conn.execute("SELECT * FROM annotations WHERE unit_id=?", (unit_id,)).fetchall()
-        annotations: Dict[str, Dict[str, object]] = {}
-        for row in rows:
-            annotations[row["label_id"]] = dict(row)
         self._annotation_baseline.setdefault(unit_id, {})
-        for label_id, data in annotations.items():
-            self._annotation_baseline[unit_id][label_id] = dict(data)
-        cached = self._annotation_cache.get(unit_id)
-        if cached:
-            annotations.update(cached)
-        else:
-            self._annotation_cache[unit_id] = {label_id: dict(data) for label_id, data in annotations.items()}
-        return annotations
+        cache = self._annotation_cache.setdefault(unit_id, {})
+        return {label_id: dict(data) for label_id, data in cache.items()}
 
     def save_annotation(self, unit_id: str, label_id: str, payload: Dict[str, object]) -> None:
         if not self.assignment_db:
