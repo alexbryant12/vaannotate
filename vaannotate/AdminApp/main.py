@@ -932,7 +932,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _load_reviewed_unit_ids(self) -> Set[str]:
         pheno_id = self.pheno_row["pheno_id"]
-        level = str(self.pheno_row.get("level", "single_doc"))
+        if isinstance(self.pheno_row, sqlite3.Row):
+            level_value: Optional[object] = None
+            try:
+                if "level" in self.pheno_row.keys():
+                    level_value = self.pheno_row["level"]
+            except Exception:
+                level_value = None
+        else:
+            level_value = self.pheno_row.get("level")
+        if not level_value:
+            level_value = "single_doc"
+        level = str(level_value)
         reviewed: Set[str] = set()
         try:
             rounds = self.ctx.list_rounds(pheno_id)
