@@ -313,6 +313,7 @@ class AssignmentContext(QtCore.QObject):
         self._pending_events: List[models.Event] = []
         self._pending_completion: Dict[str, Dict[str, object]] = {}
         self._dirty: bool = False
+        self._unit_document_cache: Dict[str, List[Dict[str, object]]] = {}
 
     def open_assignment(self, directory: Path) -> None:
         directory = directory.resolve()
@@ -331,6 +332,7 @@ class AssignmentContext(QtCore.QObject):
         self._pending_rationales.clear()
         self._pending_events.clear()
         self._pending_completion.clear()
+        self._unit_document_cache = {}
         with self.assignment_db.connect() as conn:
             ensure_schema(
                 conn,
@@ -387,14 +389,42 @@ class AssignmentContext(QtCore.QObject):
 
     # Database helpers -----------------------------------------------------
 
-    def fetch_document(self, doc_id: str) -> str:
+    def fetch_document(self, doc_id: str, unit_id: Optional[str] = None) -> str:
+        if unit_id:
+            cached_docs = self._unit_document_cache.get(unit_id)
+            if cached_docs:
+                for doc in cached_docs:
+                    if str(doc.get("doc_id")) == doc_id:
+                        return str(doc.get("text", ""))
         if not self.assignment_db:
             return ""
         with self.assignment_db.connect() as conn:
             row = conn.execute("SELECT text FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
-        return row[0] if row else ""
+        text = row[0] if row else ""
+        if unit_id:
+            existing_docs = self._unit_document_cache.get(unit_id)
+            if not existing_docs:
+                self.cache_unit_documents(
+                    unit_id,
+                    [
+                        {
+                            "order_index": 1,
+                            "doc_id": doc_id,
+                            "text": text,
+                        }
+                    ],
+                )
+            else:
+                for doc in existing_docs:
+                    if str(doc.get("doc_id")) == doc_id:
+                        doc["text"] = text
+                        break
+        return text
 
     def fetch_unit_documents(self, unit_id: str) -> List[Dict[str, object]]:
+        cached = self._unit_document_cache.get(unit_id)
+        if cached is not None:
+            return [dict(doc) for doc in cached]
         if not self.assignment_db:
             return []
         with self.assignment_db.connect() as conn:
@@ -404,7 +434,17 @@ class AssignmentContext(QtCore.QObject):
                 "WHERE unit_notes.unit_id=? ORDER BY unit_notes.order_index",
                 (unit_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        documents = [dict(row) for row in rows]
+        self.cache_unit_documents(unit_id, documents)
+        return [dict(doc) for doc in self._unit_document_cache.get(unit_id, [])]
+
+    def invalidate_unit_documents(self, unit_id: str) -> None:
+        self._unit_document_cache.pop(unit_id, None)
+
+    def cache_unit_documents(
+        self, unit_id: str, documents: List[Dict[str, object]]
+    ) -> None:
+        self._unit_document_cache[unit_id] = [dict(doc) for doc in documents]
 
     def load_annotations(self, unit_id: str) -> Dict[str, Dict[str, object]]:
         if not self.assignment_db:
@@ -1255,7 +1295,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
             self._populate_notes_table(documents)
         else:
             fallback_doc_id = str(unit.get("doc_id", ""))
-            fallback_text = self.ctx.fetch_document(fallback_doc_id)
+            fallback_text = self.ctx.fetch_document(fallback_doc_id, unit_id)
             documents = [
                 {
                     "order_index": 1,
@@ -1263,6 +1303,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
                     "text": fallback_text,
                 }
             ]
+            self.ctx.cache_unit_documents(unit_id, documents)
             self._populate_notes_table(documents)
         if self.notes_table.rowCount():
             self.notes_table.setCurrentCell(0, 0)
