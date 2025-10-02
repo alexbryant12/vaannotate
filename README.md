@@ -29,7 +29,13 @@ pip install -e .
    ```
    Choose or create a project directory. The Admin dashboard exposes project management, phenotype creation, round generation, and agreement metric dashboards.
 
-2. **Stage a corpus** by placing a `corpus.db` file in the project's `/corpus` folder or by using future ingestion tooling. The Admin UI automatically creates the SQLite schema on first open.
+2. **Stage phenotype corpora**. When a phenotype is created in the Admin UI you will be prompted to select the SQLite database that represents its corpus; the tool copies that file into `phenotypes/<pheno_id>/corpus/corpus.db` and keeps it immutable for that phenotype. Reuse a source corpus or prepare new ones per phenotype as needed. You can also generate the corpus ahead of time with the CLI, for example:
+   ```bash
+   python -m vaannotate.admin_cli import-corpus ./MyProject \
+     --patients-csv ./data/patients.csv \
+     --documents-csv ./data/documents.csv \
+     --corpus-db phenotypes/ph_example/corpus/source.db
+   ```
 
 3. **Create phenotypes and label sets** from the Phenotypes tab. Label sets are versioned; newly generated rounds can auto-provision a starter boolean label if a label set is absent.
 
