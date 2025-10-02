@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import shutil
 import sqlite3
@@ -18,6 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from vaannotate.corpus import hash_text as corpus_hash_text
+from vaannotate.corpus import normalize_text as corpus_normalize_text
 from vaannotate.project import (
     add_labelset,
     add_phenotype,
@@ -27,6 +28,7 @@ from vaannotate.project import (
     register_reviewer,
 )
 from vaannotate.rounds import RoundBuilder
+from vaannotate.schema import initialize_corpus_db
 from vaannotate.utils import canonical_json, ensure_dir
 
 
@@ -44,10 +46,23 @@ class Note:
         return int(self.date.split("-")[0])
 
 
-PATIENTS: List[Dict[str, str]] = [
-    {"patient_icn": f"20{index:02d}", "sta3n": "506" if index % 2 else "515"}
-    for index in range(1, 11)
-]
+PATIENT_COUNT = 24
+
+
+def build_patients() -> List[Dict[str, str]]:
+    patients: List[Dict[str, str]] = []
+    facilities = ["506", "515", "520"]
+    for index in range(1, PATIENT_COUNT + 1):
+        patients.append(
+            {
+                "patient_icn": f"20{index:02d}",
+                "sta3n": facilities[index % len(facilities)],
+            }
+        )
+    return patients
+
+
+PATIENTS: List[Dict[str, str]] = build_patients()
 
 NOTE_THEMES = [
     ("PRIMARY CARE NOTE", "Primary care follow-up summarizing comprehensive chronic disease management."),
@@ -93,7 +108,11 @@ def generate_notes(patients: Sequence[Dict[str, str]], total_notes: int) -> List
     return notes
 
 
-NOTES: List[Note] = generate_notes(PATIENTS, 100)
+NOTES_PER_PATIENT = 4
+TOTAL_NOTES = PATIENT_COUNT * NOTES_PER_PATIENT
+
+
+NOTES: List[Note] = generate_notes(PATIENTS, TOTAL_NOTES)
 
 REVIEWERS = [
     {"reviewer_id": "r_alex", "name": "Alex Reviewer", "email": "alex@example.test"},
@@ -222,25 +241,15 @@ ROUND_CONFIGS = [
 ]
 
 
-def normalize_text(text: str) -> str:
-    """Return normalized text for hashing and storage."""
-    stripped = "\n".join(line.strip() for line in text.strip().splitlines())
-    return stripped
-
-
-def compute_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def seed_corpus(corpus_db: Path, notes: Sequence[Note]) -> None:
-    with get_connection(corpus_db) as conn:
+    with initialize_corpus_db(corpus_db) as conn:
         for patient in PATIENTS:
             conn.execute(
                 "INSERT OR REPLACE INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
                 (patient["patient_icn"], patient["sta3n"], None, None),
             )
         for note in notes:
-            normalized = normalize_text(note.text)
+            normalized = corpus_normalize_text(note.text)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO documents(
@@ -256,7 +265,7 @@ def seed_corpus(corpus_db: Path, notes: Sequence[Note]) -> None:
                     note.date,
                     None,
                     note.sta3n,
-                    compute_hash(normalized),
+                    corpus_hash_text(normalized),
                     normalized,
                 ),
             )
@@ -553,6 +562,8 @@ def main() -> None:
         shutil.rmtree(project_root)
 
     paths = init_project(project_root, "Project_Toy", "Project Toy", "toy_seed")
+    ensure_dir(paths.root / "dist")
+    ensure_dir(paths.root / "reports")
     phenotype_corpus_dbs: Dict[str, Path] = {}
     for pheno_id in ("ph_diabetes", "ph_hypertension"):
         corpus_dir = ensure_dir(project_root / "phenotypes" / pheno_id / "corpus")
@@ -567,7 +578,7 @@ def main() -> None:
 
     builder = RoundBuilder(project_root)
     patient_docs_map = {pheno_id: load_patient_docs(db_path) for pheno_id, db_path in phenotype_corpus_dbs.items()}
-    config_dir = ensure_dir(project_root / "config")
+    config_dir = ensure_dir(paths.admin_dir / "round_configs")
     for config in ROUND_CONFIGS:
         pheno_dir = ensure_dir(project_root / "phenotypes" / config["pheno_id"])
         ensure_dir(pheno_dir / "rounds")
