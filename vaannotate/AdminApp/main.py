@@ -298,11 +298,15 @@ class RoundPage(QtWidgets.QWidget):
         layout.addWidget(splitter)
 
         self.round_list = QtWidgets.QListWidget()
+        self.round_list.itemSelectionChanged.connect(self._load_round_config)
         splitter.addWidget(self.round_list)
 
         right = QtWidgets.QWidget()
         splitter.addWidget(right)
-        form = QtWidgets.QFormLayout(right)
+        right_layout = QtWidgets.QVBoxLayout(right)
+
+        round_group = QtWidgets.QGroupBox("Round setup")
+        round_form = QtWidgets.QFormLayout(round_group)
 
         self.pheno_combo = QtWidgets.QComboBox()
         self.labelset_edit = QtWidgets.QLineEdit()
@@ -317,13 +321,79 @@ class RoundPage(QtWidgets.QWidget):
         self.create_btn = QtWidgets.QPushButton("Generate round")
         self.create_btn.clicked.connect(self._create_round)
 
-        form.addRow("Phenotype", self.pheno_combo)
-        form.addRow("Label set ID", self.labelset_edit)
-        form.addRow("Seed", self.seed_spin)
-        form.addRow("Overlap N", self.overlap_spin)
-        form.addRow("Sample per reviewer", self.sample_spin)
-        form.addRow("Status", self.status_combo)
-        form.addRow(self.create_btn)
+        round_form.addRow("Phenotype", self.pheno_combo)
+        round_form.addRow("Label set ID", self.labelset_edit)
+        round_form.addRow("Seed", self.seed_spin)
+        round_form.addRow("Overlap N", self.overlap_spin)
+        round_form.addRow("Sample per reviewer", self.sample_spin)
+        round_form.addRow("Status", self.status_combo)
+        round_form.addRow(self.create_btn)
+        right_layout.addWidget(round_group)
+
+        filter_group = QtWidgets.QGroupBox("Sampling filters")
+        filter_form = QtWidgets.QFormLayout(filter_group)
+        self.patient_sta3n_edit = QtWidgets.QLineEdit()
+        self.patient_sta3n_edit.setPlaceholderText("Comma-separated STA3N codes")
+        patient_years_layout = QtWidgets.QHBoxLayout()
+        self.patient_year_start = QtWidgets.QSpinBox()
+        self.patient_year_start.setRange(0, 2100)
+        self.patient_year_start.setSpecialValueText("Any")
+        self.patient_year_start.setValue(0)
+        self.patient_year_end = QtWidgets.QSpinBox()
+        self.patient_year_end.setRange(0, 2100)
+        self.patient_year_end.setSpecialValueText("Any")
+        self.patient_year_end.setValue(0)
+        patient_years_layout.addWidget(self.patient_year_start)
+        patient_years_layout.addWidget(QtWidgets.QLabel("to"))
+        patient_years_layout.addWidget(self.patient_year_end)
+        self.patient_softlabel_spin = QtWidgets.QDoubleSpinBox()
+        self.patient_softlabel_spin.setRange(-1.0, 100.0)
+        self.patient_softlabel_spin.setDecimals(2)
+        self.patient_softlabel_spin.setSpecialValueText("Disabled")
+        self.patient_softlabel_spin.setValue(-1.0)
+        self.note_type_edit = QtWidgets.QLineEdit()
+        self.note_type_edit.setPlaceholderText("Comma-separated note types")
+        note_years_layout = QtWidgets.QHBoxLayout()
+        self.note_year_start = QtWidgets.QSpinBox()
+        self.note_year_start.setRange(0, 2100)
+        self.note_year_start.setSpecialValueText("Any")
+        self.note_year_start.setValue(0)
+        self.note_year_end = QtWidgets.QSpinBox()
+        self.note_year_end.setRange(0, 2100)
+        self.note_year_end.setSpecialValueText("Any")
+        self.note_year_end.setValue(0)
+        note_years_layout.addWidget(self.note_year_start)
+        note_years_layout.addWidget(QtWidgets.QLabel("to"))
+        note_years_layout.addWidget(self.note_year_end)
+        self.note_regex_edit = QtWidgets.QLineEdit()
+        self.note_regex_edit.setPlaceholderText("Python regex applied to note text")
+
+        filter_form.addRow("Patient STA3N", self.patient_sta3n_edit)
+        filter_form.addRow("Patient year range", patient_years_layout)
+        filter_form.addRow("Patient softlabel ≥", self.patient_softlabel_spin)
+        filter_form.addRow("Note types", self.note_type_edit)
+        filter_form.addRow("Note year range", note_years_layout)
+        filter_form.addRow("Note regex", self.note_regex_edit)
+        right_layout.addWidget(filter_group)
+
+        strat_group = QtWidgets.QGroupBox("Stratification")
+        strat_form = QtWidgets.QFormLayout(strat_group)
+        self.strat_keys_edit = QtWidgets.QLineEdit()
+        self.strat_keys_edit.setPlaceholderText("Comma-separated document fields (e.g. note_year, sta3n)")
+        self.strat_sample_spin = QtWidgets.QSpinBox()
+        self.strat_sample_spin.setRange(0, 10000)
+        self.strat_sample_spin.setSpecialValueText("Use full strata")
+        self.strat_sample_spin.setValue(0)
+        strat_form.addRow("Stratify by", self.strat_keys_edit)
+        strat_form.addRow("Sample per stratum", self.strat_sample_spin)
+        right_layout.addWidget(strat_group)
+
+        right_layout.addWidget(QtWidgets.QLabel("Selected round configuration"))
+        self.round_config_view = QtWidgets.QTextEdit()
+        self.round_config_view.setReadOnly(True)
+        self.round_config_view.setPlaceholderText("Select an existing round to inspect its configuration")
+        right_layout.addWidget(self.round_config_view)
+        right_layout.addStretch()
 
     def refresh(self) -> None:
         db = self.ctx.require_db()
@@ -338,6 +408,10 @@ class RoundPage(QtWidgets.QWidget):
             item = QtWidgets.QListWidgetItem(f"{row['round_number']} - {row['round_id']}")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, row)
             self.round_list.addItem(item)
+        if self.round_list.count():
+            self.round_list.setCurrentRow(0)
+        else:
+            self.round_config_view.clear()
 
     def _create_round(self) -> None:
         if self.pheno_combo.currentIndex() < 0:
@@ -370,12 +444,40 @@ class RoundPage(QtWidgets.QWidget):
                     ],
                 }
             )
-        filters = SamplingFilters(patient_filters={}, note_filters={})
+        filters = self._collect_filters()
         corpus_rows = candidate_documents(ctx.require_corpus_db(), "single_doc", filters)
         if not corpus_rows:
             QtWidgets.QMessageBox.warning(self, "No corpus", "The corpus database has no documents to sample")
             return
-        assignments = allocate_units(corpus_rows[: self.sample_spin.value() * len(reviewers)], reviewers, overlap, seed)
+        strat_keys = [key.strip() for key in self.strat_keys_edit.text().split(",") if key.strip()]
+        strat_sample = self.strat_sample_spin.value()
+        if strat_sample <= 0:
+            strat_sample = None
+        default_sample = self.sample_spin.value() * len(reviewers)
+        per_stratum = strat_sample
+        if not strat_keys and strat_sample is None and default_sample:
+            per_stratum = default_sample
+        assignments = allocate_units(
+            corpus_rows,
+            reviewers,
+            overlap,
+            seed,
+            strat_keys=strat_keys or None,
+            per_stratum=per_stratum,
+        )
+        target_sample = self.sample_spin.value()
+        missing = [
+            reviewer["id"]
+            for reviewer in reviewers
+            if target_sample and len(assignments[reviewer["id"]].units) < target_sample
+        ]
+        if missing:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Sample size",
+                "Not enough candidate documents were found to satisfy the desired sample size for:"
+                f" {', '.join(missing)}",
+            )
         round_id = str(uuid.uuid4())
         round_number = self._next_round_number(pheno_id)
         round_record = models.Round(
@@ -429,7 +531,32 @@ class RoundPage(QtWidgets.QWidget):
                         )
                         option_record.save(conn)
             round_record.save(conn)
-            config = models.RoundConfig(round_id=round_id, config_json=json.dumps({"seed": seed}))
+            config_payload: Dict[str, object] = {
+                "pheno_id": pheno_id,
+                "labelset_id": labelset_id,
+                "round_number": round_number,
+                "round_id": round_id,
+                "rng_seed": seed,
+                "overlap_n": overlap,
+                "sample_per_reviewer": self.sample_spin.value(),
+                "status": self.status_combo.currentText(),
+                "reviewers": reviewers,
+            }
+            filters_payload: Dict[str, Dict[str, object]] = {}
+            if filters.patient_filters:
+                filters_payload["patient"] = filters.patient_filters
+            if filters.note_filters:
+                filters_payload["note"] = filters.note_filters
+            if filters_payload:
+                config_payload["filters"] = filters_payload
+            if strat_keys or strat_sample is not None:
+                strat_payload: Dict[str, object] = {}
+                if strat_keys:
+                    strat_payload["keys"] = strat_keys
+                if strat_sample is not None:
+                    strat_payload["sample_per_stratum"] = strat_sample
+                config_payload["stratification"] = strat_payload
+            config = models.RoundConfig(round_id=round_id, config_json=json.dumps(config_payload, indent=2))
             config.save(conn)
             for reviewer in reviewers:
                 reviewer_record = models.Reviewer(
@@ -460,6 +587,80 @@ class RoundPage(QtWidgets.QWidget):
             schema_path = assignment_dir / "label_schema.json"
             schema_path.write_text(json.dumps(label_schema, indent=2), encoding="utf-8")
         self.refresh()
+
+    def _collect_filters(self) -> SamplingFilters:
+        patient_filters: Dict[str, object] = {}
+        note_filters: Dict[str, object] = {}
+        sta_text = self.patient_sta3n_edit.text().strip()
+        if sta_text:
+            values = [value.strip() for value in sta_text.split(",") if value.strip()]
+            if values:
+                patient_filters["sta3n_in"] = values
+        start = self.patient_year_start.value()
+        end = self.patient_year_end.value()
+        if start and end:
+            if end < start:
+                start, end = end, start
+            patient_filters["year_range"] = [start, end]
+        softlabel = self.patient_softlabel_spin.value()
+        if softlabel >= 0:
+            patient_filters["softlabel_gte"] = softlabel
+        note_types = [value.strip() for value in self.note_type_edit.text().split(",") if value.strip()]
+        if note_types:
+            note_filters["notetype_in"] = note_types
+        note_start = self.note_year_start.value()
+        note_end = self.note_year_end.value()
+        if note_start and note_end:
+            if note_end < note_start:
+                note_start, note_end = note_end, note_start
+            note_filters["note_year_range"] = [note_start, note_end]
+        regex = self.note_regex_edit.text().strip()
+        if regex:
+            note_filters["regex"] = regex
+        return SamplingFilters(patient_filters=patient_filters, note_filters=note_filters)
+
+    def _load_round_config(self) -> None:
+        current = self.round_list.currentItem()
+        if not current:
+            self.round_config_view.clear()
+            return
+        data = current.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not data:
+            self.round_config_view.clear()
+            return
+        try:
+            db = self.ctx.require_db()
+        except RuntimeError:
+            self.round_config_view.setPlainText("No project loaded.")
+            return
+        config_text = ""
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT config_json FROM round_configs WHERE round_id=?",
+                (data["round_id"],),
+            ).fetchone()
+            if row and row["config_json"]:
+                config_text = row["config_json"]
+        if not config_text:
+            try:
+                project_root = self.ctx.require_project()
+            except RuntimeError:
+                self.round_config_view.setPlainText("Configuration not available.")
+                return
+            round_number = data["round_number"]
+            round_dir = project_root / "phenotypes" / data["pheno_id"] / "rounds" / f"round_{round_number}"
+            config_path = round_dir / "round_config.json"
+            if config_path.exists():
+                config_text = config_path.read_text(encoding="utf-8")
+        if config_text:
+            try:
+                parsed = json.loads(config_text)
+                pretty = json.dumps(parsed, indent=2)
+                self.round_config_view.setPlainText(pretty)
+            except json.JSONDecodeError:
+                self.round_config_view.setPlainText(config_text)
+        else:
+            self.round_config_view.setPlainText("Configuration not found for the selected round.")
 
     def _prompt_reviewers(self) -> Optional[List[Dict[str, str]]]:
         dialog = QtWidgets.QDialog(self)
