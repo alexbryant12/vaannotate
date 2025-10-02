@@ -122,6 +122,127 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
     return builder, project_root
 
 
+def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    with get_connection(paths.project_db) as conn:
+        register_reviewer(conn, "rev_one", "Reviewer One")
+        register_reviewer(conn, "rev_two", "Reviewer Two")
+        add_phenotype(
+            conn,
+            pheno_id="ph_multi",
+            project_id="proj",
+            name="Multi Doc", 
+            level="multi_doc",
+            corpus_path="phenotypes/ph_multi/corpus/corpus.db",
+        )
+        add_labelset(
+            conn,
+            labelset_id="ls_multi",
+            pheno_id="ph_multi",
+            version=1,
+            created_by="tester",
+            notes=None,
+            labels=[
+                {
+                    "label_id": "Flag",
+                    "name": "Flag",
+                    "type": "categorical_single",
+                    "required": False,
+                    "options": [
+                        {"value": "yes", "display": "Yes"},
+                        {"value": "no", "display": "No"},
+                    ],
+                }
+            ],
+        )
+        conn.commit()
+
+    docs_by_patient: dict[str, list[tuple[str, str]]] = {
+        "p1": [("p1_doc1", "Patient 1 doc A"), ("p1_doc2", "Patient 1 doc B")],
+        "p2": [("p2_doc1", "Patient 2 doc A"), ("p2_doc2", "Patient 2 doc B")],
+        "p3": [("p3_doc1", "Patient 3 doc A"), ("p3_doc2", "Patient 3 doc B")],
+    }
+    corpus_db = project_root / "phenotypes" / "ph_multi" / "corpus" / "corpus.db"
+    with initialize_corpus_db(corpus_db) as corpus_conn:
+        for idx, (patient_icn, docs) in enumerate(docs_by_patient.items()):
+            corpus_conn.execute(
+                "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
+                (patient_icn, "506", None, None),
+            )
+            for doc_index, (doc_id, text) in enumerate(docs):
+                corpus_conn.execute(
+                    """
+                    INSERT INTO documents(
+                        doc_id, patient_icn, notetype, note_year, date_note,
+                        cptname, sta3n, hash, text
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        doc_id,
+                        patient_icn,
+                        "NOTE",
+                        2020 + doc_index,
+                        f"202{doc_index}-01-01",
+                        "",
+                        "506",
+                        f"hash_{doc_id}",
+                        text,
+                    ),
+                )
+        corpus_conn.commit()
+
+    config_dir = paths.admin_dir / "round_configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "round_number": 1,
+        "round_id": "ph_multi_r1",
+        "labelset_id": "ls_multi",
+        "reviewers": [
+            {"id": "rev_one", "name": "Reviewer One"},
+            {"id": "rev_two", "name": "Reviewer Two"},
+        ],
+        "overlap_n": 0,
+        "rng_seed": 7,
+        "filters": {},
+    }
+    config_path = config_dir / "ph_multi_r1.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    builder = RoundBuilder(project_root)
+    builder.generate_round("ph_multi", config_path, created_by="tester")
+
+    round_dir = project_root / "phenotypes" / "ph_multi" / "rounds" / "round_1"
+    assignment_db = round_dir / "assignments" / "rev_one" / "assignment.db"
+    assert assignment_db.exists()
+
+    with sqlite3.connect(assignment_db) as conn:
+        conn.row_factory = sqlite3.Row
+        units = conn.execute(
+            "SELECT unit_id, patient_icn, doc_id, note_count FROM units ORDER BY display_rank"
+        ).fetchall()
+        assert units
+        for unit in units:
+            patient_icn = unit["patient_icn"]
+            assert unit["doc_id"] in (None, "")
+            expected_docs = [doc_id for doc_id, _text in docs_by_patient[patient_icn]]
+            assert unit["note_count"] == len(expected_docs)
+            doc_rows = conn.execute(
+                "SELECT doc_id FROM unit_notes WHERE unit_id=? ORDER BY order_index",
+                (unit["unit_id"],),
+            ).fetchall()
+            observed_docs = [row["doc_id"] for row in doc_rows]
+            assert observed_docs == expected_docs
+            for doc_id in observed_docs:
+                doc_row = conn.execute(
+                    "SELECT text FROM documents WHERE doc_id=?",
+                    (doc_id,),
+                ).fetchone()
+                assert doc_row is not None
+                assert doc_row["text"]
+
+
 def _annotate_assignment(db_path: Path, flag_value: str | None, score_factory) -> list[str]:
     with sqlite3.connect(db_path) as conn:
         unit_ids = [row[0] for row in conn.execute("SELECT unit_id FROM units ORDER BY display_rank").fetchall()]
