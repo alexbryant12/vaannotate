@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
 
@@ -541,44 +542,340 @@ class IaaPage(QtWidgets.QWidget):
     def __init__(self, ctx: ProjectContext) -> None:
         super().__init__()
         self.ctx = ctx
+        self.current_round: Optional[Dict[str, object]] = None
+        self.current_reviewer_names: Dict[str, str] = {}
         self._setup_ui()
+        self.ctx.project_changed.connect(self.refresh)
 
     def _setup_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         layout.addWidget(splitter)
 
+        left_panel = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.addWidget(QtWidgets.QLabel("Phenotypes"))
+        self.pheno_list = QtWidgets.QListWidget()
+        self.pheno_list.itemSelectionChanged.connect(self._on_pheno_selected)
+        left_layout.addWidget(self.pheno_list)
+        splitter.addWidget(left_panel)
+
+        right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+
+        self.round_table = QtWidgets.QTableWidget()
+        self.round_table.setColumnCount(3)
+        self.round_table.setHorizontalHeaderLabels(["Round", "Status", "Reviewers"])
+        self.round_table.verticalHeader().setVisible(False)
+        self.round_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.round_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.round_table.itemSelectionChanged.connect(self._on_round_selected)
+        self.round_table.horizontalHeader().setStretchLastSection(True)
+        right_layout.addWidget(self.round_table)
+
+        controls = QtWidgets.QHBoxLayout()
         self.metric_selector = QtWidgets.QComboBox()
         self.metric_selector.addItems(["Percent agreement", "Cohen's kappa", "Fleiss' kappa"])
-        splitter.addWidget(self.metric_selector)
+        self.label_selector = QtWidgets.QComboBox()
+        self.label_selector.setPlaceholderText("Select label")
+        self.compute_btn = QtWidgets.QPushButton("Calculate agreement")
+        self.compute_btn.clicked.connect(self._compute_agreement)
+        controls.addWidget(QtWidgets.QLabel("Label:"))
+        controls.addWidget(self.label_selector)
+        controls.addWidget(QtWidgets.QLabel("Metric:"))
+        controls.addWidget(self.metric_selector)
+        controls.addWidget(self.compute_btn)
+        right_layout.addLayout(controls)
+
+        self.round_summary = QtWidgets.QLabel("Select a round to review agreement metrics")
+        self.round_summary.setWordWrap(True)
+        right_layout.addWidget(self.round_summary)
 
         self.results_view = QtWidgets.QTextEdit()
-        splitter.addWidget(self.results_view)
+        self.results_view.setReadOnly(True)
+        self.results_view.setPlaceholderText("Agreement results will appear here once calculated")
+        right_layout.addWidget(self.results_view)
+
+        discord_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.discord_table = QtWidgets.QTableWidget()
+        self.discord_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.discord_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.discord_table.itemSelectionChanged.connect(self._on_discord_selected)
+        discord_splitter.addWidget(self.discord_table)
+
+        self.discord_note = QtWidgets.QTextEdit()
+        self.discord_note.setReadOnly(True)
+        self.discord_note.setPlaceholderText("Select a discordant unit to review the source note text")
+        discord_splitter.addWidget(self.discord_note)
+        discord_splitter.setStretchFactor(0, 3)
+        discord_splitter.setStretchFactor(1, 2)
+
+        right_layout.addWidget(discord_splitter)
+        splitter.addWidget(right_panel)
         splitter.setStretchFactor(1, 3)
 
-        run_btn = QtWidgets.QPushButton("Compute from sample data")
-        run_btn.clicked.connect(self._run_example)
-        layout.addWidget(run_btn)
+    def refresh(self) -> None:
+        self.pheno_list.clear()
+        self.round_table.setRowCount(0)
+        self.label_selector.clear()
+        self.results_view.clear()
+        self.discord_table.setRowCount(0)
+        self.discord_note.clear()
+        self.current_round = None
+        self.current_reviewer_names = {}
+        self.round_summary.setText("Select a round to review agreement metrics")
+        try:
+            db = self.ctx.require_db()
+        except RuntimeError:
+            return
+        with db.connect() as conn:
+            rows = conn.execute("SELECT pheno_id, name FROM phenotypes ORDER BY name").fetchall()
+        for row in rows:
+            item = QtWidgets.QListWidgetItem(f"{row['name']} ({row['pheno_id']})")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, dict(row))
+            self.pheno_list.addItem(item)
 
-    def _run_example(self) -> None:
-        sample = [["yes", "yes", "no"], ["no", "no", "no"], ["yes", "yes", "yes"]]
+    def _on_pheno_selected(self) -> None:
+        items = self.pheno_list.selectedItems()
+        self.round_table.setRowCount(0)
+        self.label_selector.clear()
+        self.results_view.clear()
+        self.discord_table.setRowCount(0)
+        self.discord_note.clear()
+        self.current_round = None
+        self.current_reviewer_names = {}
+        if not items:
+            return
+        pheno = items[0].data(QtCore.Qt.ItemDataRole.UserRole) or {}
+        pheno_id = pheno.get("pheno_id")
+        if not pheno_id:
+            return
+        db = self.ctx.require_db()
+        with db.connect() as conn:
+            rounds = conn.execute(
+                "SELECT round_id, round_number, status, labelset_id FROM rounds WHERE pheno_id=? ORDER BY round_number DESC",
+                (pheno_id,),
+            ).fetchall()
+        self.round_table.setRowCount(len(rounds))
+        for row_index, round_row in enumerate(rounds):
+            with db.connect() as conn:
+                reviewers = conn.execute(
+                    """
+                    SELECT reviewers.reviewer_id, reviewers.name
+                    FROM assignments
+                    JOIN reviewers ON reviewers.reviewer_id = assignments.reviewer_id
+                    WHERE assignments.round_id=?
+                    ORDER BY reviewers.name
+                    """,
+                    (round_row["round_id"],),
+                ).fetchall()
+            reviewer_names = ", ".join(r["name"] for r in reviewers) or "No reviewers"
+            round_item = QtWidgets.QTableWidgetItem(f"Round {round_row['round_number']}")
+            round_item.setData(
+                QtCore.Qt.ItemDataRole.UserRole,
+                {
+                    "pheno_id": pheno_id,
+                    "round_id": round_row["round_id"],
+                    "round_number": round_row["round_number"],
+                    "status": round_row["status"],
+                    "labelset_id": round_row["labelset_id"],
+                    "reviewers": [dict(r) for r in reviewers],
+                },
+            )
+            status_item = QtWidgets.QTableWidgetItem(round_row["status"])
+            reviewers_item = QtWidgets.QTableWidgetItem(reviewer_names)
+            self.round_table.setItem(row_index, 0, round_item)
+            self.round_table.setItem(row_index, 1, status_item)
+            self.round_table.setItem(row_index, 2, reviewers_item)
+        self.round_table.resizeColumnsToContents()
+        if self.round_table.rowCount():
+            self.round_table.setCurrentCell(0, 0)
+
+    def _on_round_selected(self) -> None:
+        items = self.round_table.selectedItems()
+        self.label_selector.clear()
+        self.results_view.clear()
+        self.discord_table.setRowCount(0)
+        self.discord_note.clear()
+        if not items:
+            self.current_round = None
+            self.round_summary.setText("Select a round to review agreement metrics")
+            return
+        round_data = items[0].data(QtCore.Qt.ItemDataRole.UserRole)
+        if not round_data:
+            self.current_round = None
+            self.round_summary.setText("Select a round to review agreement metrics")
+            return
+        self.current_round = round_data
+        reviewers = round_data.get("reviewers", [])
+        self.current_reviewer_names = {rev["reviewer_id"]: rev["name"] for rev in reviewers if "reviewer_id" in rev}
+        summary_parts = [
+            f"Round {round_data.get('round_number')}",
+            round_data.get("status", ""),
+            ", ".join(self.current_reviewer_names.values()) or "No reviewers",
+        ]
+        self.round_summary.setText(" • ".join(part for part in summary_parts if part))
+        db = self.ctx.require_db()
+        with db.connect() as conn:
+            labels = conn.execute(
+                "SELECT label_id, name FROM labels WHERE labelset_id=? ORDER BY order_index",
+                (round_data.get("labelset_id"),),
+            ).fetchall()
+        for label in labels:
+            display = label["name"]
+            self.label_selector.addItem(display, label["label_id"])
+        if self.label_selector.count():
+            self.label_selector.setCurrentIndex(0)
+
+    def _compute_agreement(self) -> None:
+        if not self.current_round:
+            QtWidgets.QMessageBox.information(self, "IAA", "Select a round before calculating agreement")
+            return
+        label_id = self.label_selector.currentData()
+        if not label_id:
+            QtWidgets.QMessageBox.information(self, "IAA", "Select a label to evaluate")
+            return
+        project_root = self.ctx.require_project()
+        pheno_id = self.current_round["pheno_id"]
+        round_number = self.current_round["round_number"]
+        round_dir = project_root / "phenotypes" / pheno_id / f"rounds/round_{round_number}"
+        aggregate_path = round_dir / "round_aggregate.db"
+        if not aggregate_path.exists():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "IAA",
+                "Round aggregate not found. Import assignments and build the aggregate before calculating agreement.",
+            )
+            return
+        round_key = f"{pheno_id}_r{round_number}"
+        with sqlite3.connect(aggregate_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT unit_id, reviewer_id, value, value_num, value_date, na
+                FROM unit_annotations
+                WHERE round_id=? AND label_id=?
+                ORDER BY unit_id, reviewer_id
+                """,
+                (round_key, label_id),
+            ).fetchall()
+            summaries = conn.execute(
+                "SELECT unit_id, patient_icn, doc_id FROM unit_summary WHERE round_id=?",
+                (round_key,),
+            ).fetchall()
+        summary_map = {row["unit_id"]: dict(row) for row in summaries}
+        if not rows:
+            self.results_view.setPlainText("No annotations found for the selected label.")
+            self.discord_table.setRowCount(0)
+            return
+        values_by_unit: Dict[str, Dict[str, str]] = {}
+        for row in rows:
+            unit_id = row["unit_id"]
+            reviewer_id = row["reviewer_id"]
+            value = self._format_value(row)
+            values_by_unit.setdefault(unit_id, {})[reviewer_id] = value
+        reviewer_ids = sorted({rid for ratings in values_by_unit.values() for rid in ratings.keys()})
+        complete_samples = []
+        for unit_id, ratings in values_by_unit.items():
+            sample_row = []
+            missing = False
+            for reviewer_id in reviewer_ids:
+                if reviewer_id not in ratings:
+                    missing = True
+                    break
+                sample_row.append(ratings[reviewer_id])
+            if not missing and len(sample_row) >= 2:
+                complete_samples.append(sample_row)
         metric = self.metric_selector.currentText()
+        result_lines = []
         if metric == "Percent agreement":
-            value = percent_agreement(sample)
+            value = percent_agreement(complete_samples)
+            result_lines.append(f"Percent agreement: {value:.3%} across {len(complete_samples)} overlapped units")
         elif metric == "Cohen's kappa":
-            value = cohens_kappa([row[0] for row in sample], [row[1] for row in sample])
+            if len(reviewer_ids) != 2:
+                QtWidgets.QMessageBox.warning(self, "IAA", "Cohen's kappa requires exactly two reviewers")
+                return
+            rater_a = [row[0] for row in complete_samples]
+            rater_b = [row[1] for row in complete_samples]
+            value = cohens_kappa(rater_a, rater_b)
+            result_lines.append(f"Cohen's kappa: {value:.3f} across {len(complete_samples)} overlapped units")
         else:
+            categories = sorted({val for ratings in values_by_unit.values() for val in ratings.values()})
             matrix = []
-            categories = sorted({item for row in sample for item in row})
-            for row in sample:
-                counts = [row.count(cat) for cat in categories]
+            for ratings in values_by_unit.values():
+                if len(ratings) < 2:
+                    continue
+                counts = [sum(1 for val in ratings.values() if val == category) for category in categories]
                 matrix.append(counts)
             value = fleiss_kappa(matrix)
-        self.results_view.setPlainText(f"{metric}: {value:.3f}")
+            result_lines.append(f"Fleiss' kappa: {value:.3f} across {len(matrix)} overlapped units")
+        discordant_units = []
+        for unit_id, ratings in values_by_unit.items():
+            if len(ratings) < 2:
+                continue
+            if len(set(ratings.values())) > 1:
+                discordant_units.append((unit_id, summary_map.get(unit_id, {}), ratings))
+        result_lines.append(f"Discordant units: {len(discordant_units)}")
+        self.results_view.setPlainText("\n".join(result_lines))
+        self._populate_discord_table(discordant_units, reviewer_ids)
 
-    def refresh(self) -> None:
-        # No dynamic content yet; placeholder to satisfy the navigation stack
-        pass
+    def _populate_discord_table(
+        self,
+        rows: List[Tuple[str, Dict[str, object], Dict[str, str]]],
+        reviewer_ids: List[str],
+    ) -> None:
+        headers = ["Unit", "Patient", "Document"] + [self.current_reviewer_names.get(rid, rid) for rid in reviewer_ids]
+        self.discord_table.clear()
+        self.discord_table.setColumnCount(len(headers))
+        self.discord_table.setHorizontalHeaderLabels(headers)
+        self.discord_table.setRowCount(len(rows))
+        for row_index, (unit_id, summary, ratings) in enumerate(rows):
+            unit_item = QtWidgets.QTableWidgetItem(unit_id)
+            unit_item.setData(QtCore.Qt.ItemDataRole.UserRole, {"doc_id": summary.get("doc_id"), "unit_id": unit_id})
+            patient_item = QtWidgets.QTableWidgetItem(str(summary.get("patient_icn", "")))
+            doc_item = QtWidgets.QTableWidgetItem(str(summary.get("doc_id", "")))
+            self.discord_table.setItem(row_index, 0, unit_item)
+            self.discord_table.setItem(row_index, 1, patient_item)
+            self.discord_table.setItem(row_index, 2, doc_item)
+            for col_offset, reviewer_id in enumerate(reviewer_ids, start=3):
+                value = ratings.get(reviewer_id, "—")
+                self.discord_table.setItem(row_index, col_offset, QtWidgets.QTableWidgetItem(value))
+        self.discord_table.resizeColumnsToContents()
+
+    def _on_discord_selected(self) -> None:
+        items = self.discord_table.selectedItems()
+        if not items:
+            self.discord_note.clear()
+            return
+        payload = items[0].data(QtCore.Qt.ItemDataRole.UserRole) or {}
+        doc_id = payload.get("doc_id")
+        if not doc_id:
+            self.discord_note.clear()
+            return
+        try:
+            corpus_db = self.ctx.require_corpus_db()
+        except RuntimeError:
+            self.discord_note.setPlainText("Corpus database is not available.")
+            return
+        with corpus_db.connect() as conn:
+            row = conn.execute("SELECT text FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+        if row and row["text"]:
+            self.discord_note.setPlainText(row["text"])
+        else:
+            self.discord_note.setPlainText("Document text not found in corpus.")
+
+    @staticmethod
+    def _format_value(row: sqlite3.Row) -> str:
+        if row["na"]:
+            return "N/A"
+        if row["value"] is not None and row["value"] != "":
+            return str(row["value"])
+        if row["value_num"] is not None:
+            return str(row["value_num"])
+        if row["value_date"]:
+            return row["value_date"]
+        return ""
 
 
 class AdminMainWindow(QtWidgets.QMainWindow):

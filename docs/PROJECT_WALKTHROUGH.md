@@ -20,44 +20,50 @@ needing to write code.
      reports\
      scripts\
    ```
-4. Copy the PowerShell helper scripts from the repository (`scripts\*.ps1`) into
-   the new `scripts\` folder so that team members can launch the tools without
-   opening a terminal.
+4. Keep a copy of the repository's `scripts/` folder in the workspace if you
+   still distribute Windows shortcuts, but the steps below assume you will run
+   the tooling from an activated Conda prompt.
 
 ## 2. Build the Admin and Client executables
 
 If you already have fresh copies of `AdminApp.exe` and `ClientApp.exe`, you can
 skip this section. Otherwise:
 
-1. On a Windows workstation with Python 3.11 installed, open PowerShell in the
-   repository root.
-2. Create and activate a virtual environment:
-   ```powershell
-   py -3.11 -m venv .venv
-   .venv\Scripts\activate
+1. On a workstation with Conda (Anaconda or Miniconda) installed, open an
+   **Anaconda Prompt** in the repository root.
+2. Create the environment (run once):
    ```
-3. Install the dependencies:
-   ```powershell
+   conda create -n vaannotate python=3.11
+   ```
+3. Activate the environment and install dependencies:
+   ```
+   conda activate vaannotate
    pip install -r requirements.txt
+   pip install pyinstaller
    ```
-4. Build the Admin executable:
-   ```powershell
-   scripts\build_admin.ps1
+4. Build the Admin executable from the activated environment:
+   ```
+   pyinstaller --noconfirm --clean --name AdminApp --onefile --windowed \
+     vaannotate/AdminApp/main.py
    ```
 5. Build the Client executable:
-   ```powershell
-   scripts\build_client.ps1
    ```
-6. After both commands succeed you will have `dist\AdminApp.exe` and
-   `dist\ClientApp.exe`. Copy these two files into the `dist\` folder you created
+   pyinstaller --noconfirm --clean --name ClientApp --onefile --windowed \
+     vaannotate/ClientApp/main.py
+   ```
+6. After both commands succeed you will have `dist/AdminApp.exe` and
+   `dist/ClientApp.exe`. Copy these two files into the `dist/` folder you created
    inside the project workspace.
 
 ## 3. Launch the Admin app against the new project folder
 
-1. From Windows Explorer, right-click the new `scripts\run_admin.ps1` inside the
-   project folder and choose **Run with PowerShell**. When prompted, supply the
-   UNC path to the project root (for example,
-   `\\\\research-fs01\\Projects\\PH_HeartFailure`).
+1. From the activated Conda prompt, launch the Admin application:
+   ```
+   conda activate vaannotate
+   python -m vaannotate.AdminApp.main
+   ```
+   Use **File → Open project folder…** to browse to the UNC path for the new
+   project (for example, `\\\\research-fs01\\Projects\\PH_HeartFailure`).
 2. On first launch the Admin application will create the SQLite databases:
    - `project.db` at the project root for metadata
    - `corpus\corpus.db` for patient notes
@@ -69,8 +75,9 @@ skip this section. Otherwise:
 
 1. Prepare two CSV files: `patients.csv` (patient ICNs and STA3Ns) and
    `documents.csv` (one row per note, including the full text).
-2. In PowerShell run the import helper, replacing the paths with your files:
-   ```powershell
+2. In the activated Conda prompt run the import helper, replacing the paths with
+   your files:
+   ```
    python -m vaannotate.admin_cli import-corpus \
      "\\research-fs01\Projects\PH_HeartFailure" \
      --patients-csv "C:\Data\patients.csv" \
@@ -93,10 +100,11 @@ skip this section. Otherwise:
 ## 6. Next steps (optional)
 
 - Use the **Rounds** tab to configure reviewers, sampling, and manifests.
-- Copy `dist\ClientApp.exe` into each reviewer assignment folder once rounds are
+- Copy `dist/ClientApp.exe` into each reviewer assignment folder once rounds are
   generated (rename the copy to `client.exe` for convenience).
 - Share the project folder path with the team. Annotators only need their
-  assignment subfolder; admins launch the project via `scripts\run_admin.ps1`.
+  assignment subfolder; admins launch the project from an activated Conda prompt
+  with `python -m vaannotate.AdminApp.main`.
 
 Following the checklist above gets you from an empty network folder to a fully
 initialized VAAnnotate project with at least one phenotype ready for round

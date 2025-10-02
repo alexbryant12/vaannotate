@@ -98,12 +98,12 @@ class AssignmentContext(QtCore.QObject):
             row = conn.execute("SELECT text FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
         return row[0] if row else ""
 
-    def fetch_unit_documents(self, unit_id: str) -> List[Dict[str, str]]:
+    def fetch_unit_documents(self, unit_id: str) -> List[Dict[str, object]]:
         if not self.assignment_db:
             return []
         with self.assignment_db.connect() as conn:
             rows = conn.execute(
-                "SELECT documents.doc_id, documents.text FROM unit_notes "
+                "SELECT unit_notes.order_index, documents.doc_id, documents.text FROM unit_notes "
                 "JOIN documents ON documents.doc_id = unit_notes.doc_id "
                 "WHERE unit_notes.unit_id=? ORDER BY unit_notes.order_index",
                 (unit_id,),
@@ -192,10 +192,16 @@ class AssignmentContext(QtCore.QObject):
 
 
 class AnnotationForm(QtWidgets.QScrollArea):
-    def __init__(self, ctx: AssignmentContext, get_selection: Callable[[], QtGui.QTextCursor]) -> None:
+    def __init__(
+        self,
+        ctx: AssignmentContext,
+        get_selection: Callable[[], QtGui.QTextCursor],
+        get_active_doc_id: Callable[[], Optional[str]],
+    ) -> None:
         super().__init__()
         self.ctx = ctx
         self.get_selection = get_selection
+        self.get_active_doc_id = get_active_doc_id
         self.container = QtWidgets.QWidget()
         self.setWidgetResizable(True)
         self.setWidget(self.container)
@@ -414,6 +420,10 @@ class AnnotationForm(QtWidgets.QScrollArea):
     def _add_highlight(self, label_id: str) -> None:
         if not self.current_unit_id or not self.ctx.current_unit:
             return
+        doc_id = self.get_active_doc_id()
+        if not doc_id:
+            QtWidgets.QMessageBox.information(self, "Highlight", "Select a note before adding highlights")
+            return
         cursor = self.get_selection()
         if cursor.isNull() or cursor.selectionStart() == cursor.selectionEnd():
             QtWidgets.QMessageBox.information(self, "Highlight", "Select text in the note first")
@@ -421,7 +431,7 @@ class AnnotationForm(QtWidgets.QScrollArea):
         start = cursor.selectionStart()
         end = cursor.selectionEnd()
         snippet = cursor.selectedText()
-        self.ctx.save_rationale(self.current_unit_id, label_id, str(self.ctx.current_unit.get("doc_id")), start, end, snippet)
+        self.ctx.save_rationale(self.current_unit_id, label_id, doc_id, start, end, snippet)
 
     def _update_gating(self) -> None:
         values = self._current_values()
@@ -511,6 +521,8 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self.ctx = AssignmentContext()
         self.setWindowTitle("VAAnnotate Client")
         self.resize(1400, 900)
+        self.current_documents: List[Dict[str, object]] = []
+        self.active_doc_id: Optional[str] = None
         self._setup_menu()
         self._setup_ui()
         self.ctx.assignment_loaded.connect(self._on_assignment_loaded)
@@ -532,19 +544,39 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         splitter.addWidget(self.unit_list)
 
         middle_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.notes_table = QtWidgets.QTableWidget()
+        self.notes_table.setColumnCount(3)
+        self.notes_table.setHorizontalHeaderLabels(["#", "Document ID", "Preview"])
+        self.notes_table.verticalHeader().setVisible(False)
+        self.notes_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.notes_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.notes_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.notes_table.itemSelectionChanged.connect(self._on_document_selected)
+        self.notes_table.horizontalHeader().setStretchLastSection(True)
+        middle_splitter.addWidget(self.notes_table)
+
+        note_panel = QtWidgets.QWidget()
+        note_panel_layout = QtWidgets.QVBoxLayout(note_panel)
+        note_panel_layout.setContentsMargins(0, 0, 0, 0)
+        note_panel_layout.setSpacing(6)
         self.note_view = QtWidgets.QTextEdit()
         self.note_view.setReadOnly(True)
         self.note_view.setFontPointSize(12)
-        middle_splitter.addWidget(self.note_view)
+        note_panel_layout.addWidget(self.note_view)
 
         info_widget = QtWidgets.QWidget()
         info_layout = QtWidgets.QHBoxLayout(info_widget)
         self.progress_label = QtWidgets.QLabel("Progress: 0/0")
         info_layout.addWidget(self.progress_label)
-        middle_splitter.addWidget(info_widget)
+        note_panel_layout.addWidget(info_widget)
+        middle_splitter.addWidget(note_panel)
         splitter.addWidget(middle_splitter)
 
-        self.form = AnnotationForm(self.ctx, lambda: self.note_view.textCursor())
+        self.form = AnnotationForm(
+            self.ctx,
+            lambda: self.note_view.textCursor(),
+            lambda: self.active_doc_id,
+        )
         splitter.addWidget(self.form)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
@@ -570,6 +602,10 @@ class ClientMainWindow(QtWidgets.QMainWindow):
 
     def _on_assignment_loaded(self) -> None:
         self.unit_list.clear()
+        self.notes_table.setRowCount(0)
+        self.note_view.clear()
+        self.current_documents = []
+        self.active_doc_id = None
         for unit in self.ctx.units:
             item = QtWidgets.QListWidgetItem(f"{unit['display_rank']}: {unit['doc_id']}")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, unit)
@@ -590,18 +626,57 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         unit_id = str(unit["unit_id"])
         documents = self.ctx.fetch_unit_documents(unit_id)
         if documents:
-            parts = []
-            for index, doc in enumerate(documents, start=1):
-                header = f"Document {index}: {doc['doc_id']}"
-                parts.append(header)
-                parts.append(doc.get("text", ""))
-            doc_text = "\n\n".join(parts)
+            self._populate_notes_table(documents)
         else:
-            doc_text = self.ctx.fetch_document(str(unit.get("doc_id", "")))
-        self.note_view.setPlainText(doc_text)
+            fallback_doc_id = str(unit.get("doc_id", ""))
+            fallback_text = self.ctx.fetch_document(fallback_doc_id)
+            documents = [
+                {
+                    "order_index": 1,
+                    "doc_id": fallback_doc_id,
+                    "text": fallback_text,
+                }
+            ]
+            self._populate_notes_table(documents)
+        if self.notes_table.rowCount():
+            self.notes_table.setCurrentCell(0, 0)
         annotations = self.ctx.load_annotations(str(unit["unit_id"]))
         self.form.load_unit(unit_id, annotations)
         self._update_progress()
+
+    def _populate_notes_table(self, documents: List[Dict[str, object]]) -> None:
+        self.current_documents = documents
+        self.active_doc_id = None
+        self.notes_table.blockSignals(True)
+        self.notes_table.setRowCount(len(documents))
+        for row_index, doc in enumerate(documents):
+            order_item = QtWidgets.QTableWidgetItem(str(doc.get("order_index", row_index + 1)))
+            order_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc)
+            doc_item = QtWidgets.QTableWidgetItem(str(doc.get("doc_id", "")))
+            preview_text = str(doc.get("text", ""))[:200].replace("\n", " ")
+            preview_item = QtWidgets.QTableWidgetItem(preview_text)
+            self.notes_table.setItem(row_index, 0, order_item)
+            self.notes_table.setItem(row_index, 1, doc_item)
+            self.notes_table.setItem(row_index, 2, preview_item)
+        self.notes_table.blockSignals(False)
+        self.notes_table.resizeColumnsToContents()
+
+    def _on_document_selected(self) -> None:
+        items = self.notes_table.selectedItems()
+        if not items:
+            self.note_view.clear()
+            self.active_doc_id = None
+            return
+        doc = items[0].data(QtCore.Qt.ItemDataRole.UserRole)
+        if not doc:
+            self.note_view.clear()
+            self.active_doc_id = None
+            return
+        self._set_active_document(doc)
+
+    def _set_active_document(self, doc: Dict[str, object]) -> None:
+        self.active_doc_id = str(doc.get("doc_id", "")) or None
+        self.note_view.setPlainText(str(doc.get("text", "")))
 
     def _navigate(self, step: int) -> None:
         row = self.unit_list.currentRow()

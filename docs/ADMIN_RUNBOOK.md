@@ -3,7 +3,7 @@
 ## Hydrate the Toy Workspace
 > The demo workspace and executables are generated on demand (no binaries are tracked in Git).
 
-1. From the repo root, run `python tools\seed_toy_project.py`, **or** double-click `scripts\new_toy_project.ps1` from Windows.
+1. From an activated Conda prompt in the repo root, run `python tools\seed_toy_project.py` to regenerate the workspace.
 2. The script rebuilds `demo/Project_Toy/`, creates reviewer assignments, and places placeholder clients into each assignment folder.
 3. When you build real executables, copy them into `dist/` before sharing the project.
 
@@ -12,20 +12,25 @@
 - `project.db` — metadata database (phenotypes, reviewers, rounds).
 - `phenotypes/ph_diabetes/rounds/round_1/` — Round 1 workspace with manifests, assignments, reports.
 - `reports/` — export targets (`reports/exports/` holds gold data after finalization).
-- `scripts/` — helper PowerShell launchers (keep with the project).
+- `scripts/` — optional helper launchers (not required when running from Conda).
 - `dist/` — locally built Admin and Client executables.
 
 > **Do not** move or rename `project.db`, `corpus/`, or anything inside `phenotypes/` once assignments are distributed.
 
 ## Launching the Admin App
-1. From Windows, open PowerShell.
-2. Run `scripts\run_admin.ps1 -Project \\server\share\Project_Toy`.
-   - Alternatively, launch directly via `dist\AdminApp.exe --project \\server\share\Project_Toy` (after building the executable locally).
-3. The Admin application opens against the provided UNC project path.
+1. Open an Anaconda Prompt and activate the environment used for VAAnnotate:
+   ```
+   conda activate vaannotate
+   ```
+2. Launch the Admin client:
+   ```
+   python -m vaannotate.AdminApp.main
+   ```
+3. Use **File → Open project folder…** to point the application at `\\server\share\Project_Toy`.
 
 ## Target Corpus Summary
-- Navigate to the **Corpus** or **Phenotypes** tabs to review seeded patients (ICNs 1001–1003).
-- Notes span 2018–2024 with mixed STA3Ns (506, 515).
+- Navigate to the **Corpus** or **Phenotypes** tabs to review seeded patients (ICNs 2001–2010).
+- Notes span 2015–2024 with mixed STA3Ns (506, 515) and now include 100 long-form entries.
 
 ## Round Wizard Walkthrough
 - Open **Rounds → ph_diabetes → Round 1**.
@@ -42,7 +47,7 @@
 - `assignment.db` — SQLite assignment package.
 - `label_schema.json` — label metadata for the client.
 - `client.exe` — placeholder annotator app (regenerated from `dist/ClientApp.exe`; replace with your real build if available).
-- `scripts/run_client.ps1` — helper launcher for that folder.
+- `scripts/run_client.ps1` — optional launcher; not required when using Conda commands.
   - `logs/` — client runtime logs.
 
 ### Sharing with Annotators
