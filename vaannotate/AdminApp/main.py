@@ -39,6 +39,13 @@ PROJECT_MODELS = [
 ]
 
 
+@dataclass(frozen=True)
+class AgreementSample:
+    unit_id: str
+    reviewer_ids: tuple[str, ...]
+    values: tuple[str, ...]
+
+
 class ProjectContext(QtCore.QObject):
     project_changed = QtCore.Signal()
 
@@ -1158,9 +1165,12 @@ class IaaWidget(QtWidgets.QWidget):
         self.round_summary.setWordWrap(True)
         layout.addWidget(self.round_summary)
 
+        units_panel = QtWidgets.QWidget()
+        units_layout = QtWidgets.QVBoxLayout(units_panel)
+        units_layout.setContentsMargins(0, 0, 0, 0)
         units_label = QtWidgets.QLabel("Imported units (overlapping assignments shown first)")
         units_label.setWordWrap(True)
-        layout.addWidget(units_label)
+        units_layout.addWidget(units_label)
 
         self.unit_table = QtWidgets.QTableWidget()
         self._update_unit_table_headers()
@@ -1171,14 +1181,18 @@ class IaaWidget(QtWidgets.QWidget):
         self.unit_table.itemSelectionChanged.connect(self._on_unit_selected)
         self.unit_table.horizontalHeader().setStretchLastSection(True)
         self.unit_table.cellDoubleClicked.connect(self._show_annotation_dialog)
-        layout.addWidget(self.unit_table)
+        units_layout.addWidget(self.unit_table)
         self._unit_metadata_column_count = 5
 
-        doc_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         doc_panel = QtWidgets.QWidget()
-        doc_layout = QtWidgets.QVBoxLayout(doc_panel)
+        doc_panel_layout = QtWidgets.QVBoxLayout(doc_panel)
+        doc_panel_layout.setContentsMargins(0, 0, 0, 0)
+        doc_panel_layout.addWidget(QtWidgets.QLabel("Documents"))
+
+        doc_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        doc_table_container = QtWidgets.QWidget()
+        doc_layout = QtWidgets.QVBoxLayout(doc_table_container)
         doc_layout.setContentsMargins(0, 0, 0, 0)
-        doc_layout.addWidget(QtWidgets.QLabel("Documents"))
         self.document_table = QtWidgets.QTableWidget()
         self.document_table.setColumnCount(4)
         self.document_table.setHorizontalHeaderLabels(["Document", "Type", "Date", "Facility"])
@@ -1188,7 +1202,7 @@ class IaaWidget(QtWidgets.QWidget):
         self.document_table.itemSelectionChanged.connect(self._on_document_selected)
         self.document_table.horizontalHeader().setStretchLastSection(True)
         doc_layout.addWidget(self.document_table)
-        doc_splitter.addWidget(doc_panel)
+        doc_splitter.addWidget(doc_table_container)
 
         self.document_preview = QtWidgets.QTextEdit()
         self.document_preview.setReadOnly(True)
@@ -1196,7 +1210,14 @@ class IaaWidget(QtWidgets.QWidget):
         doc_splitter.addWidget(self.document_preview)
         doc_splitter.setStretchFactor(0, 1)
         doc_splitter.setStretchFactor(1, 2)
-        layout.addWidget(doc_splitter)
+        doc_panel_layout.addWidget(doc_splitter)
+
+        content_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        content_splitter.addWidget(units_panel)
+        content_splitter.addWidget(doc_panel)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 2)
+        layout.addWidget(content_splitter)
 
     def reset(self) -> None:
         self.current_pheno = None
@@ -1875,14 +1896,42 @@ class IaaWidget(QtWidgets.QWidget):
             self.document_preview.clear()
 
     def _is_overlap_unit(self, unit_id: str, reviewer_ids: Iterable[str]) -> bool:
-        if self.round_manifest.get(unit_id):
-            return any(self.round_manifest[unit_id].get(rid) for rid in reviewer_ids)
-        return len(set(reviewer_ids)) > 1
+        reviewer_list = list(reviewer_ids)
+        manifest_entry = self.round_manifest.get(unit_id)
+        if manifest_entry:
+            flagged = [rid for rid in reviewer_list if manifest_entry.get(rid)]
+            if len(flagged) >= 2:
+                return True
+            if flagged:
+                return False
+            return sum(1 for flag in manifest_entry.values() if flag) >= 2
+        return len(set(reviewer_list)) > 1
 
     def _apply_discord_flags(self, discordant_ids: Set[str]) -> None:
         for row in self.unit_rows:
             row["discord"] = row["unit_id"] in discordant_ids
         self._display_unit_rows()
+
+    def _prepare_agreement_samples(
+        self, values_by_unit: Dict[str, Dict[str, str]]
+    ) -> tuple[List[AgreementSample], Set[str], List[str]]:
+        samples: List[AgreementSample] = []
+        discordant_ids: Set[str] = set()
+        included_reviewers: Set[str] = set()
+        for unit_id, ratings in values_by_unit.items():
+            reviewer_ids = tuple(sorted(ratings.keys()))
+            if not reviewer_ids:
+                continue
+            if not self._is_overlap_unit(unit_id, reviewer_ids):
+                continue
+            if len(reviewer_ids) < 2:
+                continue
+            included_reviewers.update(reviewer_ids)
+            values = tuple(ratings[reviewer_id] for reviewer_id in reviewer_ids)
+            samples.append(AgreementSample(unit_id, reviewer_ids, values))
+            if len(set(values)) > 1:
+                discordant_ids.add(unit_id)
+        return samples, discordant_ids, sorted(included_reviewers)
 
     def _compute_agreement(self) -> None:
         if not self.current_round:
@@ -1931,25 +1980,8 @@ class IaaWidget(QtWidgets.QWidget):
             reviewer_id = row["reviewer_id"]
             value = self._format_value(row)
             values_by_unit.setdefault(unit_id, {})[reviewer_id] = value
-        reviewer_ids = sorted({rid for ratings in values_by_unit.values() for rid in ratings.keys()})
-        complete_samples: List[List[str]] = []
-        discordant_ids: Set[str] = set()
-        for unit_id, ratings in values_by_unit.items():
-            if not self._is_overlap_unit(unit_id, reviewer_ids):
-                continue
-            sample_row: List[str] = []
-            missing = False
-            for reviewer_id in reviewer_ids:
-                if reviewer_id not in ratings:
-                    missing = True
-                    break
-                sample_row.append(ratings[reviewer_id])
-            if missing or len(sample_row) < 2:
-                continue
-            complete_samples.append(sample_row)
-            if len(set(sample_row)) > 1:
-                discordant_ids.add(unit_id)
-        if not complete_samples:
+        samples, discordant_ids, reviewer_ids = self._prepare_agreement_samples(values_by_unit)
+        if not samples:
             QtWidgets.QMessageBox.information(
                 self,
                 "IAA",
@@ -1960,25 +1992,46 @@ class IaaWidget(QtWidgets.QWidget):
         metric = self.metric_selector.currentText()
         result_lines: List[str] = []
         if metric == "Percent agreement":
-            value = percent_agreement(complete_samples)
+            value = percent_agreement([list(sample.values) for sample in samples])
             result_lines.append(
-                f"Percent agreement: {value:.3%} across {len(complete_samples)} overlapped units"
+                f"Percent agreement: {value:.3%} across {len(samples)} overlapped units"
             )
         elif metric == "Cohen's kappa":
             if len(reviewer_ids) != 2:
                 QtWidgets.QMessageBox.warning(self, "IAA", "Cohen's kappa requires exactly two reviewers")
                 return
-            rater_a = [row[0] for row in complete_samples]
-            rater_b = [row[1] for row in complete_samples]
+            expected_order = tuple(reviewer_ids)
+            rater_a: List[str] = []
+            rater_b: List[str] = []
+            for sample in samples:
+                if sample.reviewer_ids != expected_order:
+                    continue
+                rater_a.append(sample.values[0])
+                rater_b.append(sample.values[1])
+            if not rater_a or not rater_b:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "IAA",
+                    "Insufficient overlapping annotations for Cohen's kappa.",
+                )
+                return
             value = cohens_kappa(rater_a, rater_b)
             result_lines.append(
-                f"Cohen's kappa: {value:.3f} across {len(complete_samples)} overlapped units"
+                f"Cohen's kappa: {value:.3f} across {len(rater_a)} overlapped units"
             )
         else:
-            categories = sorted({value for sample in complete_samples for value in sample})
+            rater_counts = {len(sample.values) for sample in samples}
+            if len(rater_counts) != 1:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "IAA",
+                    "Fleiss' kappa requires a consistent number of ratings per unit.",
+                )
+                return
+            categories = sorted({value for sample in samples for value in sample.values})
             matrix: List[List[int]] = []
-            for sample in complete_samples:
-                counts = [sample.count(category) for category in categories]
+            for sample in samples:
+                counts = [sample.values.count(category) for category in categories]
                 matrix.append(counts)
             value = fleiss_kappa(matrix)
             result_lines.append(
