@@ -321,6 +321,35 @@ class ProjectContext(QtCore.QObject):
         self._corpus_cache.pop(pheno_id, None)
         self.project_changed.emit()
 
+    def update_round_status(self, round_id: str, status: str) -> None:
+        valid_statuses = {"draft", "active", "closed", "adjudicating", "finalized"}
+        if status not in valid_statuses:
+            raise ValueError(f"Invalid round status: {status}")
+        db = self.require_db()
+        with db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE rounds SET status=? WHERE round_id=?",
+                (status, round_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"Round {round_id} not found")
+            config_row = conn.execute(
+                "SELECT config_json FROM round_configs WHERE round_id=?",
+                (round_id,),
+            ).fetchone()
+            if config_row:
+                try:
+                    config_payload = json.loads(config_row["config_json"])
+                except json.JSONDecodeError:
+                    config_payload = None
+                if isinstance(config_payload, dict):
+                    config_payload["status"] = status
+                    conn.execute(
+                        "UPDATE round_configs SET config_json=? WHERE round_id=?",
+                        (json.dumps(config_payload, indent=2), round_id),
+                    )
+        self.project_changed.emit()
+
 
 class PhenotypeDialog(QtWidgets.QDialog):
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
@@ -896,12 +925,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         strat_form = QtWidgets.QFormLayout(strat_group)
         self.strat_keys_edit = QtWidgets.QLineEdit()
         self.strat_keys_edit.setPlaceholderText("Comma-separated document fields (e.g. note_year, sta3n)")
-        self.strat_sample_spin = QtWidgets.QSpinBox()
-        self.strat_sample_spin.setRange(0, 10000)
-        self.strat_sample_spin.setSpecialValueText("Use full strata")
-        self.strat_sample_spin.setValue(0)
         strat_form.addRow("Stratify by", self.strat_keys_edit)
-        strat_form.addRow("Sample per stratum", self.strat_sample_spin)
         scroll_layout.addWidget(strat_group)
 
         scroll_layout.addStretch()
@@ -1136,6 +1160,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         conn: Optional[sqlite3.Connection] = None,
     ) -> Dict[str, object]:
         def fetch(connection: sqlite3.Connection) -> Dict[str, object]:
+            labelset_row = connection.execute(
+                "SELECT * FROM label_sets WHERE labelset_id=?",
+                (labelset_id,),
+            ).fetchone()
             labels = connection.execute(
                 "SELECT * FROM labels WHERE labelset_id=? ORDER BY order_index",
                 (labelset_id,),
@@ -1170,7 +1198,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         "options": sorted(option_map.get(label["label_id"], []), key=lambda o: o["order_index"]),
                     }
                 )
-            return {"labelset_id": labelset_id, "labels": schema_labels}
+            payload: Dict[str, object] = {"labelset_id": labelset_id, "labels": schema_labels}
+            if labelset_row:
+                payload["labelset_name"] = labelset_row["labelset_id"]
+                payload["created_by"] = labelset_row["created_by"]
+                payload["created_at"] = labelset_row["created_at"]
+                payload["notes"] = labelset_row["notes"]
+            return payload
 
         if conn is not None:
             return fetch(conn)
@@ -1275,19 +1309,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "Fewer candidate units were found than the requested total. All available units will be used.",
             )
         strat_keys = [key.strip() for key in self.strat_keys_edit.text().split(",") if key.strip()]
-        strat_sample = self.strat_sample_spin.value()
-        if strat_sample <= 0:
-            strat_sample = None
-        per_stratum = strat_sample
-        assignments = allocate_units(
-            corpus_rows,
-            reviewers,
-            overlap,
-            seed,
-            total_n=total_n,
-            strat_keys=strat_keys or None,
-            per_stratum=per_stratum,
-        )
+        try:
+            assignments = allocate_units(
+                corpus_rows,
+                reviewers,
+                overlap,
+                seed,
+                total_n=total_n,
+                strat_keys=strat_keys or None,
+            )
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Round", str(exc))
+            return False
         unique_units = {
             unit["unit_id"]
             for assignment in assignments.values()
@@ -1377,13 +1410,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 filters_payload["note"] = filters.note_filters
             if filters_payload:
                 config_payload["filters"] = filters_payload
-            if strat_keys or strat_sample is not None:
-                strat_payload: Dict[str, object] = {}
-                if strat_keys:
-                    strat_payload["keys"] = strat_keys
-                if strat_sample is not None:
-                    strat_payload["sample_per_stratum"] = strat_sample
-                config_payload["stratification"] = strat_payload
+            if strat_keys:
+                config_payload["stratification"] = {"keys": strat_keys}
             if label_schema:
                 config_payload["label_schema"] = label_schema
             config = models.RoundConfig(round_id=round_id, config_json=json.dumps(config_payload, indent=2))
@@ -1504,6 +1532,15 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
         elif node_type == "phenotype":
             action = menu.addAction("Add round…")
             action.triggered.connect(lambda: self._add_round(item))
+        elif node_type == "round":
+            round_info = data.get("round") or {}
+            current_status = str(round_info.get("status", ""))
+            status_menu = menu.addMenu("Set status")
+            for status in ["draft", "active", "closed", "adjudicating", "finalized"]:
+                action = status_menu.addAction(status.capitalize())
+                action.setCheckable(True)
+                action.setChecked(status == current_status)
+                action.triggered.connect(lambda _, s=status: self._change_round_status(item, s))
         if not menu.isEmpty():
             menu.exec(self.viewport().mapToGlobal(point))
 
@@ -1567,6 +1604,24 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
         if round_id:
             self.ctx.project_changed.emit()
             QtCore.QTimer.singleShot(0, lambda: self._select_round(pheno_row["pheno_id"], round_id))
+
+    def _change_round_status(self, item: QtWidgets.QTreeWidgetItem, status: str) -> None:
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        round_info = data.get("round")
+        if not isinstance(round_info, dict):
+            return
+        round_id = round_info.get("round_id")
+        pheno_id = round_info.get("pheno_id")
+        if not round_id or not pheno_id:
+            return
+        try:
+            self.ctx.update_round_status(round_id, status)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Round status", f"Failed to update status: {exc}")
+            return
+        QtCore.QTimer.singleShot(0, lambda: self._select_round(pheno_id, round_id))
 
     def _iter_items(self, root: Optional[QtWidgets.QTreeWidgetItem]) -> Iterable[QtWidgets.QTreeWidgetItem]:
         if not root:
@@ -1692,7 +1747,14 @@ class RoundDetailWidget(QtWidgets.QWidget):
             return
         self.round_label.setText(f"Round {round_row.get('round_number')} ({round_row.get('round_id')})")
         self.status_label.setText(str(round_row.get("status", "")))
-        self.labelset_label.setText(str(round_row.get("labelset_id", "")))
+        labelset_text = str(round_row.get("labelset_id", ""))
+        if config:
+            schema = config.get("label_schema")
+            if isinstance(schema, dict):
+                schema_name = schema.get("labelset_name")
+                if schema_name and schema_name != labelset_text:
+                    labelset_text = f"{labelset_text} — {schema_name}"
+        self.labelset_label.setText(labelset_text)
         self.seed_label.setText(str(round_row.get("rng_seed", "")))
         self.overlap_label.setText(str(round_row.get("overlap_n", "")))
         if config:
@@ -1768,14 +1830,29 @@ class RoundDetailWidget(QtWidgets.QWidget):
                 strat_items.append(f"Stratify by: {', '.join(keys)}")
             else:
                 strat_items.append(f"Stratify by: {keys}")
-        if stratification.get("sample_per_stratum"):
-            strat_items.append(f"Sample per stratum: {stratification['sample_per_stratum']}")
         if strat_items:
             sections.append(self._format_section("Stratification", strat_items))
 
         label_schema = config.get("label_schema") or {}
         if isinstance(label_schema, dict):
             label_items: List[str] = []
+            labelset_name = str(label_schema.get("labelset_name") or "")
+            labelset_id = str(label_schema.get("labelset_id") or "")
+            if labelset_name:
+                label_items.append(f"Name: {labelset_name}")
+            elif labelset_id:
+                label_items.append(f"Name: {labelset_id}")
+            if labelset_id and labelset_id != labelset_name:
+                label_items.append(f"Identifier: {labelset_id}")
+            notes = str(label_schema.get("notes") or "").strip()
+            if notes:
+                label_items.append(f"Notes: {notes}")
+            created_by = label_schema.get("created_by")
+            created_at = label_schema.get("created_at")
+            if created_by and created_at:
+                label_items.append(f"Created by {created_by} on {created_at}")
+            elif created_by:
+                label_items.append(f"Created by {created_by}")
             for label in label_schema.get("labels", []):
                 if not isinstance(label, dict):
                     continue
@@ -1792,6 +1869,11 @@ class RoundDetailWidget(QtWidgets.QWidget):
                     )
                     if option_names:
                         entry += f" — Options: {option_names}"
+                rules = str(label.get("rules") or "").strip()
+                if rules:
+                    condensed = " ".join(line.strip() for line in rules.splitlines() if line.strip())
+                    if condensed:
+                        entry += f"\n    Rules: {condensed}"
                 label_items.append(entry)
             if label_items:
                 sections.append(self._format_section("Label set", label_items))

@@ -137,28 +137,54 @@ def allocate_units(
     seed: int,
     total_n: int | None = None,
     strat_keys: Sequence[str] | None = None,
-    per_stratum: int | None = None,
 ) -> Dict[str, ReviewerAssignment]:
     reviewer_units: Dict[str, ReviewerAssignment] = {r["id"]: ReviewerAssignment(r["id"], []) for r in reviewers}
     if strat_keys:
         strata = stratify(rows, strat_keys)
     else:
         strata = {"__all__": list(rows)}
-    remaining = total_n if total_n is not None else None
-    for strata_key, items in strata.items():
-        items = list(items)
+    if strat_keys and total_n is not None and len(strata) > total_n:
+        raise ValueError(
+            "The requested sample size is smaller than the number of strata. "
+            "Increase the total units or adjust the stratification keys."
+        )
+    allocations: Dict[str, int] = {}
+    total_available = sum(len(list(items)) for items in strata.values())
+    target_total = total_available if total_n is None else min(total_n, total_available)
+    if total_n is None:
+        for strata_key, items in strata.items():
+            allocations[strata_key] = len(items)
+    else:
+        allocations = {key: 0 for key in strata}
+        remaining = target_total
+        active = [key for key, items in strata.items() if len(items) > 0]
+        while remaining > 0 and active:
+            share = max(1, remaining // len(active))
+            next_active: list[str] = []
+            for strata_key in list(active):
+                capacity = len(strata[strata_key]) - allocations[strata_key]
+                if capacity <= 0:
+                    continue
+                take = min(share, capacity, remaining)
+                allocations[strata_key] += take
+                remaining -= take
+                if allocations[strata_key] < len(strata[strata_key]):
+                    next_active.append(strata_key)
+                if remaining == 0:
+                    break
+            active = next_active if remaining > 0 else []
+    remaining = target_total if total_n is not None else None
+    for strata_key in sorted(strata.keys()):
+        items = list(strata[strata_key])
         rng = random.Random(_hash_seed(seed, strata_key))
         rng.shuffle(items)
-        if per_stratum is not None:
-            if per_stratum <= 0:
-                items = []
-            elif len(items) > per_stratum:
-                items = items[:per_stratum]
+        take = allocations.get(strata_key, len(items))
         if remaining is not None:
             if remaining <= 0:
                 break
-            if len(items) > remaining:
-                items = items[:remaining]
+            if take > remaining:
+                take = remaining
+        items = items[:take]
         overlap_size = min(overlap_n, len(items))
         overlap_pool = items[:overlap_size]
         remainder = items[overlap_size:]
