@@ -304,6 +304,15 @@ class AssignmentContext(QtCore.QObject):
         self.current_unit: Optional[Dict[str, object]] = None
         self.current_unit_id: Optional[str] = None
         self.current_annotations: Dict[str, Dict[str, object]] = {}
+        self._annotation_cache: Dict[str, Dict[str, Dict[str, object]]] = {}
+        self._annotation_baseline: Dict[str, Dict[str, Dict[str, object]]] = {}
+        self._unit_completion_baseline: Dict[str, Dict[str, object]] = {}
+        self._pending_annotations: Dict[Tuple[str, str], models.Annotation] = {}
+        self._pending_annotation_events: Dict[Tuple[str, str], models.Event] = {}
+        self._pending_rationales: List[models.Rationale] = []
+        self._pending_events: List[models.Event] = []
+        self._pending_completion: Dict[str, Dict[str, object]] = {}
+        self._dirty: bool = False
 
     def open_assignment(self, directory: Path) -> None:
         directory = directory.resolve()
@@ -314,6 +323,14 @@ class AssignmentContext(QtCore.QObject):
         self.assignment_db = Database(db_path)
         self.current_unit_id = None
         self.current_annotations = {}
+        self._annotation_cache = {}
+        self._annotation_baseline = {}
+        self._unit_completion_baseline = {}
+        self._pending_annotations.clear()
+        self._pending_annotation_events.clear()
+        self._pending_rationales.clear()
+        self._pending_events.clear()
+        self._pending_completion.clear()
         with self.assignment_db.connect() as conn:
             ensure_schema(
                 conn,
@@ -327,6 +344,13 @@ class AssignmentContext(QtCore.QObject):
                 ],
             )
             self.units = [dict(row) for row in conn.execute("SELECT * FROM units ORDER BY display_rank").fetchall()]
+            self._unit_completion_baseline = {
+                str(unit["unit_id"]): {
+                    "complete": bool(unit.get("complete")),
+                    "completed_at": unit.get("completed_at"),
+                }
+                for unit in self.units
+            }
         schema_path = directory / "label_schema.json"
         if schema_path.exists():
             raw_schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -350,6 +374,7 @@ class AssignmentContext(QtCore.QObject):
         self.assignment_loaded.emit()
         if self.units:
             self.set_current_unit(self.units[0])
+        self._refresh_dirty_state("Assignment loaded")
 
     def set_current_unit(self, unit: Dict[str, object]) -> None:
         self.current_unit = unit
@@ -389,6 +414,14 @@ class AssignmentContext(QtCore.QObject):
         annotations: Dict[str, Dict[str, object]] = {}
         for row in rows:
             annotations[row["label_id"]] = dict(row)
+        self._annotation_baseline.setdefault(unit_id, {})
+        for label_id, data in annotations.items():
+            self._annotation_baseline[unit_id][label_id] = dict(data)
+        cached = self._annotation_cache.get(unit_id)
+        if cached:
+            annotations.update(cached)
+        else:
+            self._annotation_cache[unit_id] = {label_id: dict(data) for label_id, data in annotations.items()}
         return annotations
 
     def save_annotation(self, unit_id: str, label_id: str, payload: Dict[str, object]) -> None:
@@ -411,29 +444,49 @@ class AssignmentContext(QtCore.QObject):
                 state["notes"] = notes if notes is None else str(notes)
             return state
 
-        with self.assignment_db.transaction() as conn:
-            row = conn.execute(
-                "SELECT value, value_num, value_date, na, notes FROM annotations WHERE unit_id=? AND label_id=?",
-                (unit_id, label_id),
-            ).fetchone()
-            base_state: Dict[str, object] = {
-                "value": row["value"] if row else None,
-                "value_num": row["value_num"] if row else None,
-                "value_date": row["value_date"] if row else None,
-                "na": bool(row["na"]) if row else False,
-                "notes": row["notes"] if row else None,
-            }
-            base_state.update(_normalized_state(payload))
+        existing_annotation = (
+            self._annotation_cache.get(unit_id, {}).get(label_id)
+            or self._annotation_baseline.get(unit_id, {}).get(label_id)
+            or {}
+        )
+        base_state: Dict[str, object] = {
+            "value": existing_annotation.get("value"),
+            "value_num": existing_annotation.get("value_num"),
+            "value_date": existing_annotation.get("value_date"),
+            "na": bool(existing_annotation.get("na")),
+            "notes": existing_annotation.get("notes"),
+        }
+        base_state.update(_normalized_state(payload))
+        normalized_state = {
+            "value": base_state.get("value"),
+            "value_num": base_state.get("value_num"),
+            "value_date": base_state.get("value_date"),
+            "na": 1 if base_state.get("na") else 0,
+            "notes": base_state.get("notes"),
+        }
+        baseline_annotation = self._annotation_baseline.get(unit_id, {}).get(label_id, {})
+        baseline_state = {
+            "value": baseline_annotation.get("value"),
+            "value_num": baseline_annotation.get("value_num"),
+            "value_date": baseline_annotation.get("value_date"),
+            "na": baseline_annotation.get("na", 0),
+            "notes": baseline_annotation.get("notes"),
+        }
+        key = (unit_id, label_id)
+        if normalized_state == baseline_state:
+            self._pending_annotations.pop(key, None)
+            self._pending_annotation_events.pop(key, None)
+        else:
             record = models.Annotation(
                 unit_id=unit_id,
                 label_id=label_id,
-                value=base_state.get("value"),
-                value_num=base_state.get("value_num"),
-                value_date=base_state.get("value_date"),
-                na=1 if base_state.get("na") else 0,
-                notes=base_state.get("notes"),
+                value=normalized_state["value"],
+                value_num=normalized_state["value_num"],
+                value_date=normalized_state["value_date"],
+                na=normalized_state["na"],
+                notes=normalized_state["notes"],
             )
-            record.save(conn)
+            self._pending_annotations[key] = record
             event = models.Event(
                 event_id=str(uuid.uuid4()),
                 ts=QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate),
@@ -453,18 +506,20 @@ class AssignmentContext(QtCore.QObject):
                     }
                 ),
             )
-            event.save(conn)
+            self._pending_annotation_events[key] = event
+        annotation_dict = {
+            "unit_id": unit_id,
+            "label_id": label_id,
+            "value": normalized_state["value"],
+            "value_num": normalized_state["value_num"],
+            "value_date": normalized_state["value_date"],
+            "na": normalized_state["na"],
+            "notes": normalized_state["notes"],
+        }
+        self._annotation_cache.setdefault(unit_id, {})[label_id] = dict(annotation_dict)
         if self.current_unit_id == unit_id:
-            self.current_annotations[label_id] = {
-                "unit_id": unit_id,
-                "label_id": label_id,
-                "value": record.value,
-                "value_num": record.value_num,
-                "value_date": record.value_date,
-                "na": record.na,
-                "notes": record.notes,
-            }
-        self.save_state_changed.emit("Saved")
+            self.current_annotations[label_id] = dict(annotation_dict)
+        self._refresh_dirty_state()
 
     def save_rationale(self, unit_id: str, label_id: str, doc_id: str, start: int, end: int, snippet: str) -> None:
         if not self.assignment_db:
@@ -479,38 +534,151 @@ class AssignmentContext(QtCore.QObject):
             snippet=snippet,
             created_at=QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate),
         )
-        with self.assignment_db.transaction() as conn:
-            record.save(conn)
-            event = models.Event(
-                event_id=str(uuid.uuid4()),
-                ts=record.created_at,
-                actor="annotator",
-                event_type="rationale_added",
-                payload_json=json.dumps({
-                    "unit_id": unit_id,
-                    "label_id": label_id,
-                    "doc_id": doc_id,
-                    "start": start,
-                    "end": end,
-                }),
-            )
-            event.save(conn)
-        self.save_state_changed.emit("Rationale saved")
+        self._pending_rationales.append(record)
+        event = models.Event(
+            event_id=str(uuid.uuid4()),
+            ts=record.created_at,
+            actor="annotator",
+            event_type="rationale_added",
+            payload_json=json.dumps({
+                "unit_id": unit_id,
+                "label_id": label_id,
+                "doc_id": doc_id,
+                "start": start,
+                "end": end,
+            }),
+        )
+        self._pending_events.append(event)
+        self._refresh_dirty_state("Unsaved changes – click Save to persist")
 
     def mark_unit_complete(self, unit_id: str, complete: bool) -> None:
         if not self.assignment_db:
             return
-        with self.assignment_db.transaction() as conn:
-            conn.execute(
-                "UPDATE units SET complete=?, completed_at=CASE WHEN ?=1 THEN ? ELSE completed_at END WHERE unit_id=?",
-                (
-                    1 if complete else 0,
-                    1 if complete else 0,
-                    QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate),
-                    unit_id,
-                ),
+        baseline_entry = self._unit_completion_baseline.get(unit_id, {})
+        baseline_complete = bool(baseline_entry.get("complete", False))
+        baseline_completed_at = baseline_entry.get("completed_at")
+        pending_state = self._pending_completion.get(unit_id)
+        current_state = bool(pending_state["complete"]) if pending_state else baseline_complete
+        if current_state == complete:
+            return
+        if complete == baseline_complete:
+            self._pending_completion.pop(unit_id, None)
+            completed_at = baseline_completed_at
+        else:
+            completed_at = (
+                QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate)
+                if complete
+                else baseline_completed_at
             )
-        self.save_state_changed.emit("Progress updated")
+            self._pending_completion[unit_id] = {
+                "complete": 1 if complete else 0,
+                "completed_at": completed_at,
+            }
+        for unit in self.units:
+            if str(unit.get("unit_id")) == unit_id:
+                unit["complete"] = 1 if complete else 0
+                unit["completed_at"] = completed_at
+                break
+        if self.current_unit and str(self.current_unit.get("unit_id")) == unit_id:
+            self.current_unit["complete"] = 1 if complete else 0
+            self.current_unit["completed_at"] = completed_at
+        self._refresh_dirty_state()
+
+    def flush_pending_writes(self) -> bool:
+        if not self.assignment_db or not self._has_pending_changes():
+            self._refresh_dirty_state()
+            return False
+        annotations_to_save = list(self._pending_annotations.items())
+        annotation_events = list(self._pending_annotation_events.values())
+        rationales_to_save = list(self._pending_rationales)
+        other_events = list(self._pending_events)
+        completion_updates = list(self._pending_completion.items())
+        with self.assignment_db.transaction() as conn:
+            if annotations_to_save:
+                models.Annotation.insert_many(conn, [record for _, record in annotations_to_save])
+            if rationales_to_save:
+                models.Rationale.insert_many(conn, rationales_to_save)
+            all_events = annotation_events + other_events
+            if all_events:
+                models.Event.insert_many(conn, all_events)
+            for unit_id, payload in completion_updates:
+                complete_value = int(payload.get("complete", 0))
+                completed_at = payload.get("completed_at")
+                conn.execute(
+                    "UPDATE units SET complete=?, completed_at=CASE WHEN ?=1 THEN ? ELSE completed_at END WHERE unit_id=?",
+                    (complete_value, complete_value, completed_at, unit_id),
+                )
+        for (unit_id, label_id), record in annotations_to_save:
+            annotation_dict = {
+                "unit_id": record.unit_id,
+                "label_id": record.label_id,
+                "value": record.value,
+                "value_num": record.value_num,
+                "value_date": record.value_date,
+                "na": record.na,
+                "notes": record.notes,
+            }
+            self._annotation_baseline.setdefault(unit_id, {})[label_id] = dict(annotation_dict)
+            self._annotation_cache.setdefault(unit_id, {})[label_id] = dict(annotation_dict)
+            if self.current_unit_id == unit_id:
+                self.current_annotations[label_id] = dict(annotation_dict)
+        for unit_id, payload in completion_updates:
+            baseline_entry = self._unit_completion_baseline.setdefault(unit_id, {})
+            baseline_entry["complete"] = bool(payload.get("complete", 0))
+            baseline_entry["completed_at"] = payload.get("completed_at")
+        self._pending_annotations.clear()
+        self._pending_annotation_events.clear()
+        self._pending_rationales.clear()
+        self._pending_events.clear()
+        self._pending_completion.clear()
+        self._refresh_dirty_state("All changes saved")
+        return True
+
+    def discard_pending_changes(self) -> None:
+        if not self.has_unsaved_changes():
+            return
+        self._pending_annotations.clear()
+        self._pending_annotation_events.clear()
+        self._pending_rationales.clear()
+        self._pending_events.clear()
+        self._pending_completion.clear()
+        self._annotation_cache = {
+            unit_id: {label_id: dict(data) for label_id, data in annotations.items()}
+            for unit_id, annotations in self._annotation_baseline.items()
+        }
+        for unit in self.units:
+            unit_id = str(unit.get("unit_id"))
+            baseline_entry = self._unit_completion_baseline.get(unit_id, {})
+            unit["complete"] = 1 if baseline_entry.get("complete") else 0
+            unit["completed_at"] = baseline_entry.get("completed_at")
+        if self.current_unit:
+            self.set_current_unit(self.current_unit)
+        self._refresh_dirty_state()
+
+    def has_unsaved_changes(self) -> bool:
+        return self._dirty
+
+    def _has_pending_changes(self) -> bool:
+        return any(
+            [
+                bool(self._pending_annotations),
+                bool(self._pending_annotation_events),
+                bool(self._pending_rationales),
+                bool(self._pending_events),
+                bool(self._pending_completion),
+            ]
+        )
+
+    def _refresh_dirty_state(self, message: Optional[str] = None) -> None:
+        dirty_before = self._dirty
+        self._dirty = self._has_pending_changes()
+        if message is None:
+            if self._dirty and not dirty_before:
+                message = "Unsaved changes – click Save to persist"
+            elif not self._dirty and dirty_before:
+                message = "All changes saved"
+        if message:
+            self.save_state_changed.emit(message)
 
 
 class AnnotationForm(QtWidgets.QScrollArea):
@@ -904,6 +1072,11 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self.open_assignment_action = file_menu.addAction("Open assignment…")
         self.open_assignment_action.setEnabled(False)
         self.open_assignment_action.triggered.connect(self._open_assignment_within_project)
+        self.save_action = QtGui.QAction("Save changes", self)
+        self.save_action.setShortcut(QtGui.QKeySequence.StandardKey.Save)
+        self.save_action.setEnabled(False)
+        self.save_action.triggered.connect(self._save_pending_changes)
+        file_menu.addAction(self.save_action)
         file_menu.addSeparator()
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
@@ -966,6 +1139,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         submit_action.triggered.connect(self._submit_assignment)
         nav_toolbar.addAction(prev_action)
         nav_toolbar.addAction(next_action)
+        nav_toolbar.addAction(self.save_action)
         nav_toolbar.addAction(submit_action)
 
     def _open_project(self) -> None:
@@ -1011,6 +1185,9 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         assignment: AssignmentSummary,
         reviewer_label: str,
     ) -> None:
+        if self.ctx.has_unsaved_changes():
+            if not self._prompt_save_changes():
+                return
         try:
             self.ctx.open_assignment(assignment.assignment_dir)
         except Exception as exc:  # noqa: BLE001
@@ -1024,6 +1201,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self._current_project_root = project_root
         self._current_assignment = assignment
         self.open_assignment_action.setEnabled(True)
+        self.save_action.setEnabled(True)
         self._update_assignment_info_label()
         status_parts = [assignment.phenotype_name, assignment.round_label()]
         if reviewer_label:
@@ -1046,6 +1224,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         return patient or str(unit.get("unit_id"))
 
     def _on_assignment_loaded(self) -> None:
+        self.save_action.setEnabled(True)
         self.unit_list.clear()
         self.notes_table.setRowCount(0)
         self.note_view.clear()
@@ -1136,8 +1315,50 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         if 0 <= target < self.unit_list.count():
             self.unit_list.setCurrentRow(target)
 
+    def _save_pending_changes(self) -> None:
+        if not self.ctx.assignment_db:
+            return
+        if not self.ctx.has_unsaved_changes():
+            self.statusBar().showMessage("No changes to save.")
+            return
+        if self._attempt_save_changes():
+            self.statusBar().showMessage("All changes saved.")
+
+    def _attempt_save_changes(self) -> bool:
+        try:
+            if not self.ctx.has_unsaved_changes():
+                return True
+            return self.ctx.flush_pending_writes()
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Save changes",
+                f"Failed to save changes: {exc}",
+            )
+            return False
+
+    def _prompt_save_changes(self) -> bool:
+        response = QtWidgets.QMessageBox.question(
+            self,
+            "Unsaved changes",
+            "You have unsaved changes. What would you like to do?",
+            QtWidgets.QMessageBox.StandardButton.Save
+            | QtWidgets.QMessageBox.StandardButton.Discard
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Save,
+        )
+        if response == QtWidgets.QMessageBox.StandardButton.Cancel:
+            return False
+        if response == QtWidgets.QMessageBox.StandardButton.Discard:
+            self.ctx.discard_pending_changes()
+            self._update_progress()
+            return True
+        return self._attempt_save_changes()
+
     def _submit_assignment(self) -> None:
         if not self.ctx.assignment_path:
+            return
+        if self.ctx.has_unsaved_changes() and not self._attempt_save_changes():
             return
         receipt = {
             "unit_count": len(self.ctx.units),
@@ -1149,22 +1370,19 @@ class ClientMainWindow(QtWidgets.QMainWindow):
 
     def _update_progress(self) -> None:
         total = len(self.ctx.units)
-        completed = 0
-        status_map: Dict[str, int] = {}
-        if self.ctx.assignment_db:
-            with self.ctx.assignment_db.connect() as conn:
-                rows = conn.execute("SELECT unit_id, complete FROM units").fetchall()
-            status_map = {row["unit_id"]: row["complete"] for row in rows}
-            completed = sum(1 for row in rows if row["complete"])
+        status_map: Dict[str, int] = {
+            str(unit["unit_id"]): 1 if unit.get("complete") else 0 for unit in self.ctx.units
+        }
+        completed = sum(1 for value in status_map.values() if value)
         for idx in range(self.unit_list.count()):
             item = self.unit_list.item(idx)
             unit = item.data(QtCore.Qt.ItemDataRole.UserRole)
             if not unit:
                 continue
             unit_id = str(unit["unit_id"])
-            if unit_id in status_map:
-                unit["complete"] = status_map[unit_id]
-            suffix = " ✓" if unit.get("complete") else ""
+            unit_complete = bool(status_map.get(unit_id))
+            unit["complete"] = 1 if unit_complete else 0
+            suffix = " ✓" if unit_complete else ""
             item.setText(f"{unit['display_rank']}: {self._format_unit_label(unit)}{suffix}")
         self.progress_label.setText(f"Progress: {completed}/{total}")
         self._update_assignment_info_label()
@@ -1176,6 +1394,13 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         phenotype = self._current_assignment.phenotype_name
         round_label = self._current_assignment.round_label()
         self.assignment_label.setText(f"Phenotype: {phenotype} | {round_label}")
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
+        if self.ctx.has_unsaved_changes():
+            if not self._prompt_save_changes():
+                event.ignore()
+                return
+        super().closeEvent(event)
 
 
 def run(path: Optional[str] = None) -> None:
