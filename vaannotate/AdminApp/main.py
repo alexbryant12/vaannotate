@@ -224,6 +224,66 @@ class PhenotypePage(QtWidgets.QWidget):
         self._reload_phenotypes()
 
 
+class CorpusOverviewPage(QtWidgets.QWidget):
+    def __init__(self, ctx: ProjectContext) -> None:
+        super().__init__()
+        self.ctx = ctx
+        self._setup_ui()
+        self.ctx.project_changed.connect(self.refresh)
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        self.summary_label = QtWidgets.QLabel("Open a project to preview corpus contents.")
+        layout.addWidget(self.summary_label)
+
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels([
+            "Doc ID",
+            "Patient ICN",
+            "Note type",
+            "Date",
+            "Preview",
+        ])
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+    def refresh(self) -> None:
+        try:
+            db = self.ctx.require_corpus_db()
+        except RuntimeError:
+            self.summary_label.setText("Open a project to preview corpus contents.")
+            self.table.setRowCount(0)
+            return
+
+        with db.connect() as conn:
+            patient_count = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
+            document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            rows = conn.execute(
+                "SELECT doc_id, patient_icn, notetype, date_note, substr(text, 1, 200) AS preview "
+                "FROM documents ORDER BY date_note DESC LIMIT 50"
+            ).fetchall()
+
+        self.summary_label.setText(
+            f"Patients: {patient_count:,} • Documents: {document_count:,} • Showing {len(rows)} most recent notes"
+        )
+        self.table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = [
+                row["doc_id"],
+                row["patient_icn"],
+                row["notetype"],
+                row["date_note"],
+                (row["preview"] or "").replace("\n", " ") + ("…" if row["preview"] and len(row["preview"]) == 200 else ""),
+            ]
+            for col_index, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(str(value))
+                self.table.setItem(row_index, col_index, item)
+        self.table.resizeColumnsToContents()
+
+
 class RoundPage(QtWidgets.QWidget):
     def __init__(self, ctx: ProjectContext) -> None:
         super().__init__()
@@ -541,7 +601,7 @@ class AdminMainWindow(QtWidgets.QMainWindow):
     def _setup_central(self) -> None:
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         nav_widget = QtWidgets.QListWidget()
-        nav_widget.addItems(["Projects", "Phenotypes", "Rounds", "IAA"])
+        nav_widget.addItems(["Projects", "Phenotypes", "Rounds", "Corpus", "IAA"])
         nav_widget.currentRowChanged.connect(self._switch_page)
         splitter.addWidget(nav_widget)
 
@@ -550,6 +610,7 @@ class AdminMainWindow(QtWidgets.QMainWindow):
             ProjectsPage(self.ctx),
             PhenotypePage(self.ctx),
             RoundPage(self.ctx),
+            CorpusOverviewPage(self.ctx),
             IaaPage(self.ctx),
         ]
         for page in self.pages:
