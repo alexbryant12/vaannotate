@@ -40,6 +40,8 @@ class AssignmentContext(QtCore.QObject):
         self.units: List[Dict[str, object]] = []
         self.labels: List[LabelDefinition] = []
         self.current_unit: Optional[Dict[str, object]] = None
+        self.current_unit_id: Optional[str] = None
+        self.current_annotations: Dict[str, Dict[str, object]] = {}
 
     def open_assignment(self, directory: Path) -> None:
         directory = directory.resolve()
@@ -48,6 +50,8 @@ class AssignmentContext(QtCore.QObject):
             raise FileNotFoundError(db_path)
         self.assignment_path = directory
         self.assignment_db = Database(db_path)
+        self.current_unit_id = None
+        self.current_annotations = {}
         with self.assignment_db.connect() as conn:
             ensure_schema(
                 conn,
@@ -87,6 +91,11 @@ class AssignmentContext(QtCore.QObject):
 
     def set_current_unit(self, unit: Dict[str, object]) -> None:
         self.current_unit = unit
+        unit_id = str(unit.get("unit_id", "")) if unit else None
+        self.current_unit_id = unit_id or None
+        self.current_annotations = (
+            self.load_annotations(self.current_unit_id) if self.current_unit_id else {}
+        )
         self.unit_changed.emit(unit)
 
     # Database helpers -----------------------------------------------------
