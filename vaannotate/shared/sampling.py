@@ -34,6 +34,18 @@ def _hash_seed(seed: int, salt: str) -> int:
     return int(digest[:16], 16)
 
 
+def _note_year_sort_value(value: object) -> int:
+    if value is None or value == "":
+        return -1
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return -1
+
+
 def candidate_documents(corpus_db: Database, level: str, filters: SamplingFilters) -> List[sqlite3.Row]:
     with corpus_db.connect() as conn:
         base_query = [
@@ -79,7 +91,7 @@ def candidate_documents(corpus_db: Database, level: str, filters: SamplingFilter
         for patient_icn, docs in grouped.items():
             ordered_docs = sorted(
                 docs,
-                key=lambda item: (item["note_year"], item["doc_id"]),
+                key=lambda item: (_note_year_sort_value(item["note_year"]), item["doc_id"]),
             )
             primary = ordered_docs[0]
             doc_payloads = [

@@ -125,7 +125,7 @@ CORPUS_SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS patients(
         patient_icn TEXT PRIMARY KEY,
-        sta3n TEXT NOT NULL,
+        sta3n TEXT,
         date_index TEXT,
         softlabel REAL
     );
@@ -134,11 +134,11 @@ CORPUS_SCHEMA = [
     CREATE TABLE IF NOT EXISTS documents(
         doc_id TEXT PRIMARY KEY,
         patient_icn TEXT NOT NULL,
-        notetype TEXT NOT NULL,
-        note_year INTEGER NOT NULL,
+        notetype TEXT,
+        note_year INTEGER,
         date_note TEXT,
         cptname TEXT,
-        sta3n TEXT NOT NULL,
+        sta3n TEXT,
         hash TEXT NOT NULL,
         text TEXT NOT NULL,
         FOREIGN KEY(patient_icn) REFERENCES patients(patient_icn)

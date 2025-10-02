@@ -25,6 +25,7 @@ from vaannotate.shared.sampling import (
     write_manifest,
 )
 from vaannotate.shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
+from vaannotate.corpus import TABULAR_EXTENSIONS, import_tabular_corpus
 from vaannotate.utils import copy_sqlite_database, ensure_dir
 
 PROJECT_MODELS = [
@@ -214,7 +215,10 @@ class ProjectContext(QtCore.QObject):
         _ = rounds_dir  # make mypy happy about unused variable
         corpus_dir = ensure_dir(phenotype_dir / "corpus")
         target_corpus = corpus_dir / "corpus.db"
-        copy_sqlite_database(corpus_source, target_corpus)
+        if corpus_source.suffix.lower() in TABULAR_EXTENSIONS:
+            import_tabular_corpus(corpus_source, target_corpus)
+        else:
+            copy_sqlite_database(corpus_source, target_corpus)
         relative_corpus = target_corpus.relative_to(project_root)
         record = models.Phenotype(
             pheno_id=pheno_id,
@@ -356,9 +360,9 @@ class PhenotypeDialog(QtWidgets.QDialog):
         start_dir = str(self.ctx.project_root or Path.home())
         path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Select corpus database",
+            "Select corpus file",
             start_dir,
-            "SQLite databases (*.db);;All files (*)",
+            "Corpus files (*.db *.sqlite *.sqlite3 *.csv *.parquet *.pq);;All files (*)",
         )
         if not path_str:
             return
@@ -371,7 +375,7 @@ class PhenotypeDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Validation", "Phenotype name is required.")
             return
         if not self.corpus_path or not self.corpus_path.exists():
-            QtWidgets.QMessageBox.warning(self, "Validation", "Select a valid corpus database file.")
+            QtWidgets.QMessageBox.warning(self, "Validation", "Select a valid corpus file.")
             return
         super().accept()
 

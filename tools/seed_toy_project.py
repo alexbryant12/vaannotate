@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+import pandas as pd
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -373,7 +375,8 @@ ROUND_CONFIGS = [
 ]
 
 
-def seed_corpus(corpus_db: Path, notes: Sequence[Note]) -> None:
+def seed_corpus(corpus_db: Path, notes: Sequence[Note]) -> List[Dict[str, object]]:
+    tabular_rows: List[Dict[str, object]] = []
     with initialize_corpus_db(corpus_db) as conn:
         for patient in PATIENTS:
             conn.execute(
@@ -401,7 +404,32 @@ def seed_corpus(corpus_db: Path, notes: Sequence[Note]) -> None:
                     normalized,
                 ),
             )
+            tabular_rows.append(
+                {
+                    "patienticn": note.patient_icn,
+                    "text": normalized,
+                    "sta3n": note.sta3n,
+                    "notetype": note.notetype,
+                    "note_year": note.note_year,
+                    "date_note": note.date,
+                    "cptname": None,
+                }
+            )
         conn.commit()
+    return tabular_rows
+
+
+def write_tabular_corpus(corpus_dir: Path, rows: Sequence[Dict[str, object]]) -> None:
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    # Ensure required columns are ordered first for readability
+    preferred_order = ["patienticn", "text", "sta3n", "notetype", "note_year", "date_note", "cptname"]
+    remaining = [column for column in df.columns if column not in preferred_order]
+    ordered = preferred_order + remaining
+    df = df[[column for column in ordered if column in df.columns]]
+    df.to_csv(corpus_dir / "corpus.csv", index=False, encoding="utf-8")
+    df.to_parquet(corpus_dir / "corpus.parquet", index=False)
 
 
 def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
@@ -616,7 +644,8 @@ def main() -> None:
     for pheno_id in ("ph_diabetes", "ph_hypertension"):
         corpus_dir = ensure_dir(project_root / "phenotypes" / pheno_id / "corpus")
         corpus_db = corpus_dir / "corpus.db"
-        seed_corpus(corpus_db, NOTES)
+        tabular_rows = seed_corpus(corpus_db, NOTES)
+        write_tabular_corpus(corpus_dir, tabular_rows)
         phenotype_corpus_dbs[pheno_id] = corpus_db
     relative_corpus = {
         pheno_id: corpus_db.relative_to(project_root).as_posix()
