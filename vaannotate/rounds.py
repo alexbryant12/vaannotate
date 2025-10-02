@@ -23,6 +23,18 @@ from .utils import (
 )
 
 
+def _note_year_sort_value(value: object) -> int:
+    if value is None or value == "":
+        return -1
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return -1
+
+
 @dataclass
 class CandidateUnit:
     unit_id: str
@@ -280,7 +292,7 @@ class RoundBuilder:
                 strata_key = self._compute_strata_key(primary_row, config.get("stratification"))
                 ordered_docs = sorted(
                     docs,
-                    key=lambda item: (item["note_year"], item["doc_id"]),
+                    key=lambda item: (_note_year_sort_value(item["note_year"]), item["doc_id"]),
                 )
                 doc_payloads = [
                     {
