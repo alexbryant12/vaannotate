@@ -20,6 +20,7 @@ from ..shared.sampling import (
     populate_assignment_db,
     write_manifest,
 )
+from ..utils import copy_sqlite_database, ensure_dir
 from ..shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
 
 
@@ -789,6 +790,26 @@ class IaaPage(QtWidgets.QWidget):
         controls.addWidget(self.compute_btn)
         right_layout.addLayout(controls)
 
+        import_layout = QtWidgets.QHBoxLayout()
+        self.auto_import_btn = QtWidgets.QPushButton("Import submitted assignments")
+        self.auto_import_btn.clicked.connect(self._on_auto_import_clicked)
+        self.manual_reviewer_combo = QtWidgets.QComboBox()
+        self.manual_reviewer_combo.setPlaceholderText("Select reviewer")
+        self.manual_import_btn = QtWidgets.QPushButton("Import reviewer DB…")
+        self.manual_import_btn.clicked.connect(self._manual_import_assignment)
+        self.manual_import_btn.setEnabled(False)
+        self.auto_import_btn.setEnabled(False)
+        import_layout.addWidget(self.auto_import_btn)
+        import_layout.addStretch()
+        import_layout.addWidget(QtWidgets.QLabel("Reviewer:"))
+        import_layout.addWidget(self.manual_reviewer_combo)
+        import_layout.addWidget(self.manual_import_btn)
+        right_layout.addLayout(import_layout)
+
+        self.import_status_label = QtWidgets.QLabel()
+        self.import_status_label.setWordWrap(True)
+        right_layout.addWidget(self.import_status_label)
+
         self.round_summary = QtWidgets.QLabel("Select a round to review agreement metrics")
         self.round_summary.setWordWrap(True)
         right_layout.addWidget(self.round_summary)
@@ -823,6 +844,10 @@ class IaaPage(QtWidgets.QWidget):
         self.results_view.clear()
         self.discord_table.setRowCount(0)
         self.discord_note.clear()
+        self.manual_reviewer_combo.clear()
+        self.manual_import_btn.setEnabled(False)
+        self.auto_import_btn.setEnabled(False)
+        self.import_status_label.clear()
         self.current_round = None
         self.current_reviewer_names = {}
         self.round_summary.setText("Select a round to review agreement metrics")
@@ -844,6 +869,10 @@ class IaaPage(QtWidgets.QWidget):
         self.results_view.clear()
         self.discord_table.setRowCount(0)
         self.discord_note.clear()
+        self.manual_reviewer_combo.clear()
+        self.manual_import_btn.setEnabled(False)
+        self.auto_import_btn.setEnabled(False)
+        self.import_status_label.clear()
         self.current_round = None
         self.current_reviewer_names = {}
         if not items:
@@ -911,6 +940,16 @@ class IaaPage(QtWidgets.QWidget):
         self.current_round = round_data
         reviewers = round_data.get("reviewers", [])
         self.current_reviewer_names = {rev["reviewer_id"]: rev["name"] for rev in reviewers if "reviewer_id" in rev}
+        self.manual_reviewer_combo.clear()
+        for reviewer in reviewers:
+            reviewer_id = reviewer.get("reviewer_id")
+            if not reviewer_id:
+                continue
+            display = reviewer.get("name") or reviewer_id
+            self.manual_reviewer_combo.addItem(display, reviewer_id)
+        has_reviewers = self.manual_reviewer_combo.count() > 0
+        self.manual_import_btn.setEnabled(has_reviewers)
+        self.auto_import_btn.setEnabled(has_reviewers)
         summary_parts = [
             f"Round {round_data.get('round_number')}",
             round_data.get("status", ""),
@@ -928,6 +967,141 @@ class IaaPage(QtWidgets.QWidget):
             self.label_selector.addItem(display, label["label_id"])
         if self.label_selector.count():
             self.label_selector.setCurrentIndex(0)
+        if has_reviewers:
+            self._auto_import_submissions(silent=True)
+
+    def _on_auto_import_clicked(self) -> None:
+        if not self.current_round:
+            QtWidgets.QMessageBox.information(
+                self, "Assignment import", "Select a round to import submissions."
+            )
+            return
+        self._auto_import_submissions(silent=False)
+
+    def _auto_import_submissions(self, silent: bool) -> None:
+        if not self.current_round:
+            if not silent:
+                QtWidgets.QMessageBox.information(
+                    self, "Assignment import", "Select a round to import submissions."
+                )
+            return
+        try:
+            project_root = self.ctx.require_project()
+        except RuntimeError:
+            message = "Project directory is not available."
+            self.import_status_label.setText(message)
+            if not silent:
+                QtWidgets.QMessageBox.warning(self, "Assignment import", message)
+            return
+        pheno_id = self.current_round.get("pheno_id")
+        round_number = self.current_round.get("round_number")
+        if not pheno_id or round_number is None:
+            message = "Round metadata is incomplete."
+            self.import_status_label.setText(message)
+            if not silent:
+                QtWidgets.QMessageBox.warning(self, "Assignment import", message)
+            return
+        round_dir = project_root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}"
+        statuses: List[str] = []
+        errors = 0
+        for reviewer in self.current_round.get("reviewers", []):
+            reviewer_id = reviewer.get("reviewer_id")
+            display_name = reviewer.get("name") or reviewer_id or "Unknown reviewer"
+            if not reviewer_id:
+                continue
+            assignment_dir = round_dir / "assignments" / reviewer_id
+            submitted_path = assignment_dir / "submitted.json"
+            assignment_db = assignment_dir / "assignment.db"
+            if not assignment_dir.exists():
+                statuses.append(f"{display_name}: assignment folder missing")
+                errors += 1
+                continue
+            if not submitted_path.exists():
+                statuses.append(f"{display_name}: awaiting submission")
+                continue
+            if not assignment_db.exists():
+                statuses.append(f"{display_name}: assignment.db missing")
+                errors += 1
+                continue
+            try:
+                self._copy_assignment_to_imports(reviewer_id, assignment_db)
+            except Exception as exc:  # noqa: BLE001
+                statuses.append(f"{display_name}: import failed ({exc})")
+                errors += 1
+            else:
+                statuses.append(f"{display_name}: imported")
+        summary = "\n".join(statuses) if statuses else "No reviewers for this round."
+        self.import_status_label.setText(summary)
+        if not silent:
+            if errors:
+                QtWidgets.QMessageBox.warning(self, "Assignment import", summary)
+            else:
+                QtWidgets.QMessageBox.information(self, "Assignment import", summary)
+
+    def _manual_import_assignment(self) -> None:
+        if not self.current_round:
+            QtWidgets.QMessageBox.information(
+                self, "Assignment import", "Select a round before importing."
+            )
+            return
+        reviewer_id = self.manual_reviewer_combo.currentData()
+        if not reviewer_id:
+            QtWidgets.QMessageBox.information(
+                self, "Assignment import", "Select a reviewer to import."
+            )
+            return
+        start_dir = str(self.ctx.project_root or Path.home())
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select assignment database",
+            start_dir,
+            "SQLite databases (*.db);;All files (*)",
+        )
+        if not path_str:
+            return
+        display_name = self.current_reviewer_names.get(reviewer_id, reviewer_id)
+        try:
+            self._copy_assignment_to_imports(reviewer_id, Path(path_str))
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Assignment import",
+                f"Failed to import assignment for {display_name}: {exc}",
+            )
+            return
+        self.import_status_label.setText(f"{display_name}: imported from manual selection")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Assignment import",
+            f"Imported assignment for {display_name}.",
+        )
+        self._auto_import_submissions(silent=True)
+
+    def _copy_assignment_to_imports(self, reviewer_id: str, source: Path) -> Path:
+        if not self.current_round:
+            raise RuntimeError("Round context missing")
+        pheno_id = self.current_round.get("pheno_id")
+        round_number = self.current_round.get("round_number")
+        if not pheno_id or round_number is None:
+            raise RuntimeError("Round metadata incomplete")
+        project_root = self.ctx.require_project()
+        round_dir = project_root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}"
+        imports_dir = ensure_dir(round_dir / "imports")
+        target_path = imports_dir / f"{reviewer_id}_assignment.db"
+        copy_sqlite_database(source, target_path)
+        db = self.ctx.require_db()
+        with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT round_id FROM rounds WHERE pheno_id=? AND round_number=?",
+                (pheno_id, round_number),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("Round metadata missing in project database")
+            conn.execute(
+                "UPDATE assignments SET status='imported' WHERE round_id=? AND reviewer_id=?",
+                (row["round_id"], reviewer_id),
+            )
+        return target_path
 
     def _compute_agreement(self) -> None:
         if not self.current_round:

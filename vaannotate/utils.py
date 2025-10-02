@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import random
+import shutil
+import sqlite3
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -56,3 +58,23 @@ def validate_file_exists(path: os.PathLike[str] | str) -> Path:
     if not p.exists():
         raise FileNotFoundError(p)
     return p
+
+
+def copy_sqlite_database(
+    source: os.PathLike[str] | str, target: os.PathLike[str] | str
+) -> Path:
+    """Safely copy a SQLite database including WAL contents."""
+
+    src = Path(source)
+    dst = Path(target)
+    ensure_dir(dst.parent)
+    with sqlite3.connect(src) as source_conn:
+        source_conn.execute("PRAGMA wal_checkpoint(FULL)")
+        with sqlite3.connect(dst) as dest_conn:
+            source_conn.backup(dest_conn)
+    try:
+        shutil.copystat(src, dst, follow_symlinks=False)
+    except OSError:
+        # Copying metadata can fail on some filesystems; ignore best-effort.
+        pass
+    return dst

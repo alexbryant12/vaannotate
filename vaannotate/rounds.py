@@ -5,7 +5,6 @@ import csv
 import json
 import random
 import re
-import shutil
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
@@ -15,7 +14,13 @@ from typing import Iterator
 
 from .project import fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
-from .utils import canonical_json, deterministic_choice, ensure_dir, stable_hash
+from .utils import (
+    canonical_json,
+    copy_sqlite_database,
+    deterministic_choice,
+    ensure_dir,
+    stable_hash,
+)
 
 
 @dataclass
@@ -334,7 +339,7 @@ class RoundBuilder:
         assignment_db = assignment_dir / "assignment.db"
         imports_dir = ensure_dir(round_dir / "imports")
         target_path = imports_dir / f"{reviewer_id}_assignment.db"
-        shutil.copy2(assignment_db, target_path)
+        copy_sqlite_database(assignment_db, target_path)
         with self._connect_project() as conn:
             round_id = conn.execute(
                 "SELECT round_id FROM rounds WHERE pheno_id=? AND round_number=?",
