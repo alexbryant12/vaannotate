@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from .schema import initialize_project_db, initialize_corpus_db
+from .schema import initialize_project_db
 from .utils import ensure_dir, canonical_json
 
 
@@ -15,33 +15,29 @@ from .utils import ensure_dir, canonical_json
 class ProjectPaths:
     root: Path
     project_db: Path
-    corpus_dir: Path
-    corpus_db: Path
     admin_dir: Path
+    phenotypes_dir: Path
 
 
 def build_project_paths(root: Path) -> ProjectPaths:
     return ProjectPaths(
         root=root,
         project_db=root / "project.db",
-        corpus_dir=root / "corpus",
-        corpus_db=root / "corpus" / "corpus.db",
         admin_dir=root / "admin_tools",
+        phenotypes_dir=root / "phenotypes",
     )
 
 
 def init_project(root: Path, project_id: str, name: str, created_by: str) -> ProjectPaths:
     paths = build_project_paths(root)
     ensure_dir(paths.root)
-    ensure_dir(paths.corpus_dir)
     ensure_dir(paths.admin_dir)
+    ensure_dir(paths.phenotypes_dir)
     with initialize_project_db(paths.project_db) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO projects(project_id, name, created_at, created_by) VALUES (?,?,?,?)",
             (project_id, name, datetime.utcnow().isoformat(), created_by),
         )
-    with initialize_corpus_db(paths.corpus_db):
-        pass
     metadata = {
         "project_id": project_id,
         "name": name,
@@ -66,10 +62,19 @@ def register_reviewer(conn: sqlite3.Connection, reviewer_id: str, name: str, ema
     )
 
 
-def add_phenotype(conn: sqlite3.Connection, pheno_id: str, project_id: str, name: str, level: str, description: str | None = None) -> None:
+def add_phenotype(
+    conn: sqlite3.Connection,
+    pheno_id: str,
+    project_id: str,
+    name: str,
+    level: str,
+    description: str | None = None,
+    *,
+    corpus_path: str,
+) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO phenotypes(pheno_id, project_id, name, level, description) VALUES (?,?,?,?,?)",
-        (pheno_id, project_id, name, level, description),
+        "INSERT OR REPLACE INTO phenotypes(pheno_id, project_id, name, level, description, corpus_path) VALUES (?,?,?,?,?,?)",
+        (pheno_id, project_id, name, level, description, corpus_path),
     )
 
 

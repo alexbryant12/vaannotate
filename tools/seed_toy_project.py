@@ -263,10 +263,15 @@ def seed_corpus(corpus_db: Path, notes: Sequence[Note]) -> None:
         conn.commit()
 
 
-def seed_metadata(project_db: Path) -> None:
+def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
     with get_connection(project_db) as conn:
         for reviewer in REVIEWERS:
             register_reviewer(conn, **reviewer)
+        def corpus_for(pheno_id: str) -> str:
+            path = corpus_paths.get(pheno_id)
+            if not path:
+                raise RuntimeError(f"Missing corpus path for {pheno_id}")
+            return path
         add_phenotype(
             conn,
             pheno_id="ph_diabetes",
@@ -274,6 +279,7 @@ def seed_metadata(project_db: Path) -> None:
             name="Diabetes Phenotyping",
             level="multi_doc",
             description="Toy diabetes phenotype for demonstrations",
+            corpus_path=corpus_for("ph_diabetes"),
         )
         add_labelset(
             conn,
@@ -340,6 +346,7 @@ def seed_metadata(project_db: Path) -> None:
             name="Hypertension Phenotyping",
             level="single_doc",
             description="Toy hypertension phenotype for demonstrations",
+            corpus_path=corpus_for("ph_hypertension"),
         )
         add_labelset(
             conn,
@@ -546,11 +553,20 @@ def main() -> None:
         shutil.rmtree(project_root)
 
     paths = init_project(project_root, "Project_Toy", "Project Toy", "toy_seed")
-    seed_corpus(paths.corpus_db, NOTES)
-    seed_metadata(paths.project_db)
+    phenotype_corpus_dbs: Dict[str, Path] = {}
+    for pheno_id in ("ph_diabetes", "ph_hypertension"):
+        corpus_dir = ensure_dir(project_root / "phenotypes" / pheno_id / "corpus")
+        corpus_db = corpus_dir / "corpus.db"
+        seed_corpus(corpus_db, NOTES)
+        phenotype_corpus_dbs[pheno_id] = corpus_db
+    relative_corpus = {
+        pheno_id: corpus_db.relative_to(project_root).as_posix()
+        for pheno_id, corpus_db in phenotype_corpus_dbs.items()
+    }
+    seed_metadata(paths.project_db, relative_corpus)
 
     builder = RoundBuilder(project_root)
-    patient_docs = load_patient_docs(paths.corpus_db)
+    patient_docs_map = {pheno_id: load_patient_docs(db_path) for pheno_id, db_path in phenotype_corpus_dbs.items()}
     config_dir = ensure_dir(project_root / "config")
     for config in ROUND_CONFIGS:
         pheno_dir = ensure_dir(project_root / "phenotypes" / config["pheno_id"])
@@ -568,7 +584,7 @@ def main() -> None:
         for reviewer in config["reviewers"]:
             assign_dir = round_dir / "assignments" / reviewer["id"]
             assignment_db = assign_dir / "assignment.db"
-            augment_assignment_db(assignment_db, patient_docs)
+            augment_assignment_db(assignment_db, patient_docs_map.get(config["pheno_id"], {}))
             write_label_schema(paths.project_db, assign_dir, config["labelset_id"])
             copy_client_binary(repo_root, assign_dir)
             copy_client_script(repo_root, assign_dir)

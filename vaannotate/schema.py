@@ -23,6 +23,7 @@ PROJECT_SCHEMA = [
         name TEXT NOT NULL,
         level TEXT NOT NULL CHECK(level IN ('single_doc','multi_doc')),
         description TEXT,
+        corpus_path TEXT NOT NULL,
         UNIQUE(project_id, name)
     );
     """,

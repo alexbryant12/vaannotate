@@ -97,6 +97,7 @@ class Phenotype(Record):
     name: str
     level: str
     description: str
+    corpus_path: str
 
     __tablename__ = "phenotypes"
     __schema__ = (
@@ -107,6 +108,7 @@ class Phenotype(Record):
             name TEXT NOT NULL,
             level TEXT CHECK(level IN ('single_doc','multi_doc')) NOT NULL,
             description TEXT NOT NULL,
+            corpus_path TEXT NOT NULL,
             UNIQUE(project_id, name),
             FOREIGN KEY(project_id) REFERENCES projects(project_id)
         )

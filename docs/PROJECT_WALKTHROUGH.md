@@ -64,12 +64,13 @@ skip this section. Otherwise:
    ```
    Use **File → Open project folder…** to browse to the UNC path for the new
    project (for example, `\\\\research-fs01\\Projects\\PH_HeartFailure`).
-2. On first launch the Admin application will create the SQLite databases:
-   - `project.db` at the project root for metadata
-   - `corpus\corpus.db` for patient notes
-3. The window will open on the **Projects** tab. Fill in a friendly project name
-   and the “Created by” field, then click **Create Project**. The record appears
-   immediately in the list on the left.
+2. On first launch the Admin application will ensure the project metadata
+   database (`project.db`) exists. Corpora are now tracked per phenotype and are
+   stored within `phenotypes/<pheno_id>/corpus/corpus.db` once you assign one to
+   a phenotype.
+3. The window opens with a project tree on the left and detail views on the
+   right. The top-level node represents the project; right-click it at any time
+   to add new phenotypes.
 
 ## 4. Load or create the corpus
 
@@ -81,25 +82,30 @@ skip this section. Otherwise:
    python -m vaannotate.admin_cli import-corpus \
      "\\research-fs01\Projects\PH_HeartFailure" \
      --patients-csv "C:\Data\patients.csv" \
-     --documents-csv "C:\Data\documents.csv"
-   ```
-3. Return to the Admin app and switch to the **Corpus** tab. You should now see
-   the document counts and a top-50 preview confirming the data loaded
-   correctly.
+     --documents-csv "C:\Data\documents.csv" \
+     --corpus-db "phenotypes/ph_diabetes/corpus/source.db"
+  ```
+   The destination can be any path; relative values are resolved against the project
+   folder so you can stage per-phenotype corpora ahead of time.
+3. After the import, add a phenotype and select this corpus when prompted. Once
+   saved, highlight the phenotype’s **Corpus** node in the project tree to see
+   document counts and a top-50 preview confirming the data loaded correctly.
 
 ## 5. Create a phenotype definition
 
-1. Go to the **Phenotypes** tab.
-2. Choose the project you just created from the drop-down menu.
-3. Enter a descriptive phenotype name, pick the level (`single_doc` for
-   individual notes or `multi_doc` for patient-level reviews), and write a brief
-   description for annotators.
-4. Click **Create phenotype**. The phenotype appears in the list on the left and
-   is now ready for round configuration.
+1. In the project tree, right-click the project node and choose **Add phenotype…**.
+2. Enter a descriptive phenotype name, pick the level (`single_doc` for
+   individual notes or `multi_doc` for patient-level reviews), add a short
+   description, and browse to the corpus database that should back this
+   phenotype. The Admin app copies the selected corpus into the phenotype’s
+   folder and locks it in for that phenotype.
+3. Click **OK**. The phenotype appears under the project node along with child
+   items for the corpus, rounds, and the IAA dashboard.
 
 ## 6. Next steps (optional)
 
-- Use the **Rounds** tab to configure reviewers, sampling, and manifests.
+- Right-click a phenotype in the tree and choose **Add round…** to configure
+  reviewers, sampling, and manifests.
 - Copy `dist/ClientApp.exe` into each reviewer assignment folder once rounds are
   generated (rename the copy to `client.exe` for convenience).
 - Share the project folder path with the team. Annotators only need their

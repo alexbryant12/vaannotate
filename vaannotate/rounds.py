@@ -44,7 +44,6 @@ class RoundBuilder:
     def __init__(self, project_root: Path):
         self.project_root = project_root
         self.project_db = project_root / "project.db"
-        self.corpus_db = project_root / "corpus" / "corpus.db"
 
     def _connect_project(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.project_db)
@@ -52,22 +51,24 @@ class RoundBuilder:
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
-    def _connect_corpus(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.corpus_db)
+    def _connect_corpus(self, corpus_path: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(corpus_path)
         conn.row_factory = sqlite3.Row
         return conn
 
     def generate_round(self, pheno_id: str, config_path: Path, created_by: str) -> dict:
         config = json.loads(Path(config_path).read_text("utf-8"))
-        with self._connect_project() as project_conn, self._connect_corpus() as corpus_conn:
+        with self._connect_project() as project_conn:
             pheno = project_conn.execute(
                 "SELECT * FROM phenotypes WHERE pheno_id=?",
                 (pheno_id,),
             ).fetchone()
             if not pheno:
                 raise ValueError(f"Phenotype {pheno_id} not found")
-            labelset = fetch_labelset(project_conn, config["labelset_id"])
-            round_number = config.get("round_number")
+            corpus_path = self.project_root / pheno["corpus_path"]
+            with self._connect_corpus(corpus_path) as corpus_conn:
+                labelset = fetch_labelset(project_conn, config["labelset_id"])
+                round_number = config.get("round_number")
             round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
             rng_seed = config.get("rng_seed", 0)
             config_hash = stable_hash(canonical_json(config))

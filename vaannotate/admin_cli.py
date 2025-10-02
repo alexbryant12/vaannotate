@@ -36,13 +36,15 @@ def init(
 
 @app.command()
 def import_corpus(
-    project_dir: Path = typer.Argument(...),
+    project_dir: Path = typer.Argument(..., help="Project directory (used as base for relative paths)"),
     patients_csv: Path = typer.Option(..., help="CSV file of patients"),
     documents_csv: Path = typer.Option(..., help="CSV file of documents"),
+    corpus_db: Path = typer.Option(..., help="Destination SQLite database to create or overwrite"),
 ) -> None:
-    paths = build_project_paths(project_dir)
-    bulk_import_from_csv(paths.corpus_db, patients_csv, documents_csv)
-    print("Corpus imported")
+    base = project_dir.resolve()
+    target = corpus_db if corpus_db.is_absolute() else (base / corpus_db)
+    bulk_import_from_csv(target, patients_csv, documents_csv)
+    print(f"Corpus imported to {target}")
 
 
 @app.command()
@@ -67,9 +69,18 @@ def addphenotype(
     name: str = typer.Option(...),
     level: str = typer.Option(...),
     description: Optional[str] = typer.Option(None),
+    corpus_path: Path = typer.Option(..., help="Path to the corpus SQLite database for this phenotype"),
 ) -> None:
     with get_connection(build_project_paths(project_dir).project_db) as conn:
-        add_phenotype(conn, pheno_id, project_id, name, level, description)
+        add_phenotype(
+            conn,
+            pheno_id,
+            project_id,
+            name,
+            level,
+            description,
+            corpus_path=str(corpus_path),
+        )
         conn.commit()
     print(f"Added phenotype {pheno_id}")
 
