@@ -26,6 +26,7 @@ from vaannotate.shared.sampling import (
 )
 from vaannotate.shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
 from vaannotate.corpus import TABULAR_EXTENSIONS, import_tabular_corpus
+from vaannotate.project import init_project
 from vaannotate.utils import copy_sqlite_database, ensure_dir
 
 PROJECT_MODELS = [
@@ -783,11 +784,19 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.total_n_spin.setRange(1, 1000000)
         self.status_combo = QtWidgets.QComboBox()
         self.status_combo.addItems(["draft", "active", "closed", "adjudicating", "finalized"])
+        unit_label = "patients" if self.pheno_row["level"] == "multi_doc" else "documents"
+        self.independent_checkbox = QtWidgets.QCheckBox(
+            f"Exclude previously reviewed {unit_label}"
+        )
+        self.independent_checkbox.setToolTip(
+            "When enabled, sampling will skip any units that were included in previous rounds for this phenotype."
+        )
         setup_form.addRow("Label set", self.labelset_combo)
         setup_form.addRow("Seed", self.seed_spin)
         setup_form.addRow("Overlap N", self.overlap_spin)
         setup_form.addRow("Total N", self.total_n_spin)
         setup_form.addRow("Status", self.status_combo)
+        setup_form.addRow("Independent sampling", self.independent_checkbox)
         scroll_layout.addWidget(setup_group)
 
         reviewer_group = QtWidgets.QGroupBox("Reviewers")
@@ -920,6 +929,62 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if regex:
             note_filters["regex"] = regex
         return SamplingFilters(patient_filters=patient_filters, note_filters=note_filters)
+
+    def _load_reviewed_unit_ids(self) -> Set[str]:
+        pheno_id = self.pheno_row["pheno_id"]
+        level = str(self.pheno_row.get("level", "single_doc"))
+        reviewed: Set[str] = set()
+        try:
+            rounds = self.ctx.list_rounds(pheno_id)
+        except Exception:
+            return reviewed
+        for round_row in rounds:
+            round_number = round_row.get("round_number")
+            if round_number is None:
+                continue
+            try:
+                round_dir = self.ctx.resolve_round_dir(pheno_id, int(round_number))
+            except Exception:
+                continue
+            manifest_path = round_dir / "manifest.csv"
+            if not manifest_path.exists():
+                continue
+            try:
+                with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    for row in reader:
+                        if not isinstance(row, dict):
+                            continue
+                        if level == "multi_doc":
+                            key = row.get("patient_icn")
+                        else:
+                            key = row.get("doc_id") or row.get("unit_id")
+                            if not key:
+                                key = row.get("patient_icn")
+                        if key:
+                            reviewed.add(str(key))
+            except Exception:
+                continue
+        return reviewed
+
+    def _row_unit_identifier(self, row: sqlite3.Row | Dict[str, object]) -> Optional[str]:
+        keys = ["unit_id"]
+        if self.pheno_row["level"] == "multi_doc":
+            keys.append("patient_icn")
+        else:
+            keys.extend(["doc_id", "patient_icn"])
+        for key in keys:
+            value: Optional[object] = None
+            if isinstance(row, dict):
+                value = row.get(key)
+            else:
+                try:
+                    value = row[key]  # type: ignore[index]
+                except (KeyError, IndexError, TypeError):
+                    value = None
+            if value not in (None, ""):
+                return str(value)
+        return None
 
     def _prompt_reviewers(self) -> Optional[List[Dict[str, str]]]:
         reviewers: List[Dict[str, str]] = []
@@ -1108,6 +1173,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         db = ctx.require_db()
         seed = self.seed_spin.value()
         overlap = self.overlap_spin.value()
+        independent = self.independent_checkbox.isChecked()
+        sampling_metadata: Dict[str, object] = {"independent": bool(independent)}
         reviewers = self._prompt_reviewers()
         if not reviewers:
             return False
@@ -1150,7 +1217,38 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if not corpus_rows:
             QtWidgets.QMessageBox.warning(self, "Round", "The selected corpus returned no candidate documents.")
             return False
-        if len(corpus_rows) < total_n:
+        shortage_warned = False
+        if independent:
+            reviewed_units = self._load_reviewed_unit_ids()
+            sampling_metadata["previously_reviewed_units"] = len(reviewed_units)
+            filtered_rows: List[sqlite3.Row | Dict[str, object]] = []
+            for row in corpus_rows:
+                identifier = self._row_unit_identifier(row)
+                if identifier and identifier in reviewed_units:
+                    continue
+                filtered_rows.append(row)
+            excluded_count = len(corpus_rows) - len(filtered_rows)
+            sampling_metadata["excluded_prior_units"] = excluded_count
+            corpus_rows = filtered_rows
+            sampling_metadata["available_unreviewed"] = len(corpus_rows)
+            if not corpus_rows:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Round",
+                    "No unreviewed units remain for this phenotype. Reduce the independent sampling requirements or add new data.",
+                )
+                return False
+            if len(corpus_rows) < total_n:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Round",
+                    (
+                        "After excluding previously reviewed units, fewer candidates remain than requested. "
+                        "All available unreviewed units will be used."
+                    ),
+                )
+                shortage_warned = True
+        if len(corpus_rows) < total_n and not shortage_warned:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Round",
@@ -1250,6 +1348,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "status": self.status_combo.currentText(),
                 "reviewers": reviewers,
             }
+            if sampling_metadata:
+                config_payload["sampling"] = sampling_metadata
             filters_payload: Dict[str, Dict[str, object]] = {}
             if filters.patient_filters:
                 filters_payload["patient"] = filters.patient_filters
@@ -1598,6 +1698,26 @@ class RoundDetailWidget(QtWidgets.QWidget):
             reviewer_names = [str(reviewer.get("name") or reviewer.get("id")) for reviewer in reviewers]
             setup_items.append(f"Reviewers: {', '.join(reviewer_names)}")
         sections.append(self._format_section("Round setup", setup_items))
+
+        sampling_config = config.get("sampling") or {}
+        if isinstance(sampling_config, dict):
+            sampling_items: List[str] = []
+            if "independent" in sampling_config:
+                independent = sampling_config.get("independent")
+                sampling_items.append(
+                    "Independent sampling: " + ("Yes" if independent else "No")
+                )
+            excluded = sampling_config.get("excluded_prior_units")
+            if excluded is not None:
+                sampling_items.append(f"Excluded previously reviewed units: {excluded}")
+            available = sampling_config.get("available_unreviewed")
+            if available is not None:
+                sampling_items.append(f"Available unreviewed units: {available}")
+            previous_total = sampling_config.get("previously_reviewed_units")
+            if previous_total is not None:
+                sampling_items.append(f"Previously reviewed units considered: {previous_total}")
+            if sampling_items:
+                sections.append(self._format_section("Sampling", sampling_items))
 
         filters = config.get("filters") or {}
         filter_items: List[str] = []
@@ -2824,6 +2944,9 @@ class AdminMainWindow(QtWidgets.QMainWindow):
     def _setup_menu(self) -> None:
         bar = self.menuBar()
         file_menu = bar.addMenu("File")
+        new_action = file_menu.addAction("Create new project…")
+        new_action.triggered.connect(self._create_project)
+        file_menu.addSeparator()
         open_action = file_menu.addAction("Open project folder…")
         open_action.triggered.connect(self._open_project)
         exit_action = file_menu.addAction("Exit")
@@ -2891,6 +3014,71 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         else:
             self.project_view.set_project(self.ctx.project_row)
             self._show_view("project")
+
+    def _create_project(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "Create project", "Project name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Create project", "Project name is required.")
+            return
+        start_dir = str(self.ctx.project_root or Path.home())
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select project folder",
+            start_dir,
+        )
+        if not directory:
+            return
+        selected_dir = Path(directory).resolve()
+        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "project"
+        project_dir = selected_dir
+        if selected_dir.exists() and any(selected_dir.iterdir()):
+            response = QtWidgets.QMessageBox.question(
+                self,
+                "Create project",
+                (
+                    "The selected directory is not empty. "
+                    "Do you want to create the project inside a new subdirectory here?"
+                ),
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if response != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            candidate = selected_dir / slug
+            counter = 2
+            while candidate.exists():
+                candidate = selected_dir / f"{slug}_{counter}"
+                counter += 1
+            project_dir = candidate
+        if project_dir.exists() and any(project_dir.iterdir()):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Create project",
+                f"The directory '{project_dir}' already exists and is not empty. Select a different location.",
+            )
+            return
+        try:
+            ensure_dir(project_dir)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Create project", f"Failed to prepare project directory: {exc}")
+            return
+        project_id = slug or f"project_{uuid.uuid4().hex[:8]}"
+        try:
+            paths = init_project(project_dir, project_id, name, "admin_app")
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Create project", f"Failed to create project: {exc}")
+            return
+        self.ctx.open_project(paths.root)
+        self.project_view.set_project(self.ctx.project_row)
+        self.tree.refresh()
+        QtWidgets.QMessageBox.information(
+            self,
+            "Create project",
+            f"Project '{name}' created at {paths.root}.",
+        )
 
     def _open_project(self) -> None:
         directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select project folder")
