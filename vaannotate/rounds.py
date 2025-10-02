@@ -363,7 +363,9 @@ class RoundBuilder:
             agg_conn.execute("DELETE FROM unit_annotations")
             agg_conn.execute("DELETE FROM unit_summary")
             for assignment_path in imports_dir.glob("*_assignment.db"):
-                reviewer_id = assignment_path.stem.split("_")[0]
+                reviewer_id = assignment_path.stem
+                if reviewer_id.endswith("_assignment"):
+                    reviewer_id = reviewer_id[: -len("_assignment")]
                 with sqlite3.connect(assignment_path) as assign_conn:
                     assign_conn.row_factory = sqlite3.Row
                     for unit_row in assign_conn.execute("SELECT * FROM units"):
