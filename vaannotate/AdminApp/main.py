@@ -296,6 +296,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.created_round_number: Optional[int] = None
         self.setWindowTitle(f"New round • {pheno_row['name']}")
         self.resize(720, 760)
+        self._available_reviewers = self._load_existing_reviewers()
+        self._selected_reviewer_ids: Set[str] = set()
+        self._labelset_options = self._load_labelset_ids()
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -308,7 +311,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
         setup_group = QtWidgets.QGroupBox("Round setup")
         setup_form = QtWidgets.QFormLayout(setup_group)
-        self.labelset_edit = QtWidgets.QLineEdit()
+        self.labelset_combo = QtWidgets.QComboBox()
+        self.labelset_combo.setEditable(True)
+        self.labelset_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        line_edit = self.labelset_combo.lineEdit()
+        if line_edit:
+            line_edit.setPlaceholderText("Select or enter label set ID")
         self.seed_spin = QtWidgets.QSpinBox()
         self.seed_spin.setMaximum(2**31 - 1)
         self.overlap_spin = QtWidgets.QSpinBox()
@@ -317,12 +325,41 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.sample_spin.setRange(1, 10000)
         self.status_combo = QtWidgets.QComboBox()
         self.status_combo.addItems(["draft", "active", "closed", "adjudicating", "finalized"])
-        setup_form.addRow("Label set ID", self.labelset_edit)
+        setup_form.addRow("Label set", self.labelset_combo)
         setup_form.addRow("Seed", self.seed_spin)
         setup_form.addRow("Overlap N", self.overlap_spin)
         setup_form.addRow("Sample per reviewer", self.sample_spin)
         setup_form.addRow("Status", self.status_combo)
         scroll_layout.addWidget(setup_group)
+
+        reviewer_group = QtWidgets.QGroupBox("Reviewers")
+        reviewer_layout = QtWidgets.QVBoxLayout(reviewer_group)
+        self.reviewer_list = QtWidgets.QListWidget()
+        self.reviewer_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        reviewer_layout.addWidget(self.reviewer_list)
+
+        existing_layout = QtWidgets.QHBoxLayout()
+        self.reviewer_combo = QtWidgets.QComboBox()
+        self.reviewer_combo.addItem("Select existing reviewer…", None)
+        existing_layout.addWidget(self.reviewer_combo)
+        add_existing_btn = QtWidgets.QPushButton("Add selected reviewer")
+        add_existing_btn.clicked.connect(self._on_add_existing_reviewer)
+        existing_layout.addWidget(add_existing_btn)
+        reviewer_layout.addLayout(existing_layout)
+
+        new_layout = QtWidgets.QHBoxLayout()
+        self.new_reviewer_edit = QtWidgets.QLineEdit()
+        self.new_reviewer_edit.setPlaceholderText("Enter new reviewer name")
+        new_layout.addWidget(self.new_reviewer_edit)
+        add_new_btn = QtWidgets.QPushButton("Add new reviewer")
+        add_new_btn.clicked.connect(self._on_add_new_reviewer)
+        new_layout.addWidget(add_new_btn)
+        reviewer_layout.addLayout(new_layout)
+
+        remove_btn = QtWidgets.QPushButton("Remove selected reviewer")
+        remove_btn.clicked.connect(self._remove_selected_reviewer)
+        reviewer_layout.addWidget(remove_btn)
+        scroll_layout.addWidget(reviewer_group)
 
         filter_group = QtWidgets.QGroupBox("Sampling filters")
         filter_form = QtWidgets.QFormLayout(filter_group)
@@ -392,6 +429,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
 
+        self._refresh_labelset_options()
+        self._refresh_reviewer_options()
+
     def _collect_filters(self) -> SamplingFilters:
         patient_filters: Dict[str, object] = {}
         note_filters: Dict[str, object] = {}
@@ -424,52 +464,123 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         return SamplingFilters(patient_filters=patient_filters, note_filters=note_filters)
 
     def _prompt_reviewers(self) -> Optional[List[Dict[str, str]]]:
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Reviewers")
-        layout = QtWidgets.QVBoxLayout(dialog)
-        table = QtWidgets.QTableWidget(0, 1)
-        table.setHorizontalHeaderLabels(["Reviewer name"])
-        table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(table)
-
-        def add_row() -> None:
-            row = table.rowCount()
-            table.insertRow(row)
-            table.setItem(row, 0, QtWidgets.QTableWidgetItem(""))
-
-        add_row()
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
-        add_btn = QtWidgets.QPushButton("Add reviewer")
-        add_btn.clicked.connect(add_row)
-        layout.addWidget(add_btn)
-        layout.addWidget(buttons)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return None
-        names: List[str] = []
-        for row in range(table.rowCount()):
-            item = table.item(row, 0)
-            name = item.text().strip() if item else ""
-            if name:
-                names.append(name)
-        if not names:
-            QtWidgets.QMessageBox.warning(self, "Reviewers", "Add at least one reviewer name.")
-            return []
-        seen: Set[str] = set()
         reviewers: List[Dict[str, str]] = []
-        for name in names:
-            slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "reviewer"
-            candidate = slug
-            counter = 2
-            while candidate in seen:
-                candidate = f"{slug}_{counter}"
-                counter += 1
-            seen.add(candidate)
-            reviewers.append({"id": candidate, "name": name})
+        for row in range(self.reviewer_list.count()):
+            item = self.reviewer_list.item(row)
+            data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict):
+                reviewers.append(data)
+        if not reviewers:
+            QtWidgets.QMessageBox.warning(self, "Reviewers", "Add at least one reviewer.")
+            return []
         return reviewers
+
+    def _refresh_labelset_options(self) -> None:
+        self._labelset_options = self._load_labelset_ids()
+        self.labelset_combo.blockSignals(True)
+        self.labelset_combo.clear()
+        for labelset_id in self._labelset_options:
+            self.labelset_combo.addItem(labelset_id)
+        if self._labelset_options:
+            self.labelset_combo.setCurrentIndex(0)
+        else:
+            default_id = f"auto_{self.pheno_row['pheno_id']}"
+            self.labelset_combo.setEditText(default_id)
+        self.labelset_combo.blockSignals(False)
+
+    def _refresh_reviewer_options(self) -> None:
+        self._available_reviewers = self._load_existing_reviewers()
+        self.reviewer_combo.blockSignals(True)
+        self.reviewer_combo.clear()
+        self.reviewer_combo.addItem("Select existing reviewer…", None)
+        for reviewer in self._available_reviewers:
+            display = f"{reviewer['name']} ({reviewer['id']})"
+            self.reviewer_combo.addItem(display, reviewer)
+        self.reviewer_combo.blockSignals(False)
+
+    def _load_labelset_ids(self) -> List[str]:
+        db = self.ctx.require_db()
+        pheno_id = self.pheno_row["pheno_id"]
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT labelset_id FROM label_sets WHERE pheno_id=? ORDER BY created_at DESC",
+                (pheno_id,),
+            ).fetchall()
+        return [str(row["labelset_id"]) for row in rows]
+
+    def _load_existing_reviewers(self) -> List[Dict[str, str]]:
+        db = self.ctx.require_db()
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT reviewer_id, name, email FROM reviewers ORDER BY name",
+            ).fetchall()
+        reviewers: List[Dict[str, str]] = []
+        for row in rows:
+            reviewers.append(
+                {
+                    "id": str(row["reviewer_id"]),
+                    "name": str(row["name"]),
+                    "email": str(row["email"] or ""),
+                }
+            )
+        return reviewers
+
+    def _generate_reviewer_id(self, name: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "reviewer"
+        candidate = slug
+        counter = 2
+        existing_ids = {reviewer["id"] for reviewer in self._available_reviewers}
+        used_ids = existing_ids | self._selected_reviewer_ids
+        while candidate in used_ids:
+            candidate = f"{slug}_{counter}"
+            counter += 1
+        return candidate
+
+    def _add_reviewer_entry(self, reviewer: Dict[str, str]) -> None:
+        reviewer_id = reviewer.get("id")
+        if not reviewer_id:
+            return
+        if reviewer_id in self._selected_reviewer_ids:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Reviewers",
+                f"Reviewer {reviewer.get('name', reviewer_id)} is already selected.",
+            )
+            return
+        display = f"{reviewer.get('name', reviewer_id)} ({reviewer_id})"
+        item = QtWidgets.QListWidgetItem(display)
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, reviewer)
+        self.reviewer_list.addItem(item)
+        self._selected_reviewer_ids.add(reviewer_id)
+
+    def _on_add_existing_reviewer(self) -> None:
+        data = self.reviewer_combo.currentData()
+        if not isinstance(data, dict):
+            return
+        self._add_reviewer_entry(dict(data))
+
+    def _on_add_new_reviewer(self) -> None:
+        name = self.new_reviewer_edit.text().strip()
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Reviewers", "Enter a reviewer name to add.")
+            return
+        reviewer_id = self._generate_reviewer_id(name)
+        reviewer = {"id": reviewer_id, "name": name, "email": ""}
+        self._add_reviewer_entry(reviewer)
+        self.new_reviewer_edit.clear()
+
+    def _remove_selected_reviewer(self) -> None:
+        row = self.reviewer_list.currentRow()
+        if row < 0:
+            return
+        item = self.reviewer_list.takeItem(row)
+        if not item:
+            return
+        data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict):
+            reviewer_id = data.get("id")
+            if reviewer_id:
+                self._selected_reviewer_ids.discard(reviewer_id)
 
     def _next_round_number(self) -> int:
         pheno_id = self.pheno_row["pheno_id"]
@@ -481,43 +592,53 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             ).fetchone()
         return (row[0] or 0) + 1
 
-    def _build_label_schema(self, labelset_id: str, db: Database) -> Dict[str, object]:
-        with db.connect() as conn:
-            labels = conn.execute(
+    def _build_label_schema(
+        self,
+        labelset_id: str,
+        db: Database,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> Dict[str, object]:
+        def fetch(connection: sqlite3.Connection) -> Dict[str, object]:
+            labels = connection.execute(
                 "SELECT * FROM labels WHERE labelset_id=? ORDER BY order_index",
                 (labelset_id,),
             ).fetchall()
-            options = conn.execute(
+            options = connection.execute(
                 "SELECT * FROM label_options WHERE label_id IN (SELECT label_id FROM labels WHERE labelset_id=?)",
                 (labelset_id,),
             ).fetchall()
-        option_map: Dict[str, List[Dict[str, object]]] = {}
-        for opt in options:
-            option_map.setdefault(opt["label_id"], []).append(
-                {
-                    "value": opt["value"],
-                    "display": opt["display"],
-                    "order_index": opt["order_index"],
-                    "weight": opt["weight"],
-                }
-            )
-        schema_labels = []
-        for label in labels:
-            schema_labels.append(
-                {
-                    "label_id": label["label_id"],
-                    "name": label["name"],
-                    "type": label["type"],
-                    "required": bool(label["required"]),
-                    "na_allowed": bool(label["na_allowed"]),
-                    "rules": label["rules"],
-                    "unit": label["unit"],
-                    "range": {"min": label["min"], "max": label["max"]},
-                    "gating_expr": label["gating_expr"],
-                    "options": sorted(option_map.get(label["label_id"], []), key=lambda o: o["order_index"]),
-                }
-            )
-        return {"labelset_id": labelset_id, "labels": schema_labels}
+            option_map: Dict[str, List[Dict[str, object]]] = {}
+            for opt in options:
+                option_map.setdefault(opt["label_id"], []).append(
+                    {
+                        "value": opt["value"],
+                        "display": opt["display"],
+                        "order_index": opt["order_index"],
+                        "weight": opt["weight"],
+                    }
+                )
+            schema_labels = []
+            for label in labels:
+                schema_labels.append(
+                    {
+                        "label_id": label["label_id"],
+                        "name": label["name"],
+                        "type": label["type"],
+                        "required": bool(label["required"]),
+                        "na_allowed": bool(label["na_allowed"]),
+                        "rules": label["rules"],
+                        "unit": label["unit"],
+                        "range": {"min": label["min"], "max": label["max"]},
+                        "gating_expr": label["gating_expr"],
+                        "options": sorted(option_map.get(label["label_id"], []), key=lambda o: o["order_index"]),
+                    }
+                )
+            return {"labelset_id": labelset_id, "labels": schema_labels}
+
+        if conn is not None:
+            return fetch(conn)
+        with db.connect() as connection:
+            return fetch(connection)
 
     def accept(self) -> None:  # noqa: D401 - Qt override
         if not self._create_round():
@@ -534,7 +655,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         reviewers = self._prompt_reviewers()
         if not reviewers:
             return False
-        labelset_id = self.labelset_edit.text().strip() or f"auto_{pheno_id}"
+        labelset_id = self.labelset_combo.currentText().strip() or f"auto_{pheno_id}"
         created_at = QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate)
         default_labels: List[Dict[str, object]] = []
         with db.connect() as conn:
@@ -609,6 +730,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         project_root = ctx.require_project()
         round_dir = ensure_dir(project_root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}")
         write_manifest(round_dir / "manifest.csv", assignments)
+        label_schema: Optional[Dict[str, object]] = None
         with db.transaction() as conn:
             if default_labels:
                 labelset = models.LabelSet(
@@ -647,6 +769,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         )
                         option_record.save(conn)
             round_record.save(conn)
+            label_schema = self._build_label_schema(labelset_id, db, conn)
             config_payload: Dict[str, object] = {
                 "pheno_id": pheno_id,
                 "labelset_id": labelset_id,
@@ -672,6 +795,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 if strat_sample is not None:
                     strat_payload["sample_per_stratum"] = strat_sample
                 config_payload["stratification"] = strat_payload
+            if label_schema:
+                config_payload["label_schema"] = label_schema
             config = models.RoundConfig(round_id=round_id, config_json=json.dumps(config_payload, indent=2))
             config.save(conn)
             for reviewer in reviewers:
@@ -693,12 +818,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     status="open",
                 )
                 assignment.save(conn)
+        if label_schema is None:
+            label_schema = self._build_label_schema(labelset_id, db)
         for reviewer in reviewers:
             assignment_dir = ensure_dir(round_dir / "assignments" / reviewer["id"])
             db_path = assignment_dir / "assignment.db"
             assignment_db = initialize_assignment_db(db_path)
             populate_assignment_db(assignment_db, reviewer["id"], assignments[reviewer["id"]].units)
-            label_schema = self._build_label_schema(labelset_id, db)
             schema_path = assignment_dir / "label_schema.json"
             schema_path.write_text(json.dumps(label_schema, indent=2), encoding="utf-8")
         self.created_round_id = round_id
@@ -1013,6 +1139,29 @@ class RoundDetailWidget(QtWidgets.QWidget):
             strat_items.append(f"Sample per stratum: {stratification['sample_per_stratum']}")
         if strat_items:
             sections.append(self._format_section("Stratification", strat_items))
+
+        label_schema = config.get("label_schema") or {}
+        if isinstance(label_schema, dict):
+            label_items: List[str] = []
+            for label in label_schema.get("labels", []):
+                if not isinstance(label, dict):
+                    continue
+                name = str(label.get("name") or label.get("label_id") or "Label")
+                label_type = str(label.get("type", "unknown"))
+                required = "required" if label.get("required") else "optional"
+                entry = f"{name} — {label_type} ({required})"
+                if label.get("gating_expr"):
+                    entry += f" [Gate: {label['gating_expr']}]"
+                options = label.get("options") or []
+                if options:
+                    option_names = ", ".join(
+                        str(option.get("display") or option.get("value")) for option in options if isinstance(option, dict)
+                    )
+                    if option_names:
+                        entry += f" — Options: {option_names}"
+                label_items.append(entry)
+            if label_items:
+                sections.append(self._format_section("Label set", label_items))
 
         summary = "\n\n".join(section for section in sections if section)
         return summary or "Configuration not available."
