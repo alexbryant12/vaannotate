@@ -92,10 +92,17 @@ def createlabelset(
 ) -> None:
     data = json.loads(Path(config_json).read_text("utf-8"))
     with get_connection(build_project_paths(project_dir).project_db) as conn:
+        project_row = conn.execute(
+            "SELECT project_id FROM projects ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        project_id = data.get("project_id") or (project_row["project_id"] if project_row else None)
+        if not project_id:
+            raise typer.BadParameter("Project metadata missing; ensure the project has been initialized")
         add_labelset(
             conn,
             labelset_id=data["labelset_id"],
-            pheno_id=data["pheno_id"],
+            project_id=project_id,
+            pheno_id=data.get("pheno_id"),
             version=data.get("version", 1),
             created_by=data.get("created_by", "cli"),
             notes=data.get("notes"),

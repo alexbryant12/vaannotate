@@ -30,11 +30,14 @@ PROJECT_SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS label_sets(
         labelset_id TEXT PRIMARY KEY,
-        pheno_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        pheno_id TEXT,
         version INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         created_by TEXT NOT NULL,
-        notes TEXT
+        notes TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(project_id),
+        FOREIGN KEY(pheno_id) REFERENCES phenotypes(pheno_id)
     );
     """,
     """

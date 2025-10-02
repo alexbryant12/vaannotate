@@ -130,6 +130,26 @@ class ProjectContext(QtCore.QObject):
                 (pheno_id,),
             ).fetchall()
 
+    def list_label_sets(self) -> List[sqlite3.Row]:
+        db = self.require_db()
+        project_id = self.current_project_id()
+        if not project_id:
+            return []
+        with db.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM label_sets WHERE project_id=? ORDER BY created_at DESC",
+                (project_id,),
+            ).fetchall()
+
+    def get_labelset(self, labelset_id: str) -> Optional[sqlite3.Row]:
+        db = self.require_db()
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM label_sets WHERE labelset_id=?",
+                (labelset_id,),
+            ).fetchone()
+        return row
+
     def get_round(self, round_id: str) -> Optional[sqlite3.Row]:
         db = self.require_db()
         with db.connect() as conn:
@@ -189,7 +209,7 @@ class ProjectContext(QtCore.QObject):
             raise RuntimeError("Project metadata missing; ensure a project record exists")
         pheno_id = str(uuid.uuid4())
         project_root = self.require_project()
-        phenotype_dir = ensure_dir(project_root / "phenotypes" / pheno_id)
+        phenotype_dir = self._ensure_phenotype_dir(name)
         rounds_dir = ensure_dir(phenotype_dir / "rounds")
         _ = rounds_dir  # make mypy happy about unused variable
         corpus_dir = ensure_dir(phenotype_dir / "corpus")
@@ -209,6 +229,87 @@ class ProjectContext(QtCore.QObject):
             record.save(conn)
         self.project_changed.emit()
         return record
+
+    def create_labelset(
+        self,
+        *,
+        labelset_id: str,
+        created_by: str,
+        notes: str,
+        labels: List[Dict[str, object]],
+        pheno_id: Optional[str] = None,
+    ) -> models.LabelSet:
+        project_id = self.current_project_id()
+        if not project_id:
+            raise RuntimeError("Project metadata missing; ensure a project record exists")
+        created_at = QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate)
+        record = models.LabelSet(
+            labelset_id=labelset_id,
+            project_id=project_id,
+            pheno_id=pheno_id,
+            version=1,
+            created_at=created_at,
+            created_by=created_by,
+            notes=notes,
+        )
+        db = self.require_db()
+        with db.transaction() as conn:
+            record.save(conn)
+            for order_index, label in enumerate(labels):
+                label_record = models.Label(
+                    label_id=label["label_id"],
+                    labelset_id=labelset_id,
+                    name=label["name"],
+                    type=label["type"],
+                    required=1 if label.get("required") else 0,
+                    order_index=order_index,
+                    rules=label.get("rules", ""),
+                    gating_expr=label.get("gating_expr"),
+                    na_allowed=1 if label.get("na_allowed") else 0,
+                    unit=label.get("unit"),
+                    min=label.get("min"),
+                    max=label.get("max"),
+                )
+                label_record.save(conn)
+                for opt_index, option in enumerate(label.get("options", [])):
+                    option_record = models.LabelOption(
+                        option_id=option.get("option_id") or str(uuid.uuid4()),
+                        label_id=label_record.label_id,
+                        value=str(option.get("value", "")),
+                        display=str(option.get("display", option.get("value", ""))),
+                        order_index=opt_index,
+                        weight=option.get("weight"),
+                    )
+                    option_record.save(conn)
+        self.project_changed.emit()
+        return record
+
+    def _ensure_phenotype_dir(self, name: str) -> Path:
+        project_root = self.require_project()
+        phenotypes_root = ensure_dir(project_root / "phenotypes")
+        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "phenotype"
+        candidate = slug
+        counter = 2
+        while (phenotypes_root / candidate).exists():
+            candidate = f"{slug}_{counter}"
+            counter += 1
+        return ensure_dir(phenotypes_root / candidate)
+
+    def resolve_phenotype_dir(self, pheno_id: str) -> Path:
+        pheno = self.get_phenotype(pheno_id)
+        if not pheno:
+            raise RuntimeError(f"Phenotype {pheno_id} not found")
+        corpus_path = Path(str(pheno["corpus_path"]))
+        if corpus_path.is_absolute():
+            phenotype_dir = corpus_path.parent.parent
+        else:
+            project_root = self.require_project()
+            phenotype_dir = (project_root / corpus_path).resolve().parent.parent
+        return phenotype_dir
+
+    def resolve_round_dir(self, pheno_id: str, round_number: int) -> Path:
+        phenotype_dir = self.resolve_phenotype_dir(pheno_id)
+        return phenotype_dir / "rounds" / f"round_{round_number}"
 
     def update_cache_after_round(self, pheno_id: str) -> None:
         # Keep API parity with previous refresh pattern
@@ -283,6 +384,357 @@ class PhenotypeDialog(QtWidgets.QDialog):
         }
 
 
+class LabelEditorDialog(QtWidgets.QDialog):
+    TYPE_CHOICES: List[tuple[str, str]] = [
+        ("categorical_single", "Categorical (single choice)"),
+        ("categorical_multi", "Categorical (multi choice)"),
+        ("ordinal", "Ordinal"),
+        ("boolean", "Boolean"),
+        ("integer", "Integer"),
+        ("float", "Float"),
+        ("date", "Date"),
+        ("text", "Free text"),
+    ]
+
+    def __init__(
+        self,
+        *,
+        existing_ids: Optional[Set[str]] = None,
+        data: Optional[Dict[str, object]] = None,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Label details")
+        self.resize(480, 520)
+        self._existing_ids = existing_ids or set()
+        self._initial_id = str(data.get("label_id")) if data and data.get("label_id") else None
+        self._setup_ui()
+        if data:
+            self._load_data(data)
+        self._update_field_visibility()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self.label_id_edit = QtWidgets.QLineEdit()
+        form.addRow("Label ID", self.label_id_edit)
+        self.name_edit = QtWidgets.QLineEdit()
+        form.addRow("Display name", self.name_edit)
+        self.type_combo = QtWidgets.QComboBox()
+        for value, label in self.TYPE_CHOICES:
+            self.type_combo.addItem(label, value)
+        self.type_combo.currentIndexChanged.connect(self._update_field_visibility)
+        form.addRow("Type", self.type_combo)
+        self.required_check = QtWidgets.QCheckBox("Required")
+        form.addRow("Required", self.required_check)
+        self.na_check = QtWidgets.QCheckBox("Allow N/A")
+        form.addRow("N/A", self.na_check)
+        self.gating_edit = QtWidgets.QLineEdit()
+        form.addRow("Gating expression", self.gating_edit)
+        self.rules_edit = QtWidgets.QPlainTextEdit()
+        form.addRow("Annotation rules", self.rules_edit)
+        self.unit_edit = QtWidgets.QLineEdit()
+        form.addRow("Unit", self.unit_edit)
+        self.min_edit = QtWidgets.QLineEdit()
+        self.max_edit = QtWidgets.QLineEdit()
+        range_layout = QtWidgets.QHBoxLayout()
+        range_layout.addWidget(self.min_edit)
+        range_layout.addWidget(QtWidgets.QLabel("to"))
+        range_layout.addWidget(self.max_edit)
+        form.addRow("Range", range_layout)
+        layout.addLayout(form)
+
+        self.options_group = QtWidgets.QGroupBox("Options")
+        options_layout = QtWidgets.QVBoxLayout(self.options_group)
+        self.options_table = QtWidgets.QTableWidget(0, 3)
+        self.options_table.setHorizontalHeaderLabels(["Value", "Display", "Weight"])
+        self.options_table.horizontalHeader().setStretchLastSection(True)
+        self.options_table.verticalHeader().setVisible(False)
+        self.options_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.options_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        options_layout.addWidget(self.options_table)
+        options_buttons = QtWidgets.QHBoxLayout()
+        add_btn = QtWidgets.QPushButton("Add option")
+        add_btn.clicked.connect(self._add_option)
+        remove_btn = QtWidgets.QPushButton("Remove selected")
+        remove_btn.clicked.connect(self._remove_option)
+        options_buttons.addWidget(add_btn)
+        options_buttons.addWidget(remove_btn)
+        options_buttons.addStretch(1)
+        options_layout.addLayout(options_buttons)
+        layout.addWidget(self.options_group)
+
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def _load_data(self, data: Dict[str, object]) -> None:
+        self.label_id_edit.setText(str(data.get("label_id", "")))
+        self.name_edit.setText(str(data.get("name", "")))
+        type_value = str(data.get("type", ""))
+        index = self.type_combo.findData(type_value)
+        if index >= 0:
+            self.type_combo.setCurrentIndex(index)
+        self.required_check.setChecked(bool(data.get("required")))
+        self.na_check.setChecked(bool(data.get("na_allowed")))
+        self.gating_edit.setText(str(data.get("gating_expr", "")))
+        self.rules_edit.setPlainText(str(data.get("rules", "")))
+        self.unit_edit.setText(str(data.get("unit") or ""))
+        self.min_edit.setText("" if data.get("min") is None else str(data.get("min")))
+        self.max_edit.setText("" if data.get("max") is None else str(data.get("max")))
+        for option in data.get("options", []):
+            row = self.options_table.rowCount()
+            self.options_table.insertRow(row)
+            self.options_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(option.get("value", ""))))
+            self.options_table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(option.get("display", ""))))
+            weight = option.get("weight")
+            self.options_table.setItem(row, 2, QtWidgets.QTableWidgetItem("" if weight is None else str(weight)))
+
+    def _update_field_visibility(self) -> None:
+        type_value = self.type_combo.currentData()
+        requires_options = type_value in {"categorical_single", "categorical_multi", "ordinal", "boolean"}
+        self.options_group.setVisible(requires_options)
+        is_numeric = type_value in {"integer", "float"}
+        self.unit_edit.setEnabled(is_numeric)
+        self.min_edit.setEnabled(is_numeric)
+        self.max_edit.setEnabled(is_numeric)
+
+    def _add_option(self) -> None:
+        value, ok = QtWidgets.QInputDialog.getText(self, "Add option", "Value")
+        if not ok or not value.strip():
+            return
+        display, ok = QtWidgets.QInputDialog.getText(self, "Add option", "Display", text=value)
+        if not ok:
+            return
+        weight_text, ok = QtWidgets.QInputDialog.getText(self, "Add option", "Weight (optional)")
+        if not ok:
+            return
+        row = self.options_table.rowCount()
+        self.options_table.insertRow(row)
+        self.options_table.setItem(row, 0, QtWidgets.QTableWidgetItem(value.strip()))
+        self.options_table.setItem(row, 1, QtWidgets.QTableWidgetItem(display.strip()))
+        self.options_table.setItem(row, 2, QtWidgets.QTableWidgetItem(weight_text.strip()))
+
+    def _remove_option(self) -> None:
+        row = self.options_table.currentRow()
+        if row >= 0:
+            self.options_table.removeRow(row)
+
+    def _collect_options(self) -> List[Dict[str, object]]:
+        options: List[Dict[str, object]] = []
+        for row in range(self.options_table.rowCount()):
+            value_item = self.options_table.item(row, 0)
+            display_item = self.options_table.item(row, 1)
+            weight_item = self.options_table.item(row, 2)
+            value = value_item.text().strip() if value_item else ""
+            if not value:
+                continue
+            display = display_item.text().strip() if display_item else value
+            weight_text = weight_item.text().strip() if weight_item else ""
+            weight: Optional[float]
+            if weight_text:
+                try:
+                    weight = float(weight_text)
+                except ValueError:
+                    weight = None
+            else:
+                weight = None
+            options.append(
+                {
+                    "value": value,
+                    "display": display or value,
+                    "weight": weight,
+                }
+            )
+        return options
+
+    def _parse_float(self, text: str) -> Optional[float]:
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError("Enter numeric values for range bounds")
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        label_id = self.label_id_edit.text().strip()
+        if not label_id:
+            QtWidgets.QMessageBox.warning(self, "Label", "Label ID is required.")
+            return
+        existing = self._existing_ids - ({self._initial_id} if self._initial_id else set())
+        if label_id in existing:
+            QtWidgets.QMessageBox.warning(self, "Label", "Another label already uses this ID.")
+            return
+        if not self.name_edit.text().strip():
+            QtWidgets.QMessageBox.warning(self, "Label", "Display name is required.")
+            return
+        type_value = self.type_combo.currentData()
+        if not type_value:
+            QtWidgets.QMessageBox.warning(self, "Label", "Select a label type.")
+            return
+        if type_value in {"categorical_single", "categorical_multi", "ordinal", "boolean"}:
+            options = self._collect_options()
+            if len(options) < 1:
+                QtWidgets.QMessageBox.warning(self, "Label", "Add at least one option for the selected type.")
+                return
+        try:
+            _ = self._parse_float(self.min_edit.text())
+            _ = self._parse_float(self.max_edit.text())
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Label", str(exc))
+            return
+        super().accept()
+
+    def values(self) -> Dict[str, object]:
+        type_value = str(self.type_combo.currentData())
+        options = self._collect_options() if type_value in {"categorical_single", "categorical_multi", "ordinal", "boolean"} else []
+        min_value: Optional[float]
+        max_value: Optional[float]
+        try:
+            min_value = self._parse_float(self.min_edit.text())
+            max_value = self._parse_float(self.max_edit.text())
+        except ValueError:
+            min_value = max_value = None
+        return {
+            "label_id": self.label_id_edit.text().strip(),
+            "name": self.name_edit.text().strip(),
+            "type": type_value,
+            "required": self.required_check.isChecked(),
+            "na_allowed": self.na_check.isChecked(),
+            "gating_expr": self.gating_edit.text().strip() or None,
+            "rules": self.rules_edit.toPlainText().strip(),
+            "unit": self.unit_edit.text().strip() or None,
+            "min": min_value,
+            "max": max_value,
+            "options": options,
+        }
+
+
+class LabelSetWizardDialog(QtWidgets.QDialog):
+    def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.ctx = ctx
+        self.labels: List[Dict[str, object]] = []
+        self.setWindowTitle("Create label set")
+        self.resize(520, 640)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self.id_edit = QtWidgets.QLineEdit()
+        self.id_edit.setPlaceholderText("Unique label set ID")
+        form.addRow("Label set ID", self.id_edit)
+        self.creator_edit = QtWidgets.QLineEdit()
+        creator_default = "admin"
+        if self.ctx.project_row and self.ctx.project_row.get("created_by"):
+            creator_default = str(self.ctx.project_row["created_by"])
+        self.creator_edit.setText(creator_default)
+        form.addRow("Created by", self.creator_edit)
+        self.notes_edit = QtWidgets.QPlainTextEdit()
+        form.addRow("Notes", self.notes_edit)
+        layout.addLayout(form)
+
+        self.label_list = QtWidgets.QListWidget()
+        self.label_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        layout.addWidget(self.label_list)
+
+        button_row = QtWidgets.QHBoxLayout()
+        add_btn = QtWidgets.QPushButton("Add label")
+        add_btn.clicked.connect(self._add_label)
+        edit_btn = QtWidgets.QPushButton("Edit label")
+        edit_btn.clicked.connect(self._edit_label)
+        remove_btn = QtWidgets.QPushButton("Remove label")
+        remove_btn.clicked.connect(self._remove_label)
+        up_btn = QtWidgets.QPushButton("Move up")
+        up_btn.clicked.connect(lambda: self._move_label(-1))
+        down_btn = QtWidgets.QPushButton("Move down")
+        down_btn.clicked.connect(lambda: self._move_label(1))
+        button_row.addWidget(add_btn)
+        button_row.addWidget(edit_btn)
+        button_row.addWidget(remove_btn)
+        button_row.addWidget(up_btn)
+        button_row.addWidget(down_btn)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def _refresh_label_list(self) -> None:
+        self.label_list.clear()
+        for label in self.labels:
+            summary = f"{label['name']} ({label['type']})"
+            item = QtWidgets.QListWidgetItem(summary)
+            self.label_list.addItem(item)
+
+    def _add_label(self) -> None:
+        existing_ids = {label["label_id"] for label in self.labels}
+        dialog = LabelEditorDialog(existing_ids=existing_ids, parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self.labels.append(dialog.values())
+        self._refresh_label_list()
+
+    def _edit_label(self) -> None:
+        row = self.label_list.currentRow()
+        if row < 0 or row >= len(self.labels):
+            return
+        existing_ids = {label["label_id"] for label in self.labels}
+        dialog = LabelEditorDialog(existing_ids=existing_ids, data=self.labels[row], parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self.labels[row] = dialog.values()
+        self._refresh_label_list()
+        self.label_list.setCurrentRow(row)
+
+    def _remove_label(self) -> None:
+        row = self.label_list.currentRow()
+        if row < 0 or row >= len(self.labels):
+            return
+        del self.labels[row]
+        self._refresh_label_list()
+
+    def _move_label(self, delta: int) -> None:
+        row = self.label_list.currentRow()
+        target = row + delta
+        if row < 0 or target < 0 or target >= len(self.labels):
+            return
+        self.labels[row], self.labels[target] = self.labels[target], self.labels[row]
+        self._refresh_label_list()
+        self.label_list.setCurrentRow(target)
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        labelset_id = self.id_edit.text().strip()
+        if not labelset_id:
+            QtWidgets.QMessageBox.warning(self, "Label set", "Enter a label set ID.")
+            return
+        existing = self.ctx.get_labelset(labelset_id)
+        if existing:
+            QtWidgets.QMessageBox.warning(self, "Label set", "A label set with this ID already exists.")
+            return
+        if not self.labels:
+            QtWidgets.QMessageBox.warning(self, "Label set", "Add at least one label.")
+            return
+        super().accept()
+
+    def values(self) -> Dict[str, object]:
+        return {
+            "labelset_id": self.id_edit.text().strip(),
+            "created_by": self.creator_edit.text().strip() or "admin",
+            "notes": self.notes_edit.toPlainText().strip() or "",
+            "labels": self.labels,
+        }
+
+
 class RoundBuilderDialog(QtWidgets.QDialog):
     def __init__(
         self,
@@ -300,6 +752,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._available_reviewers = self._load_existing_reviewers()
         self._selected_reviewer_ids: Set[str] = set()
         self._labelset_options = self._load_labelset_ids()
+        self.ctx.project_changed.connect(self._refresh_labelset_options)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -500,13 +953,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.reviewer_combo.blockSignals(False)
 
     def _load_labelset_ids(self) -> List[str]:
-        db = self.ctx.require_db()
-        pheno_id = self.pheno_row["pheno_id"]
-        with db.connect() as conn:
-            rows = conn.execute(
-                "SELECT labelset_id FROM label_sets WHERE pheno_id=? ORDER BY created_at DESC",
-                (pheno_id,),
-            ).fetchall()
+        rows = self.ctx.list_label_sets()
         return [str(row["labelset_id"]) for row in rows]
 
     def _load_existing_reviewers(self) -> List[Dict[str, str]]:
@@ -650,6 +1097,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         pheno_id = self.pheno_row["pheno_id"]
         pheno_level = self.pheno_row["level"]
         ctx = self.ctx
+        project_id = ctx.current_project_id()
+        if not project_id:
+            QtWidgets.QMessageBox.critical(self, "Round", "Project metadata is missing; reload the project and try again.")
+            return False
         db = ctx.require_db()
         seed = self.seed_spin.value()
         overlap = self.overlap_spin.value()
@@ -741,14 +1192,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             status=self.status_combo.currentText(),
             created_at=created_at,
         )
-        project_root = ctx.require_project()
-        round_dir = ensure_dir(project_root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}")
+        round_dir = ensure_dir(ctx.resolve_round_dir(pheno_id, round_number))
         write_manifest(round_dir / "manifest.csv", assignments)
         label_schema: Optional[Dict[str, object]] = None
         with db.transaction() as conn:
             if default_labels:
                 labelset = models.LabelSet(
                     labelset_id=labelset_id,
+                    project_id=project_id,
                     pheno_id=pheno_id,
                     version=1,
                     created_at=created_at,
@@ -924,6 +1375,8 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
         if node_type == "project":
             action = menu.addAction("Add phenotype…")
             action.triggered.connect(lambda: self._add_phenotype(item))
+            label_action = menu.addAction("Add label set…")
+            label_action.triggered.connect(lambda: self._add_labelset(item))
         elif node_type == "phenotype":
             action = menu.addAction("Add round…")
             action.triggered.connect(lambda: self._add_round(item))
@@ -951,6 +1404,28 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             QtWidgets.QMessageBox.critical(self, "Phenotype", f"Failed to create phenotype: {exc}")
             return
         QtCore.QTimer.singleShot(0, lambda: self._select_phenotype(record.pheno_id))
+
+    def _add_labelset(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        del item
+        dialog = LabelSetWizardDialog(self.ctx, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        try:
+            self.ctx.create_labelset(
+                labelset_id=str(values.get("labelset_id", "")),
+                created_by=str(values.get("created_by", "admin")),
+                notes=str(values.get("notes", "")),
+                labels=[dict(label) for label in values.get("labels", [])],
+            )
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Label set", f"Failed to create label set: {exc}")
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "Label set",
+            f"Label set '{values.get('labelset_id')}' created.",
+        )
 
     def _add_round(self, item: QtWidgets.QTreeWidgetItem) -> None:
         data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
@@ -1661,8 +2136,7 @@ class IaaWidget(QtWidgets.QWidget):
         round_number = self.current_round.get("round_number")
         if not pheno_id or round_number is None:
             raise RuntimeError("Round metadata incomplete")
-        project_root = self.ctx.require_project()
-        round_dir = project_root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}"
+        round_dir = self.ctx.resolve_round_dir(pheno_id, int(round_number))
         imports_dir = ensure_dir(round_dir / "imports")
         target_path = imports_dir / f"{reviewer_id}_assignment.db"
         copy_sqlite_database(source, target_path)
@@ -1691,7 +2165,7 @@ class IaaWidget(QtWidgets.QWidget):
         round_number = self.current_round.get("round_number")
         if not pheno_id or round_number is None:
             return None
-        return project_root / "phenotypes" / pheno_id / f"rounds/round_{round_number}"
+        return self.ctx.resolve_round_dir(pheno_id, int(round_number))
 
     def _load_manifest(self, round_dir: Path) -> Dict[str, Dict[str, bool]]:
         manifest: Dict[str, Dict[str, bool]] = {}

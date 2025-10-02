@@ -425,6 +425,7 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
         add_labelset(
             conn,
             labelset_id="ls_diabetes_v1",
+            project_id="Project_Toy",
             pheno_id="ph_diabetes",
             version=1,
             created_by="toy_seed",
@@ -443,6 +444,7 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
         add_labelset(
             conn,
             labelset_id="ls_htn_v1",
+            project_id="Project_Toy",
             pheno_id="ph_hypertension",
             version=1,
             created_by="toy_seed",

@@ -119,7 +119,8 @@ class Phenotype(Record):
 @dataclass
 class LabelSet(Record):
     labelset_id: str
-    pheno_id: str
+    project_id: str
+    pheno_id: Optional[str]
     version: int
     created_at: str
     created_by: str
@@ -130,12 +131,14 @@ class LabelSet(Record):
         """
         CREATE TABLE IF NOT EXISTS label_sets (
             labelset_id TEXT PRIMARY KEY,
-            pheno_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            pheno_id TEXT NULL,
             version INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
             notes TEXT NOT NULL,
-            FOREIGN KEY(pheno_id) REFERENCES phenotypes(pheno_id)
+            FOREIGN KEY(pheno_id) REFERENCES phenotypes(pheno_id),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id)
         )
         """
     )
