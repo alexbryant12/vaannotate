@@ -85,7 +85,7 @@ class ProjectBrowser:
         with get_connection(self.project_db) as conn:
             rows = conn.execute(
                 """
-                SELECT a.round_id, r.pheno_id, r.round_number, p.name AS phenotype_name
+                SELECT a.round_id, r.pheno_id, r.round_number, p.name AS phenotype_name, p.corpus_path
                 FROM assignments AS a
                 JOIN rounds AS r ON a.round_id = r.round_id
                 JOIN phenotypes AS p ON r.pheno_id = p.pheno_id
@@ -103,7 +103,12 @@ class ProjectBrowser:
                 round_number = int(round_number_raw)
             except (TypeError, ValueError):
                 round_number = None
-            round_dir = self._resolve_round_dir(pheno_id, round_number, round_id)
+            round_dir = self._resolve_round_dir(
+                pheno_id,
+                round_number,
+                round_id,
+                str(row["corpus_path"] or ""),
+            )
             if not round_dir:
                 warnings.append(
                     f"Round directory not found for {pheno_id} ({round_id})."
@@ -130,9 +135,15 @@ class ProjectBrowser:
         return assignments, warnings
 
     def _resolve_round_dir(
-        self, pheno_id: str, round_number: Optional[int], round_id: str
+        self,
+        pheno_id: str,
+        round_number: Optional[int],
+        round_id: str,
+        corpus_path: str,
     ) -> Optional[Path]:
-        rounds_root = self.project_root / "phenotypes" / pheno_id / "rounds"
+        rounds_root = self._resolve_rounds_root(pheno_id, corpus_path)
+        if rounds_root is None:
+            return None
         if round_number is not None:
             default_dir = rounds_root / f"round_{round_number}"
             if default_dir.exists():
@@ -153,6 +164,22 @@ class ProjectBrowser:
             if config_round_id == round_id:
                 return candidate
         return None
+
+    def _resolve_rounds_root(self, pheno_id: str, corpus_path: str) -> Optional[Path]:
+        rounds_root: Optional[Path] = None
+        if corpus_path:
+            corpus = Path(corpus_path)
+            if not corpus.is_absolute():
+                corpus = (self.project_root / corpus).resolve()
+            phenotype_dir = corpus.parent.parent
+            rounds_root = phenotype_dir / "rounds"
+        else:
+            rounds_root = None
+        # Fallback for legacy directory structures where the phenotype ID was used
+        if rounds_root is None or not rounds_root.exists():
+            candidate = self.project_root / "phenotypes" / pheno_id / "rounds"
+            rounds_root = candidate if candidate.exists() else rounds_root
+        return rounds_root
 
 
 class AssignmentPickerDialog(QtWidgets.QDialog):
@@ -861,6 +888,8 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self.current_documents: List[Dict[str, object]] = []
         self.active_doc_id: Optional[str] = None
         self._last_project_dir: Optional[Path] = None
+        self._current_project_root: Optional[Path] = None
+        self._current_assignment: Optional[AssignmentSummary] = None
         self._setup_menu()
         self._setup_ui()
         self.ctx.assignment_loaded.connect(self._on_assignment_loaded)
@@ -872,6 +901,10 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         file_menu = bar.addMenu("File")
         open_action = file_menu.addAction("Open project…")
         open_action.triggered.connect(self._open_project)
+        self.open_assignment_action = file_menu.addAction("Open assignment…")
+        self.open_assignment_action.setEnabled(False)
+        self.open_assignment_action.triggered.connect(self._open_assignment_within_project)
+        file_menu.addSeparator()
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
 
@@ -906,6 +939,9 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         info_layout = QtWidgets.QHBoxLayout(info_widget)
         self.progress_label = QtWidgets.QLabel("Progress: 0/0")
         info_layout.addWidget(self.progress_label)
+        self.assignment_label = QtWidgets.QLabel("")
+        self.assignment_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        info_layout.addWidget(self.assignment_label, 1)
         note_panel_layout.addWidget(info_widget)
         middle_splitter.addWidget(note_panel)
         splitter.addWidget(middle_splitter)
@@ -942,6 +978,14 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         if not directory:
             return
         project_root = Path(directory)
+        self._launch_assignment_picker_for_project(project_root)
+
+    def _open_assignment_within_project(self) -> None:
+        if not self._current_project_root:
+            return
+        self._launch_assignment_picker_for_project(self._current_project_root)
+
+    def _launch_assignment_picker_for_project(self, project_root: Path) -> None:
         try:
             browser = ProjectBrowser(project_root)
         except FileNotFoundError:
@@ -957,6 +1001,16 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         assignment = picker.selected_assignment()
         if not assignment:
             return
+        reviewer = picker.selected_reviewer()
+        reviewer_label = reviewer.display_label() if reviewer else ""
+        self._load_assignment(project_root, assignment, reviewer_label)
+
+    def _load_assignment(
+        self,
+        project_root: Path,
+        assignment: AssignmentSummary,
+        reviewer_label: str,
+    ) -> None:
         try:
             self.ctx.open_assignment(assignment.assignment_dir)
         except Exception as exc:  # noqa: BLE001
@@ -967,8 +1021,10 @@ class ClientMainWindow(QtWidgets.QMainWindow):
             )
             return
         self._last_project_dir = project_root
-        reviewer = picker.selected_reviewer()
-        reviewer_label = reviewer.display_label() if reviewer else ""
+        self._current_project_root = project_root
+        self._current_assignment = assignment
+        self.open_assignment_action.setEnabled(True)
+        self._update_assignment_info_label()
         status_parts = [assignment.phenotype_name, assignment.round_label()]
         if reviewer_label:
             status_parts.append(f"Reviewer: {reviewer_label}")
@@ -1004,6 +1060,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         if self.ctx.units:
             self.unit_list.setCurrentRow(0)
         self._update_progress()
+        self._update_assignment_info_label()
 
     def _unit_selected(self) -> None:
         items = self.unit_list.selectedItems()
@@ -1110,6 +1167,15 @@ class ClientMainWindow(QtWidgets.QMainWindow):
             suffix = " ✓" if unit.get("complete") else ""
             item.setText(f"{unit['display_rank']}: {self._format_unit_label(unit)}{suffix}")
         self.progress_label.setText(f"Progress: {completed}/{total}")
+        self._update_assignment_info_label()
+
+    def _update_assignment_info_label(self) -> None:
+        if not self._current_assignment:
+            self.assignment_label.clear()
+            return
+        phenotype = self._current_assignment.phenotype_name
+        round_label = self._current_assignment.round_label()
+        self.assignment_label.setText(f"Phenotype: {phenotype} | {round_label}")
 
 
 def run(path: Optional[str] = None) -> None:
