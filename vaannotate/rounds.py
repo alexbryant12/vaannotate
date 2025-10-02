@@ -149,6 +149,23 @@ class RoundBuilder:
                                 unit.payload.get("note_count"),
                             ),
                         )
+                        documents = unit.payload.get("documents", [])
+                        assign_conn.execute(
+                            "DELETE FROM unit_notes WHERE unit_id=?",
+                            (unit.unit_id,),
+                        )
+                        for order_index, doc in enumerate(documents):
+                            doc_id = doc.get("doc_id")
+                            if not doc_id:
+                                continue
+                            assign_conn.execute(
+                                "INSERT OR REPLACE INTO documents(doc_id, hash, text) VALUES (?,?,?)",
+                                (doc_id, doc.get("hash", ""), doc.get("text", "")),
+                            )
+                            assign_conn.execute(
+                                "INSERT OR REPLACE INTO unit_notes(unit_id, doc_id, order_index) VALUES (?,?,?)",
+                                (unit.unit_id, doc_id, order_index),
+                            )
                     for label in labelset["labels"]:
                         for unit in units:
                             assign_conn.execute(
@@ -234,6 +251,14 @@ class RoundBuilder:
         if level == "single_doc":
             for row in cursor:
                 strata_key = self._compute_strata_key(row, config.get("stratification"))
+                documents = [
+                    {
+                        "doc_id": row["doc_id"],
+                        "hash": row["hash"],
+                        "text": row["text"],
+                        "order_index": 0,
+                    }
+                ]
                 payload = {
                     "note_year": row["note_year"],
                     "notetype": row["notetype"],
@@ -241,6 +266,8 @@ class RoundBuilder:
                     "hash": row["hash"],
                     "strata_key": strata_key,
                     "note_count": 1,
+                    "documents": documents,
+                    "display_label": row["doc_id"],
                 }
                 yield CandidateUnit(row["doc_id"], row["patient_icn"], row["doc_id"], strata_key, payload)
         else:
@@ -250,10 +277,25 @@ class RoundBuilder:
             for patient_icn, docs in patient_docs.items():
                 primary_row = docs[0]
                 strata_key = self._compute_strata_key(primary_row, config.get("stratification"))
+                ordered_docs = sorted(
+                    docs,
+                    key=lambda item: (item["note_year"], item["doc_id"]),
+                )
+                doc_payloads = [
+                    {
+                        "doc_id": doc["doc_id"],
+                        "hash": doc["hash"],
+                        "text": doc["text"],
+                        "order_index": idx,
+                    }
+                    for idx, doc in enumerate(ordered_docs)
+                ]
                 payload = {
                     "sta3n": primary_row["sta3n"],
                     "strata_key": strata_key,
                     "note_count": len(docs),
+                    "documents": doc_payloads,
+                    "display_label": patient_icn,
                 }
                 yield CandidateUnit(patient_icn, patient_icn, None, strata_key, payload)
 

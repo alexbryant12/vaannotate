@@ -172,6 +172,13 @@ ASSIGNMENT_SCHEMA = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS documents(
+        doc_id TEXT PRIMARY KEY,
+        hash TEXT NOT NULL,
+        text TEXT NOT NULL
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS annotations(
         unit_id TEXT NOT NULL,
         label_id TEXT NOT NULL,

@@ -703,6 +703,21 @@ class ClientMainWindow(QtWidgets.QMainWindow):
             return
         self.ctx.open_assignment(Path(directory))
 
+    def _format_unit_label(self, unit: Dict[str, object]) -> str:
+        doc_id = str(unit.get("doc_id") or "").strip()
+        note_count_raw = unit.get("note_count")
+        try:
+            note_count = int(note_count_raw) if note_count_raw is not None else None
+        except (TypeError, ValueError):
+            note_count = None
+        patient = str(unit.get("patient_icn") or "").strip()
+        if doc_id and (not note_count or note_count <= 1):
+            return doc_id
+        if note_count and note_count > 1:
+            base = patient or str(unit.get("unit_id"))
+            return f"{base} ({note_count} notes)"
+        return patient or str(unit.get("unit_id"))
+
     def _on_assignment_loaded(self) -> None:
         self.unit_list.clear()
         self.notes_table.setRowCount(0)
@@ -710,7 +725,8 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self.current_documents = []
         self.active_doc_id = None
         for unit in self.ctx.units:
-            item = QtWidgets.QListWidgetItem(f"{unit['display_rank']}: {unit['doc_id']}")
+            label = self._format_unit_label(unit)
+            item = QtWidgets.QListWidgetItem(f"{unit['display_rank']}: {label}")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, unit)
             self.unit_list.addItem(item)
         self.form.set_schema(self.ctx.labels)
@@ -756,6 +772,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
             order_item = QtWidgets.QTableWidgetItem(str(doc.get("order_index", row_index + 1)))
             order_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc)
             doc_item = QtWidgets.QTableWidgetItem(str(doc.get("doc_id", "")))
+            doc_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc)
             preview_text = str(doc.get("text", ""))[:200].replace("\n", " ")
             preview_item = QtWidgets.QTableWidgetItem(preview_text)
             self.notes_table.setItem(row_index, 0, order_item)
@@ -765,17 +782,21 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self.notes_table.resizeColumnsToContents()
 
     def _on_document_selected(self) -> None:
-        items = self.notes_table.selectedItems()
-        if not items:
+        row_index = self.notes_table.currentRow()
+        if row_index < 0:
             self.note_view.clear()
             self.active_doc_id = None
             return
-        doc = items[0].data(QtCore.Qt.ItemDataRole.UserRole)
+        item = self.notes_table.item(row_index, 0)
+        doc = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
         if not doc:
+            if 0 <= row_index < len(self.current_documents):
+                doc = self.current_documents[row_index]
+        if doc:
+            self._set_active_document(doc)
+        else:
             self.note_view.clear()
             self.active_doc_id = None
-            return
-        self._set_active_document(doc)
 
     def _set_active_document(self, doc: Dict[str, object]) -> None:
         self.active_doc_id = str(doc.get("doc_id", "")) or None
@@ -816,7 +837,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
             if unit_id in status_map:
                 unit["complete"] = status_map[unit_id]
             suffix = " ✓" if unit.get("complete") else ""
-            item.setText(f"{unit['display_rank']}: {unit['doc_id']}{suffix}")
+            item.setText(f"{unit['display_rank']}: {self._format_unit_label(unit)}{suffix}")
         self.progress_label.setText(f"Progress: {completed}/{total}")
 
 
