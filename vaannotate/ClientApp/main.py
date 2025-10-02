@@ -98,6 +98,18 @@ class AssignmentContext(QtCore.QObject):
             row = conn.execute("SELECT text FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
         return row[0] if row else ""
 
+    def fetch_unit_documents(self, unit_id: str) -> List[Dict[str, str]]:
+        if not self.assignment_db:
+            return []
+        with self.assignment_db.connect() as conn:
+            rows = conn.execute(
+                "SELECT documents.doc_id, documents.text FROM unit_notes "
+                "JOIN documents ON documents.doc_id = unit_notes.doc_id "
+                "WHERE unit_notes.unit_id=? ORDER BY unit_notes.order_index",
+                (unit_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def load_annotations(self, unit_id: str) -> Dict[str, Dict[str, object]]:
         if not self.assignment_db:
             return {}
@@ -575,10 +587,20 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self.ctx.set_current_unit(unit)
 
     def _load_unit(self, unit: Dict[str, object]) -> None:
-        doc_text = self.ctx.fetch_document(str(unit["doc_id"]))
+        unit_id = str(unit["unit_id"])
+        documents = self.ctx.fetch_unit_documents(unit_id)
+        if documents:
+            parts = []
+            for index, doc in enumerate(documents, start=1):
+                header = f"Document {index}: {doc['doc_id']}"
+                parts.append(header)
+                parts.append(doc.get("text", ""))
+            doc_text = "\n\n".join(parts)
+        else:
+            doc_text = self.ctx.fetch_document(str(unit.get("doc_id", "")))
         self.note_view.setPlainText(doc_text)
         annotations = self.ctx.load_annotations(str(unit["unit_id"]))
-        self.form.load_unit(str(unit["unit_id"]), annotations)
+        self.form.load_unit(unit_id, annotations)
         self._update_progress()
 
     def _navigate(self, step: int) -> None:
