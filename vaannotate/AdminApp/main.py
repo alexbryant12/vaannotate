@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Set
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from ..schema import initialize_round_aggregate_db
 from ..shared import models
 from ..shared.database import Database, ensure_schema
 from ..shared.sampling import (
@@ -321,14 +322,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.seed_spin.setMaximum(2**31 - 1)
         self.overlap_spin = QtWidgets.QSpinBox()
         self.overlap_spin.setRange(0, 1000)
-        self.sample_spin = QtWidgets.QSpinBox()
-        self.sample_spin.setRange(1, 10000)
+        self.total_n_spin = QtWidgets.QSpinBox()
+        self.total_n_spin.setRange(1, 1000000)
         self.status_combo = QtWidgets.QComboBox()
         self.status_combo.addItems(["draft", "active", "closed", "adjudicating", "finalized"])
         setup_form.addRow("Label set", self.labelset_combo)
         setup_form.addRow("Seed", self.seed_spin)
         setup_form.addRow("Overlap N", self.overlap_spin)
-        setup_form.addRow("Sample per reviewer", self.sample_spin)
+        setup_form.addRow("Total N", self.total_n_spin)
         setup_form.addRow("Status", self.status_combo)
         scroll_layout.addWidget(setup_group)
 
@@ -677,6 +678,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     ],
                 }
             )
+        total_n = self.total_n_spin.value()
+        if total_n < overlap:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Round",
+                "Total N must be greater than or equal to the overlap count.",
+            )
+            return False
         filters = self._collect_filters()
         try:
             corpus_rows = candidate_documents(ctx.get_corpus_db(pheno_id), pheno_level, filters)
@@ -686,34 +695,39 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if not corpus_rows:
             QtWidgets.QMessageBox.warning(self, "Round", "The selected corpus returned no candidate documents.")
             return False
+        if len(corpus_rows) < total_n:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Round",
+                "Fewer candidate units were found than the requested total. All available units will be used.",
+            )
         strat_keys = [key.strip() for key in self.strat_keys_edit.text().split(",") if key.strip()]
         strat_sample = self.strat_sample_spin.value()
         if strat_sample <= 0:
             strat_sample = None
-        default_sample = self.sample_spin.value() * len(reviewers)
         per_stratum = strat_sample
-        if not strat_keys and strat_sample is None and default_sample:
-            per_stratum = default_sample
         assignments = allocate_units(
             corpus_rows,
             reviewers,
             overlap,
             seed,
+            total_n=total_n,
             strat_keys=strat_keys or None,
             per_stratum=per_stratum,
         )
-        target_sample = self.sample_spin.value()
-        missing = [
-            reviewer["id"]
-            for reviewer in reviewers
-            if target_sample and len(assignments[reviewer["id"]].units) < target_sample
-        ]
-        if missing:
+        unique_units = {
+            unit["unit_id"]
+            for assignment in assignments.values()
+            for unit in assignment.units
+        }
+        if len(unique_units) < total_n:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Round",
-                "Not enough candidate documents were found to satisfy the desired sample size for: "
-                + ", ".join(missing),
+                (
+                    f"Only {len(unique_units)} unique units could be allocated out of the requested {total_n}. "
+                    "Reviewers will receive as even a distribution as possible."
+                ),
             )
         round_id = str(uuid.uuid4())
         round_number = self._next_round_number()
@@ -777,7 +791,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "round_id": round_id,
                 "rng_seed": seed,
                 "overlap_n": overlap,
-                "sample_per_reviewer": self.sample_spin.value(),
+                "total_n": total_n,
                 "status": self.status_combo.currentText(),
                 "reviewers": reviewers,
             }
@@ -1096,8 +1110,8 @@ class RoundDetailWidget(QtWidgets.QWidget):
             setup_items.append(f"Round number: {config['round_number']}")
         setup_items.append(f"Label set: {config.get('labelset_id', '—')}")
         setup_items.append(f"Status: {config.get('status', 'draft')}")
-        if config.get("sample_per_reviewer"):
-            setup_items.append(f"Sample per reviewer: {config['sample_per_reviewer']}")
+        if config.get("total_n"):
+            setup_items.append(f"Total units: {config['total_n']}")
         setup_items.append(f"Overlap units: {config.get('overlap_n', 0)}")
         setup_items.append(f"RNG seed: {config.get('rng_seed', 0)}")
         reviewers = config.get("reviewers") or []
@@ -1494,7 +1508,16 @@ class IaaWidget(QtWidgets.QWidget):
             return
         self._discover_existing_imports(round_dir)
         if self.assignment_paths:
-            self._set_import_summary("Detected existing assignment imports.")
+            summary = "Detected existing assignment imports."
+            aggregate_path = round_dir / "round_aggregate.db"
+            if not aggregate_path.exists():
+                try:
+                    self._rebuild_round_aggregate(round_dir)
+                except Exception as exc:  # noqa: BLE001
+                    summary = f"{summary}\nAggregate build failed: {exc}"
+                else:
+                    summary = f"{summary}\nRound aggregate rebuilt."
+            self._set_import_summary(summary)
 
     def _on_auto_import_clicked(self) -> None:
         if not self.current_round:
@@ -1537,6 +1560,7 @@ class IaaWidget(QtWidgets.QWidget):
     ) -> None:
         statuses: List[str] = []
         errors = 0
+        imported_any = False
         for reviewer in self.current_round.get("reviewers", []):
             reviewer_id = reviewer.get("reviewer_id")
             if not reviewer_id:
@@ -1557,7 +1581,20 @@ class IaaWidget(QtWidgets.QWidget):
             else:
                 self.assignment_paths[reviewer_id] = target_path
                 statuses.append(f"{display_name}: imported")
-        summary = "\n".join(statuses) if statuses else "No reviewers for this round."
+                imported_any = True
+        aggregate_message = ""
+        if imported_any:
+            try:
+                self._rebuild_round_aggregate(round_dir)
+            except Exception as exc:  # noqa: BLE001
+                aggregate_message = f"Aggregate build failed: {exc}"
+                errors += 1
+            else:
+                aggregate_message = "Round aggregate rebuilt."
+        summary_lines = statuses if statuses else ["No reviewers for this round."]
+        if aggregate_message:
+            summary_lines.append(aggregate_message)
+        summary = "\n".join(summary_lines)
         self._set_import_summary(summary)
         if not silent:
             if errors:
@@ -1595,12 +1632,25 @@ class IaaWidget(QtWidgets.QWidget):
             )
             return
         self.assignment_paths[reviewer_id] = target_path
-        self._set_import_summary(f"{display_name}: imported from manual selection")
-        QtWidgets.QMessageBox.information(
-            self,
-            "Assignment import",
-            f"Imported assignment for {display_name}.",
-        )
+        aggregate_message = ""
+        aggregate_failed = False
+        round_dir = self._resolve_round_dir()
+        if round_dir:
+            try:
+                self._rebuild_round_aggregate(round_dir)
+            except Exception as exc:  # noqa: BLE001
+                aggregate_message = f"Aggregate build failed: {exc}"
+                aggregate_failed = True
+            else:
+                aggregate_message = "Round aggregate rebuilt."
+        summary = f"{display_name}: imported from manual selection"
+        if aggregate_message:
+            summary = f"{summary}\n{aggregate_message}"
+        self._set_import_summary(summary)
+        if aggregate_failed:
+            QtWidgets.QMessageBox.warning(self, "Assignment import", summary)
+        else:
+            QtWidgets.QMessageBox.information(self, "Assignment import", summary)
         self._refresh_units_table()
         self._update_auto_import_state()
 
@@ -1691,6 +1741,63 @@ class IaaWidget(QtWidgets.QWidget):
                 continue
             sources[reviewer_id] = assignment_db
         return sources, problems
+
+    def _rebuild_round_aggregate(self, round_dir: Path) -> Path:
+        if not self.current_round:
+            raise RuntimeError("Round context missing")
+        round_id = self.current_round.get("round_id")
+        if not round_id:
+            raise RuntimeError("Round metadata incomplete")
+        imports_dir = round_dir / "imports"
+        if not imports_dir.exists():
+            raise RuntimeError("No imported assignments found")
+        aggregate_path = round_dir / "round_aggregate.db"
+        with initialize_round_aggregate_db(aggregate_path) as agg_conn:
+            agg_conn.execute("DELETE FROM unit_annotations")
+            agg_conn.execute("DELETE FROM unit_summary")
+            for assignment_path in sorted(imports_dir.glob("*_assignment.db")):
+                reviewer_id = assignment_path.stem
+                if reviewer_id.endswith("_assignment"):
+                    reviewer_id = reviewer_id[: -len("_assignment")]
+                with sqlite3.connect(assignment_path) as assign_conn:
+                    assign_conn.row_factory = sqlite3.Row
+                    for unit_row in assign_conn.execute(
+                        "SELECT unit_id, patient_icn, doc_id FROM units"
+                    ):
+                        agg_conn.execute(
+                            """
+                            INSERT OR IGNORE INTO unit_summary(round_id, unit_id, patient_icn, doc_id)
+                            VALUES (?,?,?,?)
+                            """,
+                            (
+                                round_id,
+                                unit_row["unit_id"],
+                                unit_row["patient_icn"],
+                                unit_row["doc_id"],
+                            ),
+                        )
+                    for ann_row in assign_conn.execute(
+                        "SELECT unit_id, label_id, value, value_num, value_date, na, notes FROM annotations"
+                    ):
+                        agg_conn.execute(
+                            """
+                            INSERT INTO unit_annotations(round_id, unit_id, reviewer_id, label_id, value, value_num, value_date, na, notes)
+                            VALUES (?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                round_id,
+                                ann_row["unit_id"],
+                                reviewer_id,
+                                ann_row["label_id"],
+                                ann_row["value"],
+                                ann_row["value_num"],
+                                ann_row["value_date"],
+                                ann_row["na"],
+                                ann_row["notes"],
+                            ),
+                        )
+            agg_conn.commit()
+        return aggregate_path
 
     def _update_auto_import_state(self) -> None:
         round_dir = self._resolve_round_dir()

@@ -123,6 +123,7 @@ def allocate_units(
     reviewers: Sequence[Dict[str, str]],
     overlap_n: int,
     seed: int,
+    total_n: int | None = None,
     strat_keys: Sequence[str] | None = None,
     per_stratum: int | None = None,
 ) -> Dict[str, ReviewerAssignment]:
@@ -131,12 +132,21 @@ def allocate_units(
         strata = stratify(rows, strat_keys)
     else:
         strata = {"__all__": list(rows)}
+    remaining = total_n if total_n is not None else None
     for strata_key, items in strata.items():
         items = list(items)
-        if per_stratum:
-            items = items[:per_stratum]
         rng = random.Random(_hash_seed(seed, strata_key))
         rng.shuffle(items)
+        if per_stratum is not None:
+            if per_stratum <= 0:
+                items = []
+            elif len(items) > per_stratum:
+                items = items[:per_stratum]
+        if remaining is not None:
+            if remaining <= 0:
+                break
+            if len(items) > remaining:
+                items = items[:remaining]
         overlap_size = min(overlap_n, len(items))
         overlap_pool = items[:overlap_size]
         remainder = items[overlap_size:]
@@ -148,6 +158,10 @@ def allocate_units(
             reviewer = reviewers[idx % len(reviewers)]["id"]
             payload = _build_unit_payload(row, strata_key, is_overlap=False)
             reviewer_units[reviewer].units.append(payload)
+        if remaining is not None:
+            remaining -= len(items)
+            if remaining <= 0:
+                break
     # randomize display order per reviewer deterministically
     for reviewer in reviewer_units.values():
         rng = random.Random(_hash_seed(seed, reviewer.reviewer_id))

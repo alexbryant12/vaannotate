@@ -323,6 +323,45 @@ def test_admin_sampling_creates_multi_doc_units(tmp_path: Path) -> None:
                 assert doc_row is not None
                 assert doc_row["text"] == text_map[doc_id]
 
+
+def test_allocate_units_respects_total_n() -> None:
+    rows = [
+        {
+            "unit_id": f"unit_{idx}",
+            "patient_icn": f"pat_{idx}",
+            "doc_id": f"doc_{idx}",
+            "hash": f"hash_{idx}",
+            "text": f"text {idx}",
+        }
+        for idx in range(20)
+    ]
+    reviewers = [
+        {"id": "rev_a", "name": "Reviewer A"},
+        {"id": "rev_b", "name": "Reviewer B"},
+        {"id": "rev_c", "name": "Reviewer C"},
+    ]
+    overlap_n = 2
+    total_n = 10
+
+    assignments = allocate_units(rows, reviewers, overlap_n=overlap_n, seed=42, total_n=total_n)
+
+    unique_units = {
+        unit["unit_id"]
+        for assignment in assignments.values()
+        for unit in assignment.units
+    }
+    assert len(unique_units) == total_n
+
+    non_overlap_total = total_n - overlap_n
+    per_reviewer_base = non_overlap_total // len(reviewers)
+    remainder = non_overlap_total % len(reviewers)
+
+    for idx, reviewer in enumerate(reviewers):
+        reviewer_id = reviewer["id"]
+        count = len(assignments[reviewer_id].units)
+        expected = overlap_n + per_reviewer_base + (1 if idx < remainder else 0)
+        assert count == expected
+
 def _annotate_assignment(db_path: Path, flag_value: str | None, score_factory) -> list[str]:
     with sqlite3.connect(db_path) as conn:
         unit_ids = [row[0] for row in conn.execute("SELECT unit_id FROM units ORDER BY display_rank").fetchall()]
