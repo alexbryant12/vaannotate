@@ -1,6 +1,7 @@
 """PySide6 based Admin application for VAAnnotate."""
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import re
@@ -1972,6 +1973,8 @@ class IaaWidget(QtWidgets.QWidget):
         self.label_lookup: Dict[str, str] = {}
         self.label_order: List[str] = []
         self.reviewer_column_order: List[str] = []
+        self._unit_table_column_map: List[Dict[str, object]] = []
+        self._unit_table_cache: Dict[str, Dict[str, object]] = {}
         self._setup_ui()
         self.ctx.project_changed.connect(self.reset)
 
@@ -2037,9 +2040,16 @@ class IaaWidget(QtWidgets.QWidget):
         self.round_summary.setWordWrap(True)
         left_layout.addWidget(self.round_summary)
 
+        units_header = QtWidgets.QHBoxLayout()
         units_label = QtWidgets.QLabel("Imported units (overlapping assignments shown first)")
         units_label.setWordWrap(True)
-        left_layout.addWidget(units_label)
+        units_header.addWidget(units_label)
+        units_header.addStretch()
+        self.export_btn = QtWidgets.QPushButton("Export table…")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._export_unit_table)
+        units_header.addWidget(self.export_btn)
+        left_layout.addLayout(units_header)
 
         self.unit_table = QtWidgets.QTableWidget()
         self._update_unit_table_headers()
@@ -2048,10 +2058,10 @@ class IaaWidget(QtWidgets.QWidget):
         self.unit_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.unit_table.setWordWrap(True)
         self.unit_table.itemSelectionChanged.connect(self._on_unit_selected)
+        self.unit_table.setSortingEnabled(True)
         self.unit_table.horizontalHeader().setStretchLastSection(True)
         self.unit_table.cellDoubleClicked.connect(self._show_annotation_dialog)
         left_layout.addWidget(self.unit_table, 1)
-        self._unit_metadata_column_count = 5
 
         doc_panel = QtWidgets.QWidget()
         doc_panel_layout = QtWidgets.QVBoxLayout(doc_panel)
@@ -2097,6 +2107,7 @@ class IaaWidget(QtWidgets.QWidget):
         self.label_lookup = {}
         self.label_order = []
         self.reviewer_column_order = []
+        self._unit_table_column_map = []
         self.round_table.setRowCount(0)
         self.label_selector.clear()
         self.unit_table.setRowCount(0)
@@ -2105,9 +2116,11 @@ class IaaWidget(QtWidgets.QWidget):
         self.manual_reviewer_combo.clear()
         self.manual_import_btn.setEnabled(False)
         self.auto_import_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
         self._set_import_summary("")
         self._set_waiting_summary("")
         self.round_summary.setText("Select a round to review agreement metrics")
+        self._update_unit_table_headers([])
 
     def set_phenotype(self, pheno: Optional[Dict[str, object]]) -> None:
         self.reset()
@@ -2302,7 +2315,7 @@ class IaaWidget(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.warning(self, "Assignment import", summary)
             else:
                 QtWidgets.QMessageBox.information(self, "Assignment import", summary)
-        self._refresh_units_table()
+        self._refresh_units_table(force=True)
         self._update_auto_import_state()
 
     def _manual_import_assignment(self) -> None:
@@ -2352,7 +2365,7 @@ class IaaWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Assignment import", summary)
         else:
             QtWidgets.QMessageBox.information(self, "Assignment import", summary)
-        self._refresh_units_table()
+        self._refresh_units_table(force=True)
         self._update_auto_import_state()
 
     def _copy_assignment_to_imports(self, reviewer_id: str, source: Path) -> Path:
@@ -2538,8 +2551,25 @@ class IaaWidget(QtWidgets.QWidget):
         if reviewer_ids is None:
             reviewer_ids = self.reviewer_column_order
         headers = ["Unit", "Patient", "Document", "Overlap", "Status"]
-        for reviewer_id in reviewer_ids:
-            headers.append(self.current_reviewer_names.get(reviewer_id, reviewer_id))
+        self._unit_table_column_map = [
+            {"type": "meta", "key": "unit"},
+            {"type": "meta", "key": "patient"},
+            {"type": "meta", "key": "document"},
+            {"type": "meta", "key": "overlap"},
+            {"type": "meta", "key": "status"},
+        ]
+        for label_id in self.label_order:
+            label_name = self.label_lookup.get(label_id, label_id)
+            for reviewer_id in reviewer_ids:
+                reviewer_name = self.current_reviewer_names.get(reviewer_id, reviewer_id)
+                headers.append(f"{label_name} ({reviewer_name})")
+                self._unit_table_column_map.append(
+                    {
+                        "type": "label",
+                        "label_id": label_id,
+                        "reviewer_id": reviewer_id,
+                    }
+                )
         self.unit_table.setColumnCount(len(headers))
         self.unit_table.setHorizontalHeaderLabels(headers)
 
@@ -2558,16 +2588,20 @@ class IaaWidget(QtWidgets.QWidget):
             lines.append(self._format_annotation_line(label_id, annotations[label_id]))
         return "\n".join(line for line in lines if line)
 
-    def _format_annotation_line(self, label_id: str, entry: object) -> str:
-        label_name = self.label_lookup.get(label_id, label_id)
+    def _extract_annotation_parts(self, entry: object) -> tuple[str, str]:
         display_value = ""
         notes_value = ""
         if isinstance(entry, dict):
             display_value = str(entry.get("display") or "")
             raw_notes = entry.get("notes")
             notes_value = str(raw_notes).strip() if raw_notes else ""
-        else:
-            display_value = str(entry) if entry is not None else ""
+        elif entry is not None:
+            display_value = str(entry)
+        return display_value, notes_value
+
+    def _format_annotation_line(self, label_id: str, entry: object) -> str:
+        label_name = self.label_lookup.get(label_id, label_id)
+        display_value, notes_value = self._extract_annotation_parts(entry)
         parts: List[str] = []
         if display_value:
             parts.append(display_value)
@@ -2576,6 +2610,15 @@ class IaaWidget(QtWidgets.QWidget):
         if not parts:
             parts.append("—")
         return f"{label_name}: {'; '.join(parts)}"
+
+    def _format_annotation_cell(self, entry: object) -> str:
+        display_value, notes_value = self._extract_annotation_parts(entry)
+        parts: List[str] = []
+        if display_value:
+            parts.append(display_value)
+        if notes_value:
+            parts.append(f"Notes: {notes_value}")
+        return "\n".join(parts) if parts else ""
 
     def _selected_unit_index(self) -> Optional[int]:
         current_row = self.unit_table.currentRow()
@@ -2604,23 +2647,70 @@ class IaaWidget(QtWidgets.QWidget):
         self.document_table.setRowCount(0)
         self.document_preview.clear()
 
-    def _refresh_units_table(self) -> None:
+    def _current_assignment_state(self) -> Dict[str, tuple[str, float, int]]:
+        state: Dict[str, tuple[str, float, int]] = {}
+        for reviewer_id, path in self.assignment_paths.items():
+            if not path:
+                continue
+            try:
+                stat_result = path.stat()
+            except OSError:
+                continue
+            state[reviewer_id] = (str(path), stat_result.st_mtime, stat_result.st_size)
+        return state
+
+    def _refresh_units_table(self, force: bool = False) -> None:
         selected_unit = self._selected_unit_id()
         existing_discord = {row["unit_id"] for row in self.unit_rows if row.get("discord")}
         self.unit_rows = []
         self.unit_table.clearContents()
         self.unit_table.setRowCount(0)
         self._clear_document_panel()
+        if not self.current_round:
+            self.reviewer_column_order = []
+            self._update_unit_table_headers()
+            self._display_unit_rows(selected_unit)
+            return
+        round_id = self.current_round.get("round_id")
+        project_id = self.ctx.current_project_id()
+        assignment_state = self._current_assignment_state()
+        if round_id and not force:
+            cached = self._unit_table_cache.get(str(round_id))
+            if (
+                cached
+                and cached.get("assignment_state") == assignment_state
+                and cached.get("project_id") == project_id
+            ):
+                self.reviewer_column_order = list(cached.get("reviewer_order", []))
+                self.unit_rows = copy.deepcopy(cached.get("unit_rows", []))
+                self._update_unit_table_headers()
+                self._display_unit_rows(selected_unit)
+                return
+        reviewer_ids: List[str] = []
+        for reviewer in self.current_round.get("reviewers", []):
+            reviewer_id = reviewer.get("reviewer_id")
+            if reviewer_id:
+                reviewer_ids.append(reviewer_id)
+        for reviewer_id in self.assignment_paths.keys():
+            if reviewer_id not in reviewer_ids:
+                reviewer_ids.append(reviewer_id)
+        self.reviewer_column_order = sorted(
+            reviewer_ids,
+            key=lambda rid: self.current_reviewer_names.get(rid, rid).lower(),
+        )
         if not self.assignment_paths:
             self._update_unit_table_headers()
+            self._display_unit_rows(selected_unit)
+            if round_id:
+                self._unit_table_cache[str(round_id)] = {
+                    "unit_rows": [],
+                    "reviewer_order": list(self.reviewer_column_order),
+                    "assignment_state": assignment_state,
+                    "project_id": project_id,
+                }
             return
-        for reviewer_id in sorted(self.assignment_paths.keys()):
-            if reviewer_id not in self.reviewer_column_order:
-                self.reviewer_column_order.append(reviewer_id)
-        self.reviewer_column_order.sort(key=lambda rid: self.current_reviewer_names.get(rid, rid).lower())
         unit_map: Dict[str, Dict[str, object]] = {}
-        for reviewer_id in self.reviewer_column_order:
-            path = self.assignment_paths.get(reviewer_id)
+        for reviewer_id, path in self.assignment_paths.items():
             if not path or not path.exists():
                 continue
             with sqlite3.connect(path) as conn:
@@ -2660,25 +2750,83 @@ class IaaWidget(QtWidgets.QWidget):
                 entry["reviewer_ids"].add(reviewer_id)
                 entry["reviewer_annotations"][reviewer_id] = ann_map.get(unit_id, {})
         for unit_id, entry in unit_map.items():
-            reviewer_ids = sorted(entry["reviewer_ids"], key=lambda rid: self.current_reviewer_names.get(rid, rid))
-            entry["reviewer_ids"] = reviewer_ids
-            entry["is_overlap"] = self._is_overlap_unit(unit_id, reviewer_ids)
+            reviewer_ids_for_unit = sorted(
+                entry["reviewer_ids"], key=lambda rid: self.current_reviewer_names.get(rid, rid)
+            )
+            entry["reviewer_ids"] = reviewer_ids_for_unit
+            entry["is_overlap"] = self._is_overlap_unit(unit_id, reviewer_ids_for_unit)
             entry["discord"] = unit_id in existing_discord
-            summaries: Dict[str, str] = {}
-            for reviewer_id in self.reviewer_column_order:
-                annotations = entry["reviewer_annotations"].get(reviewer_id, {})
-                summaries[reviewer_id] = self._format_annotation_summary(annotations)
-            entry["reviewer_summaries"] = summaries
             self.unit_rows.append(entry)
         for index, row in enumerate(self.unit_rows):
             row["index"] = index
+        self._update_unit_table_headers()
         self._display_unit_rows(selected_unit)
+        if round_id:
+            self._unit_table_cache[str(round_id)] = {
+                "unit_rows": copy.deepcopy(self.unit_rows),
+                "reviewer_order": list(self.reviewer_column_order),
+                "assignment_state": assignment_state,
+                "project_id": project_id,
+            }
+
+    def _export_unit_table(self) -> None:
+        if not self.unit_rows:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export table",
+                "No data available to export.",
+            )
+            return
+        start_dir = str(self.ctx.project_root or Path.home())
+        path_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export IAA table",
+            start_dir,
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path_str:
+            return
+        target_path = Path(path_str)
+        if target_path.suffix.lower() != ".csv":
+            target_path = target_path.with_suffix(".csv")
+        try:
+            with target_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                headers: List[str] = []
+                for col in range(self.unit_table.columnCount()):
+                    header_item = self.unit_table.horizontalHeaderItem(col)
+                    headers.append(header_item.text() if header_item else "")
+                writer.writerow(headers)
+                for row_idx in range(self.unit_table.rowCount()):
+                    row_data: List[str] = []
+                    for col_idx in range(self.unit_table.columnCount()):
+                        item = self.unit_table.item(row_idx, col_idx)
+                        row_data.append(item.text() if item else "")
+                    writer.writerow(row_data)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export table",
+                f"Failed to export table: {exc}",
+            )
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "Export table",
+            f"Table exported to {target_path}.",
+        )
 
     def _display_unit_rows(self, selected_unit: Optional[str] = None) -> None:
+        header = self.unit_table.horizontalHeader()
+        sort_section = header.sortIndicatorSection()
+        sort_order = header.sortIndicatorOrder()
+        was_sorting = self.unit_table.isSortingEnabled()
+        self.unit_table.setSortingEnabled(False)
         self.unit_table.clearContents()
-        self._update_unit_table_headers()
         if not self.unit_rows:
             self.unit_table.setRowCount(0)
+            self.export_btn.setEnabled(False)
+            self.unit_table.setSortingEnabled(was_sorting)
             return
         sorted_rows = sorted(
             self.unit_rows,
@@ -2687,37 +2835,63 @@ class IaaWidget(QtWidgets.QWidget):
         self.unit_table.setRowCount(len(sorted_rows))
         highlight = QtGui.QColor("#ffebee")
         for row_index, row in enumerate(sorted_rows):
-            items: List[QtWidgets.QTableWidgetItem] = []
-            unit_item = QtWidgets.QTableWidgetItem(row["unit_id"])
-            unit_item.setData(QtCore.Qt.ItemDataRole.UserRole, row["index"])
-            items.append(unit_item)
-            patient_item = QtWidgets.QTableWidgetItem(row.get("patient_icn") or "")
-            items.append(patient_item)
-            doc_item = QtWidgets.QTableWidgetItem(row.get("doc_id") or "—")
-            items.append(doc_item)
-            overlap_item = QtWidgets.QTableWidgetItem("Yes" if row["is_overlap"] else "No")
-            items.append(overlap_item)
-            status_item = QtWidgets.QTableWidgetItem("Discordant" if row.get("discord") else "")
-            items.append(status_item)
-            for reviewer_id in self.reviewer_column_order:
-                summary = row["reviewer_summaries"].get(reviewer_id, "")
-                summary_item = QtWidgets.QTableWidgetItem(summary)
-                summary_item.setToolTip(summary)
-                items.append(summary_item)
-            for column, item in enumerate(items):
+            row_items: List[QtWidgets.QTableWidgetItem] = []
+            for column_info in self._unit_table_column_map:
+                column_type = column_info.get("type")
+                if column_type == "meta":
+                    key = column_info.get("key")
+                    if key == "unit":
+                        text = row.get("unit_id", "")
+                        item = QtWidgets.QTableWidgetItem(text)
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, row.get("index"))
+                    elif key == "patient":
+                        item = QtWidgets.QTableWidgetItem(row.get("patient_icn") or "")
+                    elif key == "document":
+                        item = QtWidgets.QTableWidgetItem(row.get("doc_id") or "—")
+                    elif key == "overlap":
+                        item = QtWidgets.QTableWidgetItem("Yes" if row.get("is_overlap") else "No")
+                    elif key == "status":
+                        item = QtWidgets.QTableWidgetItem("Discordant" if row.get("discord") else "")
+                    else:
+                        item = QtWidgets.QTableWidgetItem("")
+                elif column_type == "label":
+                    reviewer_id = column_info.get("reviewer_id")
+                    label_id = column_info.get("label_id")
+                    annotations = row.get("reviewer_annotations", {}).get(reviewer_id, {})
+                    entry = annotations.get(label_id)
+                    text = self._format_annotation_cell(entry)
+                    item = QtWidgets.QTableWidgetItem(text)
+                    item.setToolTip(self._format_annotation_line(label_id, entry))
+                else:
+                    item = QtWidgets.QTableWidgetItem("")
+                row_items.append(item)
+            for column, item in enumerate(row_items):
                 self.unit_table.setItem(row_index, column, item)
-            if row["is_overlap"]:
-                for item in items:
+            if row.get("is_overlap"):
+                for item in row_items:
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
             if row.get("discord"):
-                for item in items:
+                for item in row_items:
                     item.setBackground(highlight)
-            if selected_unit and row["unit_id"] == selected_unit:
-                self.unit_table.selectRow(row_index)
             self.unit_table.resizeRowToContents(row_index)
         self.unit_table.resizeColumnsToContents()
+        self.export_btn.setEnabled(True)
+        self.unit_table.setSortingEnabled(was_sorting)
+        if was_sorting and header.isSortIndicatorShown():
+            self.unit_table.sortItems(sort_section, sort_order)
+        if selected_unit:
+            self._select_unit_in_table(selected_unit)
+
+    def _select_unit_in_table(self, unit_id: str) -> None:
+        if not unit_id:
+            return
+        for row_index in range(self.unit_table.rowCount()):
+            item = self.unit_table.item(row_index, 0)
+            if item and item.text() == unit_id:
+                self.unit_table.selectRow(row_index)
+                break
 
     def _on_unit_selected(self) -> None:
         index = self._selected_unit_index()
@@ -2728,7 +2902,10 @@ class IaaWidget(QtWidgets.QWidget):
         self._populate_document_table(row)
 
     def _show_annotation_dialog(self, row: int, column: int) -> None:
-        if column < self._unit_metadata_column_count:
+        if column < 0 or column >= len(self._unit_table_column_map):
+            return
+        column_info = self._unit_table_column_map[column]
+        if column_info.get("type") != "label":
             return
         item = self.unit_table.item(row, 0)
         if not item:
@@ -2740,21 +2917,24 @@ class IaaWidget(QtWidgets.QWidget):
             return
         if index < 0 or index >= len(self.unit_rows):
             return
-        reviewer_offset = column - self._unit_metadata_column_count
-        if reviewer_offset < 0 or reviewer_offset >= len(self.reviewer_column_order):
-            return
-        reviewer_id = self.reviewer_column_order[reviewer_offset]
+        reviewer_id = column_info.get("reviewer_id")
+        label_id = column_info.get("label_id")
         row_data = self.unit_rows[index]
         annotations = row_data.get("reviewer_annotations", {}).get(reviewer_id, {})
         detail = self._format_annotation_summary(annotations)
-        if not detail:
-            detail = "No annotations submitted."
+        label_detail = ""
+        if label_id is not None:
+            label_detail = self._format_annotation_line(label_id, annotations.get(label_id))
+        if detail:
+            message_body = f"{label_detail}\n\nAll annotations:\n{detail}" if label_detail else detail
+        else:
+            message_body = label_detail or "No annotations submitted."
         reviewer_name = self.current_reviewer_names.get(reviewer_id, reviewer_id)
         unit_id = row_data.get("unit_id", "")
         QtWidgets.QMessageBox.information(
             self,
             "Annotation details",
-            f"Reviewer: {reviewer_name}\nUnit: {unit_id}\n\n{detail}",
+            f"Reviewer: {reviewer_name}\nUnit: {unit_id}\n\n{message_body}",
         )
 
     def _populate_document_table(self, unit_row: Dict[str, object]) -> None:
