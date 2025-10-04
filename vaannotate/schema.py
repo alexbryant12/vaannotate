@@ -17,6 +17,17 @@ PROJECT_SCHEMA = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS corpora(
+        corpus_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        corpus_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(project_id, name),
+        FOREIGN KEY(project_id) REFERENCES projects(project_id)
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS phenotypes(
         pheno_id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
@@ -24,7 +35,9 @@ PROJECT_SCHEMA = [
         level TEXT NOT NULL CHECK(level IN ('single_doc','multi_doc')),
         description TEXT,
         corpus_path TEXT NOT NULL,
-        UNIQUE(project_id, name)
+        default_corpus_id TEXT,
+        UNIQUE(project_id, name),
+        FOREIGN KEY(default_corpus_id) REFERENCES corpora(corpus_id)
     );
     """,
     """
