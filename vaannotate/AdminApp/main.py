@@ -27,6 +27,7 @@ from vaannotate.shared.sampling import (
     write_manifest,
 )
 from vaannotate.shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
+from vaannotate.shared.theme import apply_dark_palette
 from vaannotate.corpus import TABULAR_EXTENSIONS, import_tabular_corpus
 from vaannotate.project import init_project
 from vaannotate.utils import copy_sqlite_database, ensure_dir
@@ -189,7 +190,19 @@ class ProjectContext(QtCore.QObject):
             return cached
         if not path.exists() and not create:
             return None
-        return self._get_cached_db(resolved, models_schema=ASSIGNMENT_MODELS)
+        db = self._get_cached_db(resolved, models_schema=ASSIGNMENT_MODELS)
+        self._ensure_assignment_metadata_columns(db)
+        return db
+
+    def _ensure_assignment_metadata_columns(self, db: Database) -> None:
+        try:
+            with db.connect() as conn:
+                info_rows = conn.execute("PRAGMA table_info(documents)").fetchall()
+                if not any(row["name"] == "metadata_json" for row in info_rows):
+                    conn.execute("ALTER TABLE documents ADD COLUMN metadata_json TEXT")
+                    conn.commit()
+        except sqlite3.DatabaseError:
+            return
 
     def prepare_assignment_db(self, path: Path) -> Database:
         resolved = path.resolve()
@@ -2497,6 +2510,15 @@ class IaaWidget(QtWidgets.QWidget):
         "opened_at",
         "completed_at",
     ]
+    DOCUMENT_METADATA_PRIORITY = [
+        "patient_icn",
+        "date_note",
+        "note_year",
+        "notetype",
+        "sta3n",
+        "cptname",
+        "softlabel",
+    ]
 
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -2517,6 +2539,7 @@ class IaaWidget(QtWidgets.QWidget):
         self._last_evaluated_label_id: Optional[str] = None
         self._active_discord_ids: Set[str] = set()
         self.label_definitions: Dict[str, LabelDefinition] = {}
+        self._document_metadata_columns_cache: Dict[str, List[str]] = {}
         self._setup_ui()
         self.ctx.project_changed.connect(self.reset)
 
@@ -2618,12 +2641,12 @@ class IaaWidget(QtWidgets.QWidget):
         doc_layout = QtWidgets.QVBoxLayout(doc_table_container)
         doc_layout.setContentsMargins(0, 0, 0, 0)
         self.document_table = QtWidgets.QTableWidget()
-        self.document_table.setColumnCount(4)
-        self.document_table.setHorizontalHeaderLabels(["Document", "Type", "Date", "Facility"])
+        self.document_table.setColumnCount(0)
         self.document_table.verticalHeader().setVisible(False)
         self.document_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.document_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.document_table.itemSelectionChanged.connect(self._on_document_selected)
+        self.document_table.setSortingEnabled(True)
         self.document_table.horizontalHeader().setStretchLastSection(True)
         doc_layout.addWidget(self.document_table)
         doc_splitter.addWidget(doc_table_container)
@@ -4054,7 +4077,7 @@ class IaaWidget(QtWidgets.QWidget):
         with assignment_db.connect() as conn:
             doc_rows = conn.execute(
                 """
-                SELECT unit_notes.doc_id, unit_notes.order_index, documents.text
+                SELECT unit_notes.doc_id, unit_notes.order_index, documents.text, documents.metadata_json
                 FROM unit_notes
                 LEFT JOIN documents ON documents.doc_id = unit_notes.doc_id
                 WHERE unit_notes.unit_id=?
@@ -4064,7 +4087,20 @@ class IaaWidget(QtWidgets.QWidget):
             ).fetchall()
         if not doc_rows:
             return
-        metadata: Dict[str, sqlite3.Row] = {}
+        metadata_by_doc: Dict[str, Dict[str, object]] = {}
+        for row in doc_rows:
+            doc_id = row["doc_id"]
+            payload: Dict[str, object] = {}
+            metadata_json = row.get("metadata_json") if hasattr(row, "get") else row["metadata_json"]
+            if metadata_json:
+                try:
+                    parsed = json.loads(metadata_json)
+                except Exception:  # noqa: BLE001
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    payload.update(parsed)
+            metadata_by_doc[doc_id] = payload
+
         corpus_db: Optional[Database] = None
         corpus_id = (self.current_round or {}).get("corpus_id")
         if corpus_id:
@@ -4072,26 +4108,88 @@ class IaaWidget(QtWidgets.QWidget):
                 corpus_db = self.ctx.get_corpus_db(corpus_id)
             except Exception:
                 corpus_db = None
-        if corpus_db:
-            with corpus_db.connect() as conn:
-                placeholders = ",".join(["?"] * len(doc_rows))
-                rows = conn.execute(
-                    f"SELECT doc_id, notetype, date_note, sta3n FROM documents WHERE doc_id IN ({placeholders})",
-                    [row["doc_id"] for row in doc_rows],
-                ).fetchall()
-            metadata = {row["doc_id"]: row for row in rows}
+        doc_ids = [row["doc_id"] for row in doc_rows]
+        if corpus_db and doc_ids:
+            columns = self._document_metadata_columns_cache.get(str(corpus_db.path))
+            if columns is None:
+                try:
+                    with corpus_db.connect() as conn:
+                        info_rows = conn.execute("PRAGMA table_info(documents)").fetchall()
+                    columns = [
+                        row["name"]
+                        for row in info_rows
+                        if row["name"].lower() not in {"doc_id", "text", "hash"}
+                    ]
+                except Exception:
+                    columns = []
+                self._document_metadata_columns_cache[str(corpus_db.path)] = columns
+            if columns:
+                with corpus_db.connect() as conn:
+                    placeholders = ",".join(["?"] * len(doc_ids))
+                    select_clause = ", ".join(columns)
+                    rows = conn.execute(
+                        f"SELECT doc_id, {select_clause} FROM documents WHERE doc_id IN ({placeholders})",
+                        doc_ids,
+                    ).fetchall()
+                for row in rows:
+                    payload = metadata_by_doc.setdefault(row["doc_id"], {})
+                    for column in columns:
+                        payload[column] = row[column]
+
+        discovered_keys: List[str] = []
+        for payload in metadata_by_doc.values():
+            for key in payload.keys():
+                if key not in discovered_keys:
+                    discovered_keys.append(key)
+        priority = [key for key in self.DOCUMENT_METADATA_PRIORITY if key in discovered_keys]
+        remaining = sorted(
+            [key for key in discovered_keys if key not in self.DOCUMENT_METADATA_PRIORITY],
+            key=str.lower,
+        )
+        metadata_keys = priority + remaining
+
+        headers = ["#", "Document ID"] + [self._metadata_header_for(key) for key in metadata_keys]
+        column_labels = headers + ["Preview"]
+        self.document_table.blockSignals(True)
+        self.document_table.setSortingEnabled(False)
+        self.document_table.clear()
+        self.document_table.setColumnCount(len(column_labels))
+        self.document_table.setHorizontalHeaderLabels(column_labels)
         self.document_table.setRowCount(len(doc_rows))
+        preview_column = len(column_labels) - 1
         for idx, doc_row in enumerate(doc_rows):
             doc_id = doc_row["doc_id"]
-            meta = metadata.get(doc_id)
-            values = [
-                doc_id,
-                meta["notetype"] if meta else "—",
-                meta["date_note"] if meta else "—",
-                meta["sta3n"] if meta else "—",
-            ]
-            for col, value in enumerate(values):
-                self.document_table.setItem(idx, col, QtWidgets.QTableWidgetItem(str(value)))
+            order_value = doc_row.get("order_index") if hasattr(doc_row, "get") else doc_row["order_index"]
+            order_item = QtWidgets.QTableWidgetItem(str(order_value))
+            order_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc_id)
+            order_item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self.document_table.setItem(idx, 0, order_item)
+
+            doc_item = QtWidgets.QTableWidgetItem(str(doc_id))
+            doc_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc_id)
+            doc_item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self.document_table.setItem(idx, 1, doc_item)
+
+            payload = metadata_by_doc.get(doc_id, {})
+            for offset, key in enumerate(metadata_keys, start=2):
+                value = payload.get(key)
+                display_value = self._format_metadata_value(key, value)
+                item = QtWidgets.QTableWidgetItem(display_value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, doc_id)
+                item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+                self.document_table.setItem(idx, offset, item)
+
+            preview_raw = doc_row["text"] or ""
+            preview_str = str(preview_raw)
+            preview_text = preview_str[:200].replace("\n", " ")
+            if len(preview_str) > 200:
+                preview_text += "…"
+            preview_item = QtWidgets.QTableWidgetItem(preview_text)
+            preview_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc_id)
+            preview_item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self.document_table.setItem(idx, preview_column, preview_item)
+        self.document_table.blockSignals(False)
+        self.document_table.setSortingEnabled(True)
         self.document_table.resizeColumnsToContents()
         if doc_rows:
             self.document_table.selectRow(0)
@@ -4123,11 +4221,17 @@ class IaaWidget(QtWidgets.QWidget):
         if not unit_id:
             self.document_preview.clear()
             return
+        doc_item = self.document_table.item(current_row, 1)
+        doc_id = doc_item.data(QtCore.Qt.ItemDataRole.UserRole) if doc_item else None
+        if not doc_id and doc_item:
+            doc_id = doc_item.text()
+        if not doc_id:
+            self.document_preview.clear()
+            return
         with assignment_db.connect() as conn:
             row = conn.execute(
-                "SELECT documents.text FROM unit_notes JOIN documents ON documents.doc_id = unit_notes.doc_id "
-                "WHERE unit_notes.unit_id=? ORDER BY unit_notes.order_index LIMIT 1 OFFSET ?",
-                (unit_id, current_row),
+                "SELECT text FROM documents WHERE doc_id=?",
+                (doc_id,),
             ).fetchone()
         if row:
             self.document_preview.setPlainText(row["text"] or "")
@@ -4774,6 +4878,7 @@ class AdminMainWindow(QtWidgets.QMainWindow):
 
 def run() -> None:
     app = QtWidgets.QApplication(sys.argv)
+    apply_dark_palette(app)
     window = AdminMainWindow()
     window.show()
     sys.exit(app.exec())

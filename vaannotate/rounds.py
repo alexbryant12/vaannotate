@@ -14,6 +14,7 @@ from typing import Iterator
 
 from .project import fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
+from .shared.metadata import extract_document_metadata
 from .utils import (
     canonical_json,
     copy_sqlite_database,
@@ -193,9 +194,16 @@ class RoundBuilder:
                             doc_id = doc.get("doc_id")
                             if not doc_id:
                                 continue
+                            metadata = extract_document_metadata(doc)
+                            metadata_json = json.dumps(metadata, sort_keys=True) if metadata else None
                             assign_conn.execute(
-                                "INSERT OR REPLACE INTO documents(doc_id, hash, text) VALUES (?,?,?)",
-                                (doc_id, doc.get("hash", ""), doc.get("text", "")),
+                                "INSERT OR REPLACE INTO documents(doc_id, hash, text, metadata_json) VALUES (?,?,?,?)",
+                                (
+                                    doc_id,
+                                    doc.get("hash", ""),
+                                    doc.get("text", ""),
+                                    metadata_json,
+                                ),
                             )
                             assign_conn.execute(
                                 "INSERT OR REPLACE INTO unit_notes(unit_id, doc_id, order_index) VALUES (?,?,?)",

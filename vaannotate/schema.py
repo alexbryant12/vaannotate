@@ -189,8 +189,12 @@ ASSIGNMENT_SCHEMA = [
     CREATE TABLE IF NOT EXISTS documents(
         doc_id TEXT PRIMARY KEY,
         hash TEXT NOT NULL,
-        text TEXT NOT NULL
+        text TEXT NOT NULL,
+        metadata_json TEXT
     );
+    """,
+    """
+    ALTER TABLE documents ADD COLUMN metadata_json TEXT;
     """,
     """
     CREATE TABLE IF NOT EXISTS annotations(
