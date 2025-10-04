@@ -476,7 +476,6 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
             level="multi_doc",
             description="Toy diabetes phenotype for demonstrations",
             corpus_path=corpus_for("ph_diabetes"),
-            default_corpus_id=None,
         )
         add_labelset(
             conn,
@@ -496,7 +495,6 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
             level="single_doc",
             description="Toy hypertension phenotype for demonstrations",
             corpus_path=corpus_for("ph_hypertension"),
-            default_corpus_id=None,
         )
         add_labelset(
             conn,

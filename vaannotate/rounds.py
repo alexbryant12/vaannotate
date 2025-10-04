@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator
 
 from .project import fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
@@ -77,27 +77,14 @@ class RoundBuilder:
             ).fetchone()
             if not pheno:
                 raise ValueError(f"Phenotype {pheno_id} not found")
-            config_corpus = config.get("corpus") if isinstance(config, dict) else None
-            corpus_path_value: Optional[str] = None
-            if isinstance(config_corpus, dict):
-                path_value = config_corpus.get("path")
-                if isinstance(path_value, str) and path_value.strip():
-                    corpus_path_value = path_value
-            if not corpus_path_value:
-                corpus_path_value = pheno["corpus_path"]
-            corpus_path = Path(corpus_path_value)
-            if not corpus_path.is_absolute():
-                corpus_path = (self.project_root / corpus_path).resolve()
+            corpus_path = self.project_root / pheno["corpus_path"]
             with self._connect_corpus(corpus_path) as corpus_conn:
                 labelset = fetch_labelset(project_conn, config["labelset_id"])
                 round_number = config.get("round_number")
             round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
             rng_seed = config.get("rng_seed", 0)
             config_hash = stable_hash(canonical_json(config))
-            phenotype_dir = (self.project_root / "phenotypes" / pheno_id).resolve()
-            if not phenotype_dir.exists():
-                legacy_path = (self.project_root / pheno["corpus_path"]).resolve().parent.parent
-                phenotype_dir = legacy_path
+            phenotype_dir = (self.project_root / pheno["corpus_path"]).resolve().parent.parent
             round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
             ensure_dir(round_dir)
             ensure_dir(round_dir / "assignments")

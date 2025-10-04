@@ -85,12 +85,10 @@ class ProjectBrowser:
         with get_connection(self.project_db) as conn:
             rows = conn.execute(
                 """
-                SELECT a.round_id, r.pheno_id, r.round_number, p.name AS phenotype_name,
-                       COALESCE(c.corpus_path, p.corpus_path) AS corpus_path
+                SELECT a.round_id, r.pheno_id, r.round_number, p.name AS phenotype_name, p.corpus_path
                 FROM assignments AS a
                 JOIN rounds AS r ON a.round_id = r.round_id
                 JOIN phenotypes AS p ON r.pheno_id = p.pheno_id
-                LEFT JOIN corpora AS c ON p.default_corpus_id = c.corpus_id
                 WHERE a.reviewer_id = ?
                 ORDER BY p.name COLLATE NOCASE, r.round_number
                 """,
@@ -168,9 +166,6 @@ class ProjectBrowser:
         return None
 
     def _resolve_rounds_root(self, pheno_id: str, corpus_path: str) -> Optional[Path]:
-        candidate = self.project_root / "phenotypes" / pheno_id / "rounds"
-        if candidate.exists():
-            return candidate
         rounds_root: Optional[Path] = None
         if corpus_path:
             corpus = Path(corpus_path)
@@ -178,7 +173,11 @@ class ProjectBrowser:
                 corpus = (self.project_root / corpus).resolve()
             phenotype_dir = corpus.parent.parent
             rounds_root = phenotype_dir / "rounds"
+        else:
+            rounds_root = None
+        # Fallback for legacy directory structures where the phenotype ID was used
         if rounds_root is None or not rounds_root.exists():
+            candidate = self.project_root / "phenotypes" / pheno_id / "rounds"
             rounds_root = candidate if candidate.exists() else rounds_root
         return rounds_root
 
