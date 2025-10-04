@@ -61,6 +61,18 @@ class AgreementSample:
     values: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class LabelDefinition:
+    label_id: str
+    name: str
+    type: str
+    na_allowed: bool
+    unit: Optional[str]
+    min_value: Optional[float]
+    max_value: Optional[float]
+    options: List[Dict[str, object]]
+
+
 class ProjectContext(QtCore.QObject):
     project_changed = QtCore.Signal()
     dirty_changed = QtCore.Signal(bool)
@@ -160,7 +172,13 @@ class ProjectContext(QtCore.QObject):
         if statements:
             with db.transaction() as conn:
                 for statement in statements:
-                    conn.executescript(statement)
+                    try:
+                        conn.executescript(statement)
+                    except sqlite3.OperationalError as exc:
+                        message = str(exc).lower()
+                        if "duplicate column" in message:
+                            continue
+                        raise
         self._external_db_cache[resolved] = db
         return db
 
@@ -2470,6 +2488,16 @@ class CorpusWidget(QtWidgets.QWidget):
 
 
 class IaaWidget(QtWidgets.QWidget):
+    METADATA_PRIORITY = [
+        "patient_icn",
+        "doc_id",
+        "display_rank",
+        "note_count",
+        "complete",
+        "opened_at",
+        "completed_at",
+    ]
+
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.ctx = ctx
@@ -2484,6 +2512,11 @@ class IaaWidget(QtWidgets.QWidget):
         self.reviewer_column_order: List[str] = []
         self._unit_table_column_map: List[Dict[str, object]] = []
         self._unit_table_cache: Dict[str, Dict[str, object]] = {}
+        self.unit_metadata_keys: List[str] = []
+        self._discordant_units_by_label: Dict[str, Set[str]] = {}
+        self._last_evaluated_label_id: Optional[str] = None
+        self._active_discord_ids: Set[str] = set()
+        self.label_definitions: Dict[str, LabelDefinition] = {}
         self._setup_ui()
         self.ctx.project_changed.connect(self.reset)
 
@@ -2570,6 +2603,8 @@ class IaaWidget(QtWidgets.QWidget):
         self.unit_table.setSortingEnabled(True)
         self.unit_table.horizontalHeader().setStretchLastSection(True)
         self.unit_table.cellDoubleClicked.connect(self._show_annotation_dialog)
+        self.unit_table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.unit_table.customContextMenuRequested.connect(self._on_unit_table_context_menu)
         left_layout.addWidget(self.unit_table, 1)
 
         doc_panel = QtWidgets.QWidget()
@@ -2628,6 +2663,11 @@ class IaaWidget(QtWidgets.QWidget):
         self.export_btn.setEnabled(False)
         self._set_import_summary("")
         self._set_waiting_summary("")
+        self.unit_metadata_keys = []
+        self._discordant_units_by_label = {}
+        self._last_evaluated_label_id = None
+        self._active_discord_ids = set()
+        self.label_definitions = {}
         self.round_summary.setText("Select a round to review agreement metrics")
         self._update_unit_table_headers([])
 
@@ -2702,10 +2742,23 @@ class IaaWidget(QtWidgets.QWidget):
                 (round_id,),
             ).fetchall()
             labels = conn.execute(
-                "SELECT labels.label_id, labels.name FROM labels JOIN label_sets ON label_sets.labelset_id = labels.labelset_id "
+                "SELECT labels.label_id, labels.name, labels.type, labels.na_allowed, labels.unit, labels.min, labels.max "
+                "FROM labels JOIN label_sets ON label_sets.labelset_id = labels.labelset_id "
                 "WHERE label_sets.labelset_id=? ORDER BY labels.order_index",
                 (self.current_round.get("labelset_id"),),
             ).fetchall()
+            label_ids = [row["label_id"] for row in labels]
+            options_map: Dict[str, List[Dict[str, object]]] = {}
+            if label_ids:
+                placeholders = ",".join(["?"] * len(label_ids))
+                option_rows = conn.execute(
+                    f"SELECT label_id, value, display, order_index FROM label_options WHERE label_id IN ({placeholders}) ORDER BY label_id, order_index",
+                    label_ids,
+                ).fetchall()
+                for opt in option_rows:
+                    options_map.setdefault(opt["label_id"], []).append(
+                        {"value": opt["value"], "display": opt["display"], "order_index": opt["order_index"]}
+                    )
         self.current_reviewer_names = {row["reviewer_id"]: row["name"] for row in reviewers}
         self.current_round["reviewers"] = [
             {"reviewer_id": row["reviewer_id"], "name": row["name"]} for row in reviewers
@@ -2718,6 +2771,19 @@ class IaaWidget(QtWidgets.QWidget):
         self.label_selector.clear()
         self.label_lookup = {row["label_id"]: row["name"] for row in labels}
         self.label_order = [row["label_id"] for row in labels]
+        self.label_definitions = {
+            row["label_id"]: LabelDefinition(
+                label_id=row["label_id"],
+                name=row["name"],
+                type=row["type"],
+                na_allowed=bool(row["na_allowed"]),
+                unit=row["unit"],
+                min_value=row["min"],
+                max_value=row["max"],
+                options=options_map.get(row["label_id"], []),
+            )
+            for row in labels
+        }
         for row in labels:
             self.label_selector.addItem(row["name"], row["label_id"])
         self.assignment_paths = {}
@@ -2728,6 +2794,11 @@ class IaaWidget(QtWidgets.QWidget):
         self._set_waiting_summary("")
         self.round_summary.setText("Assignments not yet imported for this round.")
         self._auto_discover_imports()
+        self._load_persisted_agreement_state()
+        if self._last_evaluated_label_id:
+            idx = self.label_selector.findData(self._last_evaluated_label_id)
+            if idx >= 0:
+                self.label_selector.setCurrentIndex(idx)
         self._refresh_units_table()
         self._update_auto_import_state()
 
@@ -2831,6 +2902,7 @@ class IaaWidget(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.warning(self, "Assignment import", summary)
             else:
                 QtWidgets.QMessageBox.information(self, "Assignment import", summary)
+        self._load_persisted_agreement_state()
         self._refresh_units_table(force=True)
         self._update_auto_import_state()
 
@@ -2882,6 +2954,7 @@ class IaaWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Assignment import", summary)
         else:
             QtWidgets.QMessageBox.information(self, "Assignment import", summary)
+        self._load_persisted_agreement_state()
         self._refresh_units_table(force=True)
         self._update_auto_import_state()
 
@@ -3062,11 +3135,9 @@ class IaaWidget(QtWidgets.QWidget):
     def _update_unit_table_headers(self, reviewer_ids: Optional[List[str]] = None) -> None:
         if reviewer_ids is None:
             reviewer_ids = self.reviewer_column_order
-        headers = ["Unit", "Patient", "Document", "Overlap", "Status"]
+        headers = ["Unit", "Overlap", "Status"]
         self._unit_table_column_map = [
             {"type": "meta", "key": "unit"},
-            {"type": "meta", "key": "patient"},
-            {"type": "meta", "key": "document"},
             {"type": "meta", "key": "overlap"},
             {"type": "meta", "key": "status"},
         ]
@@ -3082,6 +3153,17 @@ class IaaWidget(QtWidgets.QWidget):
                         "reviewer_id": reviewer_id,
                     }
                 )
+                headers.append("Change history")
+                self._unit_table_column_map.append(
+                    {
+                        "type": "history",
+                        "label_id": label_id,
+                        "reviewer_id": reviewer_id,
+                    }
+                )
+        for key in self.unit_metadata_keys:
+            headers.append(self._metadata_header_for(key))
+            self._unit_table_column_map.append({"type": "metadata", "key": key})
         self.unit_table.setColumnCount(len(headers))
         self.unit_table.setHorizontalHeaderLabels(headers)
 
@@ -3171,56 +3253,181 @@ class IaaWidget(QtWidgets.QWidget):
             state[reviewer_id] = (str(path), stat_result.st_mtime, stat_result.st_size)
         return state
 
-    def _refresh_units_table(self, force: bool = False) -> None:
-        selected_unit = self._selected_unit_id()
-        existing_discord = {row["unit_id"] for row in self.unit_rows if row.get("discord")}
+    def _aggregate_state_token(self, round_dir: Optional[Path]) -> Optional[tuple[str, float, int]]:
+        if not round_dir:
+            return None
+        path = (round_dir / "round_aggregate.db").resolve()
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        return (str(path), stat_result.st_mtime, stat_result.st_size)
+
+    def _register_metadata_key(self, key: Optional[str]) -> None:
+        if not key:
+            return
+        if key not in self.unit_metadata_keys:
+            self.unit_metadata_keys.append(key)
+
+    def _finalize_metadata_keys(self) -> None:
+        unique: List[str] = []
+        for key in self.unit_metadata_keys:
+            if key not in unique:
+                unique.append(key)
+        priority = [key for key in self.METADATA_PRIORITY if key in unique]
+        others = [key for key in unique if key not in self.METADATA_PRIORITY]
+        self.unit_metadata_keys = priority + others
+
+    def _metadata_header_for(self, key: str) -> str:
+        mapping = {
+            "patient_icn": "Patient",
+            "doc_id": "Document",
+            "display_rank": "Display rank",
+            "note_count": "Note count",
+            "complete": "Complete",
+            "opened_at": "Opened at",
+            "completed_at": "Completed at",
+        }
+        return mapping.get(key, key.replace("_", " ").title())
+
+    def _format_metadata_value(self, key: str, value: object) -> str:
+        if key == "doc_id" and not value:
+            return "—"
+        if value is None:
+            return ""
+        if key == "complete" or isinstance(value, bool):
+            return "Yes" if bool(value) else "No"
+        return str(value)
+
+    def _collect_unit_metadata(self, summary: sqlite3.Row) -> Dict[str, object]:
+        metadata: Dict[str, object] = {}
+        metadata["patient_icn"] = summary["patient_icn"]
+        metadata["doc_id"] = summary["doc_id"]
+        self._register_metadata_key("patient_icn")
+        self._register_metadata_key("doc_id")
+        raw = summary.get("metadata_json") if hasattr(summary, "get") else summary["metadata_json"]
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                for key, value in sorted(payload.items()):
+                    if key in {"unit_id"}:
+                        continue
+                    if key in metadata and metadata[key]:
+                        continue
+                    metadata[key] = value
+                    self._register_metadata_key(key)
+        return metadata
+
+    def _metadata_from_assignment_row(self, unit_row: sqlite3.Row) -> Dict[str, object]:
+        data = dict(unit_row)
+        metadata: Dict[str, object] = {}
+        metadata["patient_icn"] = data.get("patient_icn")
+        metadata["doc_id"] = data.get("doc_id")
+        self._register_metadata_key("patient_icn")
+        self._register_metadata_key("doc_id")
+        for key, value in sorted(data.items()):
+            if key in {"unit_id", "patient_icn", "doc_id"}:
+                continue
+            metadata[key] = value
+            self._register_metadata_key(key)
+        return metadata
+
+    def _load_unit_rows_from_aggregate(
+        self,
+        aggregate_db: Database,
+        round_id: str,
+        existing_discord: Set[str],
+    ) -> bool:
+        try:
+            with aggregate_db.connect() as conn:
+                summary_rows = conn.execute(
+                    "SELECT unit_id, patient_icn, doc_id, metadata_json FROM unit_summary WHERE round_id=?",
+                    (round_id,),
+                ).fetchall()
+                annotation_rows = conn.execute(
+                    "SELECT unit_id, reviewer_id, label_id, value, value_num, value_date, na, notes FROM unit_annotations WHERE round_id=?",
+                    (round_id,),
+                ).fetchall()
+                history_rows = conn.execute(
+                    "SELECT unit_id, reviewer_id, label_id, history FROM annotation_change_history WHERE round_id=?",
+                    (round_id,),
+                ).fetchall()
+        except Exception:
+            return False
+        unit_map: Dict[str, Dict[str, object]] = {}
+        history_map: Dict[str, Dict[tuple[str, str], str]] = {}
+        for history in history_rows:
+            unit_history = history_map.setdefault(history["unit_id"], {})
+            key = (history["reviewer_id"], history["label_id"])
+            unit_history[key] = history["history"] or ""
+        for summary in summary_rows:
+            unit_id = summary["unit_id"]
+            metadata = self._collect_unit_metadata(summary)
+            entry = {
+                "unit_id": unit_id,
+                "patient_icn": metadata.get("patient_icn"),
+                "doc_id": metadata.get("doc_id"),
+                "metadata": metadata,
+                "reviewer_annotations": {},
+                "reviewer_ids": set(),
+                "change_history": history_map.get(unit_id, {}),
+                "is_overlap": False,
+                "discord": unit_id in existing_discord,
+            }
+            unit_map[unit_id] = entry
+        for ann_row in annotation_rows:
+            unit_id = ann_row["unit_id"]
+            entry = unit_map.setdefault(
+                unit_id,
+                {
+                    "unit_id": unit_id,
+                    "patient_icn": None,
+                    "doc_id": None,
+                    "metadata": {},
+                    "reviewer_annotations": {},
+                    "reviewer_ids": set(),
+                    "change_history": history_map.get(unit_id, {}),
+                    "is_overlap": False,
+                    "discord": unit_id in existing_discord,
+                },
+            )
+            reviewer_id = ann_row["reviewer_id"]
+            label_id = ann_row["label_id"]
+            entry["reviewer_ids"].add(reviewer_id)
+            annotations = entry["reviewer_annotations"].setdefault(reviewer_id, {})
+            annotations[label_id] = {
+                "display": self._compute_annotation_display(
+                    ann_row["value"], ann_row["value_num"], ann_row["value_date"], ann_row["na"]
+                ),
+                "notes": ann_row["notes"] or "",
+                "value": ann_row["value"],
+                "value_num": ann_row["value_num"],
+                "value_date": ann_row["value_date"],
+                "na": ann_row["na"],
+            }
         self.unit_rows = []
-        self.unit_table.clearContents()
-        self.unit_table.setRowCount(0)
-        self._clear_document_panel()
-        if not self.current_round:
-            self.reviewer_column_order = []
-            self._update_unit_table_headers()
-            self._display_unit_rows(selected_unit)
-            return
-        round_id = self.current_round.get("round_id")
-        project_id = self.ctx.current_project_id()
-        assignment_state = self._current_assignment_state()
-        if round_id and not force:
-            cached = self._unit_table_cache.get(str(round_id))
-            if (
-                cached
-                and cached.get("assignment_state") == assignment_state
-                and cached.get("project_id") == project_id
-            ):
-                self.reviewer_column_order = list(cached.get("reviewer_order", []))
-                self.unit_rows = copy.deepcopy(cached.get("unit_rows", []))
-                self._update_unit_table_headers()
-                self._display_unit_rows(selected_unit)
-                return
-        reviewer_ids: List[str] = []
-        for reviewer in self.current_round.get("reviewers", []):
-            reviewer_id = reviewer.get("reviewer_id")
-            if reviewer_id:
-                reviewer_ids.append(reviewer_id)
-        for reviewer_id in self.assignment_paths.keys():
-            if reviewer_id not in reviewer_ids:
-                reviewer_ids.append(reviewer_id)
-        self.reviewer_column_order = sorted(
-            reviewer_ids,
-            key=lambda rid: self.current_reviewer_names.get(rid, rid).lower(),
-        )
-        if not self.assignment_paths:
-            self._update_unit_table_headers()
-            self._display_unit_rows(selected_unit)
-            if round_id:
-                self._unit_table_cache[str(round_id)] = {
-                    "unit_rows": [],
-                    "reviewer_order": list(self.reviewer_column_order),
-                    "assignment_state": assignment_state,
-                    "project_id": project_id,
-                }
-            return
+        for unit_id, entry in unit_map.items():
+            metadata = entry.get("metadata") or {}
+            if not metadata:
+                metadata.update({"patient_icn": entry.get("patient_icn"), "doc_id": entry.get("doc_id")})
+                self._register_metadata_key("patient_icn")
+                self._register_metadata_key("doc_id")
+            reviewers = sorted(
+                entry.get("reviewer_ids", []),
+                key=lambda rid: self.current_reviewer_names.get(rid, rid),
+            )
+            entry["reviewer_ids"] = reviewers
+            entry["is_overlap"] = self._is_overlap_unit(unit_id, reviewers)
+            entry["patient_icn"] = metadata.get("patient_icn")
+            entry["doc_id"] = metadata.get("doc_id")
+            entry["discord"] = unit_id in existing_discord
+            self.unit_rows.append(entry)
+        return bool(self.unit_rows)
+
+    def _load_unit_rows_from_assignments(self, existing_discord: Set[str]) -> None:
         unit_map: Dict[str, Dict[str, object]] = {}
         for reviewer_id, path in self.assignment_paths.items():
             if not path:
@@ -3229,18 +3436,15 @@ class IaaWidget(QtWidgets.QWidget):
             if not db:
                 continue
             with db.connect() as conn:
-                units = conn.execute(
-                    "SELECT unit_id, patient_icn, doc_id FROM units ORDER BY display_rank"
-                ).fetchall()
+                units = conn.execute("SELECT * FROM units ORDER BY display_rank").fetchall()
                 annotations = conn.execute(
-                    "SELECT unit_id, label_id, value, value_num, value_date, na, notes FROM annotations"
+                    "SELECT unit_id, label_id, value, value_num, value_date, na, notes FROM annotations",
                 ).fetchall()
             ann_map: Dict[str, Dict[str, Dict[str, object]]] = {}
             for ann_row in annotations:
                 unit_id = ann_row["unit_id"]
-                formatted = self._format_value(ann_row)
                 ann_map.setdefault(unit_id, {})[ann_row["label_id"]] = {
-                    "display": formatted,
+                    "display": self._format_value(ann_row),
                     "notes": ann_row["notes"] or "",
                     "value": ann_row["value"],
                     "value_num": ann_row["value_num"],
@@ -3255,32 +3459,285 @@ class IaaWidget(QtWidgets.QWidget):
                         "unit_id": unit_id,
                         "patient_icn": unit_row["patient_icn"],
                         "doc_id": unit_row["doc_id"],
+                        "metadata": {},
                         "reviewer_annotations": {},
                         "reviewer_ids": set(),
+                        "change_history": {},
+                        "is_overlap": False,
+                        "discord": unit_id in existing_discord,
                     },
                 )
-                entry["patient_icn"] = entry.get("patient_icn") or unit_row["patient_icn"]
-                entry["doc_id"] = entry.get("doc_id") or unit_row["doc_id"]
+                metadata = entry.setdefault("metadata", {})
+                new_metadata = self._metadata_from_assignment_row(unit_row)
+                for key, value in new_metadata.items():
+                    if key not in metadata or metadata[key] in (None, "", "—"):
+                        metadata[key] = value
+                entry["patient_icn"] = metadata.get("patient_icn")
+                entry["doc_id"] = metadata.get("doc_id")
                 entry["reviewer_ids"].add(reviewer_id)
                 entry["reviewer_annotations"][reviewer_id] = ann_map.get(unit_id, {})
+        self.unit_rows = []
         for unit_id, entry in unit_map.items():
-            reviewer_ids_for_unit = sorted(
-                entry["reviewer_ids"], key=lambda rid: self.current_reviewer_names.get(rid, rid)
+            reviewers = sorted(
+                entry.get("reviewer_ids", []),
+                key=lambda rid: self.current_reviewer_names.get(rid, rid),
             )
-            entry["reviewer_ids"] = reviewer_ids_for_unit
-            entry["is_overlap"] = self._is_overlap_unit(unit_id, reviewer_ids_for_unit)
+            entry["reviewer_ids"] = reviewers
+            entry["is_overlap"] = self._is_overlap_unit(unit_id, reviewers)
             entry["discord"] = unit_id in existing_discord
             self.unit_rows.append(entry)
+
+    def _determine_reviewer_order(self) -> List[str]:
+        reviewer_ids: Set[str] = set()
+        for reviewer in self.current_round.get("reviewers", []):
+            rid = reviewer.get("reviewer_id")
+            if rid:
+                reviewer_ids.add(rid)
+        reviewer_ids.update(self.assignment_paths.keys())
+        for row in self.unit_rows:
+            for reviewer_id in row.get("reviewer_annotations", {}).keys():
+                if reviewer_id:
+                    reviewer_ids.add(reviewer_id)
+        return sorted(
+            reviewer_ids,
+            key=lambda rid: self.current_reviewer_names.get(rid, rid).lower(),
+        )
+
+    def _load_persisted_agreement_state(self) -> None:
+        if not self.current_round:
+            self._discordant_units_by_label = {}
+            self._active_discord_ids = set()
+            self._last_evaluated_label_id = None
+            return
+        round_id = self.current_round.get("round_id")
+        if not round_id:
+            self._discordant_units_by_label = {}
+            self._active_discord_ids = set()
+            self._last_evaluated_label_id = None
+            return
+        round_dir = self._resolve_round_dir()
+        if not round_dir:
+            self._discordant_units_by_label = {}
+            self._active_discord_ids = set()
+            return
+        aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=False)
+        if not aggregate_db:
+            self._discordant_units_by_label = {}
+            self._active_discord_ids = set()
+            self._last_evaluated_label_id = None
+            return
+        try:
+            with aggregate_db.connect() as conn:
+                state_row = conn.execute(
+                    "SELECT last_label_id FROM round_state WHERE round_id=?",
+                    (round_id,),
+                ).fetchone()
+                status_rows = conn.execute(
+                    "SELECT label_id, unit_id, status FROM unit_status WHERE round_id=?",
+                    (round_id,),
+                ).fetchall()
+        except Exception:
+            self._discordant_units_by_label = {}
+            self._active_discord_ids = set()
+            return
+        if state_row and state_row["last_label_id"]:
+            self._last_evaluated_label_id = state_row["last_label_id"]
+        else:
+            self._last_evaluated_label_id = None
+        status_map: Dict[str, Set[str]] = {}
+        for row in status_rows:
+            status_text = (row["status"] or "").lower()
+            if status_text == "discordant":
+                status_map.setdefault(row["label_id"], set()).add(row["unit_id"])
+        self._discordant_units_by_label = status_map
+        if self._last_evaluated_label_id:
+            self._active_discord_ids = set(
+                status_map.get(self._last_evaluated_label_id, set())
+            )
+        else:
+            self._active_discord_ids = set()
+        try:
+            self.round_manifest = self._load_manifest(round_dir)
+        except Exception:
+            pass
+
+    def _update_cached_unit_rows(self) -> None:
+        if not self.current_round:
+            return
+        round_id = self.current_round.get("round_id")
+        if not round_id:
+            return
+        cache_entry = self._unit_table_cache.get(str(round_id))
+        if cache_entry is not None:
+            cache_entry["unit_rows"] = copy.deepcopy(self.unit_rows)
+            cache_entry["metadata_keys"] = list(self.unit_metadata_keys)
+
+    def _persist_discord_state(self, label_id: str, discordant_ids: Set[str]) -> None:
+        round_dir = self._resolve_round_dir()
+        if not round_dir or not self.current_round:
+            return
+        round_id = self.current_round.get("round_id")
+        if not round_id:
+            return
+        aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=True)
+        if not aggregate_db:
+            return
+        with aggregate_db.transaction() as conn:
+            conn.execute(
+                "DELETE FROM unit_status WHERE round_id=? AND label_id=?",
+                (round_id, label_id),
+            )
+            if discordant_ids:
+                conn.executemany(
+                    "INSERT INTO unit_status(round_id, label_id, unit_id, status) VALUES (?,?,?,?)",
+                    [
+                        (round_id, label_id, unit_id, "discordant")
+                        for unit_id in sorted(discordant_ids)
+                    ],
+                )
+            conn.execute(
+                "INSERT INTO round_state(round_id, last_label_id) VALUES (?, ?) "
+                "ON CONFLICT(round_id) DO UPDATE SET last_label_id=excluded.last_label_id",
+                (round_id, label_id),
+            )
+        self.ctx.mark_dirty()
+
+    def _update_discord_state(self, label_id: str, discordant_ids: Set[str]) -> None:
+        self._discordant_units_by_label[label_id] = set(discordant_ids)
+        self._last_evaluated_label_id = label_id
+        self._apply_discord_flags(discordant_ids)
+        self._persist_discord_state(label_id, discordant_ids)
+
+    def _persist_annotation_edit(
+        self,
+        unit_id: str,
+        reviewer_id: str,
+        label_id: str,
+        annotation: Dict[str, object],
+        history_entry: str,
+    ) -> None:
+        round_dir = self._resolve_round_dir()
+        if not round_dir or not self.current_round:
+            return
+        round_id = self.current_round.get("round_id")
+        if not round_id:
+            return
+        aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=True)
+        if not aggregate_db:
+            return
+        with aggregate_db.transaction() as conn:
+            existing = conn.execute(
+                "SELECT notes FROM unit_annotations WHERE round_id=? AND unit_id=? AND reviewer_id=? AND label_id=?",
+                (round_id, unit_id, reviewer_id, label_id),
+            ).fetchone()
+            notes_value = annotation.get("notes", "") if annotation else ""
+            if existing:
+                if not notes_value:
+                    notes_value = existing["notes"] or ""
+                conn.execute(
+                    "UPDATE unit_annotations SET value=?, value_num=?, value_date=?, na=?, notes=? WHERE round_id=? AND unit_id=? AND reviewer_id=? AND label_id=?",
+                    (
+                        annotation.get("value"),
+                        annotation.get("value_num"),
+                        annotation.get("value_date"),
+                        annotation.get("na"),
+                        notes_value,
+                        round_id,
+                        unit_id,
+                        reviewer_id,
+                        label_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO unit_annotations(round_id, unit_id, reviewer_id, label_id, value, value_num, value_date, na, notes) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        round_id,
+                        unit_id,
+                        reviewer_id,
+                        label_id,
+                        annotation.get("value"),
+                        annotation.get("value_num"),
+                        annotation.get("value_date"),
+                        annotation.get("na"),
+                        notes_value,
+                    ),
+                )
+            history_row = conn.execute(
+                "SELECT history FROM annotation_change_history WHERE round_id=? AND unit_id=? AND reviewer_id=? AND label_id=?",
+                (round_id, unit_id, reviewer_id, label_id),
+            ).fetchone()
+            if history_row:
+                existing_history = history_row["history"] or ""
+                combined = f"{existing_history}\n{history_entry}" if existing_history else history_entry
+                conn.execute(
+                    "UPDATE annotation_change_history SET history=? WHERE round_id=? AND unit_id=? AND reviewer_id=? AND label_id=?",
+                    (combined, round_id, unit_id, reviewer_id, label_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO annotation_change_history(round_id, unit_id, reviewer_id, label_id, history) VALUES (?,?,?,?,?)",
+                    (round_id, unit_id, reviewer_id, label_id, history_entry),
+                )
+        self.ctx.mark_dirty()
+
+    def _refresh_units_table(self, force: bool = False) -> None:
+        selected_unit = self._selected_unit_id()
+        self._load_persisted_agreement_state()
+        existing_discord = set(self._active_discord_ids)
+        self.unit_rows = []
+        self.unit_metadata_keys = []
+        self.unit_table.clearContents()
+        self.unit_table.setRowCount(0)
+        self._clear_document_panel()
+        if not self.current_round:
+            self.reviewer_column_order = []
+            self._update_unit_table_headers()
+            self._display_unit_rows(selected_unit)
+            return
+        round_id = self.current_round.get('round_id')
+        project_id = self.ctx.current_project_id()
+        assignment_state = self._current_assignment_state()
+        round_dir = self._resolve_round_dir()
+        aggregate_state = self._aggregate_state_token(round_dir)
+        if round_id and not force:
+            cached = self._unit_table_cache.get(str(round_id))
+            if (
+                cached
+                and cached.get('assignment_state') == assignment_state
+                and cached.get('project_id') == project_id
+                and cached.get('aggregate_state') == aggregate_state
+            ):
+                self.reviewer_column_order = list(cached.get('reviewer_order', []))
+                self.unit_rows = copy.deepcopy(cached.get('unit_rows', []))
+                self.unit_metadata_keys = list(cached.get('metadata_keys', []))
+                for row in self.unit_rows:
+                    row['discord'] = row.get('unit_id') in existing_discord
+                self._update_unit_table_headers()
+                self._display_unit_rows(selected_unit)
+                return
+        aggregate_db = None
+        if round_dir:
+            aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=False)
+        loaded = False
+        if aggregate_db and round_id:
+            loaded = self._load_unit_rows_from_aggregate(aggregate_db, str(round_id), existing_discord)
+        if not loaded:
+            self._load_unit_rows_from_assignments(existing_discord)
+        self._finalize_metadata_keys()
+        self.reviewer_column_order = self._determine_reviewer_order()
         for index, row in enumerate(self.unit_rows):
-            row["index"] = index
+            row['index'] = index
         self._update_unit_table_headers()
         self._display_unit_rows(selected_unit)
         if round_id:
             self._unit_table_cache[str(round_id)] = {
-                "unit_rows": copy.deepcopy(self.unit_rows),
-                "reviewer_order": list(self.reviewer_column_order),
-                "assignment_state": assignment_state,
-                "project_id": project_id,
+                'unit_rows': copy.deepcopy(self.unit_rows),
+                'reviewer_order': list(self.reviewer_column_order),
+                'assignment_state': assignment_state,
+                'project_id': project_id,
+                'metadata_keys': list(self.unit_metadata_keys),
+                'aggregate_state': aggregate_state,
             }
 
     def _export_unit_table(self) -> None:
@@ -3358,10 +3815,6 @@ class IaaWidget(QtWidgets.QWidget):
                         text = row.get("unit_id", "")
                         item = QtWidgets.QTableWidgetItem(text)
                         item.setData(QtCore.Qt.ItemDataRole.UserRole, row.get("index"))
-                    elif key == "patient":
-                        item = QtWidgets.QTableWidgetItem(row.get("patient_icn") or "")
-                    elif key == "document":
-                        item = QtWidgets.QTableWidgetItem(row.get("doc_id") or "—")
                     elif key == "overlap":
                         item = QtWidgets.QTableWidgetItem("Yes" if row.get("is_overlap") else "No")
                     elif key == "status":
@@ -3376,6 +3829,19 @@ class IaaWidget(QtWidgets.QWidget):
                     text = self._format_annotation_cell(entry)
                     item = QtWidgets.QTableWidgetItem(text)
                     item.setToolTip(self._format_annotation_line(label_id, entry))
+                elif column_type == "history":
+                    reviewer_id = column_info.get("reviewer_id")
+                    label_id = column_info.get("label_id")
+                    history_map = row.get("change_history", {})
+                    history_text = history_map.get((reviewer_id, label_id), "")
+                    item = QtWidgets.QTableWidgetItem(history_text)
+                    if history_text:
+                        item.setToolTip(history_text)
+                elif column_type == "metadata":
+                    key = column_info.get("key")
+                    metadata = row.get("metadata", {})
+                    value = metadata.get(key)
+                    item = QtWidgets.QTableWidgetItem(self._format_metadata_value(key, value))
                 else:
                     item = QtWidgets.QTableWidgetItem("")
                 row_items.append(item)
@@ -3397,6 +3863,121 @@ class IaaWidget(QtWidgets.QWidget):
             self.unit_table.sortItems(sort_section, sort_order)
         if selected_unit:
             self._select_unit_in_table(selected_unit)
+
+    def _on_unit_table_context_menu(self, point: QtCore.QPoint) -> None:
+        item = self.unit_table.itemAt(point)
+        if not item:
+            return
+        column = item.column()
+        if column < 0 or column >= len(self._unit_table_column_map):
+            return
+        column_info = self._unit_table_column_map[column]
+        if column_info.get("type") != "label":
+            return
+        menu = QtWidgets.QMenu(self.unit_table)
+        edit_action = menu.addAction("Edit reviewer label…")
+        global_pos = self.unit_table.viewport().mapToGlobal(point)
+        chosen = menu.exec(global_pos)
+        if chosen == edit_action:
+            self._edit_reviewer_label(item.row(), column)
+
+    def _edit_reviewer_label(self, row: int, column: int) -> None:
+        if column < 0 or column >= len(self._unit_table_column_map):
+            return
+        column_info = self._unit_table_column_map[column]
+        if column_info.get("type") != "label":
+            return
+        item = self.unit_table.item(row, 0)
+        if not item:
+            return
+        data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        try:
+            index = int(data)
+        except (TypeError, ValueError):
+            return
+        if index < 0 or index >= len(self.unit_rows):
+            return
+        label_id = column_info.get("label_id")
+        reviewer_id = column_info.get("reviewer_id")
+        if not label_id or not reviewer_id:
+            return
+        definition = self.label_definitions.get(label_id)
+        if not definition:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Edit reviewer label",
+                "Label definition is unavailable; reload the project and try again.",
+            )
+            return
+        unit_row = self.unit_rows[index]
+        reviewer_annotations = unit_row.setdefault("reviewer_annotations", {})
+        annotations = reviewer_annotations.setdefault(reviewer_id, {})
+        current_annotation = annotations.get(label_id, {})
+        current_display = self._format_annotation_cell(current_annotation)
+        dialog = ReviewerLabelEditDialog(
+            definition,
+            reviewer_name=self.current_reviewer_names.get(reviewer_id, reviewer_id),
+            unit_id=str(unit_row.get("unit_id") or ""),
+            current_annotation=current_annotation,
+            current_display=current_display,
+            parent=self,
+        )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        result = dialog.result_data
+        if not result:
+            return
+        annotation_payload = result["annotation"]
+        rationale = result["rationale"]
+        old_annotation = current_annotation or {}
+        if (
+            old_annotation.get("value") == annotation_payload["value"]
+            and old_annotation.get("value_num") == annotation_payload["value_num"]
+            and old_annotation.get("value_date") == annotation_payload["value_date"]
+            and bool(old_annotation.get("na")) == bool(annotation_payload["na"])
+        ):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Edit reviewer label",
+                "No changes detected for the selected label.",
+            )
+            return
+        notes = old_annotation.get("notes", "") if isinstance(old_annotation, dict) else ""
+        new_entry = {
+            "display": self._compute_annotation_display(
+                annotation_payload["value"],
+                annotation_payload["value_num"],
+                annotation_payload["value_date"],
+                annotation_payload["na"],
+            ),
+            "notes": notes,
+            "value": annotation_payload["value"],
+            "value_num": annotation_payload["value_num"],
+            "value_date": annotation_payload["value_date"],
+            "na": annotation_payload["na"],
+        }
+        annotations[label_id] = new_entry
+        history_map = unit_row.setdefault("change_history", {})
+        old_display = self._format_annotation_cell(old_annotation)
+        new_display = self._format_annotation_cell(new_entry)
+        timestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        history_entry = f"{timestamp}: {old_display or '—'} -> {new_display or '—'} ({rationale})"
+        key = (reviewer_id, label_id)
+        if key in history_map and history_map[key]:
+            history_map[key] = history_map[key] + "\n" + history_entry
+        else:
+            history_map[key] = history_entry
+        unit_id = str(unit_row.get("unit_id") or "")
+        self._persist_annotation_edit(unit_id, reviewer_id, label_id, {**annotation_payload, "notes": notes}, history_entry)
+        current_label_id = self.label_selector.currentData()
+        self._load_persisted_agreement_state()
+        self._refresh_units_table(force=True)
+        if current_label_id is not None:
+            idx = self.label_selector.findData(current_label_id)
+            if idx >= 0:
+                self.label_selector.setCurrentIndex(idx)
+        if unit_id:
+            self._select_unit_in_table(unit_id)
 
     def _select_unit_in_table(self, unit_id: str) -> None:
         if not unit_id:
@@ -3566,9 +4147,11 @@ class IaaWidget(QtWidgets.QWidget):
         return len(set(reviewer_list)) > 1
 
     def _apply_discord_flags(self, discordant_ids: Set[str]) -> None:
+        self._active_discord_ids = set(discordant_ids)
         for row in self.unit_rows:
             row["discord"] = row["unit_id"] in discordant_ids
         self._display_unit_rows()
+        self._update_cached_unit_rows()
 
     def _scroll_to_first_discordant(self, discordant_ids: Set[str]) -> None:
         if not discordant_ids:
@@ -3651,7 +4234,7 @@ class IaaWidget(QtWidgets.QWidget):
                 "IAA",
                 "No annotations found for the selected label.",
             )
-            self._apply_discord_flags(set())
+            self._update_discord_state(label_id, set())
             return
         values_by_unit: Dict[str, Dict[str, str]] = {}
         for row in rows:
@@ -3666,7 +4249,7 @@ class IaaWidget(QtWidgets.QWidget):
                 "IAA",
                 "No overlapping units with complete annotations were found.",
             )
-            self._apply_discord_flags(set())
+            self._update_discord_state(label_id, set())
             return
         metric = self.metric_selector.currentText()
         result_lines: List[str] = []
@@ -3724,8 +4307,25 @@ class IaaWidget(QtWidgets.QWidget):
         result_text = "\n".join([heading, *result_lines])
         QtWidgets.QMessageBox.information(self, "IAA results", result_text)
         self.round_summary.setText(result_text)
-        self._apply_discord_flags(filtered_discordant)
+        self._update_discord_state(label_id, filtered_discordant)
         self._scroll_to_first_discordant(filtered_discordant)
+
+    @staticmethod
+    def _compute_annotation_display(
+        value: Optional[str],
+        value_num: Optional[float],
+        value_date: Optional[str],
+        na: object,
+    ) -> str:
+        if na:
+            return "N/A"
+        if value_num is not None:
+            return format(value_num, "g")
+        if value is not None and value != "":
+            return str(value)
+        if value_date:
+            return value_date
+        return ""
 
     @staticmethod
     def _format_value(row: sqlite3.Row) -> str:
@@ -3739,6 +4339,235 @@ class IaaWidget(QtWidgets.QWidget):
             return row["value_date"]
         return ""
 
+
+
+
+class ReviewerLabelEditDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        definition: LabelDefinition,
+        reviewer_name: str,
+        unit_id: str,
+        current_annotation: Dict[str, object],
+        current_display: str,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.definition = definition
+        self.setWindowTitle("Edit reviewer label")
+        self.result_data: Optional[Dict[str, object]] = None
+        self.value_combo: Optional[QtWidgets.QComboBox] = None
+        self.value_line_edit: Optional[QtWidgets.QLineEdit] = None
+        self.value_text_edit: Optional[QtWidgets.QPlainTextEdit] = None
+        self.value_date_edit: Optional[QtWidgets.QDateEdit] = None
+        self.multi_checkboxes: List[QtWidgets.QCheckBox] = []
+        self.na_checkbox: Optional[QtWidgets.QCheckBox] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QLabel(
+            f"Reviewer: {reviewer_name}\nUnit: {unit_id or '—'}"
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+        previous = QtWidgets.QLabel(f"Previous value: {current_display or '—'}")
+        previous.setWordWrap(True)
+        layout.addWidget(previous)
+
+        self._build_value_controls(layout, current_annotation)
+
+        rationale_label = QtWidgets.QLabel("Rationale for change:")
+        layout.addWidget(rationale_label)
+        self.rationale_edit = QtWidgets.QPlainTextEdit()
+        self.rationale_edit.setPlaceholderText("Explain why this value should change")
+        self.rationale_edit.setMinimumHeight(80)
+        layout.addWidget(self.rationale_edit)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _build_value_controls(
+        self, layout: QtWidgets.QVBoxLayout, current_annotation: Dict[str, object]
+    ) -> None:
+        type_lower = self.definition.type.lower()
+        current_value = (current_annotation.get("value") or "") if current_annotation else ""
+        current_values = set(str(current_value).split(",")) if current_value else set()
+        current_value_num = current_annotation.get("value_num")
+        current_value_date = current_annotation.get("value_date")
+        is_na = bool(current_annotation.get("na"))
+
+        if type_lower in {"boolean", "categorical_single", "ordinal"}:
+            combo = QtWidgets.QComboBox()
+            combo.addItem("Select…", "")
+            for option in sorted(self.definition.options, key=lambda opt: opt.get("order_index", 0)):
+                combo.addItem(str(option.get("display")), option.get("value"))
+            if current_value:
+                index = combo.findData(current_value)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            self.value_combo = combo
+            layout.addWidget(combo)
+        elif type_lower == "categorical_multi":
+            box = QtWidgets.QGroupBox("Select all that apply")
+            box_layout = QtWidgets.QVBoxLayout(box)
+            for option in sorted(self.definition.options, key=lambda opt: opt.get("order_index", 0)):
+                checkbox = QtWidgets.QCheckBox(str(option.get("display")))
+                checkbox.setProperty("option_value", option.get("value"))
+                if option.get("value") in current_values:
+                    checkbox.setChecked(True)
+                self.multi_checkboxes.append(checkbox)
+                box_layout.addWidget(checkbox)
+            layout.addWidget(box)
+        elif type_lower in {"integer", "float"}:
+            line = QtWidgets.QLineEdit()
+            if type_lower == "integer":
+                validator = QtGui.QIntValidator()
+            else:
+                validator = QtGui.QDoubleValidator()
+                validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
+            line.setValidator(validator)
+            if current_value:
+                line.setText(str(current_value))
+            elif current_value_num is not None:
+                line.setText(str(current_value_num))
+            self.value_line_edit = line
+            layout.addWidget(line)
+        elif type_lower == "date":
+            date_edit = QtWidgets.QDateEdit()
+            date_edit.setCalendarPopup(True)
+            if current_value_date:
+                parsed = QtCore.QDate.fromString(str(current_value_date), QtCore.Qt.DateFormat.ISODate)
+                if parsed.isValid():
+                    date_edit.setDate(parsed)
+            self.value_date_edit = date_edit
+            layout.addWidget(date_edit)
+        else:
+            text_edit = QtWidgets.QPlainTextEdit()
+            text_edit.setPlainText(str(current_value))
+            text_edit.setMinimumHeight(80)
+            self.value_text_edit = text_edit
+            layout.addWidget(text_edit)
+
+        if self.definition.na_allowed:
+            na_box = QtWidgets.QCheckBox("Mark as N/A")
+            na_box.setChecked(is_na)
+            na_box.stateChanged.connect(
+                lambda state: self._set_value_widgets_enabled(state != QtCore.Qt.CheckState.Checked)
+            )
+            self.na_checkbox = na_box
+            layout.addWidget(na_box)
+            self._set_value_widgets_enabled(not is_na)
+
+    def _set_value_widgets_enabled(self, enabled: bool) -> None:
+        if self.value_combo is not None:
+            self.value_combo.setEnabled(enabled)
+        if self.value_line_edit is not None:
+            self.value_line_edit.setEnabled(enabled)
+        if self.value_text_edit is not None:
+            self.value_text_edit.setEnabled(enabled)
+        if self.value_date_edit is not None:
+            self.value_date_edit.setEnabled(enabled)
+        for checkbox in self.multi_checkboxes:
+            checkbox.setEnabled(enabled)
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        rationale = self.rationale_edit.toPlainText().strip()
+        if not rationale:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Edit reviewer label",
+                "Please provide a rationale for the change.",
+            )
+            return
+        is_na = bool(self.na_checkbox.isChecked()) if self.na_checkbox else False
+        value: Optional[str]
+        value_num: Optional[float]
+        value_date: Optional[str]
+        if is_na:
+            value = None
+            value_num = None
+            value_date = None
+        else:
+            type_lower = self.definition.type.lower()
+            if type_lower in {"boolean", "categorical_single", "ordinal"}:
+                assert self.value_combo is not None
+                selected = self.value_combo.currentData()
+                if not selected:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Edit reviewer label",
+                        "Select a value before saving.",
+                    )
+                    return
+                value = str(selected)
+                value_num = None
+                value_date = None
+            elif type_lower == "categorical_multi":
+                selections = [
+                    str(cb.property("option_value"))
+                    for cb in self.multi_checkboxes
+                    if cb.isChecked()
+                ]
+                if not selections:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Edit reviewer label",
+                        "Select at least one option before saving.",
+                    )
+                    return
+                value = ",".join(selections)
+                value_num = None
+                value_date = None
+            elif type_lower in {"integer", "float"}:
+                assert self.value_line_edit is not None
+                text = self.value_line_edit.text().strip()
+                if not text:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Edit reviewer label",
+                        "Enter a numeric value before saving.",
+                    )
+                    return
+                try:
+                    if type_lower == "integer":
+                        value_num = int(text)
+                    else:
+                        value_num = float(text)
+                except ValueError:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Edit reviewer label",
+                        "Enter a valid numeric value.",
+                    )
+                    return
+                value = text
+                value_date = None
+            elif type_lower == "date":
+                assert self.value_date_edit is not None
+                value_date = self.value_date_edit.date().toString(QtCore.Qt.DateFormat.ISODate)
+                value = None
+                value_num = None
+            else:
+                assert self.value_text_edit is not None
+                value = self.value_text_edit.toPlainText().strip()
+                value_num = None
+                value_date = None
+
+        annotation_payload = {
+            "value": value,
+            "value_num": value_num,
+            "value_date": value_date,
+            "na": 1 if is_na else 0,
+        }
+        self.result_data = {
+            "annotation": annotation_payload,
+            "rationale": rationale,
+        }
+        super().accept()
 
 
 class AdminMainWindow(QtWidgets.QMainWindow):
