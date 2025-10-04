@@ -91,6 +91,30 @@ class Project(Record):
 
 
 @dataclass
+class ProjectCorpus(Record):
+    corpus_id: str
+    project_id: str
+    name: str
+    corpus_path: str
+    created_at: str
+
+    __tablename__ = "corpora"
+    __schema__ = (
+        """
+        CREATE TABLE IF NOT EXISTS corpora (
+            corpus_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            corpus_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(project_id, name),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id)
+        )
+        """,
+    )
+
+
+@dataclass
 class Phenotype(Record):
     pheno_id: str
     project_id: str
@@ -98,6 +122,7 @@ class Phenotype(Record):
     level: str
     description: str
     corpus_path: str
+    default_corpus_id: Optional[str] = None
 
     __tablename__ = "phenotypes"
     __schema__ = (
@@ -109,7 +134,9 @@ class Phenotype(Record):
             level TEXT CHECK(level IN ('single_doc','multi_doc')) NOT NULL,
             description TEXT NOT NULL,
             corpus_path TEXT NOT NULL,
+            default_corpus_id TEXT NULL,
             UNIQUE(project_id, name),
+            FOREIGN KEY(default_corpus_id) REFERENCES corpora(corpus_id),
             FOREIGN KEY(project_id) REFERENCES projects(project_id)
         )
         """
