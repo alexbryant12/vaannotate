@@ -23,8 +23,19 @@ PROJECT_SCHEMA = [
         name TEXT NOT NULL,
         level TEXT NOT NULL CHECK(level IN ('single_doc','multi_doc')),
         description TEXT,
-        corpus_path TEXT NOT NULL,
+        storage_path TEXT NOT NULL,
         UNIQUE(project_id, name)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS project_corpora(
+        corpus_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(project_id, name),
+        FOREIGN KEY(project_id) REFERENCES projects(project_id)
     );
     """,
     """

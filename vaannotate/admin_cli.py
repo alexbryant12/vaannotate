@@ -69,9 +69,24 @@ def addphenotype(
     name: str = typer.Option(...),
     level: str = typer.Option(...),
     description: Optional[str] = typer.Option(None),
-    corpus_path: Path = typer.Option(..., help="Path to the corpus SQLite database for this phenotype"),
+    storage_path: Optional[Path] = typer.Option(
+        None,
+        help="Relative directory where phenotype assets will be stored (defaults to phenotypes/<pheno_id>)",
+    ),
 ) -> None:
-    with get_connection(build_project_paths(project_dir).project_db) as conn:
+    paths = build_project_paths(project_dir)
+    with get_connection(paths.project_db) as conn:
+        if storage_path is None:
+            storage = Path("phenotypes") / pheno_id
+        else:
+            storage = storage_path
+        if storage.is_absolute():
+            try:
+                rel_storage = storage.relative_to(paths.root)
+            except ValueError:
+                rel_storage = storage
+        else:
+            rel_storage = storage
         add_phenotype(
             conn,
             pheno_id,
@@ -79,7 +94,7 @@ def addphenotype(
             name,
             level,
             description,
-            corpus_path=str(corpus_path),
+            storage_path=str(Path(rel_storage).as_posix()),
         )
         conn.commit()
     print(f"Added phenotype {pheno_id}")

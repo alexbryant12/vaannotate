@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type
 
@@ -33,6 +34,7 @@ from vaannotate.utils import copy_sqlite_database, ensure_dir
 PROJECT_MODELS = [
     models.Project,
     models.Phenotype,
+    models.ProjectCorpus,
     models.LabelSet,
     models.Label,
     models.LabelOption,
@@ -258,9 +260,27 @@ class ProjectContext(QtCore.QObject):
         if not self.project_root:
             return
         try:
+            corpora = list(self.list_corpora())
             phenotypes = list(self.list_phenotypes())
         except Exception:  # noqa: BLE001
             return
+        for corpus in corpora:
+            corpus_id: Optional[object]
+            if isinstance(corpus, sqlite3.Row):
+                corpus_id = corpus["corpus_id"] if "corpus_id" in corpus.keys() else None
+            elif isinstance(corpus, Mapping):
+                corpus_id = corpus.get("corpus_id")
+            else:
+                try:
+                    corpus_id = corpus["corpus_id"]  # type: ignore[index]
+                except Exception:  # noqa: BLE001
+                    corpus_id = None
+            if not corpus_id:
+                continue
+            try:
+                self.get_corpus_db(str(corpus_id))
+            except Exception:  # noqa: BLE001
+                continue
         for pheno in phenotypes:
             pheno_id: Optional[object]
             if isinstance(pheno, sqlite3.Row):
@@ -273,10 +293,6 @@ class ProjectContext(QtCore.QObject):
                 except Exception:  # noqa: BLE001
                     pheno_id = None
             if not pheno_id:
-                continue
-            try:
-                self.get_corpus_db(str(pheno_id))
-            except Exception:  # noqa: BLE001
                 continue
             try:
                 pheno_dir = self.resolve_phenotype_dir(str(pheno_id))
@@ -415,25 +431,79 @@ class ProjectContext(QtCore.QObject):
         root = self.require_project()
         return (root / relative).resolve()
 
-    def resolve_corpus_path(self, pheno_id: str) -> Path:
-        pheno = self.get_phenotype(pheno_id)
-        if not pheno:
-            raise RuntimeError(f"Phenotype {pheno_id} not found")
-        corpus_path = pheno["corpus_path"]
-        if not corpus_path:
-            raise RuntimeError("Phenotype does not define a corpus")
-        root = self.require_project()
-        return (root / corpus_path).resolve()
+    def list_corpora(self) -> List[sqlite3.Row]:
+        project_id = self.current_project_id()
+        if not project_id:
+            return []
+        db = self.require_db()
+        with db.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM project_corpora WHERE project_id=? ORDER BY name",
+                (project_id,),
+            ).fetchall()
 
-    def get_corpus_db(self, pheno_id: str) -> Database:
-        if pheno_id in self._corpus_cache:
-            return self._corpus_cache[pheno_id]
-        path = self.resolve_corpus_path(pheno_id)
+    def get_corpus(self, corpus_id: str) -> Optional[sqlite3.Row]:
+        db = self.require_db()
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM project_corpora WHERE corpus_id=?",
+                (corpus_id,),
+            ).fetchone()
+        return row
+
+    def resolve_corpus_path(self, corpus_id: str) -> Path:
+        row = self.get_corpus(corpus_id)
+        if not row:
+            raise RuntimeError(f"Corpus {corpus_id} not found")
+        relative = str(row["relative_path"])
+        if not relative:
+            raise RuntimeError("Corpus record is missing a storage path")
+        root = self.require_project()
+        return (root / relative).resolve()
+
+    def get_corpus_db(self, corpus_id: str) -> Database:
+        if corpus_id in self._corpus_cache:
+            return self._corpus_cache[corpus_id]
+        path = self.resolve_corpus_path(corpus_id)
         db = self._cache_database(Database(path))
         with db.transaction() as conn:
             ensure_schema(conn, [models.Patient, models.Document])
-        self._corpus_cache[pheno_id] = db
+        self._corpus_cache[corpus_id] = db
         return db
+
+    def import_corpus(self, source_path: Path, *, name: Optional[str] = None) -> models.ProjectCorpus:
+        project_id = self.current_project_id()
+        if not project_id:
+            raise RuntimeError("Project metadata missing; ensure a project record exists")
+        project_root = self.require_project()
+        corpora_root = ensure_dir(project_root / "corpora")
+        base_name = name or source_path.stem or "corpus"
+        slug = re.sub(r"[^a-z0-9]+", "_", base_name.lower()).strip("_") or "corpus"
+        candidate = slug
+        counter = 2
+        while (corpora_root / candidate).exists():
+            candidate = f"{slug}_{counter}"
+            counter += 1
+        corpus_dir = ensure_dir(corpora_root / candidate)
+        target_corpus = corpus_dir / "corpus.db"
+        if source_path.suffix.lower() in TABULAR_EXTENSIONS:
+            import_tabular_corpus(source_path, target_corpus)
+        else:
+            copy_sqlite_database(source_path, target_corpus)
+        relative_corpus = target_corpus.relative_to(project_root)
+        record = models.ProjectCorpus(
+            corpus_id=str(uuid.uuid4()),
+            project_id=project_id,
+            name=base_name,
+            relative_path=str(relative_corpus.as_posix()),
+            created_at=datetime.utcnow().isoformat(),
+        )
+        db = self.require_db()
+        with db.transaction() as conn:
+            record.save(conn)
+        self._mark_dirty()
+        self.project_changed.emit()
+        return record
 
     def create_phenotype(
         self,
@@ -441,7 +511,6 @@ class ProjectContext(QtCore.QObject):
         name: str,
         level: str,
         description: str,
-        corpus_source: Path,
     ) -> models.Phenotype:
         project_id = self.current_project_id()
         if not project_id:
@@ -451,20 +520,14 @@ class ProjectContext(QtCore.QObject):
         phenotype_dir = self._ensure_phenotype_dir(name)
         rounds_dir = ensure_dir(phenotype_dir / "rounds")
         _ = rounds_dir  # make mypy happy about unused variable
-        corpus_dir = ensure_dir(phenotype_dir / "corpus")
-        target_corpus = corpus_dir / "corpus.db"
-        if corpus_source.suffix.lower() in TABULAR_EXTENSIONS:
-            import_tabular_corpus(corpus_source, target_corpus)
-        else:
-            copy_sqlite_database(corpus_source, target_corpus)
-        relative_corpus = target_corpus.relative_to(project_root)
+        relative_storage = phenotype_dir.relative_to(project_root)
         record = models.Phenotype(
             pheno_id=pheno_id,
             project_id=project_id,
             name=name,
             level=level,
             description=description,
-            corpus_path=str(relative_corpus.as_posix()),
+            storage_path=str(relative_storage.as_posix()),
         )
         db = self.require_db()
         with db.transaction() as conn:
@@ -543,21 +606,21 @@ class ProjectContext(QtCore.QObject):
         pheno = self.get_phenotype(pheno_id)
         if not pheno:
             raise RuntimeError(f"Phenotype {pheno_id} not found")
-        corpus_path = Path(str(pheno["corpus_path"]))
-        if corpus_path.is_absolute():
-            phenotype_dir = corpus_path.parent.parent
+        storage_path = Path(str(pheno["storage_path"]))
+        if storage_path.is_absolute():
+            phenotype_dir = storage_path
         else:
             project_root = self.require_project()
-            phenotype_dir = (project_root / corpus_path).resolve().parent.parent
+            phenotype_dir = (project_root / storage_path).resolve()
         return phenotype_dir
 
     def resolve_round_dir(self, pheno_id: str, round_number: int) -> Path:
         phenotype_dir = self.resolve_phenotype_dir(pheno_id)
         return phenotype_dir / "rounds" / f"round_{round_number}"
 
-    def update_cache_after_round(self, pheno_id: str) -> None:
+    def update_cache_after_round(self, corpus_id: str) -> None:
         # Keep API parity with previous refresh pattern
-        self._corpus_cache.pop(pheno_id, None)
+        self._corpus_cache.pop(corpus_id, None)
         self.project_changed.emit()
 
     def update_round_status(self, round_id: str, status: str) -> None:
@@ -595,9 +658,8 @@ class PhenotypeDialog(QtWidgets.QDialog):
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.ctx = ctx
-        self.corpus_path: Optional[Path] = None
         self.setWindowTitle("Add phenotype")
-        self.resize(400, 300)
+        self.resize(400, 260)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -606,17 +668,9 @@ class PhenotypeDialog(QtWidgets.QDialog):
         self.name_edit = QtWidgets.QLineEdit()
         self.level_combo = QtWidgets.QComboBox()
         self.level_combo.addItems(["single_doc", "multi_doc"])
-        corpus_layout = QtWidgets.QHBoxLayout()
-        self.corpus_edit = QtWidgets.QLineEdit()
-        self.corpus_edit.setReadOnly(True)
-        browse_btn = QtWidgets.QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_corpus)
-        corpus_layout.addWidget(self.corpus_edit)
-        corpus_layout.addWidget(browse_btn)
         self.description_edit = QtWidgets.QPlainTextEdit()
         form.addRow("Name", self.name_edit)
         form.addRow("Level", self.level_combo)
-        form.addRow("Corpus", corpus_layout)
         form.addRow("Description", self.description_edit)
         layout.addLayout(form)
         self.button_box = QtWidgets.QDialogButtonBox(
@@ -626,26 +680,10 @@ class PhenotypeDialog(QtWidgets.QDialog):
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
 
-    def _browse_corpus(self) -> None:
-        start_dir = str(self.ctx.project_root or Path.home())
-        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select corpus file",
-            start_dir,
-            "Corpus files (*.db *.sqlite *.sqlite3 *.csv *.parquet *.pq);;All files (*)",
-        )
-        if not path_str:
-            return
-        self.corpus_path = Path(path_str)
-        self.corpus_edit.setText(str(self.corpus_path))
-
     def accept(self) -> None:  # noqa: D401 - Qt override
         name = self.name_edit.text().strip()
         if not name:
             QtWidgets.QMessageBox.warning(self, "Validation", "Phenotype name is required.")
-            return
-        if not self.corpus_path or not self.corpus_path.exists():
-            QtWidgets.QMessageBox.warning(self, "Validation", "Select a valid corpus file.")
             return
         super().accept()
 
@@ -654,7 +692,6 @@ class PhenotypeDialog(QtWidgets.QDialog):
             "name": self.name_edit.text().strip(),
             "level": self.level_combo.currentText(),
             "description": self.description_edit.toPlainText().strip(),
-            "corpus_path": self.corpus_path,
         }
 
 
@@ -1026,7 +1063,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._available_reviewers = self._load_existing_reviewers()
         self._selected_reviewer_ids: Set[str] = set()
         self._labelset_options = self._load_labelset_ids()
+        self._corpus_options = self._load_corpus_options()
+        self._selected_corpus_id: Optional[str] = None
         self.ctx.project_changed.connect(self._refresh_labelset_options)
+        self.ctx.project_changed.connect(self._refresh_corpus_options)
         self._setup_ui()
 
     @staticmethod
@@ -1058,6 +1098,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
         setup_group = QtWidgets.QGroupBox("Round setup")
         setup_form = QtWidgets.QFormLayout(setup_group)
+        corpus_layout = QtWidgets.QHBoxLayout()
+        self.corpus_combo = QtWidgets.QComboBox()
+        self.corpus_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.corpus_combo.currentIndexChanged.connect(self._on_corpus_changed)
+        corpus_layout.addWidget(self.corpus_combo)
+        import_btn = QtWidgets.QPushButton("Import…")
+        import_btn.clicked.connect(self._on_import_corpus)
+        corpus_layout.addWidget(import_btn)
+        setup_form.addRow("Corpus", corpus_layout)
         self.labelset_combo = QtWidgets.QComboBox()
         self.labelset_combo.setEditable(True)
         self.labelset_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
@@ -1179,6 +1228,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
 
+        self._refresh_corpus_options()
         self._refresh_labelset_options()
         self._refresh_reviewer_options()
 
@@ -1213,11 +1263,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             note_filters["regex"] = regex
         return SamplingFilters(patient_filters=patient_filters, note_filters=note_filters)
 
-    def _load_reviewed_unit_ids(self) -> Set[str]:
+    def _load_reviewed_unit_ids(self, corpus_id: Optional[str]) -> Set[str]:
         pheno_id = self.pheno_row["pheno_id"]
         level_value = self._safe_mapping_get(self.pheno_row, "level", "single_doc")
         level = str(level_value or "single_doc")
         reviewed: Set[str] = set()
+        if not corpus_id:
+            return reviewed
         try:
             rounds = self.ctx.list_rounds(pheno_id)
         except Exception:
@@ -1226,6 +1278,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             round_number = self._safe_mapping_get(round_row, "round_number")
             if round_number is None:
                 continue
+            round_id = self._safe_mapping_get(round_row, "round_id")
+            if round_id:
+                config = self.ctx.get_round_config(str(round_id))
+                if config and config.get("corpus_id") and config.get("corpus_id") != corpus_id:
+                    continue
             try:
                 round_dir = self.ctx.resolve_round_dir(pheno_id, int(round_number))
             except Exception:
@@ -1308,6 +1365,58 @@ class RoundBuilderDialog(QtWidgets.QDialog):
     def _load_labelset_ids(self) -> List[str]:
         rows = self.ctx.list_label_sets()
         return [str(row["labelset_id"]) for row in rows]
+
+    def _load_corpus_options(self) -> List[sqlite3.Row]:
+        return list(self.ctx.list_corpora())
+
+    def _refresh_corpus_options(self) -> None:
+        if not hasattr(self, "corpus_combo"):
+            return
+        self._corpus_options = self._load_corpus_options()
+        self.corpus_combo.blockSignals(True)
+        self.corpus_combo.clear()
+        if not self._corpus_options:
+            self.corpus_combo.addItem("Select corpus…", None)
+            self.corpus_combo.setEnabled(False)
+            self._selected_corpus_id = None
+        else:
+            self.corpus_combo.setEnabled(True)
+            for row in self._corpus_options:
+                corpus_id = str(row["corpus_id"])
+                display = f"{row['name']} ({corpus_id})"
+                self.corpus_combo.addItem(display, corpus_id)
+                if self._selected_corpus_id == corpus_id:
+                    self.corpus_combo.setCurrentIndex(self.corpus_combo.count() - 1)
+        self.corpus_combo.blockSignals(False)
+        if self._corpus_options and not self._selected_corpus_id:
+            self.corpus_combo.setCurrentIndex(0)
+            self._on_corpus_changed(0)
+        elif not self._corpus_options:
+            self.corpus_combo.setCurrentIndex(0)
+            self._on_corpus_changed(0)
+
+    def _on_corpus_changed(self, index: int) -> None:
+        del index
+        corpus_id = self.corpus_combo.currentData()
+        self._selected_corpus_id = corpus_id if isinstance(corpus_id, str) else None
+
+    def _on_import_corpus(self) -> None:
+        start_dir = str(self.ctx.project_root or Path.home())
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select corpus file",
+            start_dir,
+            "Corpus files (*.db *.sqlite *.sqlite3 *.csv *.parquet *.pq);;All files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            record = self.ctx.import_corpus(Path(path_str))
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Corpus", f"Failed to import corpus: {exc}")
+            return
+        self._selected_corpus_id = record.corpus_id
+        self._refresh_corpus_options()
 
     def _load_existing_reviewers(self) -> List[Dict[str, str]]:
         db = self.ctx.require_db()
@@ -1503,8 +1612,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             )
             return False
         filters = self._collect_filters()
+        corpus_id = self._selected_corpus_id
+        if not corpus_id:
+            QtWidgets.QMessageBox.warning(self, "Round", "Select a corpus for this round.")
+            return False
+        corpus_record = self.ctx.get_corpus(corpus_id)
         try:
-            corpus_rows = candidate_documents(ctx.get_corpus_db(pheno_id), pheno_level, filters)
+            corpus_rows = candidate_documents(ctx.get_corpus_db(corpus_id), pheno_level, filters)
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Round", f"Failed to query corpus: {exc}")
             return False
@@ -1513,7 +1627,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return False
         shortage_warned = False
         if independent:
-            reviewed_units = self._load_reviewed_unit_ids()
+            reviewed_units = self._load_reviewed_unit_ids(corpus_id)
             sampling_metadata["previously_reviewed_units"] = len(reviewed_units)
             filtered_rows: List[sqlite3.Row | Dict[str, object]] = []
             for row in corpus_rows:
@@ -1633,6 +1747,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             config_payload: Dict[str, object] = {
                 "pheno_id": pheno_id,
                 "labelset_id": labelset_id,
+                "corpus_id": corpus_id,
                 "round_number": round_number,
                 "round_id": round_id,
                 "rng_seed": seed,
@@ -1641,6 +1756,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "status": self.status_combo.currentText(),
                 "reviewers": reviewers,
             }
+            if corpus_record:
+                config_payload["corpus_name"] = corpus_record["name"]
+                config_payload["corpus_path"] = corpus_record["relative_path"]
             if sampling_metadata:
                 config_payload["sampling"] = sampling_metadata
             filters_payload: Dict[str, Dict[str, object]] = {}
@@ -1687,6 +1805,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.created_round_id = round_id
         self.created_round_number = round_number
         ctx.mark_dirty()
+        ctx.update_cache_after_round(corpus_id)
         return True
 
 
@@ -1791,16 +1910,11 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
-        corpus_path = values.get("corpus_path")
-        if not isinstance(corpus_path, Path):
-            QtWidgets.QMessageBox.warning(self, "Phenotype", "Invalid corpus selection.")
-            return
         try:
             record = self.ctx.create_phenotype(
                 name=str(values.get("name", "")),
                 level=str(values.get("level", "single_doc")),
                 description=str(values.get("description", "")),
-                corpus_source=corpus_path,
             )
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Phenotype", f"Failed to create phenotype: {exc}")
@@ -1936,11 +2050,11 @@ class PhenotypeDetailWidget(QtWidgets.QWidget):
         self.level_label = QtWidgets.QLabel()
         self.description_label = QtWidgets.QTextEdit()
         self.description_label.setReadOnly(True)
-        self.corpus_label = QtWidgets.QLabel()
+        self.storage_label = QtWidgets.QLabel()
         self.description_label.setFixedHeight(120)
         layout.addRow("Name", self.name_label)
         layout.addRow("Level", self.level_label)
-        layout.addRow("Corpus", self.corpus_label)
+        layout.addRow("Storage", self.storage_label)
         layout.addRow("Description", self.description_label)
 
     def set_phenotype(self, pheno: Optional[Dict[str, object]]) -> None:
@@ -1948,11 +2062,11 @@ class PhenotypeDetailWidget(QtWidgets.QWidget):
             self.name_label.clear()
             self.level_label.clear()
             self.description_label.clear()
-            self.corpus_label.clear()
+            self.storage_label.clear()
             return
         self.name_label.setText(str(pheno.get("name", "")))
         self.level_label.setText(str(pheno.get("level", "")))
-        self.corpus_label.setText(str(pheno.get("corpus_path", "")))
+        self.storage_label.setText(str(pheno.get("storage_path", "")))
         self.description_label.setPlainText(str(pheno.get("description", "")))
 
 
@@ -2012,6 +2126,16 @@ class RoundDetailWidget(QtWidgets.QWidget):
             setup_items.append(f"Round number: {config['round_number']}")
         setup_items.append(f"Label set: {config.get('labelset_id', '—')}")
         setup_items.append(f"Status: {config.get('status', 'draft')}")
+        corpus_id = config.get("corpus_id")
+        corpus_name = config.get("corpus_name")
+        if corpus_id or corpus_name:
+            if corpus_id and corpus_name:
+                corpus_display = f"{corpus_name} ({corpus_id})"
+            else:
+                corpus_display = corpus_id or corpus_name
+            setup_items.append(f"Corpus: {corpus_display}")
+            if config.get("corpus_path"):
+                setup_items.append(f"Corpus path: {config['corpus_path']}")
         if config.get("total_n"):
             setup_items.append(f"Total units: {config['total_n']}")
         setup_items.append(f"Overlap units: {config.get('overlap_n', 0)}")
@@ -2146,8 +2270,23 @@ class CorpusWidget(QtWidgets.QWidget):
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.ctx = ctx
+        self.current_pheno: Optional[Dict[str, object]] = None
+        self.current_corpus_id: Optional[str] = None
         layout = QtWidgets.QVBoxLayout(self)
-        self.summary_label = QtWidgets.QLabel("Select a phenotype to view corpus contents.")
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("Corpus:"))
+        self.corpus_combo = QtWidgets.QComboBox()
+        self.corpus_combo.currentIndexChanged.connect(self._on_corpus_selected)
+        controls.addWidget(self.corpus_combo, 1)
+        import_btn = QtWidgets.QPushButton("Import corpus…")
+        import_btn.clicked.connect(self._import_corpus)
+        controls.addWidget(import_btn)
+        refresh_btn = QtWidgets.QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh_corpora)
+        controls.addWidget(refresh_btn)
+        layout.addLayout(controls)
+
+        self.summary_label = QtWidgets.QLabel("Select a corpus to view its contents.")
         layout.addWidget(self.summary_label)
         self.table = QtWidgets.QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Doc ID", "Patient", "Note type", "Date", "Preview"])
@@ -2157,18 +2296,70 @@ class CorpusWidget(QtWidgets.QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
+        self._refresh_corpora()
+
     def set_phenotype(self, pheno: Optional[Dict[str, object]]) -> None:
-        if not pheno:
-            self.summary_label.setText("Select a phenotype to view corpus contents.")
+        self.current_pheno = pheno
+        self._refresh_corpora()
+
+    def _refresh_corpora(self) -> None:
+        corpora = self.ctx.list_corpora()
+        current_id = self.current_corpus_id
+        self.corpus_combo.blockSignals(True)
+        self.corpus_combo.clear()
+        if not corpora:
+            self.corpus_combo.addItem("No corpora available", None)
+            self.corpus_combo.setEnabled(False)
+            self.summary_label.setText("Import a corpus to view its contents.")
             self.table.setRowCount(0)
-            return
-        pheno_id = pheno.get("pheno_id")
-        if not pheno_id:
-            self.summary_label.setText("Phenotype metadata incomplete.")
-            self.table.setRowCount(0)
+        else:
+            self.corpus_combo.setEnabled(True)
+            for corpus in corpora:
+                corpus_id = str(corpus["corpus_id"])
+                display = f"{corpus['name']} ({corpus_id})"
+                self.corpus_combo.addItem(display, corpus_id)
+                if current_id and corpus_id == current_id:
+                    self.corpus_combo.setCurrentIndex(self.corpus_combo.count() - 1)
+        self.corpus_combo.blockSignals(False)
+        if corpora:
+            if current_id and any(str(row["corpus_id"]) == current_id for row in corpora):
+                self._load_corpus(current_id)
+            else:
+                self.corpus_combo.setCurrentIndex(0)
+                self._on_corpus_selected(0)
+
+    def _import_corpus(self) -> None:
+        start_dir = str(self.ctx.project_root or Path.home())
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select corpus file",
+            start_dir,
+            "Corpus files (*.db *.sqlite *.sqlite3 *.csv *.parquet *.pq);;All files (*)",
+        )
+        if not path_str:
             return
         try:
-            db = self.ctx.get_corpus_db(pheno_id)
+            record = self.ctx.import_corpus(Path(path_str))
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Corpus", f"Failed to import corpus: {exc}")
+            return
+        self.current_corpus_id = record.corpus_id
+        self._refresh_corpora()
+
+    def _on_corpus_selected(self, index: int) -> None:
+        del index
+        corpus_id = self.corpus_combo.currentData()
+        if not isinstance(corpus_id, str):
+            self.current_corpus_id = None
+            self.summary_label.setText("Select a corpus to view its contents.")
+            self.table.setRowCount(0)
+            return
+        self.current_corpus_id = corpus_id
+        self._load_corpus(corpus_id)
+
+    def _load_corpus(self, corpus_id: str) -> None:
+        try:
+            db = self.ctx.get_corpus_db(corpus_id)
         except Exception as exc:  # noqa: BLE001
             self.summary_label.setText(f"Corpus unavailable: {exc}")
             self.table.setRowCount(0)
@@ -2178,7 +2369,7 @@ class CorpusWidget(QtWidgets.QWidget):
             document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             rows = conn.execute(
                 "SELECT doc_id, patient_icn, notetype, date_note, substr(text, 1, 200) AS preview "
-                "FROM documents ORDER BY date_note DESC LIMIT 50"
+                "FROM documents ORDER BY date_note DESC LIMIT 50",
             ).fetchall()
         self.summary_label.setText(
             f"Patients: {patient_count:,} • Documents: {document_count:,} • Showing {len(rows)} most recent notes"
@@ -2420,6 +2611,12 @@ class IaaWidget(QtWidgets.QWidget):
         round_id = self.current_round.get("round_id")
         if not round_id:
             return
+        config = self.ctx.get_round_config(str(round_id))
+        if isinstance(config, dict):
+            self.current_round.setdefault("config", config)
+            corpus_id = config.get("corpus_id")
+            if corpus_id:
+                self.current_round["corpus_id"] = corpus_id
         db = self.ctx.require_db()
         with db.connect() as conn:
             reviewers = conn.execute(
@@ -3210,10 +3407,10 @@ class IaaWidget(QtWidgets.QWidget):
             return
         metadata: Dict[str, sqlite3.Row] = {}
         corpus_db: Optional[Database] = None
-        pheno_id = (self.current_pheno or {}).get("pheno_id")
-        if pheno_id:
+        corpus_id = (self.current_round or {}).get("corpus_id")
+        if corpus_id:
             try:
-                corpus_db = self.ctx.get_corpus_db(pheno_id)
+                corpus_db = self.ctx.get_corpus_db(corpus_id)
             except Exception:
                 corpus_db = None
         if corpus_db:

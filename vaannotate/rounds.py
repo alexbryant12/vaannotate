@@ -77,14 +77,35 @@ class RoundBuilder:
             ).fetchone()
             if not pheno:
                 raise ValueError(f"Phenotype {pheno_id} not found")
-            corpus_path = self.project_root / pheno["corpus_path"]
+            storage_path = pheno["storage_path"]
+            if not storage_path:
+                raise ValueError("Phenotype storage path is not defined")
+            storage_dir = Path(storage_path)
+            if not storage_dir.is_absolute():
+                storage_dir = (self.project_root / storage_dir).resolve()
+            corpus_id = config.get("corpus_id")
+            corpus_row = None
+            if corpus_id:
+                corpus_row = project_conn.execute(
+                    "SELECT * FROM project_corpora WHERE corpus_id=?",
+                    (corpus_id,),
+                ).fetchone()
+            if corpus_row:
+                corpus_path = self.project_root / corpus_row["relative_path"]
+            else:
+                legacy_path = config.get("corpus_path")
+                if not legacy_path:
+                    raise ValueError("Round configuration does not specify a corpus")
+                corpus_path = Path(legacy_path)
+                if not corpus_path.is_absolute():
+                    corpus_path = (self.project_root / corpus_path).resolve()
             with self._connect_corpus(corpus_path) as corpus_conn:
                 labelset = fetch_labelset(project_conn, config["labelset_id"])
                 round_number = config.get("round_number")
             round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
             rng_seed = config.get("rng_seed", 0)
             config_hash = stable_hash(canonical_json(config))
-            phenotype_dir = (self.project_root / pheno["corpus_path"]).resolve().parent.parent
+            phenotype_dir = storage_dir
             round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
             ensure_dir(round_dir)
             ensure_dir(round_dir / "assignments")
@@ -421,12 +442,15 @@ class RoundBuilder:
     def import_assignment(self, pheno_id: str, round_number: int, reviewer_id: str) -> Path:
         with self._connect_project() as conn:
             pheno = conn.execute(
-                "SELECT corpus_path FROM phenotypes WHERE pheno_id=?",
+                "SELECT storage_path FROM phenotypes WHERE pheno_id=?",
                 (pheno_id,),
             ).fetchone()
             if not pheno:
                 raise ValueError(f"Phenotype {pheno_id} not found")
-            phenotype_dir = (self.project_root / pheno["corpus_path"]).resolve().parent.parent
+            storage_path = Path(pheno["storage_path"])
+            if not storage_path.is_absolute():
+                storage_path = (self.project_root / storage_path).resolve()
+            phenotype_dir = storage_path
             round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
             assignment_dir = round_dir / "assignments" / reviewer_id
             assignment_db = assignment_dir / "assignment.db"
@@ -449,12 +473,15 @@ class RoundBuilder:
     def build_round_aggregate(self, pheno_id: str, round_number: int) -> Path:
         with self._connect_project() as conn:
             pheno = conn.execute(
-                "SELECT corpus_path FROM phenotypes WHERE pheno_id=?",
+                "SELECT storage_path FROM phenotypes WHERE pheno_id=?",
                 (pheno_id,),
             ).fetchone()
             if not pheno:
                 raise ValueError(f"Phenotype {pheno_id} not found")
-            phenotype_dir = (self.project_root / pheno["corpus_path"]).resolve().parent.parent
+            storage_path = Path(pheno["storage_path"])
+            if not storage_path.is_absolute():
+                storage_path = (self.project_root / storage_path).resolve()
+            phenotype_dir = storage_path
         round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
         imports_dir = ensure_dir(round_dir / "imports")
         aggregate_db = round_dir / "round_aggregate.db"

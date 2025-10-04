@@ -26,6 +26,7 @@ from vaannotate.corpus import normalize_text as corpus_normalize_text
 from vaannotate.project import (
     add_labelset,
     add_phenotype,
+    add_project_corpus,
     fetch_labelset,
     get_connection,
     init_project,
@@ -304,6 +305,7 @@ ROUND_CONFIGS = [
     {
         "pheno_id": "ph_diabetes",
         "labelset_id": "ls_diabetes_v1",
+        "corpus_id": "cor_ph_diabetes",
         "round_number": 1,
         "round_id": "ph_diabetes_r1",
         "created_by": "toy_seed",
@@ -331,6 +333,7 @@ ROUND_CONFIGS = [
     {
         "pheno_id": "ph_diabetes",
         "labelset_id": "ls_diabetes_v1",
+        "corpus_id": "cor_ph_diabetes",
         "round_number": 2,
         "round_id": "ph_diabetes_r2",
         "created_by": "toy_seed",
@@ -354,6 +357,7 @@ ROUND_CONFIGS = [
     {
         "pheno_id": "ph_diabetes",
         "labelset_id": "ls_diabetes_v1",
+        "corpus_id": "cor_ph_diabetes",
         "round_number": 3,
         "round_id": "ph_diabetes_r3",
         "created_by": "toy_seed",
@@ -378,6 +382,7 @@ ROUND_CONFIGS = [
     {
         "pheno_id": "ph_hypertension",
         "labelset_id": "ls_htn_v1",
+        "corpus_id": "cor_ph_hypertension",
         "round_number": 1,
         "round_id": "ph_hypertension_r1",
         "created_by": "toy_seed",
@@ -463,11 +468,21 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
     with get_connection(project_db) as conn:
         for reviewer in REVIEWERS:
             register_reviewer(conn, **reviewer)
+
         def corpus_for(pheno_id: str) -> str:
             path = corpus_paths.get(pheno_id)
             if not path:
                 raise RuntimeError(f"Missing corpus path for {pheno_id}")
             return path
+
+        for pheno_id, path in corpus_paths.items():
+            add_project_corpus(
+                conn,
+                corpus_id=f"cor_{pheno_id}",
+                project_id="Project_Toy",
+                name=f"Corpus for {pheno_id}",
+                relative_path=path,
+            )
         add_phenotype(
             conn,
             pheno_id="ph_diabetes",
@@ -475,7 +490,7 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
             name="Diabetes Phenotyping",
             level="multi_doc",
             description="Toy diabetes phenotype for demonstrations",
-            corpus_path=corpus_for("ph_diabetes"),
+            storage_path=str(Path(corpus_for("ph_diabetes")).parent.parent),
         )
         add_labelset(
             conn,
@@ -494,7 +509,7 @@ def seed_metadata(project_db: Path, corpus_paths: Dict[str, str]) -> None:
             name="Hypertension Phenotyping",
             level="single_doc",
             description="Toy hypertension phenotype for demonstrations",
-            corpus_path=corpus_for("ph_hypertension"),
+            storage_path=str(Path(corpus_for("ph_hypertension")).parent.parent),
         )
         add_labelset(
             conn,

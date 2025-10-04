@@ -85,7 +85,7 @@ class ProjectBrowser:
         with get_connection(self.project_db) as conn:
             rows = conn.execute(
                 """
-                SELECT a.round_id, r.pheno_id, r.round_number, p.name AS phenotype_name, p.corpus_path
+                SELECT a.round_id, r.pheno_id, r.round_number, p.name AS phenotype_name, p.storage_path
                 FROM assignments AS a
                 JOIN rounds AS r ON a.round_id = r.round_id
                 JOIN phenotypes AS p ON r.pheno_id = p.pheno_id
@@ -107,7 +107,7 @@ class ProjectBrowser:
                 pheno_id,
                 round_number,
                 round_id,
-                str(row["corpus_path"] or ""),
+                str(row["storage_path"] or ""),
             )
             if not round_dir:
                 warnings.append(
@@ -139,9 +139,9 @@ class ProjectBrowser:
         pheno_id: str,
         round_number: Optional[int],
         round_id: str,
-        corpus_path: str,
+        storage_path: str,
     ) -> Optional[Path]:
-        rounds_root = self._resolve_rounds_root(pheno_id, corpus_path)
+        rounds_root = self._resolve_rounds_root(pheno_id, storage_path)
         if rounds_root is None:
             return None
         if round_number is not None:
@@ -165,14 +165,13 @@ class ProjectBrowser:
                 return candidate
         return None
 
-    def _resolve_rounds_root(self, pheno_id: str, corpus_path: str) -> Optional[Path]:
-        rounds_root: Optional[Path] = None
-        if corpus_path:
-            corpus = Path(corpus_path)
-            if not corpus.is_absolute():
-                corpus = (self.project_root / corpus).resolve()
-            phenotype_dir = corpus.parent.parent
-            rounds_root = phenotype_dir / "rounds"
+    def _resolve_rounds_root(self, pheno_id: str, storage_path: str) -> Optional[Path]:
+        rounds_root: Optional[Path]
+        if storage_path:
+            storage = Path(storage_path)
+            if not storage.is_absolute():
+                storage = (self.project_root / storage).resolve()
+            rounds_root = storage / "rounds"
         else:
             rounds_root = None
         # Fallback for legacy directory structures where the phenotype ID was used
