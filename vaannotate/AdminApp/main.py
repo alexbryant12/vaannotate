@@ -262,15 +262,24 @@ class ProjectContext(QtCore.QObject):
         except Exception:  # noqa: BLE001
             return
         for pheno in phenotypes:
-            pheno_id = pheno.get("pheno_id")
+            pheno_id: Optional[object]
+            if isinstance(pheno, sqlite3.Row):
+                pheno_id = pheno["pheno_id"] if "pheno_id" in pheno.keys() else None
+            elif isinstance(pheno, Mapping):
+                pheno_id = pheno.get("pheno_id")
+            else:
+                try:
+                    pheno_id = pheno["pheno_id"]  # type: ignore[index]
+                except Exception:  # noqa: BLE001
+                    pheno_id = None
             if not pheno_id:
                 continue
             try:
-                self.get_corpus_db(pheno_id)
+                self.get_corpus_db(str(pheno_id))
             except Exception:  # noqa: BLE001
                 continue
             try:
-                pheno_dir = self.resolve_phenotype_dir(pheno_id)
+                pheno_dir = self.resolve_phenotype_dir(str(pheno_id))
             except Exception:  # noqa: BLE001
                 continue
             rounds_dir = pheno_dir / "rounds"
