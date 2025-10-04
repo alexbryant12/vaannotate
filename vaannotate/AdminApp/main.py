@@ -10,18 +10,18 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Mapping
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from vaannotate.schema import initialize_round_aggregate_db
+from vaannotate.schema import ROUND_AGG_SCHEMA
 from vaannotate.shared import models
 from vaannotate.shared.database import Database, ensure_schema
 from vaannotate.shared.sampling import (
+    ReviewerAssignment,
     SamplingFilters,
     allocate_units,
     candidate_documents,
-    initialize_assignment_db,
     populate_assignment_db,
     write_manifest,
 )
@@ -42,6 +42,15 @@ PROJECT_MODELS = [
     models.Assignment,
 ]
 
+ASSIGNMENT_MODELS = [
+    models.AssignmentUnit,
+    models.AssignmentUnitNote,
+    models.AssignmentDocument,
+    models.Annotation,
+    models.Rationale,
+    models.Event,
+]
+
 
 @dataclass(frozen=True)
 class AgreementSample:
@@ -52,6 +61,7 @@ class AgreementSample:
 
 class ProjectContext(QtCore.QObject):
     project_changed = QtCore.Signal()
+    dirty_changed = QtCore.Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -59,16 +69,233 @@ class ProjectContext(QtCore.QObject):
         self.project_db: Optional[Database] = None
         self.project_row: Optional[Dict[str, object]] = None
         self._corpus_cache: Dict[str, Database] = {}
+        self._external_db_cache: Dict[Path, Database] = {}
+        self._managed_dbs: List[Database] = []
+        self._pending_manifests: Dict[Path, Dict[str, ReviewerAssignment]] = {}
+        self._pending_text_writes: Dict[Path, str] = {}
+        self._dirty_flag = False
+        self._last_dirty_state = False
+
+    def _register_db(self, db: Database) -> Database:
+        if db not in self._managed_dbs:
+            self._managed_dbs.append(db)
+        return db
+
+    def _cache_database(self, db: Database) -> Database:
+        db.enable_memory_cache()
+        return self._register_db(db)
+
+    def _shutdown_caches(self) -> None:
+        for cached_db in self._managed_dbs:
+            cached_db.close()
+        self._corpus_cache.clear()
+        self._external_db_cache.clear()
+        self._managed_dbs = []
+        self._pending_manifests.clear()
+        self._pending_text_writes.clear()
+        self._dirty_flag = False
+        self._emit_dirty_state()
+
+    def _emit_dirty_state(self) -> None:
+        dirty = self.has_unsaved_changes()
+        if dirty != self._last_dirty_state:
+            self._last_dirty_state = dirty
+            self.dirty_changed.emit(dirty)
+
+    def _mark_dirty(self) -> None:
+        self._dirty_flag = True
+        self._emit_dirty_state()
+
+    def mark_dirty(self) -> None:
+        self._mark_dirty()
+
+    def has_unsaved_changes(self) -> bool:
+        if self._dirty_flag or self._pending_manifests or self._pending_text_writes:
+            return True
+        return any(db.is_dirty for db in self._managed_dbs)
+
+    def save_all(self) -> None:
+        errors: List[str] = []
+        for db in list(self._managed_dbs):
+            try:
+                db.flush_to_disk()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{db.path}: {exc}")
+        for path, content in list(self._pending_text_writes.items()):
+            try:
+                ensure_dir(path.parent)
+                path.write_text(content, encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{path}: {exc}")
+        for path, assignments in list(self._pending_manifests.items()):
+            try:
+                ensure_dir(path.parent)
+                write_manifest(path, assignments)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{path}: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        self._pending_text_writes.clear()
+        self._pending_manifests.clear()
+        self._dirty_flag = False
+        self._emit_dirty_state()
+
+    def _get_cached_db(
+        self,
+        path: Path,
+        *,
+        models_schema: Sequence[Type[models.Record]] | None = None,
+        statements: Sequence[str] | None = None,
+    ) -> Database:
+        resolved = path.resolve()
+        cached = self._external_db_cache.get(resolved)
+        if cached:
+            return cached
+        db = self._cache_database(Database(resolved))
+        if models_schema:
+            with db.transaction() as conn:
+                ensure_schema(conn, models_schema)
+        if statements:
+            with db.transaction() as conn:
+                for statement in statements:
+                    conn.executescript(statement)
+        self._external_db_cache[resolved] = db
+        return db
+
+    def get_assignment_db(self, path: Path, *, create: bool = False) -> Optional[Database]:
+        resolved = path.resolve()
+        cached = self._external_db_cache.get(resolved)
+        if cached:
+            return cached
+        if not path.exists() and not create:
+            return None
+        return self._get_cached_db(resolved, models_schema=ASSIGNMENT_MODELS)
+
+    def prepare_assignment_db(self, path: Path) -> Database:
+        resolved = path.resolve()
+        existing = self._external_db_cache.pop(resolved, None)
+        if existing:
+            existing.close()
+            if existing in self._managed_dbs:
+                self._managed_dbs.remove(existing)
+        db = self._cache_database(Database(resolved))
+        with db.transaction() as conn:
+            ensure_schema(conn, ASSIGNMENT_MODELS)
+            for table in [
+                "units",
+                "unit_notes",
+                "documents",
+                "annotations",
+                "rationales",
+                "events",
+            ]:
+                conn.execute(f"DELETE FROM {table}")
+        self._external_db_cache[resolved] = db
+        self._mark_dirty()
+        return db
+
+    def refresh_assignment_cache(self, path: Path) -> Optional[Database]:
+        resolved = path.resolve()
+        existing = self._external_db_cache.pop(resolved, None)
+        if existing:
+            existing.close()
+            if existing in self._managed_dbs:
+                self._managed_dbs.remove(existing)
+        if not path.exists():
+            return None
+        return self.get_assignment_db(path)
+
+    def get_round_aggregate_db(self, round_dir: Path, *, create: bool = False) -> Optional[Database]:
+        path = (round_dir / "round_aggregate.db").resolve()
+        cached = self._external_db_cache.get(path)
+        if cached:
+            return cached
+        if not path.exists() and not create:
+            return None
+        return self._get_cached_db(path, statements=ROUND_AGG_SCHEMA)
+
+    @staticmethod
+    def _manifest_from_assignments(
+        assignments: Dict[str, ReviewerAssignment]
+    ) -> Dict[str, Dict[str, bool]]:
+        manifest: Dict[str, Dict[str, bool]] = {}
+        for reviewer_id, assignment in assignments.items():
+            for unit in assignment.units:
+                unit_id = str(unit.get("unit_id"))
+                if not unit_id:
+                    continue
+                manifest.setdefault(unit_id, {})[reviewer_id] = bool(unit.get("is_overlap"))
+        return manifest
+
+    def register_manifest(self, path: Path, assignments: Dict[str, ReviewerAssignment]) -> None:
+        self._pending_manifests[path.resolve()] = copy.deepcopy(assignments)
+        self._mark_dirty()
+
+    def get_manifest_flags(self, path: Path) -> Dict[str, Dict[str, bool]]:
+        resolved = path.resolve()
+        pending = self._pending_manifests.get(resolved)
+        if pending is not None:
+            return self._manifest_from_assignments(pending)
+        manifest: Dict[str, Dict[str, bool]] = {}
+        if not path.exists():
+            return manifest
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                unit_id = row.get("unit_id")
+                reviewer_id = row.get("assigned_to")
+                if not unit_id or not reviewer_id:
+                    continue
+                flag = str(row.get("is_overlap", "")).strip().lower() in {"1", "true", "yes"}
+                manifest.setdefault(unit_id, {})[reviewer_id] = flag
+        return manifest
+
+    def register_text_file(self, path: Path, content: str) -> None:
+        self._pending_text_writes[path.resolve()] = content
+        self._mark_dirty()
+
+    def _preload_round_assets(self) -> None:
+        if not self.project_root:
+            return
+        try:
+            phenotypes = list(self.list_phenotypes())
+        except Exception:  # noqa: BLE001
+            return
+        for pheno in phenotypes:
+            pheno_id = pheno.get("pheno_id")
+            if not pheno_id:
+                continue
+            try:
+                self.get_corpus_db(pheno_id)
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                pheno_dir = self.resolve_phenotype_dir(pheno_id)
+            except Exception:  # noqa: BLE001
+                continue
+            rounds_dir = pheno_dir / "rounds"
+            if not rounds_dir.exists():
+                continue
+            for round_dir in sorted(rounds_dir.glob("round_*")):
+                if round_dir.is_dir():
+                    agg_db = self.get_round_aggregate_db(round_dir)
+                    _ = agg_db  # force cache load
+                    imports_dir = round_dir / "imports"
+                    if imports_dir.exists():
+                        for assignment_path in imports_dir.glob("*_assignment.db"):
+                            self.get_assignment_db(assignment_path)
 
     def open_project(self, directory: Path) -> None:
+        self._shutdown_caches()
         directory = directory.resolve()
-        project_db = Database(directory / "project.db")
+        project_db = self._cache_database(Database(directory / "project.db"))
         with project_db.transaction() as conn:
             ensure_schema(conn, PROJECT_MODELS)
         self.project_root = directory
         self.project_db = project_db
-        self._corpus_cache.clear()
         self.project_row = self._load_project_row()
+        self._preload_round_assets()
+        self._emit_dirty_state()
         self.project_changed.emit()
 
     def _load_project_row(self) -> Optional[Dict[str, object]]:
@@ -193,7 +420,7 @@ class ProjectContext(QtCore.QObject):
         if pheno_id in self._corpus_cache:
             return self._corpus_cache[pheno_id]
         path = self.resolve_corpus_path(pheno_id)
-        db = Database(path)
+        db = self._cache_database(Database(path))
         with db.transaction() as conn:
             ensure_schema(conn, [models.Patient, models.Document])
         self._corpus_cache[pheno_id] = db
@@ -233,6 +460,7 @@ class ProjectContext(QtCore.QObject):
         db = self.require_db()
         with db.transaction() as conn:
             record.save(conn)
+        self._mark_dirty()
         self.project_changed.emit()
         return record
 
@@ -287,6 +515,7 @@ class ProjectContext(QtCore.QObject):
                         weight=option.get("weight"),
                     )
                     option_record.save(conn)
+        self._mark_dirty()
         self.project_changed.emit()
         return record
 
@@ -349,6 +578,7 @@ class ProjectContext(QtCore.QObject):
                         "UPDATE round_configs SET config_json=? WHERE round_id=?",
                         (json.dumps(config_payload, indent=2), round_id),
                     )
+        self._mark_dirty()
         self.project_changed.emit()
 
 
@@ -1349,7 +1579,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             created_at=created_at,
         )
         round_dir = ensure_dir(ctx.resolve_round_dir(pheno_id, round_number))
-        write_manifest(round_dir / "manifest.csv", assignments)
+        ctx.register_manifest(round_dir / "manifest.csv", assignments)
         label_schema: Optional[Dict[str, object]] = None
         with db.transaction() as conn:
             if default_labels:
@@ -1441,12 +1671,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         for reviewer in reviewers:
             assignment_dir = ensure_dir(round_dir / "assignments" / reviewer["id"])
             db_path = assignment_dir / "assignment.db"
-            assignment_db = initialize_assignment_db(db_path)
+            assignment_db = ctx.prepare_assignment_db(db_path)
             populate_assignment_db(assignment_db, reviewer["id"], assignments[reviewer["id"]].units)
             schema_path = assignment_dir / "label_schema.json"
-            schema_path.write_text(json.dumps(label_schema, indent=2), encoding="utf-8")
+            ctx.register_text_file(schema_path, json.dumps(label_schema, indent=2))
         self.created_round_id = round_id
         self.created_round_number = round_number
+        ctx.mark_dirty()
         return True
 
 
@@ -2294,6 +2525,7 @@ class IaaWidget(QtWidgets.QWidget):
                 errors += 1
             else:
                 self.assignment_paths[reviewer_id] = target_path
+                self.ctx.refresh_assignment_cache(target_path)
                 statuses.append(f"{display_name}: imported")
                 imported_any = True
         aggregate_message = ""
@@ -2346,6 +2578,7 @@ class IaaWidget(QtWidgets.QWidget):
             )
             return
         self.assignment_paths[reviewer_id] = target_path
+        self.ctx.refresh_assignment_cache(target_path)
         aggregate_message = ""
         aggregate_failed = False
         round_dir = self._resolve_round_dir()
@@ -2391,6 +2624,8 @@ class IaaWidget(QtWidgets.QWidget):
                 "UPDATE assignments SET status='imported' WHERE round_id=? AND reviewer_id=?",
                 (row["round_id"], reviewer_id),
             )
+        self.ctx.refresh_assignment_cache(target_path)
+        self.ctx.mark_dirty()
         return target_path
 
     def _resolve_round_dir(self) -> Optional[Path]:
@@ -2407,20 +2642,8 @@ class IaaWidget(QtWidgets.QWidget):
         return self.ctx.resolve_round_dir(pheno_id, int(round_number))
 
     def _load_manifest(self, round_dir: Path) -> Dict[str, Dict[str, bool]]:
-        manifest: Dict[str, Dict[str, bool]] = {}
         manifest_path = round_dir / "manifest.csv"
-        if not manifest_path.exists():
-            return manifest
-        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                unit_id = row.get("unit_id")
-                reviewer_id = row.get("assigned_to")
-                if not unit_id or not reviewer_id:
-                    continue
-                flag = str(row.get("is_overlap", "")).strip().lower() in {"1", "true", "yes"}
-                manifest.setdefault(unit_id, {})[reviewer_id] = flag
-        return manifest
+        return self.ctx.get_manifest_flags(manifest_path)
 
     def _discover_existing_imports(self, round_dir: Path) -> None:
         imports_dir = round_dir / "imports"
@@ -2433,6 +2656,7 @@ class IaaWidget(QtWidgets.QWidget):
             candidate = imports_dir / f"{reviewer_id}_assignment.db"
             if candidate.exists():
                 self.assignment_paths[reviewer_id] = candidate
+                self.ctx.get_assignment_db(candidate)
 
     def _collect_submission_sources(self, round_dir: Path) -> tuple[Dict[str, Path], Dict[str, str]]:
         sources: Dict[str, Path] = {}
@@ -2464,16 +2688,20 @@ class IaaWidget(QtWidgets.QWidget):
         imports_dir = round_dir / "imports"
         if not imports_dir.exists():
             raise RuntimeError("No imported assignments found")
-        aggregate_path = round_dir / "round_aggregate.db"
-        with initialize_round_aggregate_db(aggregate_path) as agg_conn:
+        aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=True)
+        if not aggregate_db:
+            raise RuntimeError("Failed to initialize round aggregate database")
+        with aggregate_db.transaction() as agg_conn:
             agg_conn.execute("DELETE FROM unit_annotations")
             agg_conn.execute("DELETE FROM unit_summary")
             for assignment_path in sorted(imports_dir.glob("*_assignment.db")):
                 reviewer_id = assignment_path.stem
                 if reviewer_id.endswith("_assignment"):
                     reviewer_id = reviewer_id[: -len("_assignment")]
-                with sqlite3.connect(assignment_path) as assign_conn:
-                    assign_conn.row_factory = sqlite3.Row
+                assignment_db = self.ctx.get_assignment_db(assignment_path)
+                if not assignment_db:
+                    continue
+                with assignment_db.connect() as assign_conn:
                     for unit_row in assign_conn.execute(
                         "SELECT unit_id, patient_icn, doc_id FROM units"
                     ):
@@ -2509,8 +2737,8 @@ class IaaWidget(QtWidgets.QWidget):
                                 ann_row["notes"],
                             ),
                         )
-            agg_conn.commit()
-        return aggregate_path
+        self.ctx.mark_dirty()
+        return (round_dir / "round_aggregate.db").resolve()
 
     def _update_auto_import_state(self) -> None:
         round_dir = self._resolve_round_dir()
@@ -2711,10 +2939,12 @@ class IaaWidget(QtWidgets.QWidget):
             return
         unit_map: Dict[str, Dict[str, object]] = {}
         for reviewer_id, path in self.assignment_paths.items():
-            if not path or not path.exists():
+            if not path:
                 continue
-            with sqlite3.connect(path) as conn:
-                conn.row_factory = sqlite3.Row
+            db = self.ctx.get_assignment_db(path)
+            if not db:
+                continue
+            with db.connect() as conn:
                 units = conn.execute(
                     "SELECT unit_id, patient_icn, doc_id FROM units ORDER BY display_rank"
                 ).fetchall()
@@ -2945,16 +3175,18 @@ class IaaWidget(QtWidgets.QWidget):
         if not unit_id:
             return
         reviewer_ids = unit_row.get("reviewer_ids") or []
-        assignment_path: Optional[Path] = None
+        assignment_db: Optional[Database] = None
         for reviewer_id in reviewer_ids:
             candidate = self.assignment_paths.get(reviewer_id)
-            if candidate and candidate.exists():
-                assignment_path = candidate
+            if not candidate:
+                continue
+            db = self.ctx.get_assignment_db(candidate)
+            if db:
+                assignment_db = db
                 break
-        if not assignment_path:
+        if not assignment_db:
             return
-        with sqlite3.connect(assignment_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with assignment_db.connect() as conn:
             doc_rows = conn.execute(
                 """
                 SELECT unit_notes.doc_id, unit_notes.order_index, documents.text
@@ -3010,21 +3242,23 @@ class IaaWidget(QtWidgets.QWidget):
             self.document_preview.clear()
             return
         reviewer_ids = self.unit_rows[unit_index].get("reviewer_ids") or []
-        assignment_path: Optional[Path] = None
+        assignment_db: Optional[Database] = None
         for reviewer_id in reviewer_ids:
             candidate = self.assignment_paths.get(reviewer_id)
-            if candidate and candidate.exists():
-                assignment_path = candidate
+            if not candidate:
+                continue
+            db = self.ctx.get_assignment_db(candidate)
+            if db:
+                assignment_db = db
                 break
-        if not assignment_path:
+        if not assignment_db:
             self.document_preview.clear()
             return
         unit_id = self.unit_rows[unit_index].get("unit_id")
         if not unit_id:
             self.document_preview.clear()
             return
-        with sqlite3.connect(assignment_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with assignment_db.connect() as conn:
             row = conn.execute(
                 "SELECT documents.text FROM unit_notes JOIN documents ON documents.doc_id = unit_notes.doc_id "
                 "WHERE unit_notes.unit_id=? ORDER BY unit_notes.order_index LIMIT 1 OFFSET ?",
@@ -3098,17 +3332,26 @@ class IaaWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "IAA", "Round directory is unavailable.")
             return
         aggregate_path = round_dir / "round_aggregate.db"
-        if not aggregate_path.exists():
+        aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=False)
+        if not aggregate_db and not aggregate_path.exists():
             QtWidgets.QMessageBox.warning(
                 self,
                 "IAA",
                 "Round aggregate not found. Import assignments and build the aggregate before calculating agreement.",
             )
             return
+        if not aggregate_db:
+            aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=True)
+        if not aggregate_db:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "IAA",
+                "Round aggregate could not be loaded.",
+            )
+            return
         self.round_manifest = self._load_manifest(round_dir)
         round_id = self.current_round["round_id"]
-        with sqlite3.connect(aggregate_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with aggregate_db.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT unit_id, reviewer_id, value, value_num, value_date, na
@@ -3222,12 +3465,18 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         self.resize(1280, 860)
         self._setup_menu()
         self._setup_central()
+        self.ctx.dirty_changed.connect(self._on_dirty_changed)
+        self._on_dirty_changed(False)
 
     def _setup_menu(self) -> None:
         bar = self.menuBar()
         file_menu = bar.addMenu("File")
         new_action = file_menu.addAction("Create new project…")
         new_action.triggered.connect(self._create_project)
+        self.save_action = file_menu.addAction("Save project")
+        self.save_action.setShortcut(QtGui.QKeySequence.StandardKey.Save)
+        self.save_action.triggered.connect(self._save_project)
+        self.save_action.setEnabled(False)
         file_menu.addSeparator()
         open_action = file_menu.addAction("Open project folder…")
         open_action.triggered.connect(self._open_project)
@@ -3267,6 +3516,22 @@ class AdminMainWindow(QtWidgets.QMainWindow):
     def _show_view(self, key: str) -> None:
         index = self.view_index.get(key, self.view_index["project"])
         self.stack.setCurrentIndex(index)
+
+    def _on_dirty_changed(self, dirty: bool) -> None:
+        if hasattr(self, "save_action"):
+            self.save_action.setEnabled(dirty)
+        title = "VAAnnotate Admin"
+        if dirty:
+            title += " • Unsaved changes"
+        self.setWindowTitle(title)
+
+    def _save_project(self) -> None:
+        try:
+            self.ctx.save_all()
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Save project", f"Failed to save project: {exc}")
+            return
+        QtWidgets.QMessageBox.information(self, "Save project", "Project saved.")
 
     def _on_node_selected(self, data: Dict[str, object]) -> None:
         node_type = data.get("type")
@@ -3369,6 +3634,29 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         self.ctx.open_project(Path(directory))
         self.project_view.set_project(self.ctx.project_row)
         self.tree.refresh()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: D401 - Qt override
+        if self.ctx.has_unsaved_changes():
+            response = QtWidgets.QMessageBox.question(
+                self,
+                "Exit",
+                "Save changes before exiting?",
+                QtWidgets.QMessageBox.StandardButton.Save
+                | QtWidgets.QMessageBox.StandardButton.Discard
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Save,
+            )
+            if response == QtWidgets.QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+            if response == QtWidgets.QMessageBox.StandardButton.Save:
+                try:
+                    self.ctx.save_all()
+                except Exception as exc:  # noqa: BLE001
+                    QtWidgets.QMessageBox.critical(self, "Save project", f"Failed to save project: {exc}")
+                    event.ignore()
+                    return
+        super().closeEvent(event)
 
 
 def run() -> None:
