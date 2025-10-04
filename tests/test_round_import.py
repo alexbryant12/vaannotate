@@ -47,7 +47,6 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
             name="Test phenotype",
             level="single_doc",
             corpus_path="phenotypes/ph_test/corpus/corpus.db",
-            default_corpus_id=None,
         )
         add_labelset(
             conn,
@@ -143,10 +142,9 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
             conn,
             pheno_id="ph_multi",
             project_id="proj",
-            name="Multi Doc",
+            name="Multi Doc", 
             level="multi_doc",
             corpus_path="phenotypes/ph_multi/corpus/corpus.db",
-            default_corpus_id=None,
         )
         add_labelset(
             conn,

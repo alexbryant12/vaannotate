@@ -80,7 +80,6 @@ def addphenotype(
             level,
             description,
             corpus_path=str(corpus_path),
-            default_corpus_id=None,
         )
         conn.commit()
     print(f"Added phenotype {pheno_id}")

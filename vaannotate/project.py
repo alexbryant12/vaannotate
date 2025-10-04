@@ -17,7 +17,6 @@ class ProjectPaths:
     project_db: Path
     admin_dir: Path
     phenotypes_dir: Path
-    corpora_dir: Path
 
 
 def build_project_paths(root: Path) -> ProjectPaths:
@@ -26,7 +25,6 @@ def build_project_paths(root: Path) -> ProjectPaths:
         project_db=root / "project.db",
         admin_dir=root / "admin_tools",
         phenotypes_dir=root / "phenotypes",
-        corpora_dir=root / "corpora",
     )
 
 
@@ -35,7 +33,6 @@ def init_project(root: Path, project_id: str, name: str, created_by: str) -> Pro
     ensure_dir(paths.root)
     ensure_dir(paths.admin_dir)
     ensure_dir(paths.phenotypes_dir)
-    ensure_dir(paths.corpora_dir)
     with initialize_project_db(paths.project_db) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO projects(project_id, name, created_at, created_by) VALUES (?,?,?,?)",
@@ -74,15 +71,10 @@ def add_phenotype(
     description: str | None = None,
     *,
     corpus_path: str,
-    default_corpus_id: str | None = None,
 ) -> None:
     conn.execute(
-        """
-        INSERT OR REPLACE INTO phenotypes(
-            pheno_id, project_id, name, level, description, corpus_path, default_corpus_id
-        ) VALUES (?,?,?,?,?,?,?)
-        """,
-        (pheno_id, project_id, name, level, description, corpus_path, default_corpus_id),
+        "INSERT OR REPLACE INTO phenotypes(pheno_id, project_id, name, level, description, corpus_path) VALUES (?,?,?,?,?,?)",
+        (pheno_id, project_id, name, level, description, corpus_path),
     )
 
 
