@@ -34,6 +34,7 @@ from vaannotate.project import (
 )
 from vaannotate.rounds import RoundBuilder
 from vaannotate.schema import initialize_corpus_db
+from vaannotate.shared.metadata import extract_document_metadata
 from vaannotate.utils import canonical_json, ensure_dir
 
 
@@ -562,8 +563,12 @@ def augment_assignment_db(
 ) -> None:
     with sqlite3.connect(assignment_path) as conn:
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS documents (doc_id TEXT PRIMARY KEY, hash TEXT NOT NULL, text TEXT NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS documents (doc_id TEXT PRIMARY KEY, hash TEXT NOT NULL, text TEXT NOT NULL, metadata_json TEXT)"
         )
+        try:
+            conn.execute("ALTER TABLE documents ADD COLUMN metadata_json TEXT")
+        except sqlite3.OperationalError:
+            pass
         units = conn.execute("SELECT unit_id, patient_icn FROM units").fetchall()
         for unit_id, patient_icn in units:
             docs = patient_docs.get(patient_icn)
@@ -575,9 +580,16 @@ def augment_assignment_db(
                     "INSERT OR REPLACE INTO unit_notes(unit_id, doc_id, order_index) VALUES (?,?,?)",
                     (unit_id, doc_row["doc_id"], order_index),
                 )
+                metadata = extract_document_metadata(doc_row)
+                metadata_json = json.dumps(metadata, sort_keys=True) if metadata else None
                 conn.execute(
-                    "INSERT OR REPLACE INTO documents(doc_id, hash, text) VALUES (?,?,?)",
-                    (doc_row["doc_id"], doc_row["hash"], doc_row["text"]),
+                    "INSERT OR REPLACE INTO documents(doc_id, hash, text, metadata_json) VALUES (?,?,?,?)",
+                    (
+                        doc_row["doc_id"],
+                        doc_row["hash"],
+                        doc_row["text"],
+                        metadata_json,
+                    ),
                 )
         conn.commit()
 
@@ -641,7 +653,8 @@ def load_patient_docs(corpus_db: Path) -> Dict[str, List[sqlite3.Row]]:
     with get_connection(corpus_db) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
-            "SELECT doc_id, patient_icn, hash, text, date_note FROM documents ORDER BY patient_icn, date_note"
+            "SELECT doc_id, patient_icn, notetype, note_year, date_note, cptname, sta3n, hash, text "
+            "FROM documents ORDER BY patient_icn, date_note"
         )
         for row in cursor:
             mapping.setdefault(row["patient_icn"], []).append(row)

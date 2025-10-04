@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import uuid
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from vaannotate.shared import models
+from vaannotate.shared.theme import apply_dark_palette
 from vaannotate.shared.database import Database, ensure_schema
 from vaannotate.project import get_connection
 
@@ -346,6 +348,11 @@ class AssignmentContext(QtCore.QObject):
                     models.Event,
                 ],
             )
+            try:
+                conn.execute("ALTER TABLE documents ADD COLUMN metadata_json TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
             unit_rows = conn.execute("SELECT * FROM units ORDER BY display_rank").fetchall()
             self.units = [dict(row) for row in unit_rows]
             self._unit_completion_baseline = {
@@ -356,10 +363,20 @@ class AssignmentContext(QtCore.QObject):
                 for unit in self.units
             }
             document_rows = conn.execute("SELECT * FROM documents").fetchall()
-            self._document_cache = {
-                str(row["doc_id"]): dict(row)
-                for row in document_rows
-            }
+            self._document_cache = {}
+            for row in document_rows:
+                data = dict(row)
+                metadata_json = data.get("metadata_json")
+                metadata: Dict[str, object]
+                if metadata_json:
+                    try:
+                        metadata = json.loads(metadata_json)
+                    except Exception:  # noqa: BLE001
+                        metadata = {}
+                else:
+                    metadata = {}
+                data["metadata"] = metadata
+                self._document_cache[str(row["doc_id"])] = data
             note_rows = conn.execute(
                 "SELECT unit_id, doc_id, order_index FROM unit_notes ORDER BY unit_id, order_index"
             ).fetchall()
@@ -374,19 +391,30 @@ class AssignmentContext(QtCore.QObject):
                     order_index = 0
                 doc_record = self._document_cache.get(doc_id, {})
                 text = str(doc_record.get("text", ""))
+                metadata = dict(doc_record.get("metadata") or {})
+                doc_entry: Dict[str, object] = {
+                    "order_index": order_index,
+                    "doc_id": doc_id,
+                    "text": text,
+                    "metadata": metadata,
+                }
+                if "hash" in doc_record:
+                    doc_entry["hash"] = doc_record.get("hash")
                 unit_documents.setdefault(unit_id, []).append(
-                    {
-                        "order_index": order_index,
-                        "doc_id": doc_id,
-                        "text": text,
-                    }
+                    doc_entry
                 )
             for unit_id, docs in unit_documents.items():
                 docs.sort(key=lambda entry: (entry.get("order_index", 0), entry.get("doc_id")))
-            self._unit_document_cache = {
-                unit_id: [dict(doc) for doc in docs]
-                for unit_id, docs in unit_documents.items()
-            }
+            self._unit_document_cache = {}
+            for unit_id, docs in unit_documents.items():
+                copies: List[Dict[str, object]] = []
+                for doc in docs:
+                    doc_copy = dict(doc)
+                    metadata = doc_copy.get("metadata")
+                    if isinstance(metadata, dict):
+                        doc_copy["metadata"] = dict(metadata)
+                    copies.append(doc_copy)
+                self._unit_document_cache[unit_id] = copies
             annotation_rows = conn.execute("SELECT * FROM annotations").fetchall()
             baseline_annotations: Dict[str, Dict[str, Dict[str, object]]] = {}
             for row in annotation_rows:
@@ -470,10 +498,35 @@ class AssignmentContext(QtCore.QObject):
                         break
         return text
 
+    def document_metadata(self, doc_id: str) -> Dict[str, object]:
+        record = self._document_cache.get(doc_id)
+        if not record:
+            return {}
+        metadata = record.get("metadata")
+        if isinstance(metadata, dict):
+            return dict(metadata)
+        metadata_json = record.get("metadata_json")
+        if isinstance(metadata_json, str) and metadata_json:
+            try:
+                parsed = json.loads(metadata_json)
+            except Exception:  # noqa: BLE001
+                return {}
+            record["metadata"] = parsed if isinstance(parsed, dict) else {}
+            if isinstance(parsed, dict):
+                return dict(parsed)
+        return {}
+
     def fetch_unit_documents(self, unit_id: str) -> List[Dict[str, object]]:
         cached = self._unit_document_cache.get(unit_id)
         if cached is not None:
-            return [dict(doc) for doc in cached]
+            copies: List[Dict[str, object]] = []
+            for doc in cached:
+                doc_copy = dict(doc)
+                metadata = doc_copy.get("metadata")
+                if isinstance(metadata, dict):
+                    doc_copy["metadata"] = dict(metadata)
+                copies.append(doc_copy)
+            return copies
         return []
 
     def invalidate_unit_documents(self, unit_id: str) -> None:
@@ -485,12 +538,24 @@ class AssignmentContext(QtCore.QObject):
         cached_docs: List[Dict[str, object]] = []
         for doc in documents:
             doc_copy = dict(doc)
+            metadata_value = doc_copy.get("metadata")
+            metadata_json: Optional[str] = None
+            if isinstance(metadata_value, dict):
+                doc_copy["metadata"] = dict(metadata_value)
+                try:
+                    metadata_json = json.dumps(metadata_value, sort_keys=True)
+                except Exception:  # noqa: BLE001
+                    metadata_json = None
             doc_id = str(doc_copy.get("doc_id", ""))
             if doc_id:
                 existing = dict(self._document_cache.get(doc_id, {}))
                 existing.setdefault("doc_id", doc_id)
                 if "text" in doc_copy:
                     existing["text"] = doc_copy["text"]
+                if metadata_value:
+                    existing["metadata"] = dict(metadata_value)
+                    if metadata_json is not None:
+                        existing["metadata_json"] = metadata_json
                 self._document_cache[doc_id] = existing
             cached_docs.append(doc_copy)
         self._unit_document_cache[unit_id] = cached_docs
@@ -1124,6 +1189,16 @@ class AnnotationForm(QtWidgets.QScrollArea):
 
 
 class ClientMainWindow(QtWidgets.QMainWindow):
+    DOCUMENT_METADATA_PRIORITY = [
+        "patient_icn",
+        "date_note",
+        "note_year",
+        "notetype",
+        "sta3n",
+        "cptname",
+        "softlabel",
+    ]
+
     def __init__(self) -> None:
         super().__init__()
         self.ctx = AssignmentContext()
@@ -1165,13 +1240,13 @@ class ClientMainWindow(QtWidgets.QMainWindow):
 
         middle_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.notes_table = QtWidgets.QTableWidget()
-        self.notes_table.setColumnCount(3)
-        self.notes_table.setHorizontalHeaderLabels(["#", "Document ID", "Preview"])
+        self.notes_table.setColumnCount(0)
         self.notes_table.verticalHeader().setVisible(False)
         self.notes_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.notes_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.notes_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.notes_table.itemSelectionChanged.connect(self._on_document_selected)
+        self.notes_table.setSortingEnabled(True)
         self.notes_table.horizontalHeader().setStretchLastSection(True)
         middle_splitter.addWidget(self.notes_table)
 
@@ -1299,6 +1374,50 @@ class ClientMainWindow(QtWidgets.QMainWindow):
             return f"{base} ({note_count} notes)"
         return patient or str(unit.get("unit_id"))
 
+    def _collect_document_metadata_keys(self, documents: List[Dict[str, object]]) -> List[str]:
+        discovered: List[str] = []
+        for doc in documents:
+            metadata = doc.get("metadata")
+            if isinstance(metadata, dict):
+                for key in metadata.keys():
+                    if key not in discovered:
+                        discovered.append(str(key))
+        priority = [key for key in self.DOCUMENT_METADATA_PRIORITY if key in discovered]
+        remaining = sorted(
+            [key for key in discovered if key not in self.DOCUMENT_METADATA_PRIORITY],
+            key=str.lower,
+        )
+        return priority + remaining
+
+    def _format_metadata_header(self, key: str) -> str:
+        parts = key.split("_")
+        formatted: List[str] = []
+        for part in parts:
+            token = part.strip()
+            if not token:
+                continue
+            upper_token = token.upper()
+            if upper_token in {"ICN", "ID", "VA", "HIN"}:
+                formatted.append(upper_token)
+            elif token.lower() == "sta3n":
+                formatted.append("STA3N")
+            elif token.isupper():
+                formatted.append(token)
+            else:
+                formatted.append(token.capitalize())
+        return " ".join(formatted) if formatted else key
+
+    def _format_metadata_value(self, value: object) -> str:
+        if value is None:
+            return "—"
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped if stripped else "—"
+        if isinstance(value, (list, tuple, set)):
+            items = [self._format_metadata_value(item) for item in value]
+            return ", ".join(item for item in items if item != "—") or "—"
+        return str(value)
+
     def _on_assignment_loaded(self) -> None:
         self.save_action.setEnabled(True)
         self.unit_list.clear()
@@ -1332,11 +1451,13 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         else:
             fallback_doc_id = str(unit.get("doc_id", ""))
             fallback_text = self.ctx.fetch_document(fallback_doc_id, unit_id)
+            fallback_metadata = self.ctx.document_metadata(fallback_doc_id)
             documents = [
                 {
                     "order_index": 1,
                     "doc_id": fallback_doc_id,
                     "text": fallback_text,
+                    "metadata": fallback_metadata,
                 }
             ]
             self.ctx.cache_unit_documents(unit_id, documents)
@@ -1350,18 +1471,47 @@ class ClientMainWindow(QtWidgets.QMainWindow):
     def _populate_notes_table(self, documents: List[Dict[str, object]]) -> None:
         self.current_documents = documents
         self.active_doc_id = None
+        metadata_keys = self._collect_document_metadata_keys(documents)
+        headers = ["#", "Document ID"] + [
+            self._format_metadata_header(key) for key in metadata_keys
+        ] + ["Preview"]
         self.notes_table.blockSignals(True)
+        self.notes_table.setSortingEnabled(False)
+        self.notes_table.clear()
+        self.notes_table.setColumnCount(len(headers))
+        self.notes_table.setHorizontalHeaderLabels(headers)
         self.notes_table.setRowCount(len(documents))
+        metadata_offset = 2
+        preview_column = len(headers) - 1
         for row_index, doc in enumerate(documents):
-            order_item = QtWidgets.QTableWidgetItem(str(doc.get("order_index", row_index + 1)))
+            order_value = doc.get("order_index", row_index + 1)
+            order_item = QtWidgets.QTableWidgetItem(str(order_value))
             order_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc)
-            doc_item = QtWidgets.QTableWidgetItem(str(doc.get("doc_id", "")))
-            doc_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc)
+            order_item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self.notes_table.setItem(row_index, 0, order_item)
+
+            doc_id_item = QtWidgets.QTableWidgetItem(str(doc.get("doc_id", "")))
+            doc_id_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc)
+            doc_id_item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self.notes_table.setItem(row_index, 1, doc_id_item)
+
+            metadata = doc.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            for offset, key in enumerate(metadata_keys, start=metadata_offset):
+                value = metadata.get(key)
+                display_value = self._format_metadata_value(value)
+                item = QtWidgets.QTableWidgetItem(display_value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, doc)
+                item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+                self.notes_table.setItem(row_index, offset, item)
+
             preview_text = str(doc.get("text", ""))[:200].replace("\n", " ")
             preview_item = QtWidgets.QTableWidgetItem(preview_text)
-            self.notes_table.setItem(row_index, 0, order_item)
-            self.notes_table.setItem(row_index, 1, doc_item)
-            self.notes_table.setItem(row_index, 2, preview_item)
+            preview_item.setData(QtCore.Qt.ItemDataRole.UserRole, doc)
+            preview_item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self.notes_table.setItem(row_index, preview_column, preview_item)
+        self.notes_table.setSortingEnabled(True)
         self.notes_table.blockSignals(False)
         self.notes_table.resizeColumnsToContents()
 
@@ -1482,6 +1632,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
 
 def run(path: Optional[str] = None) -> None:
     app = QtWidgets.QApplication(sys.argv)
+    apply_dark_palette(app)
     window = ClientMainWindow()
     window.show()
     if path:

@@ -14,6 +14,7 @@ from typing import Dict, List, Sequence
 import sqlite3
 
 from .database import Database, ensure_schema
+from .metadata import extract_document_metadata
 from . import models
 
 
@@ -93,29 +94,30 @@ def candidate_documents(corpus_db: Database, level: str, filters: SamplingFilter
                 docs,
                 key=lambda item: (_note_year_sort_value(item["note_year"]), item["doc_id"]),
             )
-            primary = ordered_docs[0]
-            doc_payloads = [
-                {
-                    "doc_id": doc["doc_id"],
-                    "hash": doc["hash"],
-                    "text": doc["text"],
-                    "note_year": doc["note_year"],
-                    "notetype": doc["notetype"],
-                    "sta3n": doc["sta3n"],
-                    "order_index": idx,
-                }
-                for idx, doc in enumerate(ordered_docs)
-            ]
+            primary = dict(ordered_docs[0])
+            doc_payloads = []
+            for idx, doc in enumerate(ordered_docs):
+                doc_dict = dict(doc)
+                doc_dict.pop("documents", None)
+                doc_dict["order_index"] = idx
+                metadata = extract_document_metadata(doc_dict)
+                doc_dict["metadata"] = metadata
+                doc_payloads.append(doc_dict)
+            primary_metadata = extract_document_metadata(primary)
             aggregated.append(
                 {
                     "unit_id": patient_icn,
                     "patient_icn": patient_icn,
                     "doc_id": None,
-                    "note_year": primary["note_year"],
-                    "notetype": primary["notetype"],
-                    "sta3n": primary["sta3n"],
+                    "note_year": primary.get("note_year"),
+                    "notetype": primary.get("notetype"),
+                    "sta3n": primary.get("sta3n"),
+                    "date_note": primary.get("date_note"),
+                    "cptname": primary.get("cptname"),
+                    "softlabel": primary.get("softlabel"),
                     "note_count": len(ordered_docs),
                     "documents": doc_payloads,
+                    "metadata": primary_metadata,
                 }
             )
         return aggregated
@@ -215,17 +217,28 @@ def _build_unit_payload(row: sqlite3.Row | Dict[str, object], strata_key: str, i
     else:
         data = {key: row[key] for key in row.keys()}
     documents = data.get("documents")
+    doc_payloads: List[Dict[str, object]] = []
     if documents:
-        doc_payloads = [dict(doc) for doc in documents]  # shallow copy
-    else:
-        doc_payloads = [
-            {
-                "doc_id": data.get("doc_id"),
-                "hash": data.get("hash", ""),
-                "text": data.get("text", ""),
-                "order_index": 0,
-            }
-        ] if data.get("doc_id") else []
+        for doc in documents:
+            doc_copy = dict(doc)
+            doc_copy.pop("documents", None)
+            try:
+                doc_copy["order_index"] = int(doc_copy.get("order_index", len(doc_payloads)))
+            except (TypeError, ValueError):
+                doc_copy["order_index"] = len(doc_payloads)
+            metadata = extract_document_metadata(doc_copy)
+            doc_copy["metadata"] = metadata
+            doc_payloads.append(doc_copy)
+    elif data.get("doc_id"):
+        doc_copy = dict(data)
+        doc_copy.pop("documents", None)
+        try:
+            doc_copy["order_index"] = int(doc_copy.get("order_index", 0))
+        except (TypeError, ValueError):
+            doc_copy["order_index"] = 0
+        metadata = extract_document_metadata(doc_copy)
+        doc_copy["metadata"] = metadata
+        doc_payloads = [doc_copy]
     unit_id = data.get("unit_id") or data.get("doc_id")
     payload = {
         "unit_id": unit_id,
@@ -299,10 +312,15 @@ def populate_assignment_db(db: Database, reviewer: str, units: Sequence[Dict[str
                         order_index=int(doc.get("order_index", 0)),
                     )
                     note.save(conn)
+                    metadata = extract_document_metadata(doc)
+                    metadata_json = (
+                        json.dumps(metadata, sort_keys=True) if metadata else None
+                    )
                     doc_record = models.AssignmentDocument(
                         doc_id=str(doc_id),
                         hash=str(doc.get("hash", "")),
                         text=str(doc.get("text", "")),
+                        metadata_json=metadata_json,
                     )
                     doc_record.save(conn)
             elif doc_id_value:
@@ -312,10 +330,13 @@ def populate_assignment_db(db: Database, reviewer: str, units: Sequence[Dict[str
                     order_index=order,
                 )
                 note.save(conn)
+                metadata = extract_document_metadata(unit)
+                metadata_json = json.dumps(metadata, sort_keys=True) if metadata else None
                 doc = models.AssignmentDocument(
                     doc_id=str(doc_id_value),
                     hash=str(unit.get("hash", "")),
                     text=str(unit.get("text", "")),
+                    metadata_json=metadata_json,
                 )
                 doc.save(conn)
         event = models.Event(
