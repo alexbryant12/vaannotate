@@ -16,6 +16,7 @@ import pytest
 from vaannotate.project import (
     add_labelset,
     add_phenotype,
+    add_project_corpus,
     get_connection,
     init_project,
     register_reviewer,
@@ -40,13 +41,20 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
     with get_connection(paths.project_db) as conn:
         register_reviewer(conn, "rev_one", "Reviewer One")
         register_reviewer(conn, "rev_two", "Reviewer Two")
+        add_project_corpus(
+            conn,
+            corpus_id="cor_ph_test",
+            project_id="proj",
+            name="Test corpus",
+            relative_path="corpora/ph_test/corpus.db",
+        )
         add_phenotype(
             conn,
             pheno_id="ph_test",
             project_id="proj",
             name="Test phenotype",
             level="single_doc",
-            corpus_path="phenotypes/ph_test/corpus/corpus.db",
+            storage_path="phenotypes/ph_test",
         )
         add_labelset(
             conn,
@@ -79,7 +87,8 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
         )
         conn.commit()
 
-    corpus_db = project_root / "phenotypes" / "ph_test" / "corpus" / "corpus.db"
+    corpus_db = project_root / "corpora" / "ph_test" / "corpus.db"
+    corpus_db.parent.mkdir(parents=True, exist_ok=True)
     with initialize_corpus_db(corpus_db) as corpus_conn:
         for idx in range(3):
             patient_id = f"p{idx}"
@@ -114,6 +123,7 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
         "round_number": 1,
         "round_id": "ph_test_r1",
         "labelset_id": "ls_test",
+        "corpus_id": "cor_ph_test",
         "reviewers": [
             {"id": "rev_one", "name": "Reviewer One"},
             {"id": "rev_two", "name": "Reviewer Two"},
@@ -138,13 +148,20 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
     with get_connection(paths.project_db) as conn:
         register_reviewer(conn, "rev_one", "Reviewer One")
         register_reviewer(conn, "rev_two", "Reviewer Two")
+        add_project_corpus(
+            conn,
+            corpus_id="cor_ph_multi",
+            project_id="proj",
+            name="Multi corpus",
+            relative_path="corpora/ph_multi/corpus.db",
+        )
         add_phenotype(
             conn,
             pheno_id="ph_multi",
             project_id="proj",
-            name="Multi Doc", 
+            name="Multi Doc",
             level="multi_doc",
-            corpus_path="phenotypes/ph_multi/corpus/corpus.db",
+            storage_path="phenotypes/ph_multi",
         )
         add_labelset(
             conn,
@@ -174,7 +191,8 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
         "p2": [("p2_doc1", "Patient 2 doc A"), ("p2_doc2", "Patient 2 doc B")],
         "p3": [("p3_doc1", "Patient 3 doc A"), ("p3_doc2", "Patient 3 doc B")],
     }
-    corpus_db = project_root / "phenotypes" / "ph_multi" / "corpus" / "corpus.db"
+    corpus_db = project_root / "corpora" / "ph_multi" / "corpus.db"
+    corpus_db.parent.mkdir(parents=True, exist_ok=True)
     with initialize_corpus_db(corpus_db) as corpus_conn:
         for idx, (patient_icn, docs) in enumerate(docs_by_patient.items()):
             corpus_conn.execute(
@@ -209,6 +227,7 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
         "round_number": 1,
         "round_id": "ph_multi_r1",
         "labelset_id": "ls_multi",
+        "corpus_id": "cor_ph_multi",
         "reviewers": [
             {"id": "rev_one", "name": "Reviewer One"},
             {"id": "rev_two", "name": "Reviewer Two"},

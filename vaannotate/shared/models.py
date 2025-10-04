@@ -97,7 +97,7 @@ class Phenotype(Record):
     name: str
     level: str
     description: str
-    corpus_path: str
+    storage_path: str
 
     __tablename__ = "phenotypes"
     __schema__ = (
@@ -108,7 +108,31 @@ class Phenotype(Record):
             name TEXT NOT NULL,
             level TEXT CHECK(level IN ('single_doc','multi_doc')) NOT NULL,
             description TEXT NOT NULL,
-            corpus_path TEXT NOT NULL,
+            storage_path TEXT NOT NULL,
+            UNIQUE(project_id, name),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id)
+        )
+        """
+    )
+
+
+@dataclass
+class ProjectCorpus(Record):
+    corpus_id: str
+    project_id: str
+    name: str
+    relative_path: str
+    created_at: str
+
+    __tablename__ = "project_corpora"
+    __schema__ = (
+        """
+        CREATE TABLE IF NOT EXISTS project_corpora (
+            corpus_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
             UNIQUE(project_id, name),
             FOREIGN KEY(project_id) REFERENCES projects(project_id)
         )

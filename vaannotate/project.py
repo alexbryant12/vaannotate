@@ -17,6 +17,7 @@ class ProjectPaths:
     project_db: Path
     admin_dir: Path
     phenotypes_dir: Path
+    corpora_dir: Path
 
 
 def build_project_paths(root: Path) -> ProjectPaths:
@@ -25,6 +26,7 @@ def build_project_paths(root: Path) -> ProjectPaths:
         project_db=root / "project.db",
         admin_dir=root / "admin_tools",
         phenotypes_dir=root / "phenotypes",
+        corpora_dir=root / "corpora",
     )
 
 
@@ -33,6 +35,7 @@ def init_project(root: Path, project_id: str, name: str, created_by: str) -> Pro
     ensure_dir(paths.root)
     ensure_dir(paths.admin_dir)
     ensure_dir(paths.phenotypes_dir)
+    ensure_dir(paths.corpora_dir)
     with initialize_project_db(paths.project_db) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO projects(project_id, name, created_at, created_by) VALUES (?,?,?,?)",
@@ -62,6 +65,25 @@ def register_reviewer(conn: sqlite3.Connection, reviewer_id: str, name: str, ema
     )
 
 
+def add_project_corpus(
+    conn: sqlite3.Connection,
+    *,
+    corpus_id: str,
+    project_id: str,
+    name: str,
+    relative_path: str,
+    created_at: str | None = None,
+) -> None:
+    timestamp = created_at or datetime.utcnow().isoformat()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO project_corpora(corpus_id, project_id, name, relative_path, created_at)
+        VALUES (?,?,?,?,?)
+        """,
+        (corpus_id, project_id, name, relative_path, timestamp),
+    )
+
+
 def add_phenotype(
     conn: sqlite3.Connection,
     pheno_id: str,
@@ -70,11 +92,11 @@ def add_phenotype(
     level: str,
     description: str | None = None,
     *,
-    corpus_path: str,
+    storage_path: str,
 ) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO phenotypes(pheno_id, project_id, name, level, description, corpus_path) VALUES (?,?,?,?,?,?)",
-        (pheno_id, project_id, name, level, description, corpus_path),
+        "INSERT OR REPLACE INTO phenotypes(pheno_id, project_id, name, level, description, storage_path) VALUES (?,?,?,?,?,?)",
+        (pheno_id, project_id, name, level, description, storage_path),
     )
 
 
