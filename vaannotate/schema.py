@@ -254,7 +254,36 @@ ROUND_AGG_SCHEMA = [
         unit_id TEXT NOT NULL,
         patient_icn TEXT,
         doc_id TEXT,
+        metadata_json TEXT,
         PRIMARY KEY(round_id, unit_id)
+    );
+    """,
+    """
+    ALTER TABLE unit_summary ADD COLUMN metadata_json TEXT;
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS unit_status(
+        round_id TEXT NOT NULL,
+        label_id TEXT NOT NULL,
+        unit_id TEXT NOT NULL,
+        status TEXT,
+        PRIMARY KEY(round_id, label_id, unit_id)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS round_state(
+        round_id TEXT PRIMARY KEY,
+        last_label_id TEXT
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS annotation_change_history(
+        round_id TEXT NOT NULL,
+        unit_id TEXT NOT NULL,
+        reviewer_id TEXT NOT NULL,
+        label_id TEXT NOT NULL,
+        history TEXT,
+        PRIMARY KEY(round_id, unit_id, reviewer_id, label_id)
     );
     """,
 ];
@@ -266,7 +295,13 @@ def initialize_db(path: Path, schema: list[str]) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys=ON;")
     for statement in schema:
-        conn.executescript(statement)
+        try:
+            conn.executescript(statement)
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "duplicate column" in message or "duplicate table" in message:
+                continue
+            raise
     conn.commit()
     return conn
 
