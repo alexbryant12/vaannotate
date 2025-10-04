@@ -1832,16 +1832,37 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             return
         display_name = project.get("name") or project.get("project_id") or "Project"
         project_item = QtWidgets.QTreeWidgetItem([str(display_name)])
-        project_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "project", "project": dict(project)})
+        project_item.setData(
+            0,
+            QtCore.Qt.ItemDataRole.UserRole,
+            {"type": "project", "project": dict(project)},
+        )
         self.addTopLevelItem(project_item)
         project_item.setExpanded(True)
+        corpora_section = QtWidgets.QTreeWidgetItem(["Corpora"])
+        corpora_section.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "corpora_section"})
+        project_item.addChild(corpora_section)
+        for corpus in self.ctx.list_corpora():
+            corpus_item = self._build_corpus_item(corpus)
+            corpora_section.addChild(corpus_item)
+        corpora_section.setExpanded(True)
+
+        phenotypes_section = QtWidgets.QTreeWidgetItem(["Phenotypes"])
+        phenotypes_section.setData(
+            0, QtCore.Qt.ItemDataRole.UserRole, {"type": "phenotypes_section"}
+        )
+        project_item.addChild(phenotypes_section)
         for pheno in self.ctx.list_phenotypes():
             pheno_item = self._build_phenotype_item(pheno)
-            project_item.addChild(pheno_item)
+            phenotypes_section.addChild(pheno_item)
             pheno_item.setExpanded(True)
+        phenotypes_section.setExpanded(True)
+
         self.expandItem(project_item)
-        if project_item.childCount():
-            self.setCurrentItem(project_item.child(0))
+        if corpora_section.childCount():
+            self.setCurrentItem(corpora_section.child(0))
+        elif phenotypes_section.childCount():
+            self.setCurrentItem(phenotypes_section.child(0))
         else:
             self.setCurrentItem(project_item)
 
@@ -1854,13 +1875,23 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             child = QtWidgets.QTreeWidgetItem([label])
             child.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "round", "round": dict(round_row)})
             pheno_item.addChild(child)
-        corpus_item = QtWidgets.QTreeWidgetItem(["Corpus"])
-        corpus_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "corpus", "pheno": dict(pheno)})
-        pheno_item.addChild(corpus_item)
         iaa_item = QtWidgets.QTreeWidgetItem(["IAA"])
         iaa_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "iaa", "pheno": dict(pheno)})
         pheno_item.addChild(iaa_item)
         return pheno_item
+
+    def _build_corpus_item(self, corpus: sqlite3.Row) -> QtWidgets.QTreeWidgetItem:
+        corpus_dict = dict(corpus)
+        name = corpus_dict.get("name")
+        corpus_id = corpus_dict.get("corpus_id")
+        label = f"{name} ({corpus_id})" if name else str(corpus_id or "Corpus")
+        item = QtWidgets.QTreeWidgetItem([label])
+        item.setData(
+            0,
+            QtCore.Qt.ItemDataRole.UserRole,
+            {"type": "corpus", "corpus": corpus_dict},
+        )
+        return item
 
     def _on_current_item_changed(
         self,
@@ -1889,6 +1920,8 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             action.triggered.connect(lambda: self._add_phenotype(item))
             label_action = menu.addAction("Add label set…")
             label_action.triggered.connect(lambda: self._add_labelset(item))
+            corpus_action = menu.addAction("Create corpus…")
+            corpus_action.triggered.connect(lambda: self._create_corpus(item))
         elif node_type == "phenotype":
             action = menu.addAction("Add round…")
             action.triggered.connect(lambda: self._add_round(item))
@@ -1920,6 +1953,24 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             QtWidgets.QMessageBox.critical(self, "Phenotype", f"Failed to create phenotype: {exc}")
             return
         QtCore.QTimer.singleShot(0, lambda: self._select_phenotype(record.pheno_id))
+
+    def _create_corpus(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        del item
+        start_dir = str(self.ctx.project_root or Path.home())
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select corpus file",
+            start_dir,
+            "Corpus files (*.db *.sqlite *.sqlite3 *.csv *.parquet *.pq);;All files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            record = self.ctx.import_corpus(Path(path_str))
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Corpus", f"Failed to import corpus: {exc}")
+            return
+        QtCore.QTimer.singleShot(0, lambda: self._select_corpus(record.corpus_id))
 
     def _add_labelset(self, item: QtWidgets.QTreeWidgetItem) -> None:
         del item
@@ -1991,6 +2042,25 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             if isinstance(data, dict) and data.get("type") == "phenotype" and data.get("pheno", {}).get("pheno_id") == pheno_id:
                 self.setCurrentItem(item)
                 self.expandItem(item)
+                return
+        self.refresh()
+
+    def _select_corpus(self, corpus_id: str) -> None:
+        project_item = self.topLevelItem(0)
+        if not project_item:
+            return
+        for item in self._iter_items(project_item):
+            data = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if (
+                isinstance(data, dict)
+                and data.get("type") == "corpus"
+                and data.get("corpus", {}).get("corpus_id") == corpus_id
+            ):
+                self.setCurrentItem(item)
+                parent = item.parent()
+                while parent:
+                    self.expandItem(parent)
+                    parent = parent.parent()
                 return
         self.refresh()
 
@@ -2270,7 +2340,6 @@ class CorpusWidget(QtWidgets.QWidget):
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.ctx = ctx
-        self.current_pheno: Optional[Dict[str, object]] = None
         self.current_corpus_id: Optional[str] = None
         layout = QtWidgets.QVBoxLayout(self)
         controls = QtWidgets.QHBoxLayout()
@@ -2296,10 +2365,18 @@ class CorpusWidget(QtWidgets.QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
+        self.ctx.project_changed.connect(self._refresh_corpora)
         self._refresh_corpora()
 
     def set_phenotype(self, pheno: Optional[Dict[str, object]]) -> None:
-        self.current_pheno = pheno
+        del pheno
+        self.set_corpus(None)
+
+    def set_corpus(self, corpus: Optional[Dict[str, object]]) -> None:
+        if corpus and corpus.get("corpus_id"):
+            self.current_corpus_id = str(corpus["corpus_id"])
+        else:
+            self.current_corpus_id = None
         self._refresh_corpora()
 
     def _refresh_corpora(self) -> None:
@@ -2312,6 +2389,7 @@ class CorpusWidget(QtWidgets.QWidget):
             self.corpus_combo.setEnabled(False)
             self.summary_label.setText("Import a corpus to view its contents.")
             self.table.setRowCount(0)
+            self.current_corpus_id = None
         else:
             self.corpus_combo.setEnabled(True)
             for corpus in corpora:
@@ -3757,8 +3835,8 @@ class AdminMainWindow(QtWidgets.QMainWindow):
                 self.round_view.set_round(None, None)
             self._show_view("round")
         elif node_type == "corpus":
-            pheno = data.get("pheno")
-            self.corpus_view.set_phenotype(pheno if isinstance(pheno, dict) else None)
+            corpus = data.get("corpus")
+            self.corpus_view.set_corpus(corpus if isinstance(corpus, dict) else None)
             self._show_view("corpus")
         elif node_type == "iaa":
             pheno = data.get("pheno")
