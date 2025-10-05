@@ -1209,6 +1209,7 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         self._last_project_dir: Optional[Path] = None
         self._current_project_root: Optional[Path] = None
         self._current_assignment: Optional[AssignmentSummary] = None
+        self._note_font_size = 12
         self._setup_menu()
         self._setup_ui()
         self.ctx.assignment_loaded.connect(self._on_assignment_loaded)
@@ -1256,8 +1257,25 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         note_panel_layout.setSpacing(6)
         self.note_view = QtWidgets.QTextEdit()
         self.note_view.setReadOnly(True)
-        self.note_view.setFontPointSize(12)
+        note_font = self.note_view.font()
+        note_font.setPointSize(self._note_font_size)
+        self.note_view.setFont(note_font)
+        self.note_view.document().setDefaultFont(note_font)
         note_panel_layout.addWidget(self.note_view)
+
+        font_controls = QtWidgets.QHBoxLayout()
+        font_label = QtWidgets.QLabel("Text size:")
+        font_controls.addWidget(font_label)
+        self.note_font_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.note_font_slider.setRange(8, 32)
+        self.note_font_slider.setSingleStep(1)
+        self.note_font_slider.setValue(self._note_font_size)
+        self.note_font_slider.valueChanged.connect(self._on_note_font_size_changed)
+        font_controls.addWidget(self.note_font_slider, 1)
+        self.note_font_value = QtWidgets.QLabel(f"{self._note_font_size} pt")
+        font_controls.addWidget(self.note_font_value)
+        font_controls.addStretch()
+        note_panel_layout.addLayout(font_controls)
 
         info_widget = QtWidgets.QWidget()
         info_layout = QtWidgets.QHBoxLayout(info_widget)
@@ -1292,6 +1310,15 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         nav_toolbar.addAction(next_action)
         nav_toolbar.addAction(self.save_action)
         nav_toolbar.addAction(submit_action)
+
+    def _on_note_font_size_changed(self, value: int) -> None:
+        self._note_font_size = int(value)
+        font = self.note_view.font()
+        font.setPointSize(self._note_font_size)
+        self.note_view.setFont(font)
+        self.note_view.document().setDefaultFont(font)
+        if hasattr(self, "note_font_value"):
+            self.note_font_value.setText(f"{self._note_font_size} pt")
 
     def _open_project(self) -> None:
         start_dir = str(self._last_project_dir) if self._last_project_dir else str(Path.home())

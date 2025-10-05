@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping, Sequence
 
 from .project import fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
@@ -253,7 +253,20 @@ class RoundBuilder:
         strat_config = config.get("stratification") or {}
         metadata_filters_config = filters_config.get("metadata")
         strat_field_keys: list[str] = []
-        use_metadata_sampling = isinstance(metadata_filters_config, list)
+        use_metadata_sampling = isinstance(metadata_filters_config, (list, dict))
+        raw_metadata_filters: list[Mapping[str, object]] = []
+        metadata_logic = "all"
+        if isinstance(metadata_filters_config, dict):
+            metadata_logic = str(metadata_filters_config.get("logic") or "all").lower()
+            raw_conditions = metadata_filters_config.get("conditions")
+            if isinstance(raw_conditions, list):
+                raw_metadata_filters = [
+                    entry for entry in raw_conditions if isinstance(entry, Mapping)
+                ]
+        elif isinstance(metadata_filters_config, list):
+            raw_metadata_filters = [
+                entry for entry in metadata_filters_config if isinstance(entry, Mapping)
+            ]
         if isinstance(strat_config, dict):
             raw_fields = strat_config.get("fields")
             if isinstance(raw_fields, list):
@@ -274,20 +287,19 @@ class RoundBuilder:
             conditions: list[MetadataFilterCondition] = []
             missing_filter_fields: list[str] = []
             invalid_filter_fields: list[str] = []
-            if isinstance(metadata_filters_config, list):
-                for entry in metadata_filters_config:
-                    try:
-                        condition = MetadataFilterCondition.from_payload(entry)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    field = field_lookup.get(condition.field)
-                    if not field:
-                        missing_filter_fields.append(condition.field or condition.label)
-                        continue
-                    if level == "multi_doc" and not field.constant_for_unit:
-                        invalid_filter_fields.append(field.label)
-                        continue
-                    conditions.append(condition)
+            for entry in raw_metadata_filters:
+                try:
+                    condition = MetadataFilterCondition.from_payload(entry)
+                except Exception:  # noqa: BLE001
+                    continue
+                field = field_lookup.get(condition.field)
+                if not field:
+                    missing_filter_fields.append(condition.field or condition.label)
+                    continue
+                if level == "multi_doc" and not field.constant_for_unit:
+                    invalid_filter_fields.append(field.label)
+                    continue
+                conditions.append(condition)
             if missing_filter_fields:
                 raise ValueError(
                     "Unknown metadata fields in filters: "
@@ -299,7 +311,10 @@ class RoundBuilder:
                     + ", ".join(sorted(set(invalid_filter_fields))),
                 )
 
-            sampling_filters = SamplingFilters(metadata_filters=conditions)
+            sampling_filters = SamplingFilters(
+                metadata_filters=conditions,
+                match_any=metadata_logic == "any",
+            )
 
             filtered_strat_keys: list[str] = []
             strat_aliases: list[str] = []

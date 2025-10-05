@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import shutil
 import re
 import sqlite3
 import sys
@@ -703,6 +704,93 @@ class ProjectContext(QtCore.QObject):
         self._mark_dirty()
         self.project_changed.emit()
 
+    def delete_corpus(self, corpus_id: str, *, delete_files: bool = True) -> None:
+        record = self.get_corpus(corpus_id)
+        if not record:
+            raise RuntimeError(f"Corpus {corpus_id} not found")
+        target_path: Optional[Path] = None
+        parent_dir: Optional[Path] = None
+        if delete_files:
+            relative = str(record.get("relative_path") or "")
+            if relative:
+                try:
+                    target_path = self.resolve_project_path(relative)
+                    parent_dir = target_path.parent
+                except Exception:
+                    target_path = None
+        db = self.require_db()
+        with db.transaction() as conn:
+            conn.execute("DELETE FROM project_corpora WHERE corpus_id=?", (corpus_id,))
+        self._corpus_cache.pop(corpus_id, None)
+        self._corpus_metadata_cache.pop(corpus_id, None)
+        self._mark_dirty()
+        if delete_files and target_path:
+            try:
+                if target_path.is_dir():
+                    shutil.rmtree(target_path, ignore_errors=True)
+                elif target_path.exists():
+                    target_path.unlink()
+                if parent_dir and parent_dir.exists():
+                    parent_dir.rmdir()
+            except OSError:
+                pass
+        self.project_changed.emit()
+
+    def delete_round(
+        self,
+        round_id: str,
+        *,
+        delete_files: bool = True,
+        emit_signal: bool = True,
+    ) -> None:
+        round_row = self.get_round(round_id)
+        if not round_row:
+            raise RuntimeError(f"Round {round_id} not found")
+        pheno_id = str(round_row["pheno_id"])
+        round_number_raw = round_row["round_number"]
+        round_dir: Optional[Path] = None
+        if delete_files:
+            try:
+                round_number = int(round_number_raw)
+            except (TypeError, ValueError):
+                round_number = None
+            if round_number is not None:
+                try:
+                    round_dir = self.resolve_round_dir(pheno_id, round_number)
+                except Exception:
+                    round_dir = None
+        db = self.require_db()
+        with db.transaction() as conn:
+            conn.execute("DELETE FROM assignments WHERE round_id=?", (round_id,))
+            conn.execute("DELETE FROM round_configs WHERE round_id=?", (round_id,))
+            conn.execute("DELETE FROM rounds WHERE round_id=?", (round_id,))
+        self._mark_dirty()
+        if delete_files and round_dir and round_dir.exists():
+            shutil.rmtree(round_dir, ignore_errors=True)
+        if emit_signal:
+            self.project_changed.emit()
+
+    def delete_phenotype(self, pheno_id: str, *, delete_files: bool = True) -> None:
+        pheno = self.get_phenotype(pheno_id)
+        if not pheno:
+            raise RuntimeError(f"Phenotype {pheno_id} not found")
+        phenotype_dir: Optional[Path] = None
+        if delete_files:
+            try:
+                phenotype_dir = self.resolve_phenotype_dir(pheno_id)
+            except Exception:
+                phenotype_dir = None
+        for round_row in self.list_rounds(pheno_id):
+            round_id = str(round_row["round_id"])
+            self.delete_round(round_id, delete_files=delete_files, emit_signal=False)
+        db = self.require_db()
+        with db.transaction() as conn:
+            conn.execute("DELETE FROM phenotypes WHERE pheno_id=?", (pheno_id,))
+        self._mark_dirty()
+        if delete_files and phenotype_dir and phenotype_dir.exists():
+            shutil.rmtree(phenotype_dir, ignore_errors=True)
+        self.project_changed.emit()
+
 
 class PhenotypeDialog(QtWidgets.QDialog):
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
@@ -1400,6 +1488,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.filter_list.itemDoubleClicked.connect(self._on_edit_filter)
         self.filter_list.currentRowChanged.connect(self._update_filter_buttons)
         filter_layout.addWidget(self.filter_list)
+        logic_row = QtWidgets.QHBoxLayout()
+        logic_label = QtWidgets.QLabel("Match mode:")
+        logic_row.addWidget(logic_label)
+        self.filter_logic_combo = QtWidgets.QComboBox()
+        self.filter_logic_combo.addItem("Match all conditions", False)
+        self.filter_logic_combo.addItem("Match any condition", True)
+        self.filter_logic_combo.setToolTip(
+            "Choose whether documents must satisfy every filter or any single filter."
+        )
+        logic_row.addWidget(self.filter_logic_combo)
+        logic_row.addStretch()
+        filter_layout.addLayout(logic_row)
         filter_controls = QtWidgets.QHBoxLayout()
         self.filter_field_combo = QtWidgets.QComboBox()
         self.filter_field_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
@@ -1461,7 +1561,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     except Exception:  # noqa: BLE001
                         continue
                     conditions.append(condition)
-        return SamplingFilters(metadata_filters=conditions)
+        match_any = False
+        if hasattr(self, "filter_logic_combo"):
+            data = self.filter_logic_combo.currentData()
+            match_any = bool(data)
+        return SamplingFilters(metadata_filters=conditions, match_any=match_any)
 
     def _load_reviewed_unit_ids(self, corpus_id: Optional[str]) -> Set[str]:
         pheno_id = self.pheno_row["pheno_id"]
@@ -1631,6 +1735,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._metadata_lookup = {field.key: field for field in self._metadata_fields}
         if hasattr(self, "filter_list"):
             self.filter_list.clear()
+        if hasattr(self, "filter_logic_combo"):
+            self.filter_logic_combo.setCurrentIndex(0)
         if hasattr(self, "strat_list"):
             self.strat_list.clear()
         self._refresh_filter_field_options()
@@ -2162,9 +2268,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if sampling_metadata:
                 config_payload["sampling"] = sampling_metadata
             if filters.metadata_filters:
-                config_payload["filters"] = {
-                    "metadata": [condition.to_payload() for condition in filters.metadata_filters]
+                metadata_payload: Dict[str, object] = {
+                    "conditions": [
+                        condition.to_payload() for condition in filters.metadata_filters
+                    ]
                 }
+                metadata_payload["logic"] = "any" if filters.match_any else "all"
+                config_payload["filters"] = {"metadata": metadata_payload}
             if strat_field_keys:
                 config_payload["stratification"] = {
                     "fields": strat_field_keys,
@@ -2327,9 +2437,14 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             label_action.triggered.connect(lambda: self._add_labelset(item))
             corpus_action = menu.addAction("Create corpus…")
             corpus_action.triggered.connect(lambda: self._create_corpus(item))
+        elif node_type == "corpus":
+            delete_action = menu.addAction("Delete corpus…")
+            delete_action.triggered.connect(lambda: self._delete_corpus(item))
         elif node_type == "phenotype":
             action = menu.addAction("Add round…")
             action.triggered.connect(lambda: self._add_round(item))
+            delete_action = menu.addAction("Delete phenotype…")
+            delete_action.triggered.connect(lambda: self._delete_phenotype(item))
         elif node_type == "round":
             round_info = data.get("round") or {}
             current_status = str(round_info.get("status", ""))
@@ -2339,6 +2454,9 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
                 action.setCheckable(True)
                 action.setChecked(status == current_status)
                 action.triggered.connect(lambda _, s=status: self._change_round_status(item, s))
+            menu.addSeparator()
+            delete_action = menu.addAction("Delete round…")
+            delete_action.triggered.connect(lambda: self._delete_round(item))
         if not menu.isEmpty():
             menu.exec(self.viewport().mapToGlobal(point))
 
@@ -2415,6 +2533,90 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
         if round_id:
             self.ctx.project_changed.emit()
             QtCore.QTimer.singleShot(0, lambda: self._select_round(pheno_row["pheno_id"], round_id))
+
+    def _delete_corpus(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
+        corpus = data.get("corpus")
+        if not isinstance(corpus, dict):
+            return
+        corpus_id = str(corpus.get("corpus_id") or "")
+        if not corpus_id:
+            return
+        display_name = str(corpus.get("name") or corpus_id)
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Delete corpus",
+            (
+                f"Delete corpus '{display_name}'?\n\n"
+                "This will remove the corpus record from the project. Files will also be deleted."
+            ),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.ctx.delete_corpus(corpus_id)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Delete corpus", f"Failed to delete corpus: {exc}")
+
+    def _delete_phenotype(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
+        pheno = data.get("pheno")
+        if not isinstance(pheno, dict):
+            return
+        pheno_id = str(pheno.get("pheno_id") or "")
+        if not pheno_id:
+            return
+        display_name = str(pheno.get("name") or pheno_id)
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Delete phenotype",
+            (
+                f"Delete phenotype '{display_name}'?\n\n"
+                "All rounds and associated files for this phenotype will be permanently removed."
+            ),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.ctx.delete_phenotype(pheno_id)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Delete phenotype", f"Failed to delete phenotype: {exc}")
+            return
+        QtCore.QTimer.singleShot(0, self.refresh)
+
+    def _delete_round(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
+        round_info = data.get("round")
+        if not isinstance(round_info, dict):
+            return
+        round_id = str(round_info.get("round_id") or "")
+        if not round_id:
+            return
+        pheno_id = str(round_info.get("pheno_id") or "")
+        round_label = item.text(0) or round_id
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Delete round",
+            (
+                f"Delete {round_label}?\n\n"
+                "Assignments, configuration, and round files will be permanently removed."
+            ),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.ctx.delete_round(round_id)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Delete round", f"Failed to delete round: {exc}")
+            return
+        if pheno_id:
+            QtCore.QTimer.singleShot(0, lambda: self._select_phenotype(pheno_id))
 
     def _change_round_status(self, item: QtWidgets.QTreeWidgetItem, status: str) -> None:
         data = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
@@ -2644,30 +2846,46 @@ class RoundDetailWidget(QtWidgets.QWidget):
         filters = config.get("filters") or {}
         filter_items: List[str] = []
         metadata_filters = filters.get("metadata")
-        if isinstance(metadata_filters, list):
-            for entry in metadata_filters:
+        metadata_items: List[str] = []
+        logic_value = "all"
+        raw_conditions: Sequence[Mapping[str, object]] | None
+        if isinstance(metadata_filters, dict):
+            logic_value = str(metadata_filters.get("logic") or "all").lower()
+            raw = metadata_filters.get("conditions")
+            raw_conditions = raw if isinstance(raw, (list, tuple)) else None
+        elif isinstance(metadata_filters, list):
+            raw_conditions = metadata_filters
+        else:
+            raw_conditions = None
+        if raw_conditions:
+            for entry in raw_conditions:
                 try:
                     condition = MetadataFilterCondition.from_payload(entry)
                 except Exception:  # noqa: BLE001
                     continue
-                filter_items.append(self._describe_metadata_filter(condition))
-        else:
-            patient_filters = filters.get("patient") or {}
-            for key, value in patient_filters.items():
-                label = {
-                    "sta3n_in": "Patient STA3N",
-                    "year_range": "Patient year range",
-                    "softlabel_gte": "Softlabel ≥",
-                }.get(key, key)
-                filter_items.append(f"Patient – {label}: {self._format_filter_value(key, value)}")
-            note_filters = filters.get("note") or {}
-            for key, value in note_filters.items():
-                label = {
-                    "notetype_in": "Note types",
-                    "note_year_range": "Note year range",
-                    "regex": "Regex",
-                }.get(key, key)
-                filter_items.append(f"Note – {label}: {self._format_filter_value(key, value)}")
+                metadata_items.append(self._describe_metadata_filter(condition))
+            if metadata_items:
+                if logic_value == "any":
+                    metadata_items.insert(0, "Match any condition (OR logic)")
+                else:
+                    metadata_items.insert(0, "Match all conditions (AND logic)")
+                filter_items.extend(metadata_items)
+        patient_filters = filters.get("patient") or {}
+        for key, value in patient_filters.items():
+            label = {
+                "sta3n_in": "Patient STA3N",
+                "year_range": "Patient year range",
+                "softlabel_gte": "Softlabel ≥",
+            }.get(key, key)
+            filter_items.append(f"Patient – {label}: {self._format_filter_value(key, value)}")
+        note_filters = filters.get("note") or {}
+        for key, value in note_filters.items():
+            label = {
+                "notetype_in": "Note types",
+                "note_year_range": "Note year range",
+                "regex": "Regex",
+            }.get(key, key)
+            filter_items.append(f"Note – {label}: {self._format_filter_value(key, value)}")
         if filter_items:
             sections.append(self._format_section("Sampling filters", filter_items))
 
