@@ -32,6 +32,7 @@ from vaannotate.shared.sampling import (
     initialize_assignment_db,
     populate_assignment_db,
 )
+from vaannotate.shared.metadata import MetadataFilterCondition
 
 
 @pytest.fixture()
@@ -320,6 +321,58 @@ def test_round_builder_metadata_filters_single_doc(seeded_project: tuple[RoundBu
     assert doc_ids == {"doc_2"}
     strata_keys = {row["strata_key"] for row in rows}
     assert strata_keys == {"506"}
+
+
+def test_candidate_documents_match_any_filters(tmp_path: Path) -> None:
+    corpus_path = tmp_path / "corpus.db"
+    with initialize_corpus_db(corpus_path) as conn:
+        conn.execute(
+            "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
+            ("p_any", "506", None, None),
+        )
+        conn.execute(
+            """
+            INSERT INTO documents(
+                doc_id, patient_icn, notetype, note_year, date_note,
+                cptname, sta3n, hash, text
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            ("doc_alpha", "p_any", "ALPHA", 2020, "2020-01-01", "", "506", "hash_a", "Alpha text"),
+        )
+        conn.execute(
+            """
+            INSERT INTO documents(
+                doc_id, patient_icn, notetype, note_year, date_note,
+                cptname, sta3n, hash, text
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            ("doc_beta", "p_any", "BETA", 2022, "2022-06-15", "", "506", "hash_b", "Beta text"),
+        )
+        conn.commit()
+
+    filters = SamplingFilters(
+        metadata_filters=[
+            MetadataFilterCondition(
+                field="document.notetype",
+                label="Notetype",
+                scope="document",
+                data_type="text",
+                values=["ALPHA"],
+            ),
+            MetadataFilterCondition(
+                field="document.note_year",
+                label="Note year",
+                scope="document",
+                data_type="number",
+                min_value="2022",
+            ),
+        ],
+        match_any=True,
+    )
+
+    rows = candidate_documents(Database(corpus_path), "single_doc", filters)
+    doc_ids = {row["doc_id"] for row in rows}
+    assert doc_ids == {"doc_alpha", "doc_beta"}
 
 
 def test_admin_sampling_creates_multi_doc_units(tmp_path: Path) -> None:

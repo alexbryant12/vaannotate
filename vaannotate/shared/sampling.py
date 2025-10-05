@@ -25,6 +25,7 @@ from . import models
 @dataclass
 class SamplingFilters:
     metadata_filters: List[MetadataFilterCondition]
+    match_any: bool = False
 
     def field_keys(self) -> List[str]:
         return [condition.field for condition in self.metadata_filters]
@@ -190,7 +191,8 @@ def _candidate_documents_from_connection(
         "JOIN patients ON patients.patient_icn = documents.patient_icn",
     ]
     if clauses:
-        query.append("WHERE " + " AND ".join(f"({clause})" for clause in clauses))
+        joiner = " OR " if filters.match_any else " AND "
+        query.append("WHERE " + joiner.join(f"({clause})" for clause in clauses))
     query.append(
         "ORDER BY documents.patient_icn, documents.note_year, documents.doc_id",
     )
