@@ -22,7 +22,7 @@ from vaannotate.project import (
     init_project,
     register_reviewer,
 )
-from vaannotate.rounds import RoundBuilder
+from vaannotate.rounds import CandidateUnit, RoundBuilder
 from vaannotate.schema import initialize_corpus_db
 from vaannotate.shared.database import Database
 from vaannotate.shared.sampling import (
@@ -592,6 +592,74 @@ def test_allocate_units_respects_total_n() -> None:
         count = len(assignments[reviewer_id].units)
         expected = overlap_n + per_reviewer_base + (1 if idx < remainder else 0)
         assert count == expected
+
+
+def test_allocate_units_stratified_overlap_matches_target() -> None:
+    rows = []
+    for strata in range(3):
+        for idx in range(5):
+            rows.append(
+                {
+                    "unit_id": f"unit_{strata}_{idx}",
+                    "patient_icn": f"pat_{strata}_{idx}",
+                    "doc_id": f"doc_{strata}_{idx}",
+                    "strata": strata,
+                }
+            )
+    reviewers = [
+        {"id": "rev_a", "name": "Reviewer A"},
+        {"id": "rev_b", "name": "Reviewer B"},
+    ]
+
+    overlap_n = 4
+    assignments = allocate_units(
+        rows,
+        reviewers,
+        overlap_n=overlap_n,
+        seed=13,
+        strat_keys=["strata"],
+    )
+
+    for reviewer in reviewers:
+        reviewer_id = reviewer["id"]
+        overlap_units = [
+            unit
+            for unit in assignments[reviewer_id].units
+            if unit.get("is_overlap")
+        ]
+        assert len(overlap_units) == overlap_n
+
+
+def test_round_builder_overlap_respects_target_total() -> None:
+    builder = RoundBuilder(Path("/tmp"))
+    candidates: list[CandidateUnit] = []
+    for strata in range(3):
+        for idx in range(4):
+            candidates.append(
+                CandidateUnit(
+                    unit_id=f"unit_{strata}_{idx}",
+                    patient_icn=f"pat_{strata}_{idx}",
+                    doc_id=f"doc_{strata}_{idx}",
+                    strata_key=str(strata),
+                    payload={"strata_key": str(strata)},
+                )
+            )
+    reviewers = ["rev_a", "rev_b", "rev_c"]
+
+    assignments = builder._allocate_units(
+        candidates,
+        reviewers,
+        rng_seed=7,
+        overlap_n=5,
+        total_n=None,
+        strat_config={"fields": ["strata"]},
+    )
+
+    overlap_counts = [
+        sum(1 for unit in units if unit.payload.get("is_overlap"))
+        for units in assignments.values()
+    ]
+    assert overlap_counts == [5, 5, 5]
 
 def _annotate_assignment(db_path: Path, flag_value: str | None, score_factory) -> list[str]:
     with sqlite3.connect(db_path) as conn:

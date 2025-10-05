@@ -28,3 +28,22 @@ def test_project_context_defers_file_deletion(tmp_path: Path) -> None:
 
     assert not file_path.exists()
     assert not ctx._pending_deletions
+
+
+def test_registering_artifact_clears_pending_deletion(tmp_path: Path) -> None:
+    ctx = ProjectContext()
+    round_dir = tmp_path / "rounds" / "round_1"
+    manifest_path = round_dir / "manifest.csv"
+
+    ctx._schedule_deletion(round_dir, mode="tree")
+    assert ctx._pending_deletions
+
+    ctx.register_manifest(manifest_path, {})
+    assert not ctx._pending_deletions
+
+    text_path = round_dir / "notes.txt"
+    ctx._schedule_deletion(text_path, mode="file")
+    assert ctx._pending_deletions
+
+    ctx.register_text_file(text_path, "sample")
+    assert not ctx._pending_deletions

@@ -298,6 +298,8 @@ def allocate_units(
                 if remaining == 0:
                     break
             active = next_active if remaining > 0 else []
+    selected_by_strata: Dict[str, List[sqlite3.Row | Dict[str, object]]] = {}
+    order: List[str] = []
     remaining = target_total if total_n is not None else None
     for strata_key in sorted(strata.keys()):
         items = list(strata[strata_key])
@@ -309,10 +311,44 @@ def allocate_units(
                 break
             if take > remaining:
                 take = remaining
-        items = items[:take]
-        overlap_size = min(overlap_n, len(items))
-        overlap_pool = items[:overlap_size]
-        remainder = items[overlap_size:]
+        selected = items[:take]
+        selected_by_strata[strata_key] = selected
+        order.append(strata_key)
+        if remaining is not None:
+            remaining -= len(selected)
+            if remaining <= 0:
+                break
+
+    overlap_allocations: Dict[str, int] = {key: 0 for key in selected_by_strata}
+    if overlap_n:
+        remaining_overlap = min(
+            overlap_n, sum(len(items) for items in selected_by_strata.values())
+        )
+        active = [key for key, items in selected_by_strata.items() if items]
+        while remaining_overlap > 0 and active:
+            share = max(1, remaining_overlap // len(active))
+            next_active: List[str] = []
+            for strata_key in list(active):
+                capacity = len(selected_by_strata[strata_key]) - overlap_allocations[strata_key]
+                if capacity <= 0:
+                    continue
+                take = min(share, capacity, remaining_overlap)
+                overlap_allocations[strata_key] += take
+                remaining_overlap -= take
+                if (
+                    overlap_allocations[strata_key] < len(selected_by_strata[strata_key])
+                    and remaining_overlap > 0
+                ):
+                    next_active.append(strata_key)
+                if remaining_overlap == 0:
+                    break
+            active = next_active if remaining_overlap > 0 else []
+
+    for strata_key in order:
+        selected = selected_by_strata.get(strata_key, [])
+        overlap_size = overlap_allocations.get(strata_key, 0)
+        overlap_pool = selected[:overlap_size]
+        remainder = selected[overlap_size:]
         for reviewer in reviewer_units.values():
             for row in overlap_pool:
                 payload = _build_unit_payload(row, strata_key, is_overlap=True)
@@ -321,10 +357,6 @@ def allocate_units(
             reviewer = reviewers[idx % len(reviewers)]["id"]
             payload = _build_unit_payload(row, strata_key, is_overlap=False)
             reviewer_units[reviewer].units.append(payload)
-        if remaining is not None:
-            remaining -= len(items)
-            if remaining <= 0:
-                break
     # randomize display order per reviewer deterministically
     for reviewer in reviewer_units.values():
         rng = random.Random(_hash_seed(seed, reviewer.reviewer_id))
