@@ -448,7 +448,7 @@ def test_admin_sampling_creates_multi_doc_units(tmp_path: Path) -> None:
                 assert doc_row["text"] == text_map[doc_id]
 
 
-def test_round_builder_blocks_variable_metadata_for_multi_doc(tmp_path: Path) -> None:
+def test_round_builder_allows_document_stratification_for_multi_doc(tmp_path: Path) -> None:
     project_root = tmp_path / "Project"
     paths = init_project(project_root, "proj", "Project", "tester")
 
@@ -539,8 +539,20 @@ def test_round_builder_blocks_variable_metadata_for_multi_doc(tmp_path: Path) ->
     }
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Cannot stratify multi-document units"):
-        builder.generate_round("ph_multi", config_path, created_by="tester")
+    builder.generate_round("ph_multi", config_path, created_by="tester")
+
+    manifest_path = (
+        project_root
+        / "phenotypes"
+        / "ph_multi"
+        / "rounds"
+        / "round_1"
+        / "manifest.csv"
+    )
+    assert manifest_path.exists()
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["strata_key"] for row in rows] == ["2020"]
 
 
 def test_allocate_units_respects_total_n() -> None:

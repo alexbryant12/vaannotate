@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .database import Database
@@ -138,19 +139,65 @@ def _human_label(name: str) -> str:
     return name[:1].upper() + name[1:]
 
 
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y/%m/%d",
+    "%Y/%m/%d %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%m/%d/%Y",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y %H:%M:%S",
+    "%m-%d-%Y",
+    "%m-%d-%Y %H:%M",
+    "%m-%d-%Y %H:%M:%S",
+    "%Y%m%d",
+)
+
+
+def _normalize_date_string(value: str) -> Optional[str]:
+    value = value.strip()
+    if not value:
+        return None
+    candidates = [value]
+    if value.endswith("Z"):
+        candidates.append(value[:-1] + "+00:00")
+    for candidate in candidates:
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        return dt.date().isoformat()
+    for fmt in _DATE_FORMATS:
+        try:
+            dt = datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+        return dt.date().isoformat()
+    if re.match(r"^\d{4}-\d{1,2}-\d{1,2}T\d{2}:\d{2}", value):
+        try:
+            dt = datetime.fromisoformat(value[:16])
+        except ValueError:
+            return None
+        return dt.date().isoformat()
+    return None
+
+
+def normalize_date_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = _normalize_date_string(str(value))
+    return normalized or (str(value).strip() or None)
+
+
 def _looks_like_date(value: Any) -> bool:
     if not isinstance(value, str):
         return False
-    value = value.strip()
-    if not value:
-        return False
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
-        return True
-    if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", value):
-        return True
-    if re.match(r"^\d{4}/\d{2}/\d{2}$", value):
-        return True
-    return False
+    return _normalize_date_string(value) is not None
 
 
 def _all_numeric(values: Sequence[Any]) -> bool:

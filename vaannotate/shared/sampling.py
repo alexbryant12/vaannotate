@@ -18,6 +18,7 @@ from .metadata import (
     MetadataFilterCondition,
     discover_corpus_metadata,
     extract_document_metadata,
+    normalize_date_value,
 )
 from . import models
 
@@ -167,15 +168,20 @@ def _candidate_documents_from_connection(
                     params.extend(numeric_values)
         elif field.data_type == "date":
             if condition.min_value:
+                normalized = normalize_date_value(condition.min_value)
+                value = normalized or condition.min_value
                 local_clauses.append(f"{field.expression} >= ?")
-                params.append(condition.min_value)
+                params.append(value)
             if condition.max_value:
+                normalized = normalize_date_value(condition.max_value)
+                value = normalized or condition.max_value
                 local_clauses.append(f"{field.expression} <= ?")
-                params.append(condition.max_value)
+                params.append(value)
             if condition.values:
-                placeholders = ",".join(["?"] * len(condition.values))
+                normalized_values = [normalize_date_value(value) or value for value in condition.values]
+                placeholders = ",".join(["?"] * len(normalized_values))
                 local_clauses.append(f"{field.expression} IN ({placeholders})")
-                params.extend(condition.values)
+                params.extend(normalized_values)
         else:
             if condition.values:
                 placeholders = ",".join(["?"] * len(condition.values))

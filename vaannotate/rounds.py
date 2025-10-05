@@ -286,7 +286,6 @@ class RoundBuilder:
 
             conditions: list[MetadataFilterCondition] = []
             missing_filter_fields: list[str] = []
-            invalid_filter_fields: list[str] = []
             for entry in raw_metadata_filters:
                 try:
                     condition = MetadataFilterCondition.from_payload(entry)
@@ -296,19 +295,11 @@ class RoundBuilder:
                 if not field:
                     missing_filter_fields.append(condition.field or condition.label)
                     continue
-                if level == "multi_doc" and not field.constant_for_unit:
-                    invalid_filter_fields.append(field.label)
-                    continue
                 conditions.append(condition)
             if missing_filter_fields:
                 raise ValueError(
                     "Unknown metadata fields in filters: "
                     + ", ".join(sorted({field for field in missing_filter_fields if field})),
-                )
-            if invalid_filter_fields:
-                raise ValueError(
-                    "Cannot filter multi-document units by fields that vary per document: "
-                    + ", ".join(sorted(set(invalid_filter_fields))),
                 )
 
             sampling_filters = SamplingFilters(
@@ -319,14 +310,10 @@ class RoundBuilder:
             filtered_strat_keys: list[str] = []
             strat_aliases: list[str] = []
             missing_strat_fields: list[str] = []
-            invalid_strat_fields: list[str] = []
             for key in strat_field_keys:
                 field = field_lookup.get(key)
                 if not field:
                     missing_strat_fields.append(key)
-                    continue
-                if level == "multi_doc" and not field.constant_for_unit:
-                    invalid_strat_fields.append(field.label)
                     continue
                 filtered_strat_keys.append(field.key)
                 strat_aliases.append(field.alias)
@@ -334,11 +321,6 @@ class RoundBuilder:
                 raise ValueError(
                     "Unknown metadata fields requested for stratification: "
                     + ", ".join(sorted(set(missing_strat_fields))),
-                )
-            if invalid_strat_fields:
-                raise ValueError(
-                    "Cannot stratify multi-document units by fields that vary per document: "
-                    + ", ".join(sorted(set(invalid_strat_fields))),
                 )
 
             rows = candidate_documents(
