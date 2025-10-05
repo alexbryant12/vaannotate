@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -95,6 +95,7 @@ class ProjectContext(QtCore.QObject):
         self._corpus_metadata_cache: Dict[str, List[MetadataField]] = {}
         self._pending_manifests: Dict[Path, Dict[str, ReviewerAssignment]] = {}
         self._pending_text_writes: Dict[Path, str] = {}
+        self._pending_deletions: Set[Tuple[str, Path]] = set()
         self._dirty_flag = False
         self._last_dirty_state = False
 
@@ -116,6 +117,7 @@ class ProjectContext(QtCore.QObject):
         self._corpus_metadata_cache.clear()
         self._pending_manifests.clear()
         self._pending_text_writes.clear()
+        self._pending_deletions.clear()
         self._dirty_flag = False
         self._emit_dirty_state()
 
@@ -132,8 +134,42 @@ class ProjectContext(QtCore.QObject):
     def mark_dirty(self) -> None:
         self._mark_dirty()
 
+    @staticmethod
+    def _path_is_within(candidate: Path, parent: Path) -> bool:
+        try:
+            candidate.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    def _clear_pending_artifacts(self, target: Path) -> None:
+        resolved_target = target.resolve()
+        for mapping in (self._pending_text_writes, self._pending_manifests):
+            for path in list(mapping.keys()):
+                resolved_candidate = path.resolve()
+                if resolved_candidate == resolved_target or self._path_is_within(
+                    resolved_candidate, resolved_target
+                ):
+                    mapping.pop(path, None)
+
+    def _schedule_deletion(self, path: Path, *, mode: str = "auto") -> None:
+        resolved = path.resolve()
+        action = mode
+        if mode == "auto":
+            action = "tree" if resolved.exists() and resolved.is_dir() else "file"
+        task = (action, resolved)
+        if task in self._pending_deletions:
+            return
+        self._pending_deletions.add(task)
+        self._clear_pending_artifacts(resolved)
+
     def has_unsaved_changes(self) -> bool:
-        if self._dirty_flag or self._pending_manifests or self._pending_text_writes:
+        if (
+            self._dirty_flag
+            or self._pending_manifests
+            or self._pending_text_writes
+            or self._pending_deletions
+        ):
             return True
         return any(db.is_dirty for db in self._managed_dbs)
 
@@ -156,10 +192,28 @@ class ProjectContext(QtCore.QObject):
                 write_manifest(path, assignments)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{path}: {exc}")
+        for action, target in sorted(
+            self._pending_deletions, key=lambda item: len(item[1].parts), reverse=True
+        ):
+            try:
+                if action == "tree":
+                    if target.exists():
+                        shutil.rmtree(target, ignore_errors=True)
+                elif action == "rmdir":
+                    try:
+                        target.rmdir()
+                    except OSError:
+                        pass
+                else:
+                    if target.exists():
+                        target.unlink()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{target}: {exc}")
         if errors:
             raise RuntimeError("; ".join(errors))
         self._pending_text_writes.clear()
         self._pending_manifests.clear()
+        self._pending_deletions.clear()
         self._dirty_flag = False
         self._emit_dirty_state()
 
@@ -725,15 +779,10 @@ class ProjectContext(QtCore.QObject):
         self._corpus_metadata_cache.pop(corpus_id, None)
         self._mark_dirty()
         if delete_files and target_path:
-            try:
-                if target_path.is_dir():
-                    shutil.rmtree(target_path, ignore_errors=True)
-                elif target_path.exists():
-                    target_path.unlink()
-                if parent_dir and parent_dir.exists():
-                    parent_dir.rmdir()
-            except OSError:
-                pass
+            mode = "tree" if target_path.exists() and target_path.is_dir() else "file"
+            self._schedule_deletion(target_path, mode=mode)
+            if parent_dir:
+                self._schedule_deletion(parent_dir, mode="rmdir")
         self.project_changed.emit()
 
     def delete_round(
@@ -765,8 +814,8 @@ class ProjectContext(QtCore.QObject):
             conn.execute("DELETE FROM round_configs WHERE round_id=?", (round_id,))
             conn.execute("DELETE FROM rounds WHERE round_id=?", (round_id,))
         self._mark_dirty()
-        if delete_files and round_dir and round_dir.exists():
-            shutil.rmtree(round_dir, ignore_errors=True)
+        if delete_files and round_dir:
+            self._schedule_deletion(round_dir, mode="tree")
         if emit_signal:
             self.project_changed.emit()
 
@@ -787,8 +836,8 @@ class ProjectContext(QtCore.QObject):
         with db.transaction() as conn:
             conn.execute("DELETE FROM phenotypes WHERE pheno_id=?", (pheno_id,))
         self._mark_dirty()
-        if delete_files and phenotype_dir and phenotype_dir.exists():
-            shutil.rmtree(phenotype_dir, ignore_errors=True)
+        if delete_files and phenotype_dir:
+            self._schedule_deletion(phenotype_dir, mode="tree")
         self.project_changed.emit()
 
 
@@ -1745,8 +1794,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._update_strat_buttons()
 
     def _available_metadata_fields(self) -> List[MetadataField]:
-        if self._safe_mapping_get(self.pheno_row, "level") == "multi_doc":
-            return [field for field in self._metadata_fields if field.constant_for_unit]
         return list(self._metadata_fields)
 
     def _current_filter_field_keys(self) -> Set[str]:
