@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import sqlite3
 import sys
@@ -272,6 +273,55 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
                 assert doc_row["text"]
 
 
+def test_round_builder_metadata_filters_single_doc(seeded_project: tuple[RoundBuilder, Path]) -> None:
+    builder, project_root = seeded_project
+    corpus_path = project_root / "corpora" / "ph_test" / "corpus.db"
+    with sqlite3.connect(corpus_path) as conn:
+        conn.execute("UPDATE documents SET notetype='OTHER' WHERE doc_id='doc_2'")
+        conn.commit()
+
+    config_dir = project_root / "admin_tools" / "round_configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "ph_test_r2.json"
+    config = {
+        "round_number": 2,
+        "round_id": "ph_test_r2",
+        "labelset_id": "ls_test",
+        "corpus_id": "cor_ph_test",
+        "reviewers": [
+            {"id": "rev_one", "name": "Reviewer One"},
+            {"id": "rev_two", "name": "Reviewer Two"},
+        ],
+        "overlap_n": 0,
+        "rng_seed": 999,
+        "filters": {
+            "metadata": [
+                {
+                    "field": "document.notetype",
+                    "label": "Notetype",
+                    "scope": "document",
+                    "type": "text",
+                    "values": ["OTHER"],
+                }
+            ]
+        },
+        "stratification": {"fields": ["patient.sta3n"]},
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    builder.generate_round("ph_test", config_path, created_by="tester")
+
+    round_dir = project_root / "phenotypes" / "ph_test" / "rounds" / "round_2"
+    manifest_path = round_dir / "manifest.csv"
+    assert manifest_path.exists()
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    doc_ids = {row["doc_id"] for row in rows}
+    assert doc_ids == {"doc_2"}
+    strata_keys = {row["strata_key"] for row in rows}
+    assert strata_keys == {"506"}
+
+
 def test_admin_sampling_creates_multi_doc_units(tmp_path: Path) -> None:
     corpus_path = tmp_path / "corpus.db"
     docs_by_patient: dict[str, list[tuple[str, str]]] = {
@@ -307,7 +357,7 @@ def test_admin_sampling_creates_multi_doc_units(tmp_path: Path) -> None:
         corpus_conn.commit()
 
     corpus_db = Database(corpus_path)
-    filters = SamplingFilters({}, {})
+    filters = SamplingFilters(metadata_filters=[])
     candidates = candidate_documents(corpus_db, "multi_doc", filters)
     assert len(candidates) == len(docs_by_patient)
 
@@ -343,6 +393,101 @@ def test_admin_sampling_creates_multi_doc_units(tmp_path: Path) -> None:
                 ).fetchone()
                 assert doc_row is not None
                 assert doc_row["text"] == text_map[doc_id]
+
+
+def test_round_builder_blocks_variable_metadata_for_multi_doc(tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    with get_connection(paths.project_db) as conn:
+        register_reviewer(conn, "rev_one", "Reviewer One")
+        add_project_corpus(
+            conn,
+            corpus_id="cor_ph_multi",
+            project_id="proj",
+            name="Multi corpus",
+            relative_path="corpora/ph_multi/corpus.db",
+        )
+        add_phenotype(
+            conn,
+            pheno_id="ph_multi",
+            project_id="proj",
+            name="Multi Doc",
+            level="multi_doc",
+            storage_path="phenotypes/ph_multi",
+        )
+        add_labelset(
+            conn,
+            labelset_id="ls_multi",
+            project_id="proj",
+            pheno_id="ph_multi",
+            version=1,
+            created_by="tester",
+            notes=None,
+            labels=[
+                {
+                    "label_id": "Flag",
+                    "name": "Flag",
+                    "type": "categorical_single",
+                    "required": False,
+                    "options": [],
+                }
+            ],
+        )
+        conn.commit()
+
+    docs_by_patient = {
+        "p1": [("p1_doc1", "P1 doc one"), ("p1_doc2", "P1 doc two")],
+    }
+    corpus_db = project_root / "corpora" / "ph_multi" / "corpus.db"
+    corpus_db.parent.mkdir(parents=True, exist_ok=True)
+    with initialize_corpus_db(corpus_db) as corpus_conn:
+        for patient_icn, docs in docs_by_patient.items():
+            corpus_conn.execute(
+                "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
+                (patient_icn, "506", None, None),
+            )
+            for idx, (doc_id, text) in enumerate(docs):
+                corpus_conn.execute(
+                    """
+                    INSERT INTO documents(
+                        doc_id, patient_icn, notetype, note_year, date_note,
+                        cptname, sta3n, hash, text
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        doc_id,
+                        patient_icn,
+                        "NOTE",
+                        2020 + idx,
+                        f"202{idx}-01-01",
+                        "",
+                        "506",
+                        f"hash_{doc_id}",
+                        text,
+                    ),
+                )
+        corpus_conn.commit()
+
+    builder = RoundBuilder(project_root)
+    config_dir = paths.admin_dir / "round_configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "ph_multi_r_invalid.json"
+    config = {
+        "round_number": 1,
+        "round_id": "ph_multi_r_invalid",
+        "labelset_id": "ls_multi",
+        "corpus_id": "cor_ph_multi",
+        "reviewers": [{"id": "rev_one", "name": "Reviewer One"}],
+        "overlap_n": 0,
+        "rng_seed": 1,
+        "filters": {"metadata": []},
+        "stratification": {"fields": ["document.note_year"]},
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Cannot stratify multi-document units"):
+        builder.generate_round("ph_multi", config_path, created_by="tester")
 
 
 def test_allocate_units_respects_total_n() -> None:

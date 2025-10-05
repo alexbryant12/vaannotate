@@ -5,23 +5,29 @@ import csv
 import hashlib
 import json
 import random
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import sqlite3
 
 from .database import Database, ensure_schema
-from .metadata import extract_document_metadata
+from .metadata import (
+    MetadataField,
+    MetadataFilterCondition,
+    discover_corpus_metadata,
+    extract_document_metadata,
+)
 from . import models
 
 
 @dataclass
 class SamplingFilters:
-    patient_filters: Dict[str, object]
-    note_filters: Dict[str, object]
+    metadata_filters: List[MetadataFilterCondition]
+
+    def field_keys(self) -> List[str]:
+        return [condition.field for condition in self.metadata_filters]
 
 
 @dataclass
@@ -47,43 +53,150 @@ def _note_year_sort_value(value: object) -> int:
             return -1
 
 
-def candidate_documents(corpus_db: Database, level: str, filters: SamplingFilters) -> List[sqlite3.Row]:
-    with corpus_db.connect() as conn:
-        base_query = [
-            "SELECT documents.*, patients.softlabel FROM documents"
-            " JOIN patients ON patients.patient_icn = documents.patient_icn"
-        ]
-        clauses = []
-        params: List[object] = []
-        pf = filters.patient_filters
-        nf = filters.note_filters
-        if year := pf.get("year_range"):
-            clauses.append("patients.date_index BETWEEN ? AND ?")
-            params.extend(year)
-        if sta := pf.get("sta3n_in"):
-            placeholders = ",".join(["?"] * len(sta))
-            clauses.append(f"patients.sta3n IN ({placeholders})")
-            params.extend(sta)
-        if softlabel := pf.get("softlabel_gte"):
-            clauses.append("(patients.softlabel IS NOT NULL AND patients.softlabel >= ?)")
-            params.append(softlabel)
-        if nf.get("notetype_in"):
-            placeholders = ",".join(["?"] * len(nf["notetype_in"]))
-            clauses.append(f"documents.notetype IN ({placeholders})")
-            params.extend(nf["notetype_in"])
-        if nf.get("note_year_range"):
-            clauses.append("documents.note_year BETWEEN ? AND ?")
-            params.extend(nf["note_year_range"])
-        if nf.get("regex"):
-            clauses.append("documents.text REGEXP ?")
-            params.append(nf["regex"])
-        if clauses:
-            base_query.append("WHERE " + " AND ".join(clauses))
-        base_query.append("ORDER BY documents.note_year")
-        sql = " ".join(base_query)
-        # register simple regexp implementation
-        conn.create_function("REGEXP", 2, lambda pattern, text: 1 if pattern and text and re.search(pattern, text) else 0)
-        rows = conn.execute(sql, params).fetchall()
+def candidate_documents(
+    corpus_db: Database | sqlite3.Connection,
+    level: str,
+    filters: SamplingFilters,
+    *,
+    metadata_fields: Sequence[MetadataField] | None = None,
+    stratify_keys: Sequence[str] | None = None,
+) -> List[sqlite3.Row | Dict[str, object]]:
+    if isinstance(corpus_db, Database):
+        with corpus_db.connect() as conn:
+            return _candidate_documents_from_connection(
+                conn,
+                level,
+                filters,
+                metadata_fields,
+                stratify_keys,
+            )
+    return _candidate_documents_from_connection(
+        corpus_db,
+        level,
+        filters,
+        metadata_fields,
+        stratify_keys,
+    )
+
+
+def _candidate_documents_from_connection(
+    conn: sqlite3.Connection,
+    level: str,
+    filters: SamplingFilters,
+    metadata_fields: Sequence[MetadataField] | None,
+    stratify_keys: Sequence[str] | None,
+) -> List[sqlite3.Row | Dict[str, object]]:
+    available_fields: Sequence[MetadataField]
+    if metadata_fields is None:
+        available_fields = discover_corpus_metadata(conn)
+    else:
+        available_fields = metadata_fields
+    field_lookup: Dict[str, MetadataField] = {field.key: field for field in available_fields}
+
+    requested: Dict[str, MetadataField] = {}
+    for condition in filters.metadata_filters:
+        field = field_lookup.get(condition.field)
+        if field:
+            requested[field.key] = field
+    if stratify_keys:
+        for key in stratify_keys:
+            field = field_lookup.get(str(key))
+            if field:
+                requested[field.key] = field
+    active_fields = list(requested.values())
+
+    select_parts = [
+        "documents.doc_id AS doc_id",
+        "documents.patient_icn AS patient_icn",
+        "documents.note_year AS note_year",
+        "documents.notetype AS notetype",
+        "documents.date_note AS date_note",
+        "documents.cptname AS cptname",
+        "documents.sta3n AS sta3n",
+        "documents.hash AS hash",
+        "documents.text AS text",
+    ]
+    seen_aliases = {
+        "doc_id",
+        "patient_icn",
+        "note_year",
+        "notetype",
+        "date_note",
+        "cptname",
+        "sta3n",
+        "hash",
+        "text",
+    }
+    for field in active_fields:
+        if field.alias in seen_aliases:
+            continue
+        select_parts.append(f'{field.expression} AS "{field.alias}"')
+        seen_aliases.add(field.alias)
+
+    clauses: List[str] = []
+    params: List[object] = []
+    for condition in filters.metadata_filters:
+        field = field_lookup.get(condition.field)
+        if not field:
+            continue
+        local_clauses: List[str] = []
+        if field.data_type == "number":
+            if condition.min_value is not None:
+                try:
+                    params.append(float(condition.min_value))
+                    local_clauses.append(f"CAST({field.expression} AS REAL) >= ?")
+                except ValueError:
+                    pass
+            if condition.max_value is not None:
+                try:
+                    params.append(float(condition.max_value))
+                    local_clauses.append(f"CAST({field.expression} AS REAL) <= ?")
+                except ValueError:
+                    pass
+            if condition.values:
+                numeric_values: List[float] = []
+                for value in condition.values:
+                    try:
+                        numeric_values.append(float(value))
+                    except ValueError:
+                        continue
+                if numeric_values:
+                    placeholders = ",".join(["?"] * len(numeric_values))
+                    local_clauses.append(f"CAST({field.expression} AS REAL) IN ({placeholders})")
+                    params.extend(numeric_values)
+        elif field.data_type == "date":
+            if condition.min_value:
+                local_clauses.append(f"{field.expression} >= ?")
+                params.append(condition.min_value)
+            if condition.max_value:
+                local_clauses.append(f"{field.expression} <= ?")
+                params.append(condition.max_value)
+            if condition.values:
+                placeholders = ",".join(["?"] * len(condition.values))
+                local_clauses.append(f"{field.expression} IN ({placeholders})")
+                params.extend(condition.values)
+        else:
+            if condition.values:
+                placeholders = ",".join(["?"] * len(condition.values))
+                local_clauses.append(f"{field.expression} IN ({placeholders})")
+                params.extend(condition.values)
+        if local_clauses:
+            clauses.append(" AND ".join(local_clauses))
+
+    query = [
+        "SELECT",
+        ", ".join(select_parts),
+        "FROM documents",
+        "JOIN patients ON patients.patient_icn = documents.patient_icn",
+    ]
+    if clauses:
+        query.append("WHERE " + " AND ".join(f"({clause})" for clause in clauses))
+    query.append(
+        "ORDER BY documents.patient_icn, documents.note_year, documents.doc_id",
+    )
+    sql = " ".join(query)
+    rows = conn.execute(sql, params).fetchall()
+
     if level == "multi_doc":
         grouped: Dict[str, List[sqlite3.Row]] = {}
         for row in rows:
@@ -94,7 +207,8 @@ def candidate_documents(corpus_db: Database, level: str, filters: SamplingFilter
                 docs,
                 key=lambda item: (_note_year_sort_value(item["note_year"]), item["doc_id"]),
             )
-            primary = dict(ordered_docs[0])
+            primary_row = ordered_docs[0]
+            primary_dict = dict(primary_row)
             doc_payloads = []
             for idx, doc in enumerate(ordered_docs):
                 doc_dict = dict(doc)
@@ -103,23 +217,24 @@ def candidate_documents(corpus_db: Database, level: str, filters: SamplingFilter
                 metadata = extract_document_metadata(doc_dict)
                 doc_dict["metadata"] = metadata
                 doc_payloads.append(doc_dict)
-            primary_metadata = extract_document_metadata(primary)
-            aggregated.append(
-                {
-                    "unit_id": patient_icn,
-                    "patient_icn": patient_icn,
-                    "doc_id": None,
-                    "note_year": primary.get("note_year"),
-                    "notetype": primary.get("notetype"),
-                    "sta3n": primary.get("sta3n"),
-                    "date_note": primary.get("date_note"),
-                    "cptname": primary.get("cptname"),
-                    "softlabel": primary.get("softlabel"),
-                    "note_count": len(ordered_docs),
-                    "documents": doc_payloads,
-                    "metadata": primary_metadata,
-                }
-            )
+            primary_metadata = extract_document_metadata(primary_dict)
+            entry: Dict[str, object] = {
+                "unit_id": patient_icn,
+                "patient_icn": patient_icn,
+                "doc_id": None,
+                "note_year": primary_dict.get("note_year"),
+                "notetype": primary_dict.get("notetype"),
+                "date_note": primary_dict.get("date_note"),
+                "cptname": primary_dict.get("cptname"),
+                "sta3n": primary_dict.get("sta3n"),
+                "softlabel": primary_dict.get("patient__softlabel"),
+                "note_count": len(ordered_docs),
+                "documents": doc_payloads,
+                "metadata": primary_metadata,
+            }
+            for field in active_fields:
+                entry[field.alias] = primary_dict.get(field.alias)
+            aggregated.append(entry)
         return aggregated
     return rows
 
