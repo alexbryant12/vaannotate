@@ -152,6 +152,15 @@ class ProjectContext(QtCore.QObject):
                 ):
                     mapping.pop(path, None)
 
+    def _clear_pending_deletions(self, target: Path) -> None:
+        resolved_target = target.resolve()
+        for action, candidate in list(self._pending_deletions):
+            resolved_candidate = candidate.resolve()
+            if resolved_candidate == resolved_target or self._path_is_within(
+                resolved_target, resolved_candidate
+            ):
+                self._pending_deletions.discard((action, candidate))
+
     def _schedule_deletion(self, path: Path, *, mode: str = "auto") -> None:
         resolved = path.resolve()
         action = mode
@@ -323,7 +332,9 @@ class ProjectContext(QtCore.QObject):
         return manifest
 
     def register_manifest(self, path: Path, assignments: Dict[str, ReviewerAssignment]) -> None:
-        self._pending_manifests[path.resolve()] = copy.deepcopy(assignments)
+        resolved = path.resolve()
+        self._clear_pending_deletions(resolved)
+        self._pending_manifests[resolved] = copy.deepcopy(assignments)
         self._mark_dirty()
 
     def get_manifest_flags(self, path: Path) -> Dict[str, Dict[str, bool]]:
@@ -346,7 +357,9 @@ class ProjectContext(QtCore.QObject):
         return manifest
 
     def register_text_file(self, path: Path, content: str) -> None:
-        self._pending_text_writes[path.resolve()] = content
+        resolved = path.resolve()
+        self._clear_pending_deletions(resolved)
+        self._pending_text_writes[resolved] = content
         self._mark_dirty()
 
     def _preload_round_assets(self) -> None:

@@ -534,6 +534,7 @@ class RoundBuilder:
                         break
                 active = next_active if remaining > 0 else []
         assigned_total = 0
+        selected_by_strata: dict[str, list[CandidateUnit]] = {}
         for strata_key in sorted(by_strata.keys()):
             strata_candidates = by_strata[strata_key]
             shuffled = deterministic_choice(strata_candidates, stable_hash(rng_seed, strata_key))
@@ -542,8 +543,38 @@ class RoundBuilder:
                 take = max(0, target_total - assigned_total)
             selected = list(shuffled[:take])
             assigned_total += len(selected)
-            overlap_units = selected[: min(overlap_n, len(selected))] if overlap_n else []
-            remainder = selected[len(overlap_units) :]
+            selected_by_strata[strata_key] = selected
+
+        overlap_allocations: dict[str, int] = {key: 0 for key in selected_by_strata}
+        if overlap_n:
+            remaining_overlap = min(
+                overlap_n, sum(len(items) for items in selected_by_strata.values())
+            )
+            active = [key for key, items in selected_by_strata.items() if items]
+            while remaining_overlap > 0 and active:
+                share = max(1, remaining_overlap // len(active))
+                next_active: list[str] = []
+                for strata_key in list(active):
+                    capacity = len(selected_by_strata[strata_key]) - overlap_allocations[strata_key]
+                    if capacity <= 0:
+                        continue
+                    take = min(share, capacity, remaining_overlap)
+                    overlap_allocations[strata_key] += take
+                    remaining_overlap -= take
+                    if (
+                        overlap_allocations[strata_key] < len(selected_by_strata[strata_key])
+                        and remaining_overlap > 0
+                    ):
+                        next_active.append(strata_key)
+                    if remaining_overlap == 0:
+                        break
+                active = next_active if remaining_overlap > 0 else []
+
+        for strata_key in sorted(selected_by_strata.keys()):
+            selected = selected_by_strata.get(strata_key, [])
+            overlap_count = overlap_allocations.get(strata_key, 0)
+            overlap_units = selected[:overlap_count]
+            remainder = selected[overlap_count:]
             per_reviewer = self._split_among_reviewers(remainder, reviewers, rng_seed, strata_key)
             for reviewer_id in reviewers:
                 combined = []
