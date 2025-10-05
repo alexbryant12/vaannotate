@@ -10,11 +10,17 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 from .project import fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
-from .shared.metadata import extract_document_metadata
+from .shared.metadata import (
+    MetadataFilterCondition,
+    MetadataField,
+    discover_corpus_metadata,
+    extract_document_metadata,
+)
+from .shared.sampling import SamplingFilters, candidate_documents
 from .utils import (
     canonical_json,
     copy_sqlite_database,
@@ -243,11 +249,132 @@ class RoundBuilder:
 
     def _build_candidates(self, corpus_conn: sqlite3.Connection, pheno_row: sqlite3.Row, config: dict) -> Iterator[CandidateUnit]:
         level = pheno_row["level"]
-        filters = config.get("filters", {})
+        filters_config = config.get("filters", {})
+        strat_config = config.get("stratification") or {}
+        metadata_filters_config = filters_config.get("metadata")
+        strat_field_keys: list[str] = []
+        use_metadata_sampling = isinstance(metadata_filters_config, list)
+        if isinstance(strat_config, dict):
+            raw_fields = strat_config.get("fields")
+            if isinstance(raw_fields, list):
+                strat_field_keys = [str(field) for field in raw_fields if str(field)]
+                if strat_field_keys:
+                    use_metadata_sampling = True
+            else:
+                legacy_keys = strat_config.get("keys")
+                if isinstance(legacy_keys, list):
+                    strat_field_keys = [str(key) for key in legacy_keys]
+                elif legacy_keys:
+                    strat_field_keys = [str(legacy_keys)]
+
+        if use_metadata_sampling:
+            metadata_fields: Sequence[MetadataField] = discover_corpus_metadata(corpus_conn)
+            field_lookup = {field.key: field for field in metadata_fields}
+
+            conditions: list[MetadataFilterCondition] = []
+            missing_filter_fields: list[str] = []
+            invalid_filter_fields: list[str] = []
+            if isinstance(metadata_filters_config, list):
+                for entry in metadata_filters_config:
+                    try:
+                        condition = MetadataFilterCondition.from_payload(entry)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    field = field_lookup.get(condition.field)
+                    if not field:
+                        missing_filter_fields.append(condition.field or condition.label)
+                        continue
+                    if level == "multi_doc" and not field.constant_for_unit:
+                        invalid_filter_fields.append(field.label)
+                        continue
+                    conditions.append(condition)
+            if missing_filter_fields:
+                raise ValueError(
+                    "Unknown metadata fields in filters: "
+                    + ", ".join(sorted({field for field in missing_filter_fields if field})),
+                )
+            if invalid_filter_fields:
+                raise ValueError(
+                    "Cannot filter multi-document units by fields that vary per document: "
+                    + ", ".join(sorted(set(invalid_filter_fields))),
+                )
+
+            sampling_filters = SamplingFilters(metadata_filters=conditions)
+
+            filtered_strat_keys: list[str] = []
+            strat_aliases: list[str] = []
+            missing_strat_fields: list[str] = []
+            invalid_strat_fields: list[str] = []
+            for key in strat_field_keys:
+                field = field_lookup.get(key)
+                if not field:
+                    missing_strat_fields.append(key)
+                    continue
+                if level == "multi_doc" and not field.constant_for_unit:
+                    invalid_strat_fields.append(field.label)
+                    continue
+                filtered_strat_keys.append(field.key)
+                strat_aliases.append(field.alias)
+            if missing_strat_fields:
+                raise ValueError(
+                    "Unknown metadata fields requested for stratification: "
+                    + ", ".join(sorted(set(missing_strat_fields))),
+                )
+            if invalid_strat_fields:
+                raise ValueError(
+                    "Cannot stratify multi-document units by fields that vary per document: "
+                    + ", ".join(sorted(set(invalid_strat_fields))),
+                )
+
+            rows = candidate_documents(
+                corpus_conn,
+                level,
+                sampling_filters,
+                metadata_fields=metadata_fields,
+                stratify_keys=filtered_strat_keys,
+            )
+            if level == "single_doc":
+                for row in rows:
+                    row_dict = dict(row)
+                    strata_key = self._compute_strata_key(row_dict, strat_aliases)
+                    documents = [
+                        {
+                            "doc_id": row_dict["doc_id"],
+                            "hash": row_dict.get("hash"),
+                            "text": row_dict.get("text"),
+                            "order_index": 0,
+                        }
+                    ]
+                    payload = {
+                        "note_year": row_dict.get("note_year"),
+                        "notetype": row_dict.get("notetype"),
+                        "sta3n": row_dict.get("sta3n"),
+                        "hash": row_dict.get("hash"),
+                        "strata_key": strata_key,
+                        "note_count": 1,
+                        "documents": documents,
+                        "display_label": row_dict["doc_id"],
+                    }
+                    yield CandidateUnit(row_dict["doc_id"], row_dict["patient_icn"], row_dict["doc_id"], strata_key, payload)
+            else:
+                for entry in rows:
+                    strata_key = self._compute_strata_key(entry, strat_aliases)
+                    payload = dict(entry)
+                    payload["strata_key"] = strata_key
+                    payload.setdefault("display_label", entry.get("unit_id") or entry.get("patient_icn"))
+                    yield CandidateUnit(
+                        str(entry.get("unit_id") or entry.get("patient_icn")),
+                        str(entry.get("patient_icn")),
+                        entry.get("doc_id"),
+                        strata_key,
+                        payload,
+                    )
+            return
+
         params: list = []
         where_clauses = []
-        if "patient" in filters:
-            pf = filters["patient"]
+        if "patient" in filters_config:
+            pf = filters_config["patient"]
             if pf.get("sta3n_in"):
                 placeholders = ",".join("?" for _ in pf["sta3n_in"])
                 where_clauses.append(f"patients.sta3n IN ({placeholders})")
@@ -258,8 +385,8 @@ class RoundBuilder:
             if pf.get("year_range"):
                 where_clauses.append("documents.note_year BETWEEN ? AND ?")
                 params.extend(pf["year_range"])
-        if "note" in filters:
-            nf = filters["note"]
+        if "note" in filters_config:
+            nf = filters_config["note"]
             if nf.get("notetype_in"):
                 placeholders = ",".join("?" for _ in nf["notetype_in"])
                 where_clauses.append(f"documents.notetype IN ({placeholders})")
@@ -281,6 +408,13 @@ class RoundBuilder:
             corpus_conn.create_function("REGEXP", 2, lambda expr, item, compiled=pattern: 1 if compiled.search(item or "") else 0)
         else:
             corpus_conn.create_function("REGEXP", 2, lambda expr, item: 1)
+        strat_keys_config = strat_config.get("keys") or []
+        if isinstance(strat_keys_config, list):
+            legacy_aliases = [str(key) for key in strat_keys_config]
+        elif strat_keys_config:
+            legacy_aliases = [str(strat_keys_config)]
+        else:
+            legacy_aliases = []
         cursor = corpus_conn.execute(
             f"""
             SELECT documents.doc_id, documents.patient_icn, documents.note_year, documents.notetype,
@@ -293,7 +427,7 @@ class RoundBuilder:
         )
         if level == "single_doc":
             for row in cursor:
-                strata_key = self._compute_strata_key(row, config.get("stratification"))
+                strata_key = self._compute_strata_key(row, legacy_aliases)
                 documents = [
                     {
                         "doc_id": row["doc_id"],
@@ -319,7 +453,7 @@ class RoundBuilder:
                 patient_docs[row["patient_icn"]].append(row)
             for patient_icn, docs in patient_docs.items():
                 primary_row = docs[0]
-                strata_key = self._compute_strata_key(primary_row, config.get("stratification"))
+                strata_key = self._compute_strata_key(primary_row, legacy_aliases)
                 ordered_docs = sorted(
                     docs,
                     key=lambda item: (_note_year_sort_value(item["note_year"]), item["doc_id"]),
@@ -342,12 +476,22 @@ class RoundBuilder:
                 }
                 yield CandidateUnit(patient_icn, patient_icn, None, strata_key, payload)
 
-    def _compute_strata_key(self, row: sqlite3.Row, strat_config: dict | None) -> str:
-        if not strat_config:
+    def _compute_strata_key(self, row: sqlite3.Row | dict, aliases: Sequence[str]) -> str:
+        if not aliases:
             return "default"
-        keys = []
-        for key in strat_config.get("keys", []):
-            keys.append(str(row[key]))
+        keys: list[str] = []
+        for alias in aliases:
+            value: object | None
+            if isinstance(row, dict):
+                value = row.get(alias)
+                if value is None and alias in row:
+                    value = row[alias]
+            else:
+                try:
+                    value = row[alias]
+                except Exception:
+                    value = None
+            keys.append("" if value is None else str(value))
         return "|".join(keys) if keys else "default"
 
     def _allocate_units(
@@ -363,7 +507,8 @@ class RoundBuilder:
         for candidate in candidates:
             by_strata[candidate.strata_key].append(candidate)
         assignments: dict[str, list[AssignmentUnit]] = {rid: [] for rid in reviewers}
-        if strat_config and strat_config.get("keys") and total_n is not None and len(by_strata) > total_n:
+        stratified = self._stratification_requested(strat_config)
+        if stratified and total_n is not None and len(by_strata) > total_n:
             raise ValueError(
                 "The requested sample size is smaller than the number of strata. "
                 "Increase the total units or adjust the stratification keys."
@@ -445,6 +590,17 @@ class RoundBuilder:
                 )
             )
         return buckets
+
+    def _stratification_requested(self, strat_config: dict | None) -> bool:
+        if not strat_config or not isinstance(strat_config, dict):
+            return False
+        fields = strat_config.get("fields")
+        if isinstance(fields, list) and fields:
+            return True
+        keys = strat_config.get("keys")
+        if isinstance(keys, list):
+            return bool(keys)
+        return bool(keys)
 
     # Aggregation & import helpers
     def import_assignment(self, pheno_id: str, round_number: int, reviewer_id: str) -> Path:

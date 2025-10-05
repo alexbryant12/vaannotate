@@ -18,6 +18,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from vaannotate.schema import ROUND_AGG_SCHEMA
 from vaannotate.shared import models
 from vaannotate.shared.database import Database, ensure_schema
+from vaannotate.shared.metadata import (
+    MetadataField,
+    MetadataFilterCondition,
+    discover_corpus_metadata,
+)
 from vaannotate.shared.sampling import (
     ReviewerAssignment,
     SamplingFilters,
@@ -86,6 +91,7 @@ class ProjectContext(QtCore.QObject):
         self._corpus_cache: Dict[str, Database] = {}
         self._external_db_cache: Dict[Path, Database] = {}
         self._managed_dbs: List[Database] = []
+        self._corpus_metadata_cache: Dict[str, List[MetadataField]] = {}
         self._pending_manifests: Dict[Path, Dict[str, ReviewerAssignment]] = {}
         self._pending_text_writes: Dict[Path, str] = {}
         self._dirty_flag = False
@@ -106,6 +112,7 @@ class ProjectContext(QtCore.QObject):
         self._corpus_cache.clear()
         self._external_db_cache.clear()
         self._managed_dbs = []
+        self._corpus_metadata_cache.clear()
         self._pending_manifests.clear()
         self._pending_text_writes.clear()
         self._dirty_flag = False
@@ -501,6 +508,18 @@ class ProjectContext(QtCore.QObject):
             ensure_schema(conn, [models.Patient, models.Document])
         self._corpus_cache[corpus_id] = db
         return db
+
+    def get_corpus_metadata_fields(self, corpus_id: str) -> List[MetadataField]:
+        cached = self._corpus_metadata_cache.get(corpus_id)
+        if cached is not None:
+            return cached
+        db = self.get_corpus_db(corpus_id)
+        try:
+            fields = discover_corpus_metadata(db)
+        except Exception:
+            fields = []
+        self._corpus_metadata_cache[corpus_id] = fields
+        return fields
 
     def import_corpus(self, source_path: Path, *, name: Optional[str] = None) -> models.ProjectCorpus:
         project_id = self.current_project_id()
@@ -1077,6 +1096,182 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         }
 
 
+class MetadataFilterDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        field: MetadataField,
+        parent: Optional[QtWidgets.QWidget] = None,
+        existing: Optional[MetadataFilterCondition] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.field = field
+        self._condition: Optional[MetadataFilterCondition] = None
+        self._existing = existing
+        self.setWindowTitle(f"Filter • {field.label}")
+        self._build_ui()
+        if existing:
+            self._apply_existing(existing)
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QFormLayout(self)
+        description = QtWidgets.QLabel(f"{self.field.label} ({self.field.data_type})")
+        description.setWordWrap(True)
+        layout.addRow(description)
+
+        if self.field.data_type == "number":
+            self.min_edit = QtWidgets.QLineEdit()
+            self.min_edit.setPlaceholderText("Optional minimum")
+            self.min_edit.setValidator(QtGui.QDoubleValidator(self))
+            self.max_edit = QtWidgets.QLineEdit()
+            self.max_edit.setPlaceholderText("Optional maximum")
+            self.max_edit.setValidator(QtGui.QDoubleValidator(self))
+            self.value_edit = QtWidgets.QLineEdit()
+            self.value_edit.setPlaceholderText("Exact values (comma separated)")
+            layout.addRow("Minimum", self.min_edit)
+            layout.addRow("Maximum", self.max_edit)
+            layout.addRow("Values", self.value_edit)
+        elif self.field.data_type == "date":
+            self.start_check = QtWidgets.QCheckBox("Enable")
+            self.start_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+            self.start_date.setDisplayFormat("yyyy-MM-dd")
+            self.start_date.setCalendarPopup(True)
+            self.start_date.setEnabled(False)
+            self.start_check.toggled.connect(self.start_date.setEnabled)
+
+            self.end_check = QtWidgets.QCheckBox("Enable")
+            self.end_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+            self.end_date.setDisplayFormat("yyyy-MM-dd")
+            self.end_date.setCalendarPopup(True)
+            self.end_date.setEnabled(False)
+            self.end_check.toggled.connect(self.end_date.setEnabled)
+
+            self.date_values_edit = QtWidgets.QLineEdit()
+            self.date_values_edit.setPlaceholderText("Specific dates (comma separated)")
+
+            layout.addRow("Start date", self._wrap_controls(self.start_check, self.start_date))
+            layout.addRow("End date", self._wrap_controls(self.end_check, self.end_date))
+            layout.addRow("Values", self.date_values_edit)
+        else:
+            self.value_edit = QtWidgets.QLineEdit()
+            self.value_edit.setPlaceholderText("Values (comma separated)")
+            layout.addRow("Values", self.value_edit)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    @staticmethod
+    def _wrap_controls(*widgets: QtWidgets.QWidget) -> QtWidgets.QWidget:
+        container = QtWidgets.QWidget()
+        inner = QtWidgets.QHBoxLayout(container)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(6)
+        for widget in widgets:
+            inner.addWidget(widget)
+        inner.addStretch()
+        return container
+
+    def _apply_existing(self, existing: MetadataFilterCondition) -> None:
+        if self.field.data_type == "number":
+            if existing.min_value is not None:
+                self.min_edit.setText(str(existing.min_value))
+            if existing.max_value is not None:
+                self.max_edit.setText(str(existing.max_value))
+            if existing.values:
+                self.value_edit.setText(", ".join(existing.values))
+        elif self.field.data_type == "date":
+            if existing.min_value:
+                self._set_date_value(self.start_date, self.start_check, existing.min_value)
+            if existing.max_value:
+                self._set_date_value(self.end_date, self.end_check, existing.max_value)
+            if existing.values:
+                self.date_values_edit.setText(", ".join(existing.values))
+        else:
+            if existing.values:
+                self.value_edit.setText(", ".join(existing.values))
+
+    @staticmethod
+    def _set_date_value(
+        widget: QtWidgets.QDateEdit,
+        checkbox: QtWidgets.QCheckBox,
+        value: str,
+    ) -> None:
+        date = QtCore.QDate.fromString(value, QtCore.Qt.DateFormat.ISODate)
+        if date.isValid():
+            widget.setDate(date)
+            checkbox.setChecked(True)
+
+    @staticmethod
+    def _date_to_string(widget: QtWidgets.QDateEdit) -> Optional[str]:
+        date = widget.date()
+        if not date.isValid():
+            return None
+        return date.toString(QtCore.Qt.DateFormat.ISODate)
+
+    def _on_accept(self) -> None:
+        if self.field.data_type == "number":
+            min_value = self.min_edit.text().strip()
+            max_value = self.max_edit.text().strip()
+            values = [value.strip() for value in self.value_edit.text().split(",") if value.strip()]
+            if not min_value and not max_value and not values:
+                QtWidgets.QMessageBox.warning(self, "Filter", "Specify at least one constraint.")
+                return
+            condition = MetadataFilterCondition(
+                field=self.field.key,
+                label=self.field.label,
+                scope=self.field.scope,
+                data_type=self.field.data_type,
+                min_value=min_value or None,
+                max_value=max_value or None,
+                values=values or None,
+            )
+        elif self.field.data_type == "date":
+            min_value = self._date_to_string(self.start_date) if self.start_check.isChecked() else None
+            max_value = self._date_to_string(self.end_date) if self.end_check.isChecked() else None
+            values = [value.strip() for value in self.date_values_edit.text().split(",") if value.strip()]
+            if not min_value and not max_value and not values:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Filter",
+                    "Specify a start date, end date, or specific values.",
+                )
+                return
+            condition = MetadataFilterCondition(
+                field=self.field.key,
+                label=self.field.label,
+                scope=self.field.scope,
+                data_type=self.field.data_type,
+                min_value=min_value,
+                max_value=max_value,
+                values=values or None,
+            )
+        else:
+            values = [value.strip() for value in self.value_edit.text().split(",") if value.strip()]
+            if not values:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Filter",
+                    "Enter one or more values to filter by.",
+                )
+                return
+            condition = MetadataFilterCondition(
+                field=self.field.key,
+                label=self.field.label,
+                scope=self.field.scope,
+                data_type=self.field.data_type,
+                values=values,
+            )
+        self._condition = condition
+        super().accept()
+
+    def condition(self) -> Optional[MetadataFilterCondition]:
+        return self._condition
+
+
 class RoundBuilderDialog(QtWidgets.QDialog):
     def __init__(
         self,
@@ -1096,6 +1291,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._labelset_options = self._load_labelset_ids()
         self._corpus_options = self._load_corpus_options()
         self._selected_corpus_id: Optional[str] = None
+        self._metadata_fields: List[MetadataField] = []
+        self._metadata_lookup: Dict[str, MetadataField] = {}
         self.ctx.project_changed.connect(self._refresh_labelset_options)
         self.ctx.project_changed.connect(self._refresh_corpus_options)
         self._setup_ui()
@@ -1197,55 +1394,42 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         scroll_layout.addWidget(reviewer_group)
 
         filter_group = QtWidgets.QGroupBox("Sampling filters")
-        filter_form = QtWidgets.QFormLayout(filter_group)
-        self.patient_sta3n_edit = QtWidgets.QLineEdit()
-        self.patient_sta3n_edit.setPlaceholderText("Comma-separated STA3N codes")
-        patient_years_layout = QtWidgets.QHBoxLayout()
-        self.patient_year_start = QtWidgets.QSpinBox()
-        self.patient_year_start.setRange(0, 2100)
-        self.patient_year_start.setSpecialValueText("Any")
-        self.patient_year_start.setValue(0)
-        self.patient_year_end = QtWidgets.QSpinBox()
-        self.patient_year_end.setRange(0, 2100)
-        self.patient_year_end.setSpecialValueText("Any")
-        self.patient_year_end.setValue(0)
-        patient_years_layout.addWidget(self.patient_year_start)
-        patient_years_layout.addWidget(QtWidgets.QLabel("to"))
-        patient_years_layout.addWidget(self.patient_year_end)
-        self.patient_softlabel_spin = QtWidgets.QDoubleSpinBox()
-        self.patient_softlabel_spin.setRange(-1.0, 100.0)
-        self.patient_softlabel_spin.setDecimals(2)
-        self.patient_softlabel_spin.setSpecialValueText("Disabled")
-        self.patient_softlabel_spin.setValue(-1.0)
-        self.note_type_edit = QtWidgets.QLineEdit()
-        self.note_type_edit.setPlaceholderText("Comma-separated note types")
-        note_years_layout = QtWidgets.QHBoxLayout()
-        self.note_year_start = QtWidgets.QSpinBox()
-        self.note_year_start.setRange(0, 2100)
-        self.note_year_start.setSpecialValueText("Any")
-        self.note_year_start.setValue(0)
-        self.note_year_end = QtWidgets.QSpinBox()
-        self.note_year_end.setRange(0, 2100)
-        self.note_year_end.setSpecialValueText("Any")
-        self.note_year_end.setValue(0)
-        note_years_layout.addWidget(self.note_year_start)
-        note_years_layout.addWidget(QtWidgets.QLabel("to"))
-        note_years_layout.addWidget(self.note_year_end)
-        self.note_regex_edit = QtWidgets.QLineEdit()
-        self.note_regex_edit.setPlaceholderText("Python regex applied to note text")
-        filter_form.addRow("Patient STA3N", self.patient_sta3n_edit)
-        filter_form.addRow("Patient year range", patient_years_layout)
-        filter_form.addRow("Patient softlabel ≥", self.patient_softlabel_spin)
-        filter_form.addRow("Note types", self.note_type_edit)
-        filter_form.addRow("Note year range", note_years_layout)
-        filter_form.addRow("Note regex", self.note_regex_edit)
+        filter_layout = QtWidgets.QVBoxLayout(filter_group)
+        self.filter_list = QtWidgets.QListWidget()
+        self.filter_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.filter_list.itemDoubleClicked.connect(self._on_edit_filter)
+        self.filter_list.currentRowChanged.connect(self._update_filter_buttons)
+        filter_layout.addWidget(self.filter_list)
+        filter_controls = QtWidgets.QHBoxLayout()
+        self.filter_field_combo = QtWidgets.QComboBox()
+        self.filter_field_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        filter_controls.addWidget(self.filter_field_combo)
+        self.add_filter_btn = QtWidgets.QPushButton("Add filter")
+        self.add_filter_btn.clicked.connect(self._on_add_filter)
+        filter_controls.addWidget(self.add_filter_btn)
+        self.remove_filter_btn = QtWidgets.QPushButton("Remove selected")
+        self.remove_filter_btn.clicked.connect(self._on_remove_filter)
+        filter_controls.addWidget(self.remove_filter_btn)
+        filter_layout.addLayout(filter_controls)
         scroll_layout.addWidget(filter_group)
 
         strat_group = QtWidgets.QGroupBox("Stratification")
-        strat_form = QtWidgets.QFormLayout(strat_group)
-        self.strat_keys_edit = QtWidgets.QLineEdit()
-        self.strat_keys_edit.setPlaceholderText("Comma-separated document fields (e.g. note_year, sta3n)")
-        strat_form.addRow("Stratify by", self.strat_keys_edit)
+        strat_layout = QtWidgets.QVBoxLayout(strat_group)
+        self.strat_list = QtWidgets.QListWidget()
+        self.strat_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.strat_list.currentRowChanged.connect(self._update_strat_buttons)
+        strat_layout.addWidget(self.strat_list)
+        strat_controls = QtWidgets.QHBoxLayout()
+        self.strat_field_combo = QtWidgets.QComboBox()
+        self.strat_field_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        strat_controls.addWidget(self.strat_field_combo)
+        self.add_strat_btn = QtWidgets.QPushButton("Add field")
+        self.add_strat_btn.clicked.connect(self._on_add_strat_field)
+        strat_controls.addWidget(self.add_strat_btn)
+        self.remove_strat_btn = QtWidgets.QPushButton("Remove selected")
+        self.remove_strat_btn.clicked.connect(self._on_remove_strat_field)
+        strat_controls.addWidget(self.remove_strat_btn)
+        strat_layout.addLayout(strat_controls)
         scroll_layout.addWidget(strat_group)
 
         scroll_layout.addStretch()
@@ -1264,35 +1448,20 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._refresh_reviewer_options()
 
     def _collect_filters(self) -> SamplingFilters:
-        patient_filters: Dict[str, object] = {}
-        note_filters: Dict[str, object] = {}
-        sta_text = self.patient_sta3n_edit.text().strip()
-        if sta_text:
-            values = [value.strip() for value in sta_text.split(",") if value.strip()]
-            if values:
-                patient_filters["sta3n_in"] = values
-        start = self.patient_year_start.value()
-        end = self.patient_year_end.value()
-        if start and end:
-            if end < start:
-                start, end = end, start
-            patient_filters["year_range"] = [start, end]
-        softlabel = self.patient_softlabel_spin.value()
-        if softlabel >= 0:
-            patient_filters["softlabel_gte"] = softlabel
-        note_types = [value.strip() for value in self.note_type_edit.text().split(",") if value.strip()]
-        if note_types:
-            note_filters["notetype_in"] = note_types
-        note_start = self.note_year_start.value()
-        note_end = self.note_year_end.value()
-        if note_start and note_end:
-            if note_end < note_start:
-                note_start, note_end = note_end, note_start
-            note_filters["note_year_range"] = [note_start, note_end]
-        regex = self.note_regex_edit.text().strip()
-        if regex:
-            note_filters["regex"] = regex
-        return SamplingFilters(patient_filters=patient_filters, note_filters=note_filters)
+        conditions: List[MetadataFilterCondition] = []
+        if hasattr(self, "filter_list"):
+            for row in range(self.filter_list.count()):
+                item = self.filter_list.item(row)
+                data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(data, MetadataFilterCondition):
+                    conditions.append(data)
+                elif isinstance(data, Mapping):
+                    try:
+                        condition = MetadataFilterCondition.from_payload(data)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    conditions.append(condition)
+        return SamplingFilters(metadata_filters=conditions)
 
     def _load_reviewed_unit_ids(self, corpus_id: Optional[str]) -> Set[str]:
         pheno_id = self.pheno_row["pheno_id"]
@@ -1430,6 +1599,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         del index
         corpus_id = self.corpus_combo.currentData()
         self._selected_corpus_id = corpus_id if isinstance(corpus_id, str) else None
+        self._load_metadata_fields(self._selected_corpus_id)
 
     def _on_import_corpus(self) -> None:
         start_dir = str(self.ctx.project_root or Path.home())
@@ -1448,6 +1618,194 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return
         self._selected_corpus_id = record.corpus_id
         self._refresh_corpus_options()
+
+    def _load_metadata_fields(self, corpus_id: Optional[str]) -> None:
+        if corpus_id:
+            try:
+                fields = self.ctx.get_corpus_metadata_fields(corpus_id)
+            except Exception:  # noqa: BLE001
+                fields = []
+        else:
+            fields = []
+        self._metadata_fields = list(fields)
+        self._metadata_lookup = {field.key: field for field in self._metadata_fields}
+        if hasattr(self, "filter_list"):
+            self.filter_list.clear()
+        if hasattr(self, "strat_list"):
+            self.strat_list.clear()
+        self._refresh_filter_field_options()
+        self._refresh_strat_field_options()
+        self._update_filter_buttons()
+        self._update_strat_buttons()
+
+    def _available_metadata_fields(self) -> List[MetadataField]:
+        if self.pheno_row.get("level") == "multi_doc":
+            return [field for field in self._metadata_fields if field.constant_for_unit]
+        return list(self._metadata_fields)
+
+    def _current_filter_field_keys(self) -> Set[str]:
+        keys: Set[str] = set()
+        if not hasattr(self, "filter_list"):
+            return keys
+        for row in range(self.filter_list.count()):
+            item = self.filter_list.item(row)
+            data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(data, MetadataFilterCondition):
+                keys.add(data.field)
+        return keys
+
+    def _selected_stratification_keys(self) -> List[str]:
+        keys: List[str] = []
+        if not hasattr(self, "strat_list"):
+            return keys
+        for row in range(self.strat_list.count()):
+            item = self.strat_list.item(row)
+            data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(data, str):
+                keys.append(data)
+        return keys
+
+    def _refresh_filter_field_options(self) -> None:
+        if not hasattr(self, "filter_field_combo"):
+            return
+        available = [
+            field
+            for field in self._available_metadata_fields()
+            if field.key not in self._current_filter_field_keys()
+        ]
+        self.filter_field_combo.blockSignals(True)
+        self.filter_field_combo.clear()
+        self.filter_field_combo.addItem("Select metadata field…", None)
+        for field in available:
+            self.filter_field_combo.addItem(field.label, field.key)
+        self.filter_field_combo.blockSignals(False)
+        if hasattr(self, "add_filter_btn"):
+            self.add_filter_btn.setEnabled(bool(available))
+
+    def _refresh_strat_field_options(self) -> None:
+        if not hasattr(self, "strat_field_combo"):
+            return
+        used = set(self._selected_stratification_keys())
+        available = [field for field in self._available_metadata_fields() if field.key not in used]
+        self.strat_field_combo.blockSignals(True)
+        self.strat_field_combo.clear()
+        self.strat_field_combo.addItem("Select metadata field…", None)
+        for field in available:
+            self.strat_field_combo.addItem(field.label, field.key)
+        self.strat_field_combo.blockSignals(False)
+        if hasattr(self, "add_strat_btn"):
+            self.add_strat_btn.setEnabled(bool(available))
+
+    def _update_filter_buttons(self) -> None:
+        if not hasattr(self, "remove_filter_btn"):
+            return
+        has_selection = hasattr(self, "filter_list") and self.filter_list.currentRow() >= 0
+        self.remove_filter_btn.setEnabled(has_selection)
+        if hasattr(self, "filter_field_combo") and hasattr(self, "add_filter_btn"):
+            self.add_filter_btn.setEnabled(self.filter_field_combo.count() > 1)
+
+    def _update_strat_buttons(self) -> None:
+        if not hasattr(self, "remove_strat_btn"):
+            return
+        has_selection = hasattr(self, "strat_list") and self.strat_list.currentRow() >= 0
+        self.remove_strat_btn.setEnabled(has_selection)
+        if hasattr(self, "strat_field_combo") and hasattr(self, "add_strat_btn"):
+            self.add_strat_btn.setEnabled(self.strat_field_combo.count() > 1)
+
+    def _format_filter_summary(self, condition: MetadataFilterCondition) -> str:
+        label = condition.label or condition.field
+        parts: List[str] = []
+        if condition.min_value is not None and condition.max_value is not None:
+            parts.append(f"{condition.min_value} ≤ value ≤ {condition.max_value}")
+        elif condition.min_value is not None:
+            parts.append(f"≥ {condition.min_value}")
+        elif condition.max_value is not None:
+            parts.append(f"≤ {condition.max_value}")
+        if condition.values:
+            if len(condition.values) == 1:
+                parts.append(f"= {condition.values[0]}")
+            else:
+                parts.append(", ".join(condition.values))
+        if not parts:
+            parts.append("No constraints")
+        return f"{label}: {'; '.join(parts)}"
+
+    def _add_filter_condition(self, condition: MetadataFilterCondition) -> None:
+        item = QtWidgets.QListWidgetItem(self._format_filter_summary(condition))
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, condition)
+        self.filter_list.addItem(item)
+        self.filter_list.setCurrentItem(item)
+
+    def _on_add_filter(self) -> None:
+        data = self.filter_field_combo.currentData() if hasattr(self, "filter_field_combo") else None
+        if not isinstance(data, str):
+            return
+        field = self._metadata_lookup.get(data)
+        if not field:
+            return
+        dialog = MetadataFilterDialog(field, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        condition = dialog.condition()
+        if not condition:
+            return
+        self._add_filter_condition(condition)
+        self._refresh_filter_field_options()
+        self._update_filter_buttons()
+
+    def _on_edit_filter(self, item: QtWidgets.QListWidgetItem) -> None:
+        data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not isinstance(data, MetadataFilterCondition):
+            return
+        field = self._metadata_lookup.get(data.field)
+        if not field:
+            return
+        dialog = MetadataFilterDialog(field, self, existing=data)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        condition = dialog.condition()
+        if not condition:
+            return
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, condition)
+        item.setText(self._format_filter_summary(condition))
+        self._refresh_filter_field_options()
+        self._update_filter_buttons()
+
+    def _on_remove_filter(self) -> None:
+        if not hasattr(self, "filter_list"):
+            return
+        row = self.filter_list.currentRow()
+        if row < 0:
+            return
+        self.filter_list.takeItem(row)
+        self._refresh_filter_field_options()
+        self._update_filter_buttons()
+
+    def _on_add_strat_field(self) -> None:
+        data = self.strat_field_combo.currentData() if hasattr(self, "strat_field_combo") else None
+        if not isinstance(data, str):
+            return
+        if data in self._selected_stratification_keys():
+            return
+        field = self._metadata_lookup.get(data)
+        if not field:
+            return
+        item = QtWidgets.QListWidgetItem(field.label)
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, data)
+        self.strat_list.addItem(item)
+        self.strat_list.setCurrentItem(item)
+        self._refresh_strat_field_options()
+        self._update_strat_buttons()
+
+    def _on_remove_strat_field(self) -> None:
+        if not hasattr(self, "strat_list"):
+            return
+        row = self.strat_list.currentRow()
+        if row < 0:
+            return
+        self.strat_list.takeItem(row)
+        self._refresh_strat_field_options()
+        self._update_strat_buttons()
 
     def _load_existing_reviewers(self) -> List[Dict[str, str]]:
         db = self.ctx.require_db()
@@ -1643,13 +2001,20 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             )
             return False
         filters = self._collect_filters()
+        strat_field_keys = self._selected_stratification_keys()
         corpus_id = self._selected_corpus_id
         if not corpus_id:
             QtWidgets.QMessageBox.warning(self, "Round", "Select a corpus for this round.")
             return False
         corpus_record = self.ctx.get_corpus(corpus_id)
         try:
-            corpus_rows = candidate_documents(ctx.get_corpus_db(corpus_id), pheno_level, filters)
+            corpus_rows = candidate_documents(
+                ctx.get_corpus_db(corpus_id),
+                pheno_level,
+                filters,
+                metadata_fields=self._metadata_fields,
+                stratify_keys=strat_field_keys,
+            )
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Round", f"Failed to query corpus: {exc}")
             return False
@@ -1693,7 +2058,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "Round",
                 "Fewer candidate units were found than the requested total. All available units will be used.",
             )
-        strat_keys = [key.strip() for key in self.strat_keys_edit.text().split(",") if key.strip()]
+        strat_aliases = [
+            self._metadata_lookup[key].alias
+            for key in strat_field_keys
+            if key in self._metadata_lookup
+        ]
         try:
             assignments = allocate_units(
                 corpus_rows,
@@ -1701,7 +2070,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 overlap,
                 seed,
                 total_n=total_n,
-                strat_keys=strat_keys or None,
+                strat_keys=strat_aliases or None,
             )
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Round", str(exc))
@@ -1792,15 +2161,20 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 config_payload["corpus_path"] = corpus_record["relative_path"]
             if sampling_metadata:
                 config_payload["sampling"] = sampling_metadata
-            filters_payload: Dict[str, Dict[str, object]] = {}
-            if filters.patient_filters:
-                filters_payload["patient"] = filters.patient_filters
-            if filters.note_filters:
-                filters_payload["note"] = filters.note_filters
-            if filters_payload:
-                config_payload["filters"] = filters_payload
-            if strat_keys:
-                config_payload["stratification"] = {"keys": strat_keys}
+            if filters.metadata_filters:
+                config_payload["filters"] = {
+                    "metadata": [condition.to_payload() for condition in filters.metadata_filters]
+                }
+            if strat_field_keys:
+                config_payload["stratification"] = {
+                    "fields": strat_field_keys,
+                    "labels": [
+                        self._metadata_lookup[key].label
+                        for key in strat_field_keys
+                        if key in self._metadata_lookup
+                    ],
+                    "aliases": strat_aliases,
+                }
             if label_schema:
                 config_payload["label_schema"] = label_schema
             config = models.RoundConfig(round_id=round_id, config_json=json.dumps(config_payload, indent=2))
@@ -2269,33 +2643,49 @@ class RoundDetailWidget(QtWidgets.QWidget):
 
         filters = config.get("filters") or {}
         filter_items: List[str] = []
-        patient_filters = filters.get("patient") or {}
-        for key, value in patient_filters.items():
-            label = {
-                "sta3n_in": "Patient STA3N",
-                "year_range": "Patient year range",
-                "softlabel_gte": "Softlabel ≥",
-            }.get(key, key)
-            filter_items.append(f"Patient – {label}: {self._format_filter_value(key, value)}")
-        note_filters = filters.get("note") or {}
-        for key, value in note_filters.items():
-            label = {
-                "notetype_in": "Note types",
-                "note_year_range": "Note year range",
-                "regex": "Regex",
-            }.get(key, key)
-            filter_items.append(f"Note – {label}: {self._format_filter_value(key, value)}")
+        metadata_filters = filters.get("metadata")
+        if isinstance(metadata_filters, list):
+            for entry in metadata_filters:
+                try:
+                    condition = MetadataFilterCondition.from_payload(entry)
+                except Exception:  # noqa: BLE001
+                    continue
+                filter_items.append(self._describe_metadata_filter(condition))
+        else:
+            patient_filters = filters.get("patient") or {}
+            for key, value in patient_filters.items():
+                label = {
+                    "sta3n_in": "Patient STA3N",
+                    "year_range": "Patient year range",
+                    "softlabel_gte": "Softlabel ≥",
+                }.get(key, key)
+                filter_items.append(f"Patient – {label}: {self._format_filter_value(key, value)}")
+            note_filters = filters.get("note") or {}
+            for key, value in note_filters.items():
+                label = {
+                    "notetype_in": "Note types",
+                    "note_year_range": "Note year range",
+                    "regex": "Regex",
+                }.get(key, key)
+                filter_items.append(f"Note – {label}: {self._format_filter_value(key, value)}")
         if filter_items:
             sections.append(self._format_section("Sampling filters", filter_items))
 
         stratification = config.get("stratification") or {}
         strat_items: List[str] = []
-        keys = stratification.get("keys")
-        if keys:
-            if isinstance(keys, list):
-                strat_items.append(f"Stratify by: {', '.join(keys)}")
-            else:
-                strat_items.append(f"Stratify by: {keys}")
+        labels = stratification.get("labels")
+        fields = stratification.get("fields")
+        if isinstance(labels, list) and labels:
+            strat_items.append(f"Stratify by: {', '.join(str(label) for label in labels)}")
+        elif isinstance(fields, list) and fields:
+            strat_items.append(f"Stratify by: {', '.join(str(field) for field in fields)}")
+        else:
+            keys = stratification.get("keys")
+            if keys:
+                if isinstance(keys, list):
+                    strat_items.append(f"Stratify by: {', '.join(keys)}")
+                else:
+                    strat_items.append(f"Stratify by: {keys}")
         if strat_items:
             sections.append(self._format_section("Stratification", strat_items))
 
@@ -2365,6 +2755,25 @@ class RoundDetailWidget(QtWidgets.QWidget):
         if key == "softlabel_gte":
             return str(value)
         return str(value)
+
+    @staticmethod
+    def _describe_metadata_filter(condition: MetadataFilterCondition) -> str:
+        label = condition.label or condition.field
+        parts: List[str] = []
+        if condition.min_value is not None and condition.max_value is not None:
+            parts.append(f"{condition.min_value} ≤ value ≤ {condition.max_value}")
+        elif condition.min_value is not None:
+            parts.append(f"≥ {condition.min_value}")
+        elif condition.max_value is not None:
+            parts.append(f"≤ {condition.max_value}")
+        if condition.values:
+            if len(condition.values) == 1:
+                parts.append(f"= {condition.values[0]}")
+            else:
+                parts.append(", ".join(condition.values))
+        if not parts:
+            parts.append("No constraints")
+        return f"{label}: {'; '.join(parts)}"
 
 
 class CorpusWidget(QtWidgets.QWidget):
