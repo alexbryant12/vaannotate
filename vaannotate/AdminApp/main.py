@@ -1639,7 +1639,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._update_strat_buttons()
 
     def _available_metadata_fields(self) -> List[MetadataField]:
-        if self.pheno_row.get("level") == "multi_doc":
+        if self._safe_mapping_get(self.pheno_row, "level") == "multi_doc":
             return [field for field in self._metadata_fields if field.constant_for_unit]
         return list(self._metadata_fields)
 
