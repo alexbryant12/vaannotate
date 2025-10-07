@@ -8,7 +8,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -305,12 +305,17 @@ class AssignmentContext(QtCore.QObject):
         self.current_unit: Optional[Dict[str, object]] = None
         self.current_unit_id: Optional[str] = None
         self.current_annotations: Dict[str, Dict[str, object]] = {}
+        self.current_rationales: Dict[str, List[Dict[str, object]]] = {}
         self._annotation_cache: Dict[str, Dict[str, Dict[str, object]]] = {}
         self._annotation_baseline: Dict[str, Dict[str, Dict[str, object]]] = {}
+        self._rationale_cache: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
+        self._rationale_baseline: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
         self._unit_completion_baseline: Dict[str, Dict[str, object]] = {}
         self._pending_annotations: Dict[Tuple[str, str], models.Annotation] = {}
         self._pending_annotation_events: Dict[Tuple[str, str], models.Event] = {}
-        self._pending_rationales: List[models.Rationale] = []
+        self._pending_rationale_inserts: Dict[str, models.Rationale] = {}
+        self._pending_rationale_updates: Dict[str, models.Rationale] = {}
+        self._pending_rationale_deletes: Set[str] = set()
         self._pending_events: List[models.Event] = []
         self._pending_completion: Dict[str, Dict[str, object]] = {}
         self._dirty: bool = False
@@ -326,12 +331,17 @@ class AssignmentContext(QtCore.QObject):
         self.assignment_db = Database(db_path)
         self.current_unit_id = None
         self.current_annotations = {}
+        self.current_rationales = {}
         self._annotation_cache = {}
         self._annotation_baseline = {}
+        self._rationale_cache = {}
+        self._rationale_baseline = {}
         self._unit_completion_baseline = {}
         self._pending_annotations.clear()
         self._pending_annotation_events.clear()
-        self._pending_rationales.clear()
+        self._pending_rationale_inserts.clear()
+        self._pending_rationale_updates.clear()
+        self._pending_rationale_deletes.clear()
         self._pending_events.clear()
         self._pending_completion.clear()
         self._document_cache = {}
@@ -429,10 +439,45 @@ class AssignmentContext(QtCore.QObject):
                 unit_id: {label_id: dict(data) for label_id, data in labels.items()}
                 for unit_id, labels in self._annotation_baseline.items()
             }
+            rationale_rows = conn.execute("SELECT * FROM rationales").fetchall()
+            baseline_rationales: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
+            for row in rationale_rows:
+                unit_id = str(row["unit_id"])
+                label_id = str(row["label_id"])
+                entry = {
+                    "rationale_id": str(row["rationale_id"]),
+                    "unit_id": unit_id,
+                    "label_id": label_id,
+                    "doc_id": str(row["doc_id"]),
+                    "start_offset": int(row["start_offset"]),
+                    "end_offset": int(row["end_offset"]),
+                    "snippet": str(row["snippet"] or ""),
+                    "created_at": str(row["created_at"] or ""),
+                }
+                baseline_rationales.setdefault(unit_id, {}).setdefault(label_id, []).append(entry)
+            for label_map in baseline_rationales.values():
+                for entries in label_map.values():
+                    self._sort_rationales(entries)
+            self._rationale_baseline = {
+                unit_id: {
+                    label_id: [dict(entry) for entry in entries]
+                    for label_id, entries in labels.items()
+                }
+                for unit_id, labels in baseline_rationales.items()
+            }
+            self._rationale_cache = {
+                unit_id: {
+                    label_id: [dict(entry) for entry in entries]
+                    for label_id, entries in labels.items()
+                }
+                for unit_id, labels in self._rationale_baseline.items()
+            }
             for unit in self.units:
                 unit_id = str(unit.get("unit_id"))
                 self._annotation_baseline.setdefault(unit_id, {})
                 self._annotation_cache.setdefault(unit_id, {})
+                self._rationale_baseline.setdefault(unit_id, {})
+                self._rationale_cache.setdefault(unit_id, {})
         schema_path = directory / "label_schema.json"
         if schema_path.exists():
             raw_schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -464,6 +509,9 @@ class AssignmentContext(QtCore.QObject):
         self.current_unit_id = unit_id or None
         self.current_annotations = (
             self.load_annotations(self.current_unit_id) if self.current_unit_id else {}
+        )
+        self.current_rationales = (
+            self.load_rationales(self.current_unit_id) if self.current_unit_id else {}
         )
         self.unit_changed.emit(unit)
 
@@ -565,6 +613,41 @@ class AssignmentContext(QtCore.QObject):
         cache = self._annotation_cache.setdefault(unit_id, {})
         return {label_id: dict(data) for label_id, data in cache.items()}
 
+    @staticmethod
+    def _sort_rationales(entries: List[Dict[str, object]]) -> None:
+        entries.sort(
+            key=lambda entry: (
+                str(entry.get("doc_id", "")),
+                int(entry.get("start_offset", 0)),
+                int(entry.get("end_offset", 0)),
+                str(entry.get("created_at", "")),
+            )
+        )
+
+    def load_rationales(self, unit_id: str) -> Dict[str, List[Dict[str, object]]]:
+        cache = self._rationale_cache.setdefault(unit_id, {})
+        return {label_id: [dict(entry) for entry in entries] for label_id, entries in cache.items()}
+
+    def _remove_rationale_events(self, rationale_id: str, event_types: Optional[Set[str]] = None) -> None:
+        if not self._pending_events:
+            return
+        remaining: List[models.Event] = []
+        for event in self._pending_events:
+            if not event.event_type.startswith("rationale_"):
+                remaining.append(event)
+                continue
+            if event_types is not None and event.event_type not in event_types:
+                remaining.append(event)
+                continue
+            try:
+                payload = json.loads(event.payload_json)
+            except Exception:  # noqa: BLE001
+                payload = {}
+            if payload.get("rationale_id") == rationale_id:
+                continue
+            remaining.append(event)
+        self._pending_events = remaining
+
     def save_annotation(self, unit_id: str, label_id: str, payload: Dict[str, object]) -> None:
         if not self.assignment_db:
             return
@@ -662,9 +745,10 @@ class AssignmentContext(QtCore.QObject):
             self.current_annotations[label_id] = dict(annotation_dict)
         self._refresh_dirty_state()
 
-    def save_rationale(self, unit_id: str, label_id: str, doc_id: str, start: int, end: int, snippet: str) -> None:
+    def save_rationale(self, unit_id: str, label_id: str, doc_id: str, start: int, end: int, snippet: str) -> str:
         if not self.assignment_db:
-            return
+            return ""
+        created_at = QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate)
         record = models.Rationale(
             rationale_id=str(uuid.uuid4()),
             unit_id=unit_id,
@@ -673,24 +757,159 @@ class AssignmentContext(QtCore.QObject):
             start_offset=start,
             end_offset=end,
             snippet=snippet,
-            created_at=QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate),
+            created_at=created_at,
         )
-        self._pending_rationales.append(record)
-        event = models.Event(
-            event_id=str(uuid.uuid4()),
-            ts=record.created_at,
-            actor="annotator",
-            event_type="rationale_added",
-            payload_json=json.dumps({
+        self._pending_rationale_inserts[record.rationale_id] = record
+        self._pending_rationale_deletes.discard(record.rationale_id)
+        cache = self._rationale_cache.setdefault(unit_id, {})
+        highlights = cache.setdefault(label_id, [])
+        highlights.append(
+            {
+                "rationale_id": record.rationale_id,
                 "unit_id": unit_id,
                 "label_id": label_id,
                 "doc_id": doc_id,
-                "start": start,
-                "end": end,
-            }),
+                "start_offset": start,
+                "end_offset": end,
+                "snippet": snippet,
+                "created_at": created_at,
+            }
+        )
+        self._sort_rationales(highlights)
+        event = models.Event(
+            event_id=str(uuid.uuid4()),
+            ts=created_at,
+            actor="annotator",
+            event_type="rationale_added",
+            payload_json=json.dumps(
+                {
+                    "rationale_id": record.rationale_id,
+                    "unit_id": unit_id,
+                    "label_id": label_id,
+                    "doc_id": doc_id,
+                    "start": start,
+                    "end": end,
+                }
+            ),
         )
         self._pending_events.append(event)
+        if self.current_unit_id == unit_id:
+            self.current_rationales = self.load_rationales(unit_id)
         self._refresh_dirty_state("Unsaved changes – click Save to persist")
+        return record.rationale_id
+
+    def update_rationale(
+        self,
+        unit_id: str,
+        label_id: str,
+        rationale_id: str,
+        doc_id: str,
+        start: int,
+        end: int,
+        snippet: str,
+    ) -> bool:
+        if not self.assignment_db:
+            return False
+        cache = self._rationale_cache.setdefault(unit_id, {})
+        highlights = cache.get(label_id, [])
+        target: Optional[Dict[str, object]] = None
+        for entry in highlights:
+            if entry.get("rationale_id") == rationale_id:
+                target = entry
+                break
+        if not target:
+            return False
+        created_at = str(target.get("created_at") or "")
+        target.update(
+            {
+                "doc_id": doc_id,
+                "start_offset": start,
+                "end_offset": end,
+                "snippet": snippet,
+            }
+        )
+        self._sort_rationales(highlights)
+        if rationale_id in self._pending_rationale_inserts:
+            record = self._pending_rationale_inserts[rationale_id]
+            record.doc_id = doc_id
+            record.start_offset = start
+            record.end_offset = end
+            record.snippet = snippet
+        else:
+            record = models.Rationale(
+                rationale_id=rationale_id,
+                unit_id=unit_id,
+                label_id=label_id,
+                doc_id=doc_id,
+                start_offset=start,
+                end_offset=end,
+                snippet=snippet,
+                created_at=created_at or QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate),
+            )
+            self._pending_rationale_updates[rationale_id] = record
+        self._pending_rationale_deletes.discard(rationale_id)
+        self._remove_rationale_events(rationale_id, {"rationale_updated"})
+        event = models.Event(
+            event_id=str(uuid.uuid4()),
+            ts=QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate),
+            actor="annotator",
+            event_type="rationale_updated",
+            payload_json=json.dumps(
+                {
+                    "rationale_id": rationale_id,
+                    "unit_id": unit_id,
+                    "label_id": label_id,
+                    "doc_id": doc_id,
+                    "start": start,
+                    "end": end,
+                }
+            ),
+        )
+        self._pending_events.append(event)
+        if self.current_unit_id == unit_id:
+            self.current_rationales = self.load_rationales(unit_id)
+        self._refresh_dirty_state("Unsaved changes – click Save to persist")
+        return True
+
+    def delete_rationale(self, unit_id: str, label_id: str, rationale_id: str) -> bool:
+        if not self.assignment_db:
+            return False
+        cache = self._rationale_cache.setdefault(unit_id, {})
+        highlights = cache.get(label_id, [])
+        index = -1
+        for idx, entry in enumerate(highlights):
+            if entry.get("rationale_id") == rationale_id:
+                index = idx
+                break
+        if index < 0:
+            return False
+        highlights.pop(index)
+        self._sort_rationales(highlights)
+        if rationale_id in self._pending_rationale_inserts:
+            self._pending_rationale_inserts.pop(rationale_id, None)
+            self._remove_rationale_events(rationale_id, {"rationale_added", "rationale_updated"})
+        else:
+            self._pending_rationale_updates.pop(rationale_id, None)
+            self._pending_rationale_deletes.add(rationale_id)
+            self._remove_rationale_events(rationale_id, {"rationale_updated"})
+            event = models.Event(
+                event_id=str(uuid.uuid4()),
+                ts=QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate),
+                actor="annotator",
+                event_type="rationale_deleted",
+                payload_json=json.dumps(
+                    {
+                        "rationale_id": rationale_id,
+                        "unit_id": unit_id,
+                        "label_id": label_id,
+                    }
+                ),
+            )
+            self._pending_events.append(event)
+        if self.current_unit_id == unit_id:
+            self.current_rationales = self.load_rationales(unit_id)
+        self._refresh_dirty_state("Unsaved changes – click Save to persist")
+        return True
 
     def mark_unit_complete(self, unit_id: str, complete: bool) -> None:
         if not self.assignment_db:
@@ -731,14 +950,33 @@ class AssignmentContext(QtCore.QObject):
             return False
         annotations_to_save = list(self._pending_annotations.items())
         annotation_events = list(self._pending_annotation_events.values())
-        rationales_to_save = list(self._pending_rationales)
+        rationale_inserts = list(self._pending_rationale_inserts.values())
+        rationale_updates = list(self._pending_rationale_updates.values())
+        rationale_deletes = list(self._pending_rationale_deletes)
         other_events = list(self._pending_events)
         completion_updates = list(self._pending_completion.items())
         with self.assignment_db.transaction() as conn:
             if annotations_to_save:
                 models.Annotation.insert_many(conn, [record for _, record in annotations_to_save])
-            if rationales_to_save:
-                models.Rationale.insert_many(conn, rationales_to_save)
+            if rationale_inserts:
+                models.Rationale.insert_many(conn, rationale_inserts)
+            for record in rationale_updates:
+                conn.execute(
+                    "UPDATE rationales SET doc_id=?, start_offset=?, end_offset=?, snippet=? WHERE rationale_id=?",
+                    (
+                        record.doc_id,
+                        record.start_offset,
+                        record.end_offset,
+                        record.snippet,
+                        record.rationale_id,
+                    ),
+                )
+            if rationale_deletes:
+                placeholders = ",".join(["?"] * len(rationale_deletes))
+                conn.execute(
+                    f"DELETE FROM rationales WHERE rationale_id IN ({placeholders})",
+                    rationale_deletes,
+                )
             all_events = annotation_events + other_events
             if all_events:
                 models.Event.insert_many(conn, all_events)
@@ -767,11 +1005,78 @@ class AssignmentContext(QtCore.QObject):
             baseline_entry = self._unit_completion_baseline.setdefault(unit_id, {})
             baseline_entry["complete"] = bool(payload.get("complete", 0))
             baseline_entry["completed_at"] = payload.get("completed_at")
+        affected_units: Set[str] = set()
+        for record in rationale_inserts:
+            entry = {
+                "rationale_id": record.rationale_id,
+                "unit_id": record.unit_id,
+                "label_id": record.label_id,
+                "doc_id": record.doc_id,
+                "start_offset": record.start_offset,
+                "end_offset": record.end_offset,
+                "snippet": record.snippet,
+                "created_at": record.created_at,
+            }
+            baseline_list = self._rationale_baseline.setdefault(record.unit_id, {}).setdefault(
+                record.label_id, []
+            )
+            baseline_list.append(dict(entry))
+            self._sort_rationales(baseline_list)
+            cache_list = self._rationale_cache.setdefault(record.unit_id, {}).setdefault(
+                record.label_id, []
+            )
+            cache_list.append(dict(entry))
+            self._sort_rationales(cache_list)
+            affected_units.add(record.unit_id)
+        for record in rationale_updates:
+            entry = {
+                "doc_id": record.doc_id,
+                "start_offset": record.start_offset,
+                "end_offset": record.end_offset,
+                "snippet": record.snippet,
+            }
+            baseline_list = self._rationale_baseline.setdefault(record.unit_id, {}).setdefault(
+                record.label_id, []
+            )
+            cache_list = self._rationale_cache.setdefault(record.unit_id, {}).setdefault(
+                record.label_id, []
+            )
+            for target in baseline_list:
+                if target.get("rationale_id") == record.rationale_id:
+                    target.update(entry)
+                    break
+            else:
+                baseline_list.append({"rationale_id": record.rationale_id, **entry})
+            self._sort_rationales(baseline_list)
+            for target in cache_list:
+                if target.get("rationale_id") == record.rationale_id:
+                    target.update(entry)
+                    break
+            else:
+                cache_list.append({"rationale_id": record.rationale_id, **entry})
+            self._sort_rationales(cache_list)
+            affected_units.add(record.unit_id)
+        for rationale_id in rationale_deletes:
+            for container in (self._rationale_baseline, self._rationale_cache):
+                for unit_id, labels in container.items():
+                    changed = False
+                    for label_id, entries in labels.items():
+                        before = len(entries)
+                        entries[:] = [entry for entry in entries if entry.get("rationale_id") != rationale_id]
+                        if len(entries) != before:
+                            self._sort_rationales(entries)
+                            changed = True
+                    if changed:
+                        affected_units.add(unit_id)
         self._pending_annotations.clear()
         self._pending_annotation_events.clear()
-        self._pending_rationales.clear()
+        self._pending_rationale_inserts.clear()
+        self._pending_rationale_updates.clear()
+        self._pending_rationale_deletes.clear()
         self._pending_events.clear()
         self._pending_completion.clear()
+        if self.current_unit_id and self.current_unit_id in affected_units:
+            self.current_rationales = self.load_rationales(self.current_unit_id)
         self._refresh_dirty_state("All changes saved")
         return True
 
@@ -780,12 +1085,21 @@ class AssignmentContext(QtCore.QObject):
             return
         self._pending_annotations.clear()
         self._pending_annotation_events.clear()
-        self._pending_rationales.clear()
+        self._pending_rationale_inserts.clear()
+        self._pending_rationale_updates.clear()
+        self._pending_rationale_deletes.clear()
         self._pending_events.clear()
         self._pending_completion.clear()
         self._annotation_cache = {
             unit_id: {label_id: dict(data) for label_id, data in annotations.items()}
             for unit_id, annotations in self._annotation_baseline.items()
+        }
+        self._rationale_cache = {
+            unit_id: {
+                label_id: [dict(entry) for entry in entries]
+                for label_id, entries in labels.items()
+            }
+            for unit_id, labels in self._rationale_baseline.items()
         }
         for unit in self.units:
             unit_id = str(unit.get("unit_id"))
@@ -804,7 +1118,9 @@ class AssignmentContext(QtCore.QObject):
             [
                 bool(self._pending_annotations),
                 bool(self._pending_annotation_events),
-                bool(self._pending_rationales),
+                bool(self._pending_rationale_inserts),
+                bool(self._pending_rationale_updates),
+                bool(self._pending_rationale_deletes),
                 bool(self._pending_events),
                 bool(self._pending_completion),
             ]
@@ -836,10 +1152,13 @@ class AnnotationForm(QtWidgets.QScrollArea):
         self.container = QtWidgets.QWidget()
         self.setWidgetResizable(True)
         self.setWidget(self.container)
-        self.layout = QtWidgets.QFormLayout(self.container)
+        self.layout = QtWidgets.QVBoxLayout(self.container)
+        self.layout.setContentsMargins(8, 8, 8, 8)
+        self.layout.setSpacing(12)
         self.label_widgets: Dict[str, Dict[str, object]] = {}
         self.current_unit_id: Optional[str] = None
         self.current_annotations: Dict[str, Dict[str, object]] = {}
+        self.current_rationales: Dict[str, List[Dict[str, object]]] = {}
 
     def clear(self) -> None:
         while self.layout.count():
@@ -848,22 +1167,29 @@ class AnnotationForm(QtWidgets.QScrollArea):
             if widget:
                 widget.deleteLater()
         self.label_widgets.clear()
+        self.current_rationales = {}
 
     def set_schema(self, labels: List[LabelDefinition]) -> None:
         self.clear()
         for label in labels:
             row_widget = self._create_row(label)
-            label_widget = QtWidgets.QLabel(label.name)
-            label_widget.setProperty("label_id", label.label_id)
             row_widget.setProperty("label_id", label.label_id)
-            self.layout.addRow(label_widget, row_widget)
+            self.layout.addWidget(row_widget)
+        self.layout.addStretch()
 
-    def load_unit(self, unit_id: str, annotations: Dict[str, Dict[str, object]]) -> None:
+    def load_unit(
+        self,
+        unit_id: str,
+        annotations: Dict[str, Dict[str, object]],
+        rationales: Dict[str, List[Dict[str, object]]],
+    ) -> None:
         self.current_unit_id = unit_id
         self.current_annotations = annotations
+        self.current_rationales = rationales
         with self._suspend_widget_signals():
             for label_id, widgets in self.label_widgets.items():
                 self._apply_annotation(label_id, widgets, annotations.get(label_id, {}))
+                self._refresh_highlights(label_id)
         self._update_gating()
         self._update_completion()
 
@@ -871,9 +1197,30 @@ class AnnotationForm(QtWidgets.QScrollArea):
 
     def _create_row(self, label: LabelDefinition) -> QtWidgets.QWidget:
         wrapper = QtWidgets.QWidget()
+        wrapper.setProperty("label_id", label.label_id)
         v_layout = QtWidgets.QVBoxLayout(wrapper)
+        v_layout.setContentsMargins(0, 0, 12, 12)
+        v_layout.setSpacing(6)
         value_widget: QtWidgets.QWidget
-        state: Dict[str, object] = {"definition": label}
+        state: Dict[str, object] = {"definition": label, "row_widget": wrapper}
+
+        header_layout = QtWidgets.QHBoxLayout()
+        title_label = QtWidgets.QLabel(label.name)
+        font = title_label.font()
+        font.setBold(True)
+        title_label.setFont(font)
+        title_label.setProperty("label_id", label.label_id)
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        if label.na_allowed:
+            na_box = QtWidgets.QCheckBox("N/A")
+            na_box.stateChanged.connect(
+                lambda _state, lid=label.label_id, widget=na_box: self._on_na(lid, widget)
+            )
+            header_layout.addWidget(na_box)
+            state["na_box"] = na_box
+        v_layout.addLayout(header_layout)
+
         if label.type in {"boolean", "categorical_single", "ordinal"}:
             button_group = QtWidgets.QButtonGroup(wrapper)
             button_group.setExclusive(True)
@@ -919,29 +1266,204 @@ class AnnotationForm(QtWidgets.QScrollArea):
             state["text_edit"] = text
         v_layout.addWidget(value_widget)
 
-        info_layout = QtWidgets.QHBoxLayout()
-        if label.na_allowed:
-            na_box = QtWidgets.QCheckBox("N/A")
-            na_box.stateChanged.connect(lambda _state, lid=label.label_id, widget=na_box: self._on_na(lid, widget))
-            info_layout.addWidget(na_box)
-            state["na_box"] = na_box
         notes = QtWidgets.QLineEdit()
         notes.setPlaceholderText("Notes")
+        notes.setClearButtonEnabled(True)
         notes.editingFinished.connect(lambda lid=label.label_id, widget=notes: self._on_notes(lid, widget))
-        info_layout.addWidget(notes)
+        v_layout.addWidget(notes)
         state["notes"] = notes
+
+        highlight_controls = QtWidgets.QHBoxLayout()
         highlight_btn = QtWidgets.QPushButton("Add highlight")
         highlight_btn.clicked.connect(lambda _checked, lid=label.label_id: self._add_highlight(lid))
-        info_layout.addWidget(highlight_btn)
-        v_layout.addLayout(info_layout)
+        highlight_controls.addWidget(highlight_btn)
+        update_btn = QtWidgets.QPushButton("Replace from selection")
+        update_btn.setEnabled(False)
+        update_btn.clicked.connect(
+            lambda _checked, lid=label.label_id: self._update_highlight_from_selection(lid)
+        )
+        highlight_controls.addWidget(update_btn)
+        delete_btn = QtWidgets.QPushButton("Delete highlight")
+        delete_btn.setEnabled(False)
+        delete_btn.clicked.connect(lambda _checked, lid=label.label_id: self._delete_highlight(lid))
+        highlight_controls.addWidget(delete_btn)
+        highlight_controls.addStretch()
+        v_layout.addLayout(highlight_controls)
+        state["highlight_update_btn"] = update_btn
+        state["highlight_delete_btn"] = delete_btn
+
+        highlight_list = QtWidgets.QTreeWidget()
+        highlight_list.setColumnCount(3)
+        highlight_list.setHeaderLabels(["Document", "Range", "Text"])
+        highlight_list.setRootIsDecorated(False)
+        highlight_list.setIndentation(0)
+        highlight_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        highlight_list.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        highlight_list.setUniformRowHeights(True)
+        highlight_list.setAlternatingRowColors(True)
+        highlight_list.setMinimumHeight(80)
+        header = highlight_list.header()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        highlight_list.itemSelectionChanged.connect(
+            lambda lid=label.label_id: self._on_highlight_selection_changed(lid)
+        )
+        v_layout.addWidget(highlight_list)
+        state["highlight_list"] = highlight_list
 
         if label.rules:
             rules_label = QtWidgets.QLabel(label.rules)
             rules_label.setWordWrap(True)
             v_layout.addWidget(rules_label)
-        wrapper.setProperty("label_id", label.label_id)
         self.label_widgets[label.label_id] = state
         return wrapper
+
+    @staticmethod
+    def _format_highlight_snippet(snippet: object) -> str:
+        text = str(snippet or "")
+        text = text.replace("\u2029", " ").replace("\n", " ")
+        text = " ".join(text.split())
+        if len(text) > 120:
+            return text[:117] + "…"
+        return text
+
+    def _refresh_highlights(self, label_id: str) -> None:
+        widgets = self.label_widgets.get(label_id)
+        if not widgets:
+            return
+        highlight_list = widgets.get("highlight_list")
+        if not isinstance(highlight_list, QtWidgets.QTreeWidget):
+            return
+        highlights = self.current_rationales.get(label_id, [])
+        highlight_list.blockSignals(True)
+        highlight_list.clear()
+        for entry in highlights:
+            doc_id = str(entry.get("doc_id", ""))
+            start = int(entry.get("start_offset", 0))
+            end = int(entry.get("end_offset", 0))
+            range_display = f"{start}-{end}" if end >= start else str(start)
+            snippet = self._format_highlight_snippet(entry.get("snippet"))
+            item = QtWidgets.QTreeWidgetItem([doc_id, range_display, snippet])
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, dict(entry))
+            highlight_list.addTopLevelItem(item)
+        highlight_list.blockSignals(False)
+        self._on_highlight_selection_changed(label_id)
+
+    def _selected_highlight(self, label_id: str) -> Optional[Dict[str, object]]:
+        widgets = self.label_widgets.get(label_id)
+        if not widgets:
+            return None
+        highlight_list = widgets.get("highlight_list")
+        if not isinstance(highlight_list, QtWidgets.QTreeWidget):
+            return None
+        items = highlight_list.selectedItems()
+        if not items:
+            return None
+        data = items[0].data(0, QtCore.Qt.ItemDataRole.UserRole)
+        return dict(data) if isinstance(data, dict) else None
+
+    def _select_highlight(self, label_id: str, rationale_id: str) -> None:
+        widgets = self.label_widgets.get(label_id)
+        if not widgets:
+            return
+        highlight_list = widgets.get("highlight_list")
+        if not isinstance(highlight_list, QtWidgets.QTreeWidget):
+            return
+        for index in range(highlight_list.topLevelItemCount()):
+            item = highlight_list.topLevelItem(index)
+            data = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict) and data.get("rationale_id") == rationale_id:
+                highlight_list.setCurrentItem(item)
+                break
+
+    def _on_highlight_selection_changed(self, label_id: str) -> None:
+        widgets = self.label_widgets.get(label_id)
+        if not widgets:
+            return
+        has_selection = bool(self._selected_highlight(label_id))
+        for key in ("highlight_update_btn", "highlight_delete_btn"):
+            widget = widgets.get(key)
+            if isinstance(widget, QtWidgets.QPushButton):
+                widget.setEnabled(has_selection)
+
+    def _update_highlight_from_selection(self, label_id: str) -> None:
+        if not self.current_unit_id:
+            return
+        highlight = self._selected_highlight(label_id)
+        if not highlight:
+            return
+        doc_id = self.get_active_doc_id()
+        if not doc_id:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Highlight",
+                "Select a note before updating highlights",
+            )
+            return
+        cursor = self.get_selection()
+        if cursor.isNull() or cursor.selectionStart() == cursor.selectionEnd():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Highlight",
+                "Select text in the note first",
+            )
+            return
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+        snippet = cursor.selectedText()
+        rationale_id = str(highlight.get("rationale_id", ""))
+        if not rationale_id:
+            return
+        updated = self.ctx.update_rationale(
+            self.current_unit_id,
+            label_id,
+            rationale_id,
+            doc_id,
+            start,
+            end,
+            snippet,
+        )
+        if not updated:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Highlight",
+                "Unable to update the selected highlight.",
+            )
+            return
+        self.current_rationales = self.ctx.load_rationales(self.current_unit_id)
+        self._refresh_highlights(label_id)
+        self._select_highlight(label_id, rationale_id)
+
+    def _delete_highlight(self, label_id: str) -> None:
+        if not self.current_unit_id:
+            return
+        highlight = self._selected_highlight(label_id)
+        if not highlight:
+            return
+        rationale_id = str(highlight.get("rationale_id", ""))
+        if not rationale_id:
+            return
+        response = QtWidgets.QMessageBox.question(
+            self,
+            "Delete highlight",
+            "Remove the selected highlight?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if response != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        removed = self.ctx.delete_rationale(self.current_unit_id, label_id, rationale_id)
+        if not removed:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Highlight",
+                "Unable to delete the selected highlight.",
+            )
+            return
+        self.current_rationales = self.ctx.load_rationales(self.current_unit_id)
+        self._refresh_highlights(label_id)
 
     def _apply_annotation(self, label_id: str, widgets: Dict[str, object], annotation: Dict[str, object]) -> None:
         if not annotation:
@@ -1104,26 +1626,20 @@ class AnnotationForm(QtWidgets.QScrollArea):
         start = cursor.selectionStart()
         end = cursor.selectionEnd()
         snippet = cursor.selectedText()
-        self.ctx.save_rationale(self.current_unit_id, label_id, doc_id, start, end, snippet)
+        new_id = self.ctx.save_rationale(self.current_unit_id, label_id, doc_id, start, end, snippet)
+        self.current_rationales = self.ctx.load_rationales(self.current_unit_id)
+        self._refresh_highlights(label_id)
+        if new_id:
+            self._select_highlight(label_id, new_id)
 
     def _update_gating(self) -> None:
         values = self._current_values()
-        for i in range(self.layout.rowCount()):
-            label_item = self.layout.itemAt(i, QtWidgets.QFormLayout.ItemRole.LabelRole)
-            field_item = self.layout.itemAt(i, QtWidgets.QFormLayout.ItemRole.FieldRole)
-            if not label_item or not field_item:
-                continue
-            field_widget = field_item.widget()
-            label_widget = label_item.widget()
-            if not field_widget or not label_widget:
-                continue
-            label_id = field_widget.property("label_id") or label_widget.property("label_id")
-            if not label_id:
-                continue
-            definition: LabelDefinition = self.label_widgets[label_id]["definition"]  # type: ignore[index]
+        for label_id, widgets in self.label_widgets.items():
+            definition: LabelDefinition = widgets["definition"]  # type: ignore[index]
+            row_widget = widgets.get("row_widget")
             visible = self._is_label_visible(definition, values)
-            field_widget.setVisible(visible)
-            label_widget.setVisible(visible)
+            if isinstance(row_widget, QtWidgets.QWidget):
+                row_widget.setVisible(visible)
         self._update_completion()
 
     def _current_values(self) -> Dict[str, object]:
@@ -1492,7 +2008,8 @@ class ClientMainWindow(QtWidgets.QMainWindow):
         if self.notes_table.rowCount():
             self.notes_table.setCurrentCell(0, 0)
         annotations = self.ctx.load_annotations(str(unit["unit_id"]))
-        self.form.load_unit(unit_id, annotations)
+        rationales = self.ctx.load_rationales(str(unit["unit_id"]))
+        self.form.load_unit(unit_id, annotations, rationales)
         self._update_progress()
 
     def _populate_notes_table(self, documents: List[Dict[str, object]]) -> None:

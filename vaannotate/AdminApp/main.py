@@ -3903,6 +3903,34 @@ class IaaWidget(QtWidgets.QWidget):
             display_value = str(entry)
         return display_value, notes_value
 
+    @staticmethod
+    def _format_rationale_snippet(snippet: object) -> str:
+        text = str(snippet or "")
+        text = text.replace("\u2029", " ").replace("\n", " ")
+        text = " ".join(text.split())
+        if len(text) > 80:
+            return text[:77] + "…"
+        return text
+
+    def _format_rationale_summary(self, rationales: Iterable[Dict[str, object]]) -> str:
+        items: List[str] = []
+        for rationale in rationales or []:
+            doc_id = str(rationale.get("doc_id") or "—")
+            start = rationale.get("start_offset")
+            end = rationale.get("end_offset")
+            if isinstance(start, int) and isinstance(end, int):
+                range_part = f"{start}-{end}"
+            else:
+                range_part = ""
+            snippet = self._format_rationale_snippet(rationale.get("snippet"))
+            details = doc_id
+            if range_part:
+                details = f"{details} [{range_part}]"
+            if snippet:
+                details = f"{details} {snippet}"
+            items.append(details.strip())
+        return f"Highlights: {'; '.join(items)}" if items else ""
+
     def _format_annotation_line(self, label_id: str, entry: object) -> str:
         label_name = self.label_lookup.get(label_id, label_id)
         display_value, notes_value = self._extract_annotation_parts(entry)
@@ -3911,6 +3939,12 @@ class IaaWidget(QtWidgets.QWidget):
             parts.append(display_value)
         if notes_value:
             parts.append(f"Notes: {notes_value}")
+        rationales = []
+        if isinstance(entry, dict):
+            rationales = entry.get("rationales") or []
+        highlight_text = self._format_rationale_summary(rationales)
+        if highlight_text:
+            parts.append(highlight_text)
         if not parts:
             parts.append("—")
         return f"{label_name}: {'; '.join(parts)}"
@@ -3922,6 +3956,12 @@ class IaaWidget(QtWidgets.QWidget):
             parts.append(display_value)
         if notes_value:
             parts.append(f"Notes: {notes_value}")
+        rationales = []
+        if isinstance(entry, dict):
+            rationales = entry.get("rationales") or []
+        highlight_text = self._format_rationale_summary(rationales)
+        if highlight_text:
+            parts.append(highlight_text)
         return "\n".join(parts) if parts else ""
 
     def _selected_unit_index(self) -> Optional[int]:
@@ -4045,6 +4085,54 @@ class IaaWidget(QtWidgets.QWidget):
             self._register_metadata_key(key)
         return metadata
 
+    @staticmethod
+    def _normalize_rationales(rows: Iterable[sqlite3.Row]) -> Dict[str, Dict[str, List[Dict[str, object]]]]:
+        mapping: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
+        for row in rows:
+            unit_id = str(row["unit_id"])
+            label_id = str(row["label_id"])
+            entry = {
+                "doc_id": str(row["doc_id"] or ""),
+                "start_offset": int(row["start_offset"]),
+                "end_offset": int(row["end_offset"]),
+                "snippet": str(row["snippet"] or ""),
+            }
+            mapping.setdefault(unit_id, {}).setdefault(label_id, []).append(entry)
+        for label_map in mapping.values():
+            for entries in label_map.values():
+                entries.sort(
+                    key=lambda value: (
+                        value.get("doc_id", ""),
+                        int(value.get("start_offset", 0)),
+                        int(value.get("end_offset", 0)),
+                    )
+                )
+        return mapping
+
+    def _collect_reviewer_rationales(self) -> Dict[str, Dict[str, Dict[str, List[Dict[str, object]]]]]:
+        cache: Dict[str, Dict[str, Dict[str, List[Dict[str, object]]]]] = {}
+        for reviewer_id, path in self.assignment_paths.items():
+            if not path:
+                continue
+            db = self.ctx.get_assignment_db(path)
+            if not db:
+                continue
+            try:
+                with db.connect() as conn:
+                    rows = conn.execute(
+                        "SELECT unit_id, label_id, doc_id, start_offset, end_offset, snippet FROM rationales"
+                    ).fetchall()
+            except Exception:
+                continue
+            normalized = self._normalize_rationales(rows)
+            reviewer_map: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
+            for unit_id, labels in normalized.items():
+                reviewer_map[unit_id] = {
+                    label_id: [dict(entry) for entry in entries] for label_id, entries in labels.items()
+                }
+            cache[reviewer_id] = reviewer_map
+        return cache
+
     def _load_unit_rows_from_aggregate(
         self,
         aggregate_db: Database,
@@ -4067,6 +4155,7 @@ class IaaWidget(QtWidgets.QWidget):
                 ).fetchall()
         except Exception:
             return False
+        reviewer_rationales = self._collect_reviewer_rationales()
         unit_map: Dict[str, Dict[str, object]] = {}
         history_map: Dict[str, Dict[tuple[str, str], str]] = {}
         for history in history_rows:
@@ -4117,6 +4206,10 @@ class IaaWidget(QtWidgets.QWidget):
                 "value_num": ann_row["value_num"],
                 "value_date": ann_row["value_date"],
                 "na": ann_row["na"],
+                "rationales": [
+                    dict(entry)
+                    for entry in reviewer_rationales.get(reviewer_id, {}).get(unit_id, {}).get(label_id, [])
+                ],
             }
         self.unit_rows = []
         for unit_id, entry in unit_map.items():
@@ -4150,6 +4243,10 @@ class IaaWidget(QtWidgets.QWidget):
                 annotations = conn.execute(
                     "SELECT unit_id, label_id, value, value_num, value_date, na, notes FROM annotations",
                 ).fetchall()
+                rationale_rows = conn.execute(
+                    "SELECT unit_id, label_id, doc_id, start_offset, end_offset, snippet FROM rationales"
+                ).fetchall()
+            rationale_map = self._normalize_rationales(rationale_rows)
             ann_map: Dict[str, Dict[str, Dict[str, object]]] = {}
             for ann_row in annotations:
                 unit_id = ann_row["unit_id"]
@@ -4160,6 +4257,10 @@ class IaaWidget(QtWidgets.QWidget):
                     "value_num": ann_row["value_num"],
                     "value_date": ann_row["value_date"],
                     "na": ann_row["na"],
+                    "rationales": [
+                        dict(entry)
+                        for entry in rationale_map.get(unit_id, {}).get(ann_row["label_id"], [])
+                    ],
                 }
             for unit_row in units:
                 unit_id = unit_row["unit_id"]
