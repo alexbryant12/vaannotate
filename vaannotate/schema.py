@@ -152,9 +152,11 @@ CORPUS_SCHEMA = [
         sta3n TEXT,
         hash TEXT NOT NULL,
         text TEXT NOT NULL,
+        metadata_json TEXT,
         FOREIGN KEY(patient_icn) REFERENCES patients(patient_icn)
     );
     """,
+    """ALTER TABLE documents ADD COLUMN metadata_json TEXT;""",
     """CREATE INDEX IF NOT EXISTS idx_documents_patient ON documents(patient_icn);""",
     """CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(note_year);""",
     """CREATE INDEX IF NOT EXISTS idx_documents_sta ON documents(sta3n);""",

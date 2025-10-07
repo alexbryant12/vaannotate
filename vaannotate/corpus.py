@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -54,6 +55,13 @@ def import_documents(conn: sqlite3.Connection, rows: Iterable[dict]) -> None:
                 note_year = int(note_year)
             except (TypeError, ValueError):
                 raise ValueError(f"Invalid note_year value: {note_year!r}") from None
+        raw_metadata = row.get("metadata")
+        if not raw_metadata and "__metadata__" in row:
+            raw_metadata = row.get("__metadata__")
+        metadata: dict[str, object] = {}
+        if isinstance(raw_metadata, dict):
+            metadata = {key: value for key, value in raw_metadata.items() if value not in (None, "")}
+        metadata_json = json.dumps(metadata, sort_keys=True) if metadata else None
         prepared.append(
             {
                 "doc_id": row["doc_id"],
@@ -65,12 +73,13 @@ def import_documents(conn: sqlite3.Connection, rows: Iterable[dict]) -> None:
                 "sta3n": row.get("sta3n"),
                 "hash": hash_text(text),
                 "text": text,
+                "metadata_json": metadata_json,
             }
         )
     conn.executemany(
         """
-        INSERT OR REPLACE INTO documents(doc_id, patient_icn, notetype, note_year, date_note, cptname, sta3n, hash, text)
-        VALUES (:doc_id,:patient_icn,:notetype,:note_year,:date_note,:cptname,:sta3n,:hash,:text)
+        INSERT OR REPLACE INTO documents(doc_id, patient_icn, notetype, note_year, date_note, cptname, sta3n, hash, text, metadata_json)
+        VALUES (:doc_id,:patient_icn,:notetype,:note_year,:date_note,:cptname,:sta3n,:hash,:text,:metadata_json)
         """,
         prepared,
     )
@@ -91,17 +100,40 @@ def load_patients_csv(path: Path) -> Iterator[dict]:
 def load_documents_csv(path: Path) -> Iterator[dict]:
     with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            return
+        rename: dict[str, str] = {}
+        for column in reader.fieldnames:
+            canonical = _canonical_column(str(column))
+            if canonical:
+                rename[column] = canonical
+        recognized = REQUIRED_COLUMNS | OPTIONAL_COLUMNS | {"doc_id"}
         for row in reader:
-            yield {
-                "doc_id": row["doc_id"],
-                "patient_icn": row["patient_icn"],
-                "notetype": row.get("notetype"),
-                "note_year": int(row["note_year"]) if row.get("note_year") else None,
-                "date_note": row.get("date_note"),
-                "cptname": row.get("cptname"),
-                "sta3n": row.get("sta3n"),
-                "text": row["text"],
-            }
+            normalized: dict[str, object] = {}
+            metadata: dict[str, object] = {}
+            for column, value in row.items():
+                if column is None:
+                    continue
+                key = rename.get(column, column)
+                cell = value
+                if isinstance(cell, str):
+                    if key == "text":
+                        cell = cell
+                    else:
+                        cell = cell.strip() or None
+                if key in recognized:
+                    normalized[key] = cell
+                else:
+                    metadata[key] = cell
+            if "patient_icn" not in normalized:
+                raise ValueError("Corpus is missing required column 'patienticn'")
+            if "text" not in normalized:
+                raise ValueError("Corpus is missing required column 'text'")
+            if metadata:
+                cleaned_metadata = {key: val for key, val in metadata.items() if val not in (None, "")}
+                if cleaned_metadata:
+                    normalized["__metadata__"] = cleaned_metadata
+            yield normalized
 
 
 def bulk_import_from_csv(corpus_db: Path, patients_csv: Path, documents_csv: Path) -> None:
@@ -167,21 +199,28 @@ def load_tabular_corpus(path: Path) -> List[dict]:
     missing = REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(f"Corpus is missing required columns: {', '.join(sorted(missing))}")
-    recognized = list(REQUIRED_COLUMNS | OPTIONAL_COLUMNS)
+    recognized = REQUIRED_COLUMNS | OPTIONAL_COLUMNS | {"doc_id"}
     rows: List[dict] = []
     for record in df.to_dict(orient="records"):
         normalized: dict[str, object] = {}
-        for column in recognized:
-            if column not in record:
+        metadata: dict[str, object] = {}
+        for column, value in record.items():
+            if column is None:
                 continue
-            value = record[column]
-            if isinstance(value, str):
+            cell = value
+            if isinstance(cell, str):
                 if column == "text":
-                    normalized[column] = value
+                    cell = cell
                 else:
-                    normalized[column] = value.strip() or None
+                    cell = cell.strip() or None
+            if column in recognized:
+                normalized[column] = cell
             else:
-                normalized[column] = value
+                metadata[column] = cell
+        if metadata:
+            cleaned_metadata = {key: val for key, val in metadata.items() if val not in (None, "")}
+            if cleaned_metadata:
+                normalized["__metadata__"] = cleaned_metadata
         rows.append(normalized)
     return rows
 
@@ -228,6 +267,7 @@ def import_tabular_corpus(source: Path, corpus_db: Path) -> None:
         patient_icn = _coerce_str(patient_icn_raw)
         if not patient_icn:
             raise ValueError(f"Row {index} is missing a patienticn value")
+        metadata = row.get("__metadata__") or {}
         text_value = row.get("text")
         if text_value is None or (isinstance(text_value, str) and text_value.strip() == ""):
             raise ValueError(f"Row {index} is missing note text")
@@ -264,6 +304,7 @@ def import_tabular_corpus(source: Path, corpus_db: Path) -> None:
                 "cptname": _coerce_str(row.get("cptname")),
                 "sta3n": sta3n or patient_entry.get("sta3n"),
                 "text": str(text_value),
+                "metadata": metadata,
             }
         )
     with initialize_corpus_db(corpus_db) as conn:

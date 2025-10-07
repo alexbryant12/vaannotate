@@ -334,12 +334,15 @@ class RoundBuilder:
                 for row in rows:
                     row_dict = dict(row)
                     strata_key = self._compute_strata_key(row_dict, strat_aliases)
+                    document_metadata = extract_document_metadata(row_dict)
                     documents = [
                         {
                             "doc_id": row_dict["doc_id"],
                             "hash": row_dict.get("hash"),
                             "text": row_dict.get("text"),
                             "order_index": 0,
+                            "metadata_json": row_dict.get("metadata_json"),
+                            "metadata": document_metadata,
                         }
                     ]
                     payload = {
@@ -347,6 +350,8 @@ class RoundBuilder:
                         "notetype": row_dict.get("notetype"),
                         "sta3n": row_dict.get("sta3n"),
                         "hash": row_dict.get("hash"),
+                        "metadata_json": row_dict.get("metadata_json"),
+                        "metadata": document_metadata,
                         "strata_key": strata_key,
                         "note_count": 1,
                         "documents": documents,
@@ -415,7 +420,7 @@ class RoundBuilder:
         cursor = corpus_conn.execute(
             f"""
             SELECT documents.doc_id, documents.patient_icn, documents.note_year, documents.notetype,
-                   documents.sta3n, documents.hash, documents.text
+                   documents.sta3n, documents.hash, documents.text, documents.metadata_json
             FROM documents
             JOIN patients ON patients.patient_icn = documents.patient_icn
             WHERE {where_sql}
@@ -424,13 +429,17 @@ class RoundBuilder:
         )
         if level == "single_doc":
             for row in cursor:
+                row_dict = dict(row)
                 strata_key = self._compute_strata_key(row, legacy_aliases)
+                document_metadata = extract_document_metadata(row_dict)
                 documents = [
                     {
                         "doc_id": row["doc_id"],
                         "hash": row["hash"],
                         "text": row["text"],
                         "order_index": 0,
+                        "metadata_json": row_dict.get("metadata_json"),
+                        "metadata": document_metadata,
                     }
                 ]
                 payload = {
@@ -438,6 +447,8 @@ class RoundBuilder:
                     "notetype": row["notetype"],
                     "sta3n": row["sta3n"],
                     "hash": row["hash"],
+                    "metadata_json": row_dict.get("metadata_json"),
+                    "metadata": document_metadata,
                     "strata_key": strata_key,
                     "note_count": 1,
                     "documents": documents,
@@ -455,17 +466,26 @@ class RoundBuilder:
                     docs,
                     key=lambda item: (_note_year_sort_value(item["note_year"]), item["doc_id"]),
                 )
-                doc_payloads = [
-                    {
-                        "doc_id": doc["doc_id"],
-                        "hash": doc["hash"],
-                        "text": doc["text"],
-                        "order_index": idx,
-                    }
-                    for idx, doc in enumerate(ordered_docs)
-                ]
+                doc_payloads = []
+                for idx, doc in enumerate(ordered_docs):
+                    doc_dict = dict(doc)
+                    metadata = extract_document_metadata(doc_dict)
+                    doc_payloads.append(
+                        {
+                            "doc_id": doc_dict["doc_id"],
+                            "hash": doc_dict.get("hash"),
+                            "text": doc_dict.get("text"),
+                            "order_index": idx,
+                            "metadata_json": doc_dict.get("metadata_json"),
+                            "metadata": metadata,
+                        }
+                    )
+                primary_dict = dict(primary_row)
+                primary_metadata = extract_document_metadata(primary_dict)
                 payload = {
                     "sta3n": primary_row["sta3n"],
+                    "metadata_json": primary_dict.get("metadata_json"),
+                    "metadata": primary_metadata,
                     "strata_key": strata_key,
                     "note_count": len(docs),
                     "documents": doc_payloads,

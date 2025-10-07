@@ -116,6 +116,7 @@ def _candidate_documents_from_connection(
         "documents.cptname AS cptname",
         "documents.sta3n AS sta3n",
         "documents.hash AS hash",
+        "documents.metadata_json AS metadata_json",
         "documents.text AS text",
     ]
     seen_aliases = {
@@ -127,6 +128,7 @@ def _candidate_documents_from_connection(
         "cptname",
         "sta3n",
         "hash",
+        "metadata_json",
         "text",
     }
     for field in active_fields:
@@ -239,6 +241,7 @@ def _candidate_documents_from_connection(
                 "note_count": len(ordered_docs),
                 "documents": doc_payloads,
                 "metadata": primary_metadata,
+                "metadata_json": primary_dict.get("metadata_json"),
             }
             for field in active_fields:
                 entry[field.alias] = primary_dict.get(field.alias)
