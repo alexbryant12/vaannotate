@@ -3904,9 +3904,13 @@ class IaaWidget(QtWidgets.QWidget):
         return display_value, notes_value
 
     @staticmethod
-    def _format_rationale_snippet(snippet: object) -> str:
+    def _normalize_rationale_text(snippet: object) -> str:
         text = str(snippet or "")
-        text = text.replace("\u2029", " ").replace("\n", " ")
+        return text.replace("\u2029", "\n")
+
+    def _format_rationale_snippet(self, snippet: object) -> str:
+        text = self._normalize_rationale_text(snippet)
+        text = text.replace("\n", " ")
         text = " ".join(text.split())
         if len(text) > 80:
             return text[:77] + "…"
@@ -4044,8 +4048,10 @@ class IaaWidget(QtWidgets.QWidget):
         tree.setColumnCount(3)
         tree.setHeaderLabels(["Document", "Range", "Text"])
         tree.setRootIsDecorated(False)
-        tree.setUniformRowHeights(True)
+        tree.setUniformRowHeights(False)
         tree.setAlternatingRowColors(True)
+        tree.setWordWrap(True)
+        tree.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
         for rationale in items:
             doc_id = str(rationale.get("doc_id") or "—")
             start = rationale.get("start_offset")
@@ -4056,8 +4062,10 @@ class IaaWidget(QtWidgets.QWidget):
                 range_text = str(start)
             else:
                 range_text = ""
-            snippet = self._format_rationale_snippet(rationale.get("snippet"))
-            item = QtWidgets.QTreeWidgetItem([doc_id, range_text, snippet])
+            full_text = self._normalize_rationale_text(rationale.get("snippet"))
+            item = QtWidgets.QTreeWidgetItem([doc_id, range_text, full_text])
+            if full_text:
+                item.setToolTip(2, full_text)
             tree.addTopLevelItem(item)
         header_view = tree.header()
         header_view.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)

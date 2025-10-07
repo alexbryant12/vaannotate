@@ -1264,11 +1264,6 @@ class AnnotationForm(QtWidgets.QScrollArea):
             text.textChanged.connect(lambda lid=label.label_id, widget=text: self._on_text(lid, widget))
             value_widget = text
             state["text_edit"] = text
-        content_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        content_splitter.setChildrenCollapsible(False)
-        content_splitter.setHandleWidth(6)
-        v_layout.addWidget(content_splitter)
-
         main_section = QtWidgets.QWidget()
         main_layout = QtWidgets.QVBoxLayout(main_section)
         main_layout.setContentsMargins(0, 0, 0, 0)
@@ -1286,6 +1281,8 @@ class AnnotationForm(QtWidgets.QScrollArea):
             rules_label = QtWidgets.QLabel(label.rules)
             rules_label.setWordWrap(True)
             main_layout.addWidget(rules_label)
+
+        v_layout.addWidget(main_section)
 
         highlight_section = QtWidgets.QWidget()
         highlight_layout = QtWidgets.QVBoxLayout(highlight_section)
@@ -1322,7 +1319,7 @@ class AnnotationForm(QtWidgets.QScrollArea):
         )
         highlight_list.setUniformRowHeights(True)
         highlight_list.setAlternatingRowColors(True)
-        highlight_list.setMinimumHeight(60)
+        highlight_list.setMinimumHeight(40)
         highlight_list.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.MinimumExpanding,
@@ -1337,12 +1334,25 @@ class AnnotationForm(QtWidgets.QScrollArea):
         highlight_layout.addWidget(highlight_list)
         state["highlight_list"] = highlight_list
 
-        content_splitter.addWidget(main_section)
-        content_splitter.addWidget(highlight_section)
-        content_splitter.setStretchFactor(0, 3)
-        content_splitter.setStretchFactor(1, 1)
-        content_splitter.setSizes([260, 100])
-        content_splitter.setCollapsible(1, True)
+        highlight_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        highlight_splitter.setChildrenCollapsible(False)
+        highlight_splitter.setHandleWidth(6)
+        highlight_splitter.addWidget(highlight_section)
+
+        highlight_spacer = QtWidgets.QWidget()
+        highlight_spacer.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        highlight_splitter.addWidget(highlight_spacer)
+        highlight_splitter.setStretchFactor(0, 0)
+        highlight_splitter.setStretchFactor(1, 1)
+        highlight_splitter.setCollapsible(0, True)
+        raw_height = max(1, highlight_section.sizeHint().height())
+        initial_height = max(40, raw_height // 3)
+        highlight_splitter.setSizes([initial_height, max(40, raw_height - initial_height)])
+
+        v_layout.addWidget(highlight_splitter)
         self.label_widgets[label.label_id] = state
         return wrapper
 
