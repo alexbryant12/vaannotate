@@ -242,7 +242,13 @@ def _infer_data_type(declared_type: str, samples: Sequence[Any]) -> MetadataType
 def _column_samples(conn: sqlite3.Connection, table: str, column: str, limit: int) -> List[Any]:
     sql = f'SELECT "{column}" FROM {table} WHERE "{column}" IS NOT NULL LIMIT ?'
     rows = conn.execute(sql, (limit,)).fetchall()
-    return [row[0] for row in rows]
+    samples: List[Any] = []
+    for row in rows:
+        value = row[0]
+        if not _is_meaningful(value):
+            continue
+        samples.append(value)
+    return samples
 
 
 def _json_samples(conn: sqlite3.Connection, limit: int) -> Dict[str, List[Any]]:
@@ -266,6 +272,8 @@ def _json_samples(conn: sqlite3.Connection, limit: int) -> Dict[str, List[Any]]:
             continue
         for key, value in parsed.items():
             if isinstance(value, (list, dict)):
+                continue
+            if not _is_meaningful(value):
                 continue
             samples.setdefault(key, []).append(value)
     return samples
@@ -310,6 +318,8 @@ def _discover_from_connection(conn: sqlite3.Connection, sample_limit: int) -> Li
             continue
         declared = row["type"]
         samples = _column_samples(conn, "patients", name, sample_limit)
+        if not samples:
+            continue
         data_type = _infer_data_type(declared, samples)
         key = f"patient.{name}"
         alias = _sanitize_alias(f"patient__{name}")
@@ -335,6 +345,8 @@ def _discover_from_connection(conn: sqlite3.Connection, sample_limit: int) -> Li
             continue
         declared = row["type"]
         samples = _column_samples(conn, "documents", name, sample_limit)
+        if not samples:
+            continue
         data_type = _infer_data_type(declared, samples)
         key = f"document.{name}"
         alias = _sanitize_alias(f"document__{name}")

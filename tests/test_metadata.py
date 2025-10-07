@@ -54,6 +54,43 @@ def test_discover_metadata_identifies_dates(tmp_path: Path) -> None:
     assert any(field.key == "document.custom_date" and field.data_type == "date" for field in fields)
 
 
+def test_discover_metadata_ignores_empty_columns(tmp_path: Path) -> None:
+    corpus_path = tmp_path / "corpus.db"
+    with initialize_corpus_db(corpus_path) as conn:
+        conn.execute(
+            "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
+            ("p_empty", "506", None, None),
+        )
+        conn.execute(
+            """
+            INSERT INTO documents(
+                doc_id, patient_icn, notetype, note_year, date_note,
+                cptname, sta3n, hash, text
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "doc_empty",
+                "p_empty",
+                "NOTE",
+                2024,
+                "2024-03-01",
+                None,
+                "506",
+                "hash-empty",
+                "Example text",
+            ),
+        )
+        conn.commit()
+
+    with initialize_corpus_db(corpus_path) as conn:
+        conn.row_factory = sqlite3.Row
+        fields = discover_corpus_metadata(conn)
+
+    keys = {field.key for field in fields}
+    assert "document.cptname" not in keys
+    assert "patient.softlabel" not in keys
+
+
 def test_candidate_documents_supports_date_range_filters(tmp_path: Path) -> None:
     corpus_path = tmp_path / "corpus.db"
     with initialize_corpus_db(corpus_path) as conn:
