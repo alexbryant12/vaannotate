@@ -3950,19 +3950,129 @@ class IaaWidget(QtWidgets.QWidget):
         return f"{label_name}: {'; '.join(parts)}"
 
     def _format_annotation_cell(self, entry: object) -> str:
-        display_value, notes_value = self._extract_annotation_parts(entry)
-        parts: List[str] = []
-        if display_value:
-            parts.append(display_value)
-        if notes_value:
-            parts.append(f"Notes: {notes_value}")
-        rationales = []
-        if isinstance(entry, dict):
-            rationales = entry.get("rationales") or []
-        highlight_text = self._format_rationale_summary(rationales)
-        if highlight_text:
-            parts.append(highlight_text)
-        return "\n".join(parts) if parts else ""
+        display_value, _notes_value = self._extract_annotation_parts(entry)
+        return display_value
+
+    def _annotation_context_for_cell(
+        self, table_row: int, column_info: Dict[str, object]
+    ) -> Optional[Dict[str, object]]:
+        if column_info.get("type") != "label":
+            return None
+        index_item = self.unit_table.item(table_row, 0)
+        if not index_item:
+            return None
+        data = index_item.data(QtCore.Qt.ItemDataRole.UserRole)
+        try:
+            index = int(data)
+        except (TypeError, ValueError):
+            return None
+        if index < 0 or index >= len(self.unit_rows):
+            return None
+        row_data = self.unit_rows[index]
+        reviewer_id = column_info.get("reviewer_id")
+        label_id = column_info.get("label_id")
+        if not reviewer_id or not label_id:
+            return None
+        annotations = row_data.get("reviewer_annotations", {}).get(reviewer_id, {})
+        entry = annotations.get(label_id)
+        label_name = self.label_lookup.get(label_id, label_id)
+        reviewer_name = self.current_reviewer_names.get(reviewer_id, reviewer_id)
+        unit_id = str(row_data.get("unit_id") or "")
+        return {
+            "row": row_data,
+            "entry": entry,
+            "reviewer_id": reviewer_id,
+            "label_id": label_id,
+            "label_name": label_name,
+            "reviewer_name": reviewer_name,
+            "unit_id": unit_id,
+        }
+
+    def _show_annotation_notes_dialog(
+        self, context: Dict[str, object], notes_text: str
+    ) -> None:
+        if not notes_text:
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Reviewer notes")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        header = QtWidgets.QLabel(
+            "\n".join(
+                [
+                    f"Label: {context.get('label_name', '')}",
+                    f"Reviewer: {context.get('reviewer_name', '')}",
+                    f"Unit: {context.get('unit_id') or '—'}",
+                ]
+            )
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+        notes_view = QtWidgets.QPlainTextEdit()
+        notes_view.setReadOnly(True)
+        notes_view.setPlainText(notes_text)
+        notes_view.setMinimumSize(400, 200)
+        layout.addWidget(notes_view)
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch()
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+        dialog.exec()
+
+    def _show_annotation_highlights_dialog(
+        self, context: Dict[str, object], rationales: Iterable[Dict[str, object]]
+    ) -> None:
+        items = list(rationales or [])
+        if not items:
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Reviewer highlights")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        header = QtWidgets.QLabel(
+            "\n".join(
+                [
+                    f"Label: {context.get('label_name', '')}",
+                    f"Reviewer: {context.get('reviewer_name', '')}",
+                    f"Unit: {context.get('unit_id') or '—'}",
+                ]
+            )
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+        tree = QtWidgets.QTreeWidget()
+        tree.setColumnCount(3)
+        tree.setHeaderLabels(["Document", "Range", "Text"])
+        tree.setRootIsDecorated(False)
+        tree.setUniformRowHeights(True)
+        tree.setAlternatingRowColors(True)
+        for rationale in items:
+            doc_id = str(rationale.get("doc_id") or "—")
+            start = rationale.get("start_offset")
+            end = rationale.get("end_offset")
+            if isinstance(start, int) and isinstance(end, int):
+                range_text = f"{start}-{end}" if end >= start else str(start)
+            elif isinstance(start, int):
+                range_text = str(start)
+            else:
+                range_text = ""
+            snippet = self._format_rationale_snippet(rationale.get("snippet"))
+            item = QtWidgets.QTreeWidgetItem([doc_id, range_text, snippet])
+            tree.addTopLevelItem(item)
+        header_view = tree.header()
+        header_view.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        tree.setMinimumSize(500, 220)
+        layout.addWidget(tree)
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch()
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+        dialog.resize(600, 320)
+        dialog.exec()
 
     def _selected_unit_index(self) -> Optional[int]:
         current_row = self.unit_table.currentRow()
@@ -4687,10 +4797,30 @@ class IaaWidget(QtWidgets.QWidget):
             return
         menu = QtWidgets.QMenu(self.unit_table)
         edit_action = menu.addAction("Edit reviewer label…")
+        context = self._annotation_context_for_cell(item.row(), column_info)
+        notes_action: Optional[QtGui.QAction] = None
+        highlights_action: Optional[QtGui.QAction] = None
+        notes_value = ""
+        rationale_items: List[Dict[str, object]] = []
+        if context:
+            entry = context.get("entry")
+            _display_value, notes_value = self._extract_annotation_parts(entry)
+            if isinstance(entry, dict):
+                rationale_items = list(entry.get("rationales") or [])
+            if notes_value or rationale_items:
+                menu.addSeparator()
+            if notes_value:
+                notes_action = menu.addAction("View notes…")
+            if rationale_items:
+                highlights_action = menu.addAction("View highlights…")
         global_pos = self.unit_table.viewport().mapToGlobal(point)
         chosen = menu.exec(global_pos)
         if chosen == edit_action:
             self._edit_reviewer_label(item.row(), column)
+        elif notes_action and chosen == notes_action and context:
+            self._show_annotation_notes_dialog(context, notes_value)
+        elif highlights_action and chosen == highlights_action and context:
+            self._show_annotation_highlights_dialog(context, rationale_items)
 
     def _edit_reviewer_label(self, row: int, column: int) -> None:
         if column < 0 or column >= len(self._unit_table_column_map):

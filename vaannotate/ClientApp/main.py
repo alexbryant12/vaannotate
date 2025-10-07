@@ -1264,14 +1264,33 @@ class AnnotationForm(QtWidgets.QScrollArea):
             text.textChanged.connect(lambda lid=label.label_id, widget=text: self._on_text(lid, widget))
             value_widget = text
             state["text_edit"] = text
-        v_layout.addWidget(value_widget)
+        content_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        content_splitter.setChildrenCollapsible(False)
+        content_splitter.setHandleWidth(6)
+        v_layout.addWidget(content_splitter)
+
+        main_section = QtWidgets.QWidget()
+        main_layout = QtWidgets.QVBoxLayout(main_section)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(6)
+        main_layout.addWidget(value_widget)
 
         notes = QtWidgets.QLineEdit()
         notes.setPlaceholderText("Notes")
         notes.setClearButtonEnabled(True)
         notes.editingFinished.connect(lambda lid=label.label_id, widget=notes: self._on_notes(lid, widget))
-        v_layout.addWidget(notes)
+        main_layout.addWidget(notes)
         state["notes"] = notes
+
+        if label.rules:
+            rules_label = QtWidgets.QLabel(label.rules)
+            rules_label.setWordWrap(True)
+            main_layout.addWidget(rules_label)
+
+        highlight_section = QtWidgets.QWidget()
+        highlight_layout = QtWidgets.QVBoxLayout(highlight_section)
+        highlight_layout.setContentsMargins(0, 0, 0, 0)
+        highlight_layout.setSpacing(4)
 
         highlight_controls = QtWidgets.QHBoxLayout()
         highlight_btn = QtWidgets.QPushButton("Add highlight")
@@ -1288,7 +1307,7 @@ class AnnotationForm(QtWidgets.QScrollArea):
         delete_btn.clicked.connect(lambda _checked, lid=label.label_id: self._delete_highlight(lid))
         highlight_controls.addWidget(delete_btn)
         highlight_controls.addStretch()
-        v_layout.addLayout(highlight_controls)
+        highlight_layout.addLayout(highlight_controls)
         state["highlight_update_btn"] = update_btn
         state["highlight_delete_btn"] = delete_btn
 
@@ -1303,7 +1322,11 @@ class AnnotationForm(QtWidgets.QScrollArea):
         )
         highlight_list.setUniformRowHeights(True)
         highlight_list.setAlternatingRowColors(True)
-        highlight_list.setMinimumHeight(80)
+        highlight_list.setMinimumHeight(60)
+        highlight_list.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.MinimumExpanding,
+        )
         header = highlight_list.header()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
@@ -1311,13 +1334,15 @@ class AnnotationForm(QtWidgets.QScrollArea):
         highlight_list.itemSelectionChanged.connect(
             lambda lid=label.label_id: self._on_highlight_selection_changed(lid)
         )
-        v_layout.addWidget(highlight_list)
+        highlight_layout.addWidget(highlight_list)
         state["highlight_list"] = highlight_list
 
-        if label.rules:
-            rules_label = QtWidgets.QLabel(label.rules)
-            rules_label.setWordWrap(True)
-            v_layout.addWidget(rules_label)
+        content_splitter.addWidget(main_section)
+        content_splitter.addWidget(highlight_section)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 1)
+        content_splitter.setSizes([260, 100])
+        content_splitter.setCollapsible(1, True)
         self.label_widgets[label.label_id] = state
         return wrapper
 
