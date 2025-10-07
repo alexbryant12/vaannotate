@@ -82,6 +82,7 @@ _METADATA_EXCLUDE_KEYS = {
     "documents",
     "metadata",
     "metadata_json",
+    "patient_icn",
 }
 
 
@@ -110,6 +111,17 @@ def extract_document_metadata(source: Mapping[str, object] | None) -> Dict[str, 
         for key, value in raw_metadata.items():
             if _is_meaningful(value):
                 metadata[key] = value
+    if isinstance(source, Mapping):
+        metadata_json = source.get("metadata_json")
+        if isinstance(metadata_json, str) and metadata_json.strip():
+            try:
+                parsed = json.loads(metadata_json)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, Mapping):
+                for key, value in parsed.items():
+                    if _is_meaningful(value):
+                        metadata.setdefault(key, value)
     for key, value in source.items():
         if key in _METADATA_EXCLUDE_KEYS:
             continue
@@ -133,10 +145,7 @@ def _sanitize_alias(value: str) -> str:
 
 
 def _human_label(name: str) -> str:
-    name = name.replace("_", " ").strip()
-    if not name:
-        return "Metadata"
-    return name[:1].upper() + name[1:]
+    return name
 
 
 _DATE_FORMATS = (

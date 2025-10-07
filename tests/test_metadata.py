@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -6,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from vaannotate.corpus import import_tabular_corpus
 from vaannotate.schema import initialize_corpus_db
 from vaannotate.shared.database import Database
 from vaannotate.shared.metadata import (
@@ -134,6 +136,26 @@ def test_candidate_documents_supports_date_range_filters(tmp_path: Path) -> None
 
     rows = candidate_documents(Database(corpus_path), "single_doc", filters)
     assert [row["doc_id"] for row in rows] == ["doc_range"]
+
+
+def test_import_tabular_corpus_preserves_custom_columns(tmp_path: Path) -> None:
+    source = tmp_path / "notes.csv"
+    source.write_text("patienticn,text,risk_score\n123,Example note,high\n", encoding="utf-8")
+    corpus_path = tmp_path / "corpus.db"
+
+    import_tabular_corpus(source, corpus_path)
+
+    with sqlite3.connect(corpus_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT metadata_json FROM documents").fetchone()
+        assert row is not None
+        metadata = json.loads(row["metadata_json"])
+        assert metadata == {"risk_score": "high"}
+        fields = discover_corpus_metadata(conn)
+
+    assert any(field.key == "metadata.risk_score" for field in fields)
+    risk_field = next(field for field in fields if field.key == "metadata.risk_score")
+    assert risk_field.label == "risk_score"
 
 
 def test_normalize_date_value_formats() -> None:
