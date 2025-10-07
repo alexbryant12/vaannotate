@@ -16,13 +16,26 @@ def apply_dark_palette(app: QtWidgets.QApplication) -> None:
     palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor(53, 53, 53))
     palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor(220, 220, 220))
     palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor(220, 220, 220))
+    palette.setColor(QtGui.QPalette.ColorRole.PlaceholderText, QtGui.QColor(185, 185, 185))
     palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor(53, 53, 53))
     palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor(220, 220, 220))
     palette.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor(255, 85, 85))
     palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor(100, 100, 150))
     palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor(255, 255, 255))
     palette.setColor(QtGui.QPalette.ColorRole.Link, QtGui.QColor(130, 160, 255))
+    palette.setColor(QtGui.QPalette.ColorRole.Mid, QtGui.QColor(110, 110, 110))
+    palette.setColor(QtGui.QPalette.ColorRole.Dark, QtGui.QColor(80, 80, 80))
+    palette.setColor(QtGui.QPalette.ColorRole.Shadow, QtGui.QColor(70, 70, 70))
     app.setPalette(palette)
-    app.setStyleSheet(
-        "QToolTip { color: #f0f0f0; background-color: #353535; border: 1px solid #767676; }"
+
+    existing_stylesheet = app.styleSheet() or ""
+    snippets = [existing_stylesheet.strip()] if existing_stylesheet.strip() else []
+    snippets.extend(
+        [
+            "QTableView, QTreeView {",
+            "    gridline-color: rgb(110, 110, 110);",
+            "}",
+            "QToolTip { color: #f0f0f0; background-color: #353535; border: 1px solid #767676; }",
+        ]
     )
+    app.setStyleSheet("\n".join(snippets))
