@@ -78,6 +78,7 @@ class LabelDefinition:
     min_value: Optional[float]
     max_value: Optional[float]
     options: List[Dict[str, object]]
+    rules: str = ""
 
 
 class ProjectContext(QtCore.QObject):
@@ -3297,9 +3298,9 @@ class IaaWidget(QtWidgets.QWidget):
         units_label.setWordWrap(True)
         units_header.addWidget(units_label)
         units_header.addStretch()
-        self.export_btn = QtWidgets.QPushButton("Export table…")
+        self.export_btn = QtWidgets.QPushButton("Export round data…")
         self.export_btn.setEnabled(False)
-        self.export_btn.clicked.connect(self._export_unit_table)
+        self.export_btn.clicked.connect(self._export_round_data)
         units_header.addWidget(self.export_btn)
         left_layout.addLayout(units_header)
 
@@ -3452,7 +3453,7 @@ class IaaWidget(QtWidgets.QWidget):
                 (round_id,),
             ).fetchall()
             labels = conn.execute(
-                "SELECT labels.label_id, labels.name, labels.type, labels.na_allowed, labels.unit, labels.min, labels.max "
+                "SELECT labels.label_id, labels.name, labels.type, labels.na_allowed, labels.unit, labels.min, labels.max, labels.rules "
                 "FROM labels JOIN label_sets ON label_sets.labelset_id = labels.labelset_id "
                 "WHERE label_sets.labelset_id=? ORDER BY labels.order_index",
                 (self.current_round.get("labelset_id"),),
@@ -3491,6 +3492,7 @@ class IaaWidget(QtWidgets.QWidget):
                 min_value=row["min"],
                 max_value=row["max"],
                 options=options_map.get(row["label_id"], []),
+                rules=str(row.get("rules") or ""),
             )
             for row in labels
         }
@@ -4669,19 +4671,69 @@ class IaaWidget(QtWidgets.QWidget):
                 'aggregate_state': aggregate_state,
             }
 
-    def _export_unit_table(self) -> None:
+    def _export_round_data(self) -> None:
         if not self.unit_rows:
             QtWidgets.QMessageBox.information(
                 self,
-                "Export table",
+                "Export round data",
                 "No data available to export.",
             )
             return
-        start_dir = str(self.ctx.project_root or Path.home())
+        if not self.current_round:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export round data",
+                "Select a round before exporting.",
+            )
+            return
+        has_annotations = any(
+            annotations
+            for row in self.unit_rows
+            for annotations in (row.get("reviewer_annotations") or {}).values()
+        )
+        if not has_annotations:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export round data",
+                "No reviewer annotations available to export.",
+            )
+            return
+        round_id = str(self.current_round.get("round_id") or "")
+        if not round_id:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export round data",
+                "Round metadata is incomplete; refresh and try again.",
+            )
+            return
+        pheno_id = str(self.current_round.get("pheno_id") or "")
+        unit_ids: List[str] = []
+        doc_ids_by_unit: Dict[str, Set[str]] = {}
+        for unit_row in self.unit_rows:
+            unit_id = str(unit_row.get("unit_id") or "")
+            if not unit_id:
+                continue
+            unit_ids.append(unit_id)
+            doc_ids = doc_ids_by_unit.setdefault(unit_id, set())
+            metadata = unit_row.get("metadata") or {}
+            candidate_doc = metadata.get("doc_id") or unit_row.get("doc_id")
+            if candidate_doc:
+                doc_ids.add(str(candidate_doc))
+            reviewer_annotations = unit_row.get("reviewer_annotations") or {}
+            for annotation_map in reviewer_annotations.values():
+                for annotation in annotation_map.values():
+                    for rationale in annotation.get("rationales") or []:
+                        doc_ref = rationale.get("doc_id")
+                        if doc_ref:
+                            doc_ids.add(str(doc_ref))
+        documents_by_unit = self._gather_unit_documents(unit_ids, doc_ids_by_unit)
+        project_root = self.ctx.project_root or Path.home()
+        default_name = f"{round_id}_round_data.csv"
+        default_path = Path(project_root) / default_name
         path_str, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Export IAA table",
-            start_dir,
+            "Export round data",
+            str(default_path),
             "CSV files (*.csv);;All files (*)",
         )
         if not path_str:
@@ -4689,31 +4741,154 @@ class IaaWidget(QtWidgets.QWidget):
         target_path = Path(path_str)
         if target_path.suffix.lower() != ".csv":
             target_path = target_path.with_suffix(".csv")
+        headers = [
+            "round_id",
+            "phenotype_id",
+            "unit_id",
+            "doc_id",
+            "patient_icn",
+            "reviewer_id",
+            "reviewer_name",
+            "label_id",
+            "label_name",
+            "label_value",
+            "label_value_num",
+            "label_value_date",
+            "label_na",
+            "reviewer_notes",
+            "rationales_json",
+            "document_text",
+            "document_metadata_json",
+            "label_rules",
+            "label_change_history",
+        ]
         try:
+            rows_written = 0
             with target_path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.writer(handle)
-                headers: List[str] = []
-                for col in range(self.unit_table.columnCount()):
-                    header_item = self.unit_table.horizontalHeaderItem(col)
-                    headers.append(header_item.text() if header_item else "")
                 writer.writerow(headers)
-                for row_idx in range(self.unit_table.rowCount()):
-                    row_data: List[str] = []
-                    for col_idx in range(self.unit_table.columnCount()):
-                        item = self.unit_table.item(row_idx, col_idx)
-                        row_data.append(item.text() if item else "")
-                    writer.writerow(row_data)
+                label_rules = {label_id: definition.rules for label_id, definition in self.label_definitions.items()}
+                for unit_row in self.unit_rows:
+                    unit_id = str(unit_row.get("unit_id") or "")
+                    if not unit_id:
+                        continue
+                    metadata = unit_row.get("metadata") or {}
+                    patient_icn = str(metadata.get("patient_icn") or unit_row.get("patient_icn") or "")
+                    reviewer_annotations = unit_row.get("reviewer_annotations") or {}
+                    change_history = unit_row.get("change_history") or {}
+                    doc_entries = documents_by_unit.get(unit_id, {})
+                    sorted_docs = sorted(
+                        doc_entries.items(),
+                        key=lambda item: item[1].get("order_index", 0),
+                    )
+                    ordered_doc_ids: List[str] = [doc_id for doc_id, _ in sorted_docs]
+                    known_doc_ids = set(ordered_doc_ids)
+                    for doc_id in sorted(doc_ids_by_unit.get(unit_id, set())):
+                        if doc_id and doc_id not in known_doc_ids:
+                            ordered_doc_ids.append(doc_id)
+                            known_doc_ids.add(doc_id)
+                    if not ordered_doc_ids:
+                        ordered_doc_ids = [""]
+                    for reviewer_id, annotation_map in sorted(
+                        reviewer_annotations.items(), key=lambda item: self.current_reviewer_names.get(item[0], item[0])
+                    ):
+                        reviewer_name = self.current_reviewer_names.get(reviewer_id, reviewer_id)
+                        ordered_labels = [label_id for label_id in self.label_order if label_id in annotation_map]
+                        extra_labels = [label_id for label_id in annotation_map.keys() if label_id not in self.label_order]
+                        for label_id in ordered_labels + sorted(extra_labels):
+                            annotation = annotation_map.get(label_id)
+                            if not annotation:
+                                continue
+                            label_name = self.label_lookup.get(label_id, label_id)
+                            rules_text = str(label_rules.get(label_id, "") or "")
+                            history_text = str(change_history.get((reviewer_id, label_id), "") or "")
+                            value = annotation.get("value")
+                            value_str = "" if value is None else str(value)
+                            value_num = annotation.get("value_num")
+                            value_num_str = ""
+                            if value_num is not None:
+                                try:
+                                    value_num_str = format(value_num, "g")
+                                except Exception:  # noqa: BLE001
+                                    value_num_str = str(value_num)
+                            value_date = str(annotation.get("value_date") or "")
+                            notes = str(annotation.get("notes") or "")
+                            na_flag = 1 if annotation.get("na") else 0
+                            rationales = annotation.get("rationales") or []
+                            normalized_rationales = [
+                                {
+                                    "doc_id": str(rationale.get("doc_id") or ""),
+                                    "start_offset": rationale.get("start_offset"),
+                                    "end_offset": rationale.get("end_offset"),
+                                    "snippet": rationale.get("snippet"),
+                                }
+                                for rationale in rationales
+                            ]
+                            for doc_id in ordered_doc_ids:
+                                doc_id_str = str(doc_id or "")
+                                doc_entry = doc_entries.get(doc_id_str, {}) if doc_id_str else {}
+                                doc_text = str(doc_entry.get("text") or "")
+                                metadata_json = str(doc_entry.get("metadata_json") or "")
+                                if doc_id_str:
+                                    doc_specific_rationales = [
+                                        entry
+                                        for entry in normalized_rationales
+                                        if entry.get("doc_id") == doc_id_str
+                                    ]
+                                else:
+                                    doc_specific_rationales = normalized_rationales
+                                rationale_json = (
+                                    json.dumps(doc_specific_rationales, ensure_ascii=False)
+                                    if doc_specific_rationales
+                                    else ""
+                                )
+                                writer.writerow(
+                                    [
+                                        round_id,
+                                        pheno_id,
+                                        unit_id,
+                                        doc_id_str,
+                                        patient_icn,
+                                        str(reviewer_id),
+                                        str(reviewer_name),
+                                        str(label_id),
+                                        str(label_name),
+                                        value_str,
+                                        value_num_str,
+                                        value_date,
+                                        na_flag,
+                                        notes,
+                                        rationale_json,
+                                        doc_text,
+                                        metadata_json,
+                                        rules_text,
+                                        history_text,
+                                    ]
+                                )
+                                rows_written += 1
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(
                 self,
-                "Export table",
-                f"Failed to export table: {exc}",
+                "Export round data",
+                f"Failed to export round data: {exc}",
+            )
+            return
+        if rows_written == 0:
+            try:
+                if target_path.exists():
+                    target_path.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export round data",
+                "No annotation rows were available to export.",
             )
             return
         QtWidgets.QMessageBox.information(
             self,
-            "Export table",
-            f"Table exported to {target_path}.",
+            "Export round data",
+            f"Round data exported to {target_path} ({rows_written} rows).",
         )
 
     def _display_unit_rows(self, selected_unit: Optional[str] = None) -> None:
@@ -4980,6 +5155,119 @@ class IaaWidget(QtWidgets.QWidget):
             "Annotation details",
             f"Reviewer: {reviewer_name}\nUnit: {unit_id}\n\n{message_body}",
         )
+
+    @staticmethod
+    def _chunked_list(items: Sequence[str], chunk_size: int) -> Iterable[List[str]]:
+        if chunk_size <= 0:
+            yield list(items)
+            return
+        for index in range(0, len(items), chunk_size):
+            yield list(items[index : index + chunk_size])
+
+    def _gather_unit_documents(
+        self,
+        unit_ids: Iterable[str],
+        doc_ids_by_unit: Dict[str, Set[str]],
+    ) -> Dict[str, Dict[str, Dict[str, object]]]:
+        unit_id_set = {str(uid) for uid in unit_ids if uid}
+        unit_id_set.update(str(uid) for uid in doc_ids_by_unit.keys() if uid)
+        if not unit_id_set:
+            return {}
+        result: Dict[str, Dict[str, Dict[str, object]]] = {unit_id: {} for unit_id in unit_id_set}
+        missing_units = set(unit_id_set)
+        assignment_dbs: List[Database] = []
+        for path in self.assignment_paths.values():
+            if not path:
+                continue
+            db = self.ctx.get_assignment_db(path)
+            if db:
+                assignment_dbs.append(db)
+        for db in assignment_dbs:
+            if not missing_units:
+                break
+            try:
+                with db.connect() as conn:
+                    units_to_query = list(missing_units)
+                    for chunk in self._chunked_list(units_to_query, 200):
+                        if not chunk:
+                            continue
+                        placeholders = ",".join(["?"] * len(chunk))
+                        query = (
+                            "SELECT unit_notes.unit_id, unit_notes.doc_id, unit_notes.order_index, "
+                            "documents.text, documents.metadata_json "
+                            "FROM unit_notes "
+                            "LEFT JOIN documents ON documents.doc_id = unit_notes.doc_id "
+                            f"WHERE unit_notes.unit_id IN ({placeholders}) "
+                            "ORDER BY unit_notes.unit_id, unit_notes.order_index"
+                        )
+                        rows = conn.execute(query, chunk).fetchall()
+                        for row in rows:
+                            unit_value = str(row["unit_id"])
+                            doc_value = str(row["doc_id"] or "")
+                            if not doc_value:
+                                continue
+                            payload = {
+                                "text": row["text"] or "",
+                                "metadata_json": row["metadata_json"] or "",
+                                "order_index": int(row["order_index"] or 0),
+                            }
+                            result.setdefault(unit_value, {})[doc_value] = payload
+                        for candidate in chunk:
+                            candidate_str = str(candidate)
+                            if result.get(candidate_str):
+                                missing_units.discard(candidate_str)
+            except Exception:  # noqa: BLE001
+                continue
+        for unit_id in doc_ids_by_unit.keys():
+            result.setdefault(str(unit_id), {})
+        required_doc_ids: Set[str] = set()
+        for unit_id, doc_ids in doc_ids_by_unit.items():
+            unit_key = str(unit_id)
+            known = set(result.get(unit_key, {}).keys())
+            for doc_id in doc_ids:
+                doc_key = str(doc_id)
+                if doc_key and doc_key not in known:
+                    required_doc_ids.add(doc_key)
+        corpus_db: Optional[Database] = None
+        corpus_id = (self.current_round or {}).get("corpus_id")
+        if corpus_id:
+            try:
+                corpus_db = self.ctx.get_corpus_db(corpus_id)
+            except Exception:  # noqa: BLE001
+                corpus_db = None
+        corpus_docs: Dict[str, Dict[str, object]] = {}
+        if corpus_db and required_doc_ids:
+            try:
+                with corpus_db.connect() as conn:
+                    doc_list = list(required_doc_ids)
+                    for chunk in self._chunked_list(doc_list, 200):
+                        if not chunk:
+                            continue
+                        placeholders = ",".join(["?"] * len(chunk))
+                        query = (
+                            "SELECT doc_id, text, metadata_json FROM documents "
+                            f"WHERE doc_id IN ({placeholders})"
+                        )
+                        rows = conn.execute(query, chunk).fetchall()
+                        for row in rows:
+                            doc_key = str(row["doc_id"] or "")
+                            corpus_docs[doc_key] = {
+                                "text": row["text"] or "",
+                                "metadata_json": row["metadata_json"] or "",
+                                "order_index": 0,
+                            }
+            except Exception:  # noqa: BLE001
+                corpus_docs = {}
+        for unit_id, doc_ids in doc_ids_by_unit.items():
+            unit_key = str(unit_id)
+            storage = result.setdefault(unit_key, {})
+            for doc_id in doc_ids:
+                doc_key = str(doc_id)
+                if not doc_key or doc_key in storage:
+                    continue
+                if doc_key in corpus_docs:
+                    storage[doc_key] = dict(corpus_docs[doc_key])
+        return result
 
     def _populate_document_table(self, unit_row: Dict[str, object]) -> None:
         self.document_table.clearContents()
