@@ -3492,7 +3492,7 @@ class IaaWidget(QtWidgets.QWidget):
                 min_value=row["min"],
                 max_value=row["max"],
                 options=options_map.get(row["label_id"], []),
-                rules=str(row.get("rules") or ""),
+                rules=str(row["rules"] or ""),
             )
             for row in labels
         }
