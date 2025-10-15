@@ -3193,18 +3193,53 @@ class CorpusWidget(QtWidgets.QWidget):
                 rows = conn.execute(query).fetchall()
             else:
                 rows = []
+
+        metadata_column_order: List[str] = []
+        row_metadata: List[Dict[str, object]] = []
+        if rows and "metadata_json" in columns:
+            seen_metadata_keys: Set[str] = set()
+            for row in rows:
+                parsed_metadata: Dict[str, object] = {}
+                raw_metadata = row["metadata_json"]
+                if isinstance(raw_metadata, str) and raw_metadata.strip():
+                    try:
+                        metadata_payload = json.loads(raw_metadata)
+                    except json.JSONDecodeError:
+                        metadata_payload = None
+                    if isinstance(metadata_payload, Mapping):
+                        for key, value in metadata_payload.items():
+                            if isinstance(value, (dict, list)):
+                                display_value = json.dumps(value, ensure_ascii=False)
+                            else:
+                                display_value = value
+                            parsed_metadata[key] = display_value
+                            if key not in seen_metadata_keys:
+                                seen_metadata_keys.add(key)
+                                metadata_column_order.append(key)
+                row_metadata.append(parsed_metadata)
+        else:
+            row_metadata = [{} for _ in rows]
+
+        display_columns = [column for column in columns if column != "metadata_json"]
+        if metadata_column_order:
+            display_columns.extend(metadata_column_order)
+
         self.summary_label.setText(
             f"Patients: {patient_count:,} • Documents: {document_count:,} • Showing {len(rows)} most recent notes"
         )
-        if columns:
-            self.table.setColumnCount(len(columns))
-            self.table.setHorizontalHeaderLabels(columns)
+        if display_columns:
+            self.table.setColumnCount(len(display_columns))
+            self.table.setHorizontalHeaderLabels(display_columns)
         else:
             self.table.setColumnCount(0)
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
-            for col_index, column in enumerate(columns):
-                value = row[column]
+            metadata_for_row = row_metadata[row_index] if row_metadata else {}
+            for col_index, column in enumerate(display_columns):
+                if column in metadata_column_order:
+                    value = metadata_for_row.get(column)
+                else:
+                    value = row[column]
                 text = "" if value is None else str(value).replace("\n", " ")
                 item = QtWidgets.QTableWidgetItem(text)
                 self.table.setItem(row_index, col_index, item)
