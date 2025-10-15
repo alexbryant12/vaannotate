@@ -3076,8 +3076,7 @@ class CorpusWidget(QtWidgets.QWidget):
 
         self.summary_label = QtWidgets.QLabel("Select a corpus to view its contents.")
         layout.addWidget(self.summary_label)
-        self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Doc ID", "Patient", "Note type", "Date", "Preview"])
+        self.table = QtWidgets.QTableWidget(0, 0)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
@@ -3164,25 +3163,50 @@ class CorpusWidget(QtWidgets.QWidget):
         with db.connect() as conn:
             patient_count = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
             document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-            rows = conn.execute(
-                "SELECT doc_id, patient_icn, notetype, date_note, substr(text, 1, 200) AS preview "
-                "FROM documents ORDER BY date_note DESC LIMIT 50",
-            ).fetchall()
+            columns = [row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()]
+            if columns:
+                truncated_columns = {"text", "metadata_json"}
+                select_parts = []
+                for column in columns:
+                    identifier = f'"{column}"'
+                    if column in truncated_columns:
+                        select_parts.append(
+                            (
+                                "CASE WHEN length({identifier}) > 200 "
+                                "THEN substr({identifier}, 1, 200) || '…' "
+                                "ELSE {identifier} END AS {identifier}"
+                            ).format(identifier=identifier)
+                        )
+                    else:
+                        select_parts.append(identifier)
+                order_column: Optional[str]
+                if "date_note" in columns:
+                    order_column = '"date_note" DESC'
+                elif "doc_id" in columns:
+                    order_column = '"doc_id" DESC'
+                else:
+                    order_column = "rowid DESC"
+                query = "SELECT {columns} FROM documents ORDER BY {order} LIMIT 50".format(
+                    columns=", ".join(select_parts),
+                    order=order_column,
+                )
+                rows = conn.execute(query).fetchall()
+            else:
+                rows = []
         self.summary_label.setText(
             f"Patients: {patient_count:,} • Documents: {document_count:,} • Showing {len(rows)} most recent notes"
         )
+        if columns:
+            self.table.setColumnCount(len(columns))
+            self.table.setHorizontalHeaderLabels(columns)
+        else:
+            self.table.setColumnCount(0)
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
-            values = [
-                row["doc_id"],
-                row["patient_icn"],
-                row["notetype"],
-                row["date_note"],
-                (row["preview"] or "").replace("\n", " ")
-                + ("…" if row["preview"] and len(row["preview"]) == 200 else ""),
-            ]
-            for col_index, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(str(value))
+            for col_index, column in enumerate(columns):
+                value = row[column]
+                text = "" if value is None else str(value).replace("\n", " ")
+                item = QtWidgets.QTableWidgetItem(text)
                 self.table.setItem(row_index, col_index, item)
         self.table.resizeColumnsToContents()
 
