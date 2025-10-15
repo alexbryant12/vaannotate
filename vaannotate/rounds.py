@@ -30,16 +30,11 @@ from .utils import (
 )
 
 
-def _note_year_sort_value(value: object) -> int:
-    if value is None or value == "":
-        return -1
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return -1
+def _date_sort_value(value: object) -> tuple:
+    if value is None:
+        return ("", "")
+    text = str(value)
+    return (text, text)
 
 
 @dataclass
@@ -343,12 +338,11 @@ class RoundBuilder:
                             "order_index": 0,
                             "metadata_json": row_dict.get("metadata_json"),
                             "metadata": document_metadata,
+                            "date_note": row_dict.get("date_note"),
                         }
                     ]
                     payload = {
-                        "note_year": row_dict.get("note_year"),
-                        "notetype": row_dict.get("notetype"),
-                        "sta3n": row_dict.get("sta3n"),
+                        "date_note": row_dict.get("date_note"),
                         "hash": row_dict.get("hash"),
                         "metadata_json": row_dict.get("metadata_json"),
                         "metadata": document_metadata,
@@ -375,32 +369,15 @@ class RoundBuilder:
 
         params: list = []
         where_clauses = []
-        if "patient" in filters_config:
-            pf = filters_config["patient"]
-            if pf.get("sta3n_in"):
-                placeholders = ",".join("?" for _ in pf["sta3n_in"])
-                where_clauses.append(f"patients.sta3n IN ({placeholders})")
-                params.extend(pf["sta3n_in"])
-            if pf.get("softlabel_gte") is not None:
-                where_clauses.append("patients.softlabel >= ?")
-                params.append(pf["softlabel_gte"])
-            if pf.get("year_range"):
-                where_clauses.append("documents.note_year BETWEEN ? AND ?")
-                params.extend(pf["year_range"])
+        regex_expr = None
+        regex_flags = ""
         if "note" in filters_config:
             nf = filters_config["note"]
-            if nf.get("notetype_in"):
-                placeholders = ",".join("?" for _ in nf["notetype_in"])
-                where_clauses.append(f"documents.notetype IN ({placeholders})")
-                params.extend(nf["notetype_in"])
-            if nf.get("note_year"):
-                where_clauses.append("documents.note_year BETWEEN ? AND ?")
-                params.extend(nf["note_year"])
             regex_expr = nf.get("regex")
             regex_flags = nf.get("regex_flags", "")
-        else:
-            regex_expr = None
-            regex_flags = ""
+            if regex_expr:
+                where_clauses.append("documents.text REGEXP ?")
+                params.append(regex_expr)
         where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
         if regex_expr:
             flags = 0
@@ -419,10 +396,9 @@ class RoundBuilder:
             legacy_aliases = []
         cursor = corpus_conn.execute(
             f"""
-            SELECT documents.doc_id, documents.patient_icn, documents.note_year, documents.notetype,
-                   documents.sta3n, documents.hash, documents.text, documents.metadata_json
+            SELECT documents.doc_id, documents.patient_icn, documents.date_note,
+                   documents.hash, documents.text, documents.metadata_json
             FROM documents
-            JOIN patients ON patients.patient_icn = documents.patient_icn
             WHERE {where_sql}
             """,
             params,
@@ -440,12 +416,11 @@ class RoundBuilder:
                         "order_index": 0,
                         "metadata_json": row_dict.get("metadata_json"),
                         "metadata": document_metadata,
+                        "date_note": row_dict.get("date_note"),
                     }
                 ]
                 payload = {
-                    "note_year": row["note_year"],
-                    "notetype": row["notetype"],
-                    "sta3n": row["sta3n"],
+                    "date_note": row["date_note"],
                     "hash": row["hash"],
                     "metadata_json": row_dict.get("metadata_json"),
                     "metadata": document_metadata,
@@ -464,7 +439,7 @@ class RoundBuilder:
                 strata_key = self._compute_strata_key(primary_row, legacy_aliases)
                 ordered_docs = sorted(
                     docs,
-                    key=lambda item: (_note_year_sort_value(item["note_year"]), item["doc_id"]),
+                    key=lambda item: (_date_sort_value(item["date_note"]), item["doc_id"]),
                 )
                 doc_payloads = []
                 for idx, doc in enumerate(ordered_docs):
@@ -478,12 +453,13 @@ class RoundBuilder:
                             "order_index": idx,
                             "metadata_json": doc_dict.get("metadata_json"),
                             "metadata": metadata,
+                            "date_note": doc_dict.get("date_note"),
                         }
                     )
                 primary_dict = dict(primary_row)
                 primary_metadata = extract_document_metadata(primary_dict)
                 payload = {
-                    "sta3n": primary_row["sta3n"],
+                    "date_note": primary_dict.get("date_note"),
                     "metadata_json": primary_dict.get("metadata_json"),
                     "metadata": primary_metadata,
                     "strata_key": strata_key,

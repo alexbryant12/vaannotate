@@ -95,26 +95,29 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
         for idx in range(3):
             patient_id = f"p{idx}"
             corpus_conn.execute(
-                "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-                (patient_id, "506", None, None),
+                "INSERT INTO patients(patient_icn) VALUES (?)",
+                (patient_id,),
+            )
+            metadata = json.dumps(
+                {
+                    "notetype": "NOTE",
+                    "note_year": 2020,
+                    "sta3n": "506",
+                },
+                sort_keys=True,
             )
             corpus_conn.execute(
                 """
-                INSERT INTO documents(
-                    doc_id, patient_icn, notetype, note_year, date_note,
-                    cptname, sta3n, hash, text
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+                VALUES (?,?,?,?,?,?)
                 """,
                 (
                     f"doc_{idx}",
                     patient_id,
-                    "NOTE",
-                    2020,
                     "2020-01-01",
-                    "",
-                    "506",
                     f"hash{idx}",
                     f"Example text {idx}",
+                    metadata,
                 ),
             )
         corpus_conn.commit()
@@ -198,27 +201,30 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
     with initialize_corpus_db(corpus_db) as corpus_conn:
         for idx, (patient_icn, docs) in enumerate(docs_by_patient.items()):
             corpus_conn.execute(
-                "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-                (patient_icn, "506", None, None),
+                "INSERT INTO patients(patient_icn) VALUES (?)",
+                (patient_icn,),
             )
             for doc_index, (doc_id, text) in enumerate(docs):
+                metadata = json.dumps(
+                    {
+                        "notetype": "NOTE",
+                        "note_year": 2020 + doc_index,
+                        "sta3n": "506",
+                    },
+                    sort_keys=True,
+                )
                 corpus_conn.execute(
                     """
-                    INSERT INTO documents(
-                        doc_id, patient_icn, notetype, note_year, date_note,
-                        cptname, sta3n, hash, text
-                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+                    VALUES (?,?,?,?,?,?)
                     """,
                     (
                         doc_id,
                         patient_icn,
-                        "NOTE",
-                        2020 + doc_index,
                         f"202{doc_index}-01-01",
-                        "",
-                        "506",
                         f"hash_{doc_id}",
                         text,
+                        metadata,
                     ),
                 )
         corpus_conn.commit()
@@ -278,7 +284,13 @@ def test_round_builder_metadata_filters_single_doc(seeded_project: tuple[RoundBu
     builder, project_root = seeded_project
     corpus_path = project_root / "corpora" / "ph_test" / "corpus.db"
     with sqlite3.connect(corpus_path) as conn:
-        conn.execute("UPDATE documents SET notetype='OTHER' WHERE doc_id='doc_2'")
+        row = conn.execute("SELECT metadata_json FROM documents WHERE doc_id='doc_2'").fetchone()
+        metadata = json.loads(row[0] or "{}") if row else {}
+        metadata["notetype"] = "OTHER"
+        conn.execute(
+            "UPDATE documents SET metadata_json=? WHERE doc_id='doc_2'",
+            (json.dumps(metadata, sort_keys=True),),
+        )
         conn.commit()
 
     config_dir = project_root / "admin_tools" / "round_configs"
@@ -298,7 +310,7 @@ def test_round_builder_metadata_filters_single_doc(seeded_project: tuple[RoundBu
         "filters": {
             "metadata": [
                 {
-                    "field": "document.notetype",
+                    "field": "metadata.notetype",
                     "label": "Notetype",
                     "scope": "document",
                     "type": "text",
@@ -306,7 +318,7 @@ def test_round_builder_metadata_filters_single_doc(seeded_project: tuple[RoundBu
                 }
             ]
         },
-        "stratification": {"fields": ["patient.sta3n"]},
+        "stratification": {"fields": ["metadata.sta3n"]},
     }
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
@@ -327,40 +339,42 @@ def test_candidate_documents_match_any_filters(tmp_path: Path) -> None:
     corpus_path = tmp_path / "corpus.db"
     with initialize_corpus_db(corpus_path) as conn:
         conn.execute(
-            "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-            ("p_any", "506", None, None),
+            "INSERT INTO patients(patient_icn) VALUES (?)",
+            ("p_any",),
+        )
+        metadata_alpha = json.dumps(
+            {"notetype": "ALPHA", "note_year": 2020, "sta3n": "506"}, sort_keys=True
         )
         conn.execute(
             """
-            INSERT INTO documents(
-                doc_id, patient_icn, notetype, note_year, date_note,
-                cptname, sta3n, hash, text
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
             """,
-            ("doc_alpha", "p_any", "ALPHA", 2020, "2020-01-01", "", "506", "hash_a", "Alpha text"),
+            ("doc_alpha", "p_any", "2020-01-01", "hash_a", "Alpha text", metadata_alpha),
+        )
+        metadata_beta = json.dumps(
+            {"notetype": "BETA", "note_year": 2022, "sta3n": "506"}, sort_keys=True
         )
         conn.execute(
             """
-            INSERT INTO documents(
-                doc_id, patient_icn, notetype, note_year, date_note,
-                cptname, sta3n, hash, text
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
             """,
-            ("doc_beta", "p_any", "BETA", 2022, "2022-06-15", "", "506", "hash_b", "Beta text"),
+            ("doc_beta", "p_any", "2022-06-15", "hash_b", "Beta text", metadata_beta),
         )
         conn.commit()
 
     filters = SamplingFilters(
         metadata_filters=[
             MetadataFilterCondition(
-                field="document.notetype",
+                field="metadata.notetype",
                 label="Notetype",
                 scope="document",
                 data_type="text",
                 values=["ALPHA"],
             ),
             MetadataFilterCondition(
-                field="document.note_year",
+                field="metadata.note_year",
                 label="Note year",
                 scope="document",
                 data_type="number",
@@ -384,27 +398,30 @@ def test_admin_sampling_creates_multi_doc_units(tmp_path: Path) -> None:
     with initialize_corpus_db(corpus_path) as corpus_conn:
         for patient_icn, docs in docs_by_patient.items():
             corpus_conn.execute(
-                "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-                (patient_icn, "506", None, None),
+                "INSERT INTO patients(patient_icn) VALUES (?)",
+                (patient_icn,),
             )
             for order_idx, (doc_id, text) in enumerate(docs):
+                metadata = json.dumps(
+                    {
+                        "notetype": "NOTE",
+                        "note_year": 2020 + order_idx,
+                        "sta3n": "506",
+                    },
+                    sort_keys=True,
+                )
                 corpus_conn.execute(
                     """
-                    INSERT INTO documents(
-                        doc_id, patient_icn, notetype, note_year, date_note,
-                        cptname, sta3n, hash, text
-                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+                    VALUES (?,?,?,?,?,?)
                     """,
                     (
                         doc_id,
                         patient_icn,
-                        "NOTE",
-                        2020 + order_idx,
                         f"202{order_idx}-01-01",
-                        "",
-                        "506",
                         f"hash_{doc_id}",
                         text,
+                        metadata,
                     ),
                 )
         corpus_conn.commit()
@@ -497,27 +514,30 @@ def test_round_builder_allows_document_stratification_for_multi_doc(tmp_path: Pa
     with initialize_corpus_db(corpus_db) as corpus_conn:
         for patient_icn, docs in docs_by_patient.items():
             corpus_conn.execute(
-                "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-                (patient_icn, "506", None, None),
+                "INSERT INTO patients(patient_icn) VALUES (?)",
+                (patient_icn,),
             )
             for idx, (doc_id, text) in enumerate(docs):
+                metadata = json.dumps(
+                    {
+                        "notetype": "NOTE",
+                        "note_year": 2020 + idx,
+                        "sta3n": "506",
+                    },
+                    sort_keys=True,
+                )
                 corpus_conn.execute(
                     """
-                    INSERT INTO documents(
-                        doc_id, patient_icn, notetype, note_year, date_note,
-                        cptname, sta3n, hash, text
-                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+                    VALUES (?,?,?,?,?,?)
                     """,
                     (
                         doc_id,
                         patient_icn,
-                        "NOTE",
-                        2020 + idx,
                         f"202{idx}-01-01",
-                        "",
-                        "506",
                         f"hash_{doc_id}",
                         text,
+                        metadata,
                     ),
                 )
         corpus_conn.commit()
@@ -535,7 +555,7 @@ def test_round_builder_allows_document_stratification_for_multi_doc(tmp_path: Pa
         "overlap_n": 0,
         "rng_seed": 1,
         "filters": {"metadata": []},
-        "stratification": {"fields": ["document.note_year"]},
+        "stratification": {"fields": ["metadata.note_year"]},
     }
     config_path.write_text(json.dumps(config), encoding="utf-8")
 

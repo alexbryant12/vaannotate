@@ -19,18 +19,12 @@ from .database import Record
 @dataclass
 class Patient(Record):
     patient_icn: str
-    sta3n: str
-    date_index: Optional[str] = None
-    softlabel: Optional[float] = None
 
     __tablename__ = "patients"
     __schema__ = (
         """
         CREATE TABLE IF NOT EXISTS patients (
-            patient_icn TEXT PRIMARY KEY,
-            sta3n TEXT NOT NULL,
-            date_index TEXT NULL,
-            softlabel REAL NULL
+            patient_icn TEXT PRIMARY KEY
         )
         """
     )
@@ -40,13 +34,10 @@ class Patient(Record):
 class Document(Record):
     doc_id: str
     patient_icn: str
-    notetype: str
-    note_year: int
     date_note: str
-    cptname: Optional[str]
-    sta3n: str
     hash: str
     text: str
+    metadata_json: Optional[str] = None
 
     __tablename__ = "documents"
     __schema__ = (
@@ -54,13 +45,10 @@ class Document(Record):
         CREATE TABLE IF NOT EXISTS documents (
             doc_id TEXT PRIMARY KEY,
             patient_icn TEXT NOT NULL,
-            notetype TEXT NOT NULL,
-            note_year INTEGER NOT NULL,
             date_note TEXT NOT NULL,
-            cptname TEXT NULL,
-            sta3n TEXT NOT NULL,
             hash TEXT NOT NULL,
             text TEXT NOT NULL,
+            metadata_json TEXT,
             FOREIGN KEY(patient_icn) REFERENCES patients(patient_icn)
         )
         """
