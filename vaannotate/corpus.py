@@ -28,18 +28,16 @@ def hash_text(text: str) -> str:
 def import_patients(conn: sqlite3.Connection, rows: Iterable[dict]) -> None:
     prepared = []
     for row in rows:
-        prepared.append(
-            {
-                "patient_icn": row["patient_icn"],
-                "sta3n": row.get("sta3n"),
-                "date_index": row.get("date_index"),
-                "softlabel": row.get("softlabel"),
-            }
-        )
+        patient_icn = row.get("patient_icn")
+        if not patient_icn:
+            continue
+        prepared.append({"patient_icn": patient_icn})
+    if not prepared:
+        return
     conn.executemany(
         """
-        INSERT OR REPLACE INTO patients(patient_icn, sta3n, date_index, softlabel)
-        VALUES (:patient_icn, :sta3n, :date_index, :softlabel)
+        INSERT OR IGNORE INTO patients(patient_icn)
+        VALUES (:patient_icn)
         """,
         prepared,
     )
@@ -49,12 +47,6 @@ def import_documents(conn: sqlite3.Connection, rows: Iterable[dict]) -> None:
     prepared = []
     for row in rows:
         text = normalize_text(row["text"])
-        note_year = row.get("note_year")
-        if note_year is not None:
-            try:
-                note_year = int(note_year)
-            except (TypeError, ValueError):
-                raise ValueError(f"Invalid note_year value: {note_year!r}") from None
         raw_metadata = row.get("metadata")
         if not raw_metadata and "__metadata__" in row:
             raw_metadata = row.get("__metadata__")
@@ -66,20 +58,18 @@ def import_documents(conn: sqlite3.Connection, rows: Iterable[dict]) -> None:
             {
                 "doc_id": row["doc_id"],
                 "patient_icn": row["patient_icn"],
-                "notetype": row.get("notetype"),
-                "note_year": note_year,
                 "date_note": row.get("date_note"),
-                "cptname": row.get("cptname"),
-                "sta3n": row.get("sta3n"),
                 "hash": hash_text(text),
                 "text": text,
                 "metadata_json": metadata_json,
             }
         )
+    if not prepared:
+        return
     conn.executemany(
         """
-        INSERT OR REPLACE INTO documents(doc_id, patient_icn, notetype, note_year, date_note, cptname, sta3n, hash, text, metadata_json)
-        VALUES (:doc_id,:patient_icn,:notetype,:note_year,:date_note,:cptname,:sta3n,:hash,:text,:metadata_json)
+        INSERT OR REPLACE INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+        VALUES (:doc_id,:patient_icn,:date_note,:hash,:text,:metadata_json)
         """,
         prepared,
     )
@@ -89,12 +79,9 @@ def load_patients_csv(path: Path) -> Iterator[dict]:
     with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
-            yield {
-                "patient_icn": row["patient_icn"],
-                "sta3n": row.get("sta3n"),
-                "date_index": row.get("date_index"),
-                "softlabel": float(row["softlabel"]) if row.get("softlabel") else None,
-            }
+            patient_icn = row.get("patient_icn")
+            if patient_icn:
+                yield {"patient_icn": patient_icn}
 
 
 def load_documents_csv(path: Path) -> Iterator[dict]:
@@ -107,7 +94,7 @@ def load_documents_csv(path: Path) -> Iterator[dict]:
             canonical = _canonical_column(str(column))
             if canonical:
                 rename[column] = canonical
-        recognized = REQUIRED_COLUMNS | OPTIONAL_COLUMNS | {"doc_id"}
+        recognized = CORE_COLUMNS
         for row in reader:
             normalized: dict[str, object] = {}
             metadata: dict[str, object] = {}
@@ -127,6 +114,8 @@ def load_documents_csv(path: Path) -> Iterator[dict]:
                     metadata[key] = cell
             if "patient_icn" not in normalized:
                 raise ValueError("Corpus is missing required column 'patienticn'")
+            if "date_note" not in normalized:
+                raise ValueError("Corpus is missing required column 'date_note'")
             if "text" not in normalized:
                 raise ValueError("Corpus is missing required column 'text'")
             if metadata:
@@ -146,18 +135,9 @@ def bulk_import_from_csv(corpus_db: Path, patients_csv: Path, documents_csv: Pat
 
 TABULAR_EXTENSIONS = {".csv", ".parquet", ".pq"}
 
-REQUIRED_COLUMNS = {"patient_icn", "text"}
+REQUIRED_COLUMNS = {"patient_icn", "date_note", "text"}
 
-OPTIONAL_COLUMNS = {
-    "sta3n",
-    "date_index",
-    "notetype",
-    "note_year",
-    "date_note",
-    "cptname",
-    "doc_id",
-    "softlabel",
-}
+CORE_COLUMNS = REQUIRED_COLUMNS | {"doc_id"}
 
 _COLUMN_ALIAS_MAP = {
     "patienticn": "patient_icn",
@@ -199,7 +179,7 @@ def load_tabular_corpus(path: Path) -> List[dict]:
     missing = REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(f"Corpus is missing required columns: {', '.join(sorted(missing))}")
-    recognized = REQUIRED_COLUMNS | OPTIONAL_COLUMNS | {"doc_id"}
+    recognized = CORE_COLUMNS
     rows: List[dict] = []
     for record in df.to_dict(orient="records"):
         normalized: dict[str, object] = {}
@@ -232,26 +212,16 @@ def _coerce_str(value: object | None) -> str | None:
     return text or None
 
 
-def _coerce_float(value: object | None) -> float | None:
-    if value is None or value == "":
+def _derive_note_year(date_note: str | None) -> int | None:
+    if not date_note:
+        return None
+    match = re.search(r"(\d{4})", date_note)
+    if not match:
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"Invalid numeric value: {value!r}") from None
-
-
-def _infer_note_year(note_year: object | None, date_note: str | None) -> int | None:
-    if note_year in (None, ""):
-        if date_note:
-            match = re.search(r"(\d{4})", date_note)
-            if match:
-                return int(match.group(1))
+        return int(match.group(1))
+    except ValueError:
         return None
-    try:
-        return int(note_year)
-    except (TypeError, ValueError):
-        raise ValueError(f"Invalid note_year value: {note_year!r}") from None
 
 
 def import_tabular_corpus(source: Path, corpus_db: Path) -> None:
@@ -259,7 +229,7 @@ def import_tabular_corpus(source: Path, corpus_db: Path) -> None:
     if not rows:
         raise ValueError("Corpus file is empty")
     ensure_dir(corpus_db.parent)
-    patient_map: dict[str, dict] = {}
+    patient_ids: set[str] = set()
     doc_counter: dict[str, int] = {}
     documents: List[dict] = []
     for index, row in enumerate(rows, start=1):
@@ -267,7 +237,7 @@ def import_tabular_corpus(source: Path, corpus_db: Path) -> None:
         patient_icn = _coerce_str(patient_icn_raw)
         if not patient_icn:
             raise ValueError(f"Row {index} is missing a patienticn value")
-        metadata = row.get("__metadata__") or {}
+        metadata = dict(row.get("__metadata__") or {})
         text_value = row.get("text")
         if text_value is None or (isinstance(text_value, str) and text_value.strip() == ""):
             raise ValueError(f"Row {index} is missing note text")
@@ -276,38 +246,23 @@ def import_tabular_corpus(source: Path, corpus_db: Path) -> None:
             seq = doc_counter.get(patient_icn, 0) + 1
             doc_counter[patient_icn] = seq
             doc_id = f"{patient_icn}_{seq:05d}"
-        sta3n = _coerce_str(row.get("sta3n"))
         date_note = _coerce_str(row.get("date_note"))
-        note_year = _infer_note_year(row.get("note_year"), date_note)
-        patient_entry = patient_map.setdefault(
-            patient_icn,
-            {
-                "patient_icn": patient_icn,
-                "sta3n": sta3n,
-                "date_index": _coerce_str(row.get("date_index")),
-                "softlabel": _coerce_float(row.get("softlabel")),
-            },
-        )
-        if sta3n and not patient_entry.get("sta3n"):
-            patient_entry["sta3n"] = sta3n
-        if row.get("date_index") and not patient_entry.get("date_index"):
-            patient_entry["date_index"] = _coerce_str(row.get("date_index"))
-        if row.get("softlabel") is not None:
-            patient_entry["softlabel"] = _coerce_float(row.get("softlabel"))
+        if not date_note:
+            raise ValueError(f"Row {index} is missing a date_note value")
+        derived_year = _derive_note_year(date_note)
+        if derived_year is not None and "note_year" not in metadata:
+            metadata["note_year"] = derived_year
         documents.append(
             {
                 "doc_id": doc_id,
                 "patient_icn": patient_icn,
-                "notetype": _coerce_str(row.get("notetype")),
-                "note_year": note_year,
                 "date_note": date_note,
-                "cptname": _coerce_str(row.get("cptname")),
-                "sta3n": sta3n or patient_entry.get("sta3n"),
                 "text": str(text_value),
                 "metadata": metadata,
             }
         )
+        patient_ids.add(patient_icn)
     with initialize_corpus_db(corpus_db) as conn:
-        import_patients(conn, patient_map.values())
+        import_patients(conn, ({"patient_icn": icn} for icn in patient_ids))
         import_documents(conn, documents)
         conn.commit()

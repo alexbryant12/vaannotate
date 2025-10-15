@@ -21,29 +21,23 @@ from vaannotate.shared.sampling import SamplingFilters, candidate_documents
 def test_discover_metadata_identifies_dates(tmp_path: Path) -> None:
     corpus_path = tmp_path / "corpus.db"
     with initialize_corpus_db(corpus_path) as conn:
-        conn.execute("ALTER TABLE documents ADD COLUMN custom_date TEXT")
         conn.execute(
-            "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-            ("p1", "506", None, None),
+            "INSERT INTO patients(patient_icn) VALUES (?)",
+            ("p1",),
         )
+        metadata = json.dumps({"custom_date": "02/15/2024", "notetype": "NOTE"}, sort_keys=True)
         conn.execute(
             """
-            INSERT INTO documents(
-                doc_id, patient_icn, notetype, note_year, date_note,
-                cptname, sta3n, hash, text, custom_date
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
             """,
             (
                 "doc1",
                 "p1",
-                "NOTE",
-                2024,
                 "2024-02-15",
-                "",
-                "506",
                 "hash1",
                 "Example text",
-                "02/15/2024",
+                metadata,
             ),
         )
         conn.commit()
@@ -53,33 +47,29 @@ def test_discover_metadata_identifies_dates(tmp_path: Path) -> None:
         fields = discover_corpus_metadata(conn)
 
     assert any(field.key == "document.date_note" and field.data_type == "date" for field in fields)
-    assert any(field.key == "document.custom_date" and field.data_type == "date" for field in fields)
+    assert any(field.key == "metadata.custom_date" and field.data_type == "date" for field in fields)
 
 
 def test_discover_metadata_ignores_empty_columns(tmp_path: Path) -> None:
     corpus_path = tmp_path / "corpus.db"
     with initialize_corpus_db(corpus_path) as conn:
         conn.execute(
-            "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-            ("p_empty", "506", None, None),
+            "INSERT INTO patients(patient_icn) VALUES (?)",
+            ("p_empty",),
         )
+        empty_metadata = json.dumps({"cptname": None}, sort_keys=True)
         conn.execute(
             """
-            INSERT INTO documents(
-                doc_id, patient_icn, notetype, note_year, date_note,
-                cptname, sta3n, hash, text
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
             """,
             (
                 "doc_empty",
                 "p_empty",
-                "NOTE",
-                2024,
                 "2024-03-01",
-                None,
-                "506",
                 "hash-empty",
                 "Example text",
+                empty_metadata,
             ),
         )
         conn.commit()
@@ -89,34 +79,29 @@ def test_discover_metadata_ignores_empty_columns(tmp_path: Path) -> None:
         fields = discover_corpus_metadata(conn)
 
     keys = {field.key for field in fields}
-    assert "document.cptname" not in keys
-    assert "patient.softlabel" not in keys
+    assert "metadata.cptname" not in keys
 
 
 def test_candidate_documents_supports_date_range_filters(tmp_path: Path) -> None:
     corpus_path = tmp_path / "corpus.db"
     with initialize_corpus_db(corpus_path) as conn:
         conn.execute(
-            "INSERT INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-            ("p2", "506", None, None),
+            "INSERT INTO patients(patient_icn) VALUES (?)",
+            ("p2",),
         )
+        metadata = json.dumps({"notetype": "NOTE"}, sort_keys=True)
         conn.execute(
             """
-            INSERT INTO documents(
-                doc_id, patient_icn, notetype, note_year, date_note,
-                cptname, sta3n, hash, text
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
             """,
             (
                 "doc_range",
                 "p2",
-                "NOTE",
-                2024,
                 "2024-02-15",
-                "",
-                "506",
                 "hash_range",
                 "Range test",
+                metadata,
             ),
         )
         conn.commit()
@@ -140,7 +125,10 @@ def test_candidate_documents_supports_date_range_filters(tmp_path: Path) -> None
 
 def test_import_tabular_corpus_preserves_custom_columns(tmp_path: Path) -> None:
     source = tmp_path / "notes.csv"
-    source.write_text("patienticn,text,risk_score\n123,Example note,high\n", encoding="utf-8")
+    source.write_text(
+        "patienticn,date_note,text,risk_score\n123,2024-01-01,Example note,high\n",
+        encoding="utf-8",
+    )
     corpus_path = tmp_path / "corpus.db"
 
     import_tabular_corpus(source, corpus_path)
@@ -150,7 +138,8 @@ def test_import_tabular_corpus_preserves_custom_columns(tmp_path: Path) -> None:
         row = conn.execute("SELECT metadata_json FROM documents").fetchone()
         assert row is not None
         metadata = json.loads(row["metadata_json"])
-        assert metadata == {"risk_score": "high"}
+        assert metadata.get("risk_score") == "high"
+        assert metadata.get("note_year") == 2024
         fields = discover_corpus_metadata(conn)
 
     assert any(field.key == "metadata.risk_score" for field in fields)

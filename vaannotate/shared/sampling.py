@@ -43,16 +43,11 @@ def _hash_seed(seed: int, salt: str) -> int:
     return int(digest[:16], 16)
 
 
-def _note_year_sort_value(value: object) -> int:
-    if value is None or value == "":
-        return -1
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return -1
+def _date_sort_value(value: object) -> tuple:
+    if value is None:
+        return ("", "")
+    text = str(value)
+    return (text, text)
 
 
 def candidate_documents(
@@ -110,11 +105,7 @@ def _candidate_documents_from_connection(
     select_parts = [
         "documents.doc_id AS doc_id",
         "documents.patient_icn AS patient_icn",
-        "documents.note_year AS note_year",
-        "documents.notetype AS notetype",
         "documents.date_note AS date_note",
-        "documents.cptname AS cptname",
-        "documents.sta3n AS sta3n",
         "documents.hash AS hash",
         "documents.metadata_json AS metadata_json",
         "documents.text AS text",
@@ -122,11 +113,7 @@ def _candidate_documents_from_connection(
     seen_aliases = {
         "doc_id",
         "patient_icn",
-        "note_year",
-        "notetype",
         "date_note",
-        "cptname",
-        "sta3n",
         "hash",
         "metadata_json",
         "text",
@@ -196,13 +183,12 @@ def _candidate_documents_from_connection(
         "SELECT",
         ", ".join(select_parts),
         "FROM documents",
-        "JOIN patients ON patients.patient_icn = documents.patient_icn",
     ]
     if clauses:
         joiner = " OR " if filters.match_any else " AND "
         query.append("WHERE " + joiner.join(f"({clause})" for clause in clauses))
     query.append(
-        "ORDER BY documents.patient_icn, documents.note_year, documents.doc_id",
+        "ORDER BY documents.patient_icn, documents.date_note, documents.doc_id",
     )
     sql = " ".join(query)
     rows = conn.execute(sql, params).fetchall()
@@ -215,7 +201,7 @@ def _candidate_documents_from_connection(
         for patient_icn, docs in grouped.items():
             ordered_docs = sorted(
                 docs,
-                key=lambda item: (_note_year_sort_value(item["note_year"]), item["doc_id"]),
+                key=lambda item: (_date_sort_value(item["date_note"]), item["doc_id"]),
             )
             primary_row = ordered_docs[0]
             primary_dict = dict(primary_row)
@@ -226,18 +212,14 @@ def _candidate_documents_from_connection(
                 doc_dict["order_index"] = idx
                 metadata = extract_document_metadata(doc_dict)
                 doc_dict["metadata"] = metadata
+                doc_dict.setdefault("date_note", doc_dict.get("date_note"))
                 doc_payloads.append(doc_dict)
             primary_metadata = extract_document_metadata(primary_dict)
             entry: Dict[str, object] = {
                 "unit_id": patient_icn,
                 "patient_icn": patient_icn,
                 "doc_id": None,
-                "note_year": primary_dict.get("note_year"),
-                "notetype": primary_dict.get("notetype"),
                 "date_note": primary_dict.get("date_note"),
-                "cptname": primary_dict.get("cptname"),
-                "sta3n": primary_dict.get("sta3n"),
-                "softlabel": primary_dict.get("patient__softlabel"),
                 "note_count": len(ordered_docs),
                 "documents": doc_payloads,
                 "metadata": primary_metadata,

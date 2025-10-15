@@ -312,17 +312,36 @@ ROUND_CONFIGS = [
         "created_by": "toy_seed",
         "label_schema": copy.deepcopy(LABELSET_SCHEMAS["ls_diabetes_v1"]),
         "filters": {
-            "patient": {
-                "year_range": [2018, 2024],
-                "sta3n_in": ["506", "515"],
-            },
+            "metadata": [
+                {
+                    "field": "metadata.note_year",
+                    "label": "Note year",
+                    "scope": "document",
+                    "type": "number",
+                    "min_value": "2018",
+                    "max_value": "2024",
+                },
+                {
+                    "field": "metadata.sta3n",
+                    "label": "Facility",
+                    "scope": "document",
+                    "type": "text",
+                    "values": ["506", "515"],
+                },
+                {
+                    "field": "metadata.notetype",
+                    "label": "Notetype",
+                    "scope": "document",
+                    "type": "text",
+                    "values": ["PRIMARY CARE NOTE", "ENDOCRINOLOGY NOTE"],
+                },
+            ],
             "note": {
-                "notetype_in": ["PRIMARY CARE NOTE", "ENDOCRINOLOGY NOTE"],
-                "regex": r"(metformin|insulin|hba1c\\s*\\d+(\\.\\d+)?)",
+                "regex": r"(metformin|insulin|hba1c\s*\d+(\.\d+)?)",
                 "regex_flags": "i",
             },
         },
-        "stratification": {"keys": ["note_year"]},
+        "stratification": {"fields": ["metadata.note_year"]},
         "reviewers": [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
@@ -340,13 +359,32 @@ ROUND_CONFIGS = [
         "created_by": "toy_seed",
         "label_schema": copy.deepcopy(LABELSET_SCHEMAS["ls_diabetes_v1"]),
         "filters": {
-            "patient": {"sta3n_in": ["506", "515"]},
-            "note": {
-                "notetype_in": ["PHARMACY NOTE", "ENDOCRINOLOGY NOTE"],
-                "note_year": [2016, 2020],
-            },
+            "metadata": [
+                {
+                    "field": "metadata.sta3n",
+                    "label": "Facility",
+                    "scope": "document",
+                    "type": "text",
+                    "values": ["506", "515"],
+                },
+                {
+                    "field": "metadata.notetype",
+                    "label": "Notetype",
+                    "scope": "document",
+                    "type": "text",
+                    "values": ["PHARMACY NOTE", "ENDOCRINOLOGY NOTE"],
+                },
+                {
+                    "field": "metadata.note_year",
+                    "label": "Note year",
+                    "scope": "document",
+                    "type": "number",
+                    "min_value": "2016",
+                    "max_value": "2020",
+                },
+            ],
         },
-        "stratification": {"keys": ["sta3n"]},
+        "stratification": {"fields": ["metadata.sta3n"]},
         "reviewers": [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
@@ -364,14 +402,25 @@ ROUND_CONFIGS = [
         "created_by": "toy_seed",
         "label_schema": copy.deepcopy(LABELSET_SCHEMAS["ls_diabetes_v1"]),
         "filters": {
-            "patient": {
-                "year_range": [2015, 2022],
-            },
-            "note": {
-                "notetype_in": ["PRIMARY CARE NOTE", "TELEHEALTH NOTE"],
-            },
+            "metadata": [
+                {
+                    "field": "metadata.note_year",
+                    "label": "Note year",
+                    "scope": "document",
+                    "type": "number",
+                    "min_value": "2015",
+                    "max_value": "2022",
+                },
+                {
+                    "field": "metadata.notetype",
+                    "label": "Notetype",
+                    "scope": "document",
+                    "type": "text",
+                    "values": ["PRIMARY CARE NOTE", "TELEHEALTH NOTE"],
+                },
+            ],
         },
-        "stratification": {"keys": ["note_year", "sta3n"]},
+        "stratification": {"fields": ["metadata.note_year", "metadata.sta3n"]},
         "reviewers": [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
@@ -389,14 +438,28 @@ ROUND_CONFIGS = [
         "created_by": "toy_seed",
         "label_schema": copy.deepcopy(LABELSET_SCHEMAS["ls_htn_v1"]),
         "filters": {
-            "patient": {"sta3n_in": ["506", "515"]},
+            "metadata": [
+                {
+                    "field": "metadata.sta3n",
+                    "label": "Facility",
+                    "scope": "document",
+                    "type": "text",
+                    "values": ["506", "515"],
+                },
+                {
+                    "field": "metadata.notetype",
+                    "label": "Notetype",
+                    "scope": "document",
+                    "type": "text",
+                    "values": ["PRIMARY CARE NOTE", "PHARMACY NOTE"],
+                },
+            ],
             "note": {
-                "notetype_in": ["PRIMARY CARE NOTE", "PHARMACY NOTE"],
-                "regex": r"blood pressure|bp\\s*:?\\s*\\d{2,3}/\\d{2,3}",
+                "regex": r"blood pressure|bp\s*:?\s*\d{2,3}/\d{2,3}",
                 "regex_flags": "i",
             },
         },
-        "stratification": {"keys": ["note_year"]},
+        "stratification": {"fields": ["metadata.note_year"]},
         "reviewers": [
             {"id": "r_alex", "name": "Alex Reviewer"},
             {"id": "r_blake", "name": "Blake Reviewer"},
@@ -413,38 +476,40 @@ def seed_corpus(corpus_db: Path, notes: Sequence[Note]) -> List[Dict[str, object
     with initialize_corpus_db(corpus_db) as conn:
         for patient in PATIENTS:
             conn.execute(
-                "INSERT OR REPLACE INTO patients(patient_icn, sta3n, date_index, softlabel) VALUES (?,?,?,?)",
-                (patient["patient_icn"], patient["sta3n"], None, None),
+                "INSERT OR IGNORE INTO patients(patient_icn) VALUES (?)",
+                (patient["patient_icn"],),
             )
         for note in notes:
             normalized = corpus_normalize_text(note.text)
+            metadata = {
+                "sta3n": note.sta3n,
+                "notetype": note.notetype,
+                "note_year": note.note_year,
+            }
+            metadata = {key: value for key, value in metadata.items() if value not in (None, "")}
             conn.execute(
                 """
                 INSERT OR REPLACE INTO documents(
-                    doc_id, patient_icn, notetype, note_year, date_note,
-                    cptname, sta3n, hash, text
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    doc_id, patient_icn, date_note, hash, text, metadata_json
+                ) VALUES (?,?,?,?,?,?)
                 """,
                 (
                     note.doc_id,
                     note.patient_icn,
-                    note.notetype,
-                    note.note_year,
                     note.date,
-                    None,
-                    note.sta3n,
                     corpus_hash_text(normalized),
                     normalized,
+                    json.dumps(metadata, sort_keys=True) if metadata else None,
                 ),
             )
             tabular_rows.append(
                 {
                     "patienticn": note.patient_icn,
+                    "date_note": note.date,
                     "text": normalized,
                     "sta3n": note.sta3n,
                     "notetype": note.notetype,
                     "note_year": note.note_year,
-                    "date_note": note.date,
                     "cptname": None,
                 }
             )
@@ -457,7 +522,7 @@ def write_tabular_corpus(corpus_dir: Path, rows: Sequence[Dict[str, object]]) ->
         return
     df = pd.DataFrame(rows)
     # Ensure required columns are ordered first for readability
-    preferred_order = ["patienticn", "text", "sta3n", "notetype", "note_year", "date_note", "cptname"]
+    preferred_order = ["patienticn", "date_note", "text", "sta3n", "notetype", "note_year", "cptname"]
     remaining = [column for column in df.columns if column not in preferred_order]
     ordered = preferred_order + remaining
     df = df[[column for column in ordered if column in df.columns]]
@@ -653,7 +718,7 @@ def load_patient_docs(corpus_db: Path) -> Dict[str, List[sqlite3.Row]]:
     with get_connection(corpus_db) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
-            "SELECT doc_id, patient_icn, notetype, note_year, date_note, cptname, sta3n, hash, text "
+            "SELECT doc_id, patient_icn, date_note, hash, text, metadata_json "
             "FROM documents ORDER BY patient_icn, date_note"
         )
         for row in cursor:

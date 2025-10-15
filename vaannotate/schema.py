@@ -135,32 +135,22 @@ PROJECT_SCHEMA = [
 CORPUS_SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS patients(
-        patient_icn TEXT PRIMARY KEY,
-        sta3n TEXT,
-        date_index TEXT,
-        softlabel REAL
+        patient_icn TEXT PRIMARY KEY
     );
     """,
     """
     CREATE TABLE IF NOT EXISTS documents(
         doc_id TEXT PRIMARY KEY,
         patient_icn TEXT NOT NULL,
-        notetype TEXT,
-        note_year INTEGER,
         date_note TEXT,
-        cptname TEXT,
-        sta3n TEXT,
         hash TEXT NOT NULL,
         text TEXT NOT NULL,
         metadata_json TEXT,
         FOREIGN KEY(patient_icn) REFERENCES patients(patient_icn)
     );
     """,
-    """ALTER TABLE documents ADD COLUMN metadata_json TEXT;""",
     """CREATE INDEX IF NOT EXISTS idx_documents_patient ON documents(patient_icn);""",
-    """CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(note_year);""",
-    """CREATE INDEX IF NOT EXISTS idx_documents_sta ON documents(sta3n);""",
-    """CREATE INDEX IF NOT EXISTS idx_documents_notetype ON documents(notetype);""",
+    """CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(date_note);""",
 ];
 
 
