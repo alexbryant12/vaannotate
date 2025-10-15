@@ -3165,7 +3165,7 @@ class CorpusWidget(QtWidgets.QWidget):
             document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             columns = [row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()]
             if columns:
-                truncated_columns = {"text", "metadata_json"}
+                truncated_columns = {"text"}
                 select_parts = []
                 for column in columns:
                     identifier = f'"{column}"'
@@ -3241,6 +3241,8 @@ class CorpusWidget(QtWidgets.QWidget):
                 else:
                     value = row[column]
                 text = "" if value is None else str(value).replace("\n", " ")
+                if len(text) > 200:
+                    text = f"{text[:200]}…"
                 item = QtWidgets.QTableWidgetItem(text)
                 self.table.setItem(row_index, col_index, item)
         self.table.resizeColumnsToContents()
