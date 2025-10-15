@@ -347,7 +347,7 @@ def _discover_from_connection(conn: sqlite3.Connection, sample_limit: int) -> Li
         )
 
     document_info = conn.execute("PRAGMA table_info(documents)").fetchall()
-    excluded = {"doc_id", "patient_icn", "hash", "text"}
+    excluded = {"doc_id", "patient_icn", "hash", "text", "metadata_json"}
     for row in document_info:
         name = row["name"]
         if name in excluded:
