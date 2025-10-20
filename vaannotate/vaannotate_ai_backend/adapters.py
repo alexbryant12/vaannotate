@@ -154,35 +154,259 @@ def _find_corpus_db(project_root: Path, pheno_id: str, prior_rounds: List[int]) 
 def _read_corpus_db(corpus_db: Path) -> pd.DataFrame:
     con = sqlite3.connect(str(corpus_db))
     try:
-        # Documents table assumed: doc_id TEXT, patienticn TEXT, text TEXT, metadata_json TEXT, date_note TEXT, notetype TEXT
-        df = pd.read_sql_query(            """
-            SELECT d.patienticn, d.doc_id, d.text,
-                   COALESCE(d.date_note,'') as date_note,
-                   COALESCE(d.notetype,'') as notetype,
-                   COALESCE(d.metadata_json,'{}') as document_metadata_json
-            FROM documents d
-            """, con)
+        con.row_factory = sqlite3.Row
+        doc_columns = {row["name"] for row in con.execute("PRAGMA table_info(documents)")}
+
+        def select_expr(target: str, candidates: List[str], *, default: str) -> str:
+            for candidate in candidates:
+                if candidate in doc_columns:
+                    return f"{candidate} AS {target}"
+            return f"{default} AS {target}"
+
+        select_clauses = [
+            select_expr("patient_icn", ["patient_icn", "patienticn"], default="''"),
+            select_expr("doc_id", ["doc_id"], default="''"),
+            select_expr("text", ["text", "document_text"], default="''"),
+            select_expr("date_note", ["date_note"], default="''"),
+            select_expr("notetype", ["notetype"], default="''"),
+            select_expr(
+                "document_metadata_json",
+                ["document_metadata_json", "metadata_json"],
+                default="'{}'",
+            ),
+        ]
+
+        query = f"SELECT {', '.join(select_clauses)} FROM documents"
+        df = pd.read_sql_query(query, con)
         return df
     finally:
         con.close()
 
-def _read_round_aggregate(round_db: Path) -> pd.DataFrame:
-    con = sqlite3.connect(str(round_db))
-    try:
-        # Long-format annotations
-        df = pd.read_sql_query(            """
-            SELECT round_id, unit_id, doc_id, label_id, reviewer_id,
-                   label_value,
-                   COALESCE(reviewer_notes,'') AS reviewer_notes,
-                   COALESCE(rationales_json,'[]') AS rationales_json,
-                   COALESCE(document_text,'') AS document_text,
-                   COALESCE(document_metadata_json,'{}') AS document_metadata_json,
-                   COALESCE(label_rules,'') AS label_rules
-            FROM annotations
-            """, con)
-        return df
-    finally:
-        con.close()
+
+def _iter_assignment_dbs(round_dir: Path) -> List[Path]:
+    imports_dir = round_dir / "imports"
+    if not imports_dir.exists():
+        return []
+    return sorted(p for p in imports_dir.glob("*_assignment.db") if p.is_file())
+
+
+def _normalize_reviewer_id(assignment_path: Path) -> str:
+    name = assignment_path.stem
+    if name.endswith("_assignment"):
+        return name[: -len("_assignment")]
+    return name
+
+
+def _read_round_annotations(round_dir: Path, pheno_id: str, round_number: int) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    round_id = f"{pheno_id}_r{round_number}"
+
+    for assignment_path in _iter_assignment_dbs(round_dir):
+        reviewer_id = _normalize_reviewer_id(assignment_path)
+        con = sqlite3.connect(str(assignment_path))
+        try:
+            con.row_factory = sqlite3.Row
+            units = {
+                str(row["unit_id"]): {
+                    "patient_icn": str(row["patient_icn"] or ""),
+                    "doc_id": str(row["doc_id"] or ""),
+                }
+                for row in con.execute("SELECT unit_id, patient_icn, doc_id FROM units")
+            }
+
+            doc_rows = con.execute(
+                """
+                SELECT unit_notes.unit_id, unit_notes.doc_id, unit_notes.order_index,
+                       documents.text, documents.metadata_json
+                FROM unit_notes
+                LEFT JOIN documents ON documents.doc_id = unit_notes.doc_id
+                ORDER BY unit_notes.unit_id, unit_notes.order_index
+                """
+            ).fetchall()
+
+            docs_by_unit: Dict[str, List[Dict[str, Any]]] = {}
+            for row in doc_rows:
+                unit_id = str(row["unit_id"] or "")
+                doc_id = str(row["doc_id"] or "")
+                if not unit_id:
+                    continue
+                entries = docs_by_unit.setdefault(unit_id, [])
+                entries.append(
+                    {
+                        "doc_id": doc_id,
+                        "order_index": int(row["order_index"] or 0),
+                        "text": str(row["text"] or ""),
+                        "metadata_json": str(row["metadata_json"] or ""),
+                    }
+                )
+
+            documents = {
+                str(row["doc_id"] or ""): {
+                    "text": str(row["text"] or ""),
+                    "metadata_json": str(row["metadata_json"] or ""),
+                }
+                for row in con.execute("SELECT doc_id, text, metadata_json FROM documents")
+            }
+
+            rationale_rows = con.execute(
+                "SELECT unit_id, label_id, doc_id, start_offset, end_offset, snippet FROM rationales"
+            ).fetchall()
+            rationales: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+            for row in rationale_rows:
+                unit_id = str(row["unit_id"] or "")
+                label_id = str(row["label_id"] or "")
+                if not unit_id or not label_id:
+                    continue
+                entry = {
+                    "doc_id": str(row["doc_id"] or ""),
+                    "start_offset": row["start_offset"],
+                    "end_offset": row["end_offset"],
+                    "snippet": row["snippet"],
+                }
+                rationales.setdefault((unit_id, label_id), []).append(entry)
+
+            for ann in con.execute(
+                "SELECT unit_id, label_id, value, value_num, value_date, na, notes FROM annotations"
+            ):
+                unit_id = str(ann["unit_id"] or "")
+                label_id = str(ann["label_id"] or "")
+                if not unit_id or not label_id:
+                    continue
+                unit_meta = units.get(unit_id, {})
+                patient_icn = unit_meta.get("patient_icn", "")
+                primary_doc_id = unit_meta.get("doc_id", "")
+                doc_entries = sorted(
+                    docs_by_unit.get(unit_id, []), key=lambda entry: entry.get("order_index", 0)
+                )
+                ordered_doc_ids = [entry.get("doc_id", "") for entry in doc_entries if entry.get("doc_id")]
+
+                if primary_doc_id and primary_doc_id not in ordered_doc_ids:
+                    ordered_doc_ids.append(primary_doc_id)
+                    doc_entries.append(
+                        {
+                            "doc_id": primary_doc_id,
+                            "order_index": len(doc_entries),
+                            **documents.get(primary_doc_id, {"text": "", "metadata_json": ""}),
+                        }
+                    )
+
+                normalized_rationales = rationales.get((unit_id, label_id), [])
+                rationale_doc_ids = {
+                    entry.get("doc_id") or "" for entry in normalized_rationales if entry is not None
+                }
+                for doc_id in rationale_doc_ids:
+                    if doc_id and doc_id not in ordered_doc_ids:
+                        ordered_doc_ids.append(doc_id)
+                        doc_entries.append(
+                            {
+                                "doc_id": doc_id,
+                                "order_index": len(doc_entries),
+                                **documents.get(doc_id, {"text": "", "metadata_json": ""}),
+                            }
+                        )
+
+                if not ordered_doc_ids:
+                    ordered_doc_ids = [""]
+                    doc_entries.append(
+                        {
+                            "doc_id": "",
+                            "order_index": 0,
+                            "text": "",
+                            "metadata_json": "",
+                        }
+                    )
+
+                # Deduplicate doc entries while preserving order
+                seen_docs: set[str] = set()
+                ordered_entries: List[Dict[str, Any]] = []
+                for entry in doc_entries:
+                    doc_id = str(entry.get("doc_id") or "")
+                    if doc_id in seen_docs:
+                        continue
+                    seen_docs.add(doc_id)
+                    ordered_entries.append(entry)
+
+                value = ann["value"]
+                value_str = "" if value is None else str(value)
+                value_num = ann["value_num"]
+                if value_num is None:
+                    value_num_str = ""
+                else:
+                    try:
+                        value_num_str = format(value_num, "g")
+                    except Exception:  # noqa: BLE001
+                        value_num_str = str(value_num)
+                value_date = "" if ann["value_date"] is None else str(ann["value_date"])
+                notes = "" if ann["notes"] is None else str(ann["notes"])
+                na_flag = 1 if ann["na"] else 0
+
+                for entry in ordered_entries:
+                    doc_id = str(entry.get("doc_id") or "")
+                    doc_text = str(entry.get("text") or "")
+                    metadata_json = str(entry.get("metadata_json") or "")
+                    if doc_id:
+                        doc_specific_rationales = [
+                            r
+                            for r in normalized_rationales
+                            if (r or {}).get("doc_id") == doc_id
+                        ]
+                    else:
+                        doc_specific_rationales = normalized_rationales
+                    rationale_json = (
+                        json.dumps(doc_specific_rationales, ensure_ascii=False)
+                        if doc_specific_rationales
+                        else ""
+                    )
+
+                    rows.append(
+                        {
+                            "round_id": round_id,
+                            "phenotype_id": pheno_id,
+                            "unit_id": unit_id,
+                            "doc_id": doc_id,
+                            "patient_icn": patient_icn,
+                            "reviewer_id": reviewer_id,
+                            "reviewer_name": "",
+                            "label_id": label_id,
+                            "label_name": "",
+                            "label_value": value_str,
+                            "label_value_num": value_num_str,
+                            "label_value_date": value_date,
+                            "label_na": na_flag,
+                            "reviewer_notes": notes,
+                            "rationales_json": rationale_json,
+                            "document_text": doc_text,
+                            "document_metadata_json": metadata_json,
+                            "label_rules": "",
+                            "label_change_history": "",
+                        }
+                    )
+        finally:
+            con.close()
+
+    columns = [
+        "round_id",
+        "phenotype_id",
+        "unit_id",
+        "doc_id",
+        "patient_icn",
+        "reviewer_id",
+        "reviewer_name",
+        "label_id",
+        "label_name",
+        "label_value",
+        "label_value_num",
+        "label_value_date",
+        "label_na",
+        "reviewer_notes",
+        "rationales_json",
+        "document_text",
+        "document_metadata_json",
+        "label_rules",
+        "label_change_history",
+    ]
+
+    return pd.DataFrame(rows, columns=columns)
 
 def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: List[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     root = Path(project_root)
@@ -190,16 +414,42 @@ def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: Lis
     corpus_db = _find_corpus_db(root, pheno_id, prior_rounds)
     notes_df = _read_corpus_db(corpus_db)
 
-    # Aggregate from selected rounds: <storage_path>/rounds/round_<n>/round_aggregate.db
     ann_frames = []
     for r in prior_rounds:
-        round_db = phenotype_dir / "rounds" / f"round_{r}" / "round_aggregate.db"
-        if round_db.exists():
-            ann_frames.append(_read_round_aggregate(round_db))
-    ann_df = pd.concat(ann_frames, ignore_index=True) if ann_frames else pd.DataFrame(columns=[
-        "round_id","unit_id","doc_id","label_id","reviewer_id","label_value",
-        "reviewer_notes","rationales_json","document_text","document_metadata_json","label_rules"
-    ])
+        round_dir = phenotype_dir / "rounds" / f"round_{r}"
+        if not round_dir.exists():
+            continue
+        frame = _read_round_annotations(round_dir, pheno_id, r)
+        if not frame.empty:
+            ann_frames.append(frame)
+
+    ann_df = (
+        pd.concat(ann_frames, ignore_index=True)
+        if ann_frames
+        else pd.DataFrame(
+            columns=[
+                "round_id",
+                "phenotype_id",
+                "unit_id",
+                "doc_id",
+                "patient_icn",
+                "reviewer_id",
+                "reviewer_name",
+                "label_id",
+                "label_name",
+                "label_value",
+                "label_value_num",
+                "label_value_date",
+                "label_na",
+                "reviewer_notes",
+                "rationales_json",
+                "document_text",
+                "document_metadata_json",
+                "label_rules",
+                "label_change_history",
+            ]
+        )
+    )
     return notes_df, ann_df
 
 def run_ai_backend_and_collect(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -36,7 +35,7 @@ if "langchain" not in sys.modules:
     sys.modules["langchain.text_splitter"] = text_splitter_stub
 
 from vaannotate.project import add_phenotype, get_connection, init_project
-from vaannotate.schema import initialize_corpus_db
+from vaannotate.schema import initialize_assignment_db, initialize_corpus_db
 from vaannotate.vaannotate_ai_backend.adapters import export_inputs_from_repo
 
 
@@ -90,45 +89,25 @@ def test_export_inputs_uses_storage_path(tmp_path: Path) -> None:
         conn.commit()
 
     round_dir = phenotype_dir / "rounds" / "round_1"
-    round_dir.mkdir(parents=True, exist_ok=True)
-    round_db = round_dir / "round_aggregate.db"
-    with sqlite3.connect(round_db) as conn:
+    imports_dir = round_dir / "imports"
+    imports_dir.mkdir(parents=True, exist_ok=True)
+    assignment_db = imports_dir / "rev1_assignment.db"
+    with initialize_assignment_db(assignment_db) as conn:
         conn.execute(
-            """
-            CREATE TABLE annotations(
-                round_id TEXT,
-                unit_id TEXT,
-                doc_id TEXT,
-                label_id TEXT,
-                reviewer_id TEXT,
-                label_value TEXT,
-                reviewer_notes TEXT,
-                rationales_json TEXT,
-                document_text TEXT,
-                document_metadata_json TEXT,
-                label_rules TEXT
-            )
-            """
+            "INSERT INTO units(unit_id, display_rank, patient_icn, doc_id, note_count) VALUES (?,?,?,?,?)",
+            ("unit_1", 1, "p1", "doc_1", 1),
         )
         conn.execute(
-            """
-            INSERT INTO annotations(round_id, unit_id, doc_id, label_id, reviewer_id, label_value,
-                                     reviewer_notes, rationales_json, document_text, document_metadata_json, label_rules)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                "ph_test_r1",
-                "unit_1",
-                "doc_1",
-                "LabelA",
-                "rev1",
-                "yes",
-                "note",
-                "[]",
-                "Sample text",
-                "{}",
-                "",
-            ),
+            "INSERT INTO documents(doc_id, hash, text, metadata_json) VALUES (?,?,?,?)",
+            ("doc_1", "hash1", "Sample text", "{}"),
+        )
+        conn.execute(
+            "INSERT INTO unit_notes(unit_id, doc_id, order_index) VALUES (?,?,?)",
+            ("unit_1", "doc_1", 0),
+        )
+        conn.execute(
+            "INSERT INTO annotations(unit_id, label_id, value, value_num, na, notes) VALUES (?,?,?,?,?,?)",
+            ("unit_1", "LabelA", "yes", None, 0, "note"),
         )
         conn.commit()
 
@@ -136,7 +115,10 @@ def test_export_inputs_uses_storage_path(tmp_path: Path) -> None:
 
     assert isinstance(notes_df, pd.DataFrame)
     assert isinstance(ann_df, pd.DataFrame)
-    assert {"doc_id", "patienticn", "text"}.issubset(notes_df.columns)
+    assert {"doc_id", "patient_icn", "text"}.issubset(notes_df.columns)
     assert notes_df.loc[0, "doc_id"] == "doc_1"
+    assert {"round_id", "label_value", "patient_icn"}.issubset(ann_df.columns)
     assert ann_df.loc[0, "round_id"] == "ph_test_r1"
+    assert ann_df.loc[0, "reviewer_id"] == "rev1"
+    assert ann_df.loc[0, "document_text"] == "Sample text"
 
