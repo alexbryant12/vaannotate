@@ -154,32 +154,91 @@ def _find_corpus_db(project_root: Path, pheno_id: str, prior_rounds: List[int]) 
 def _read_corpus_db(corpus_db: Path) -> pd.DataFrame:
     con = sqlite3.connect(str(corpus_db))
     try:
-        # Documents table assumed: doc_id TEXT, patienticn TEXT, text TEXT, metadata_json TEXT, date_note TEXT, notetype TEXT
-        df = pd.read_sql_query(            """
-            SELECT d.patienticn, d.doc_id, d.text,
-                   COALESCE(d.date_note,'') as date_note,
-                   COALESCE(d.notetype,'') as notetype,
-                   COALESCE(d.metadata_json,'{}') as document_metadata_json
-            FROM documents d
-            """, con)
+        con.row_factory = sqlite3.Row
+        doc_columns = {row["name"] for row in con.execute("PRAGMA table_info(documents)")}
+
+        def select_expr(target: str, candidates: List[str], *, default: str) -> str:
+            for candidate in candidates:
+                if candidate in doc_columns:
+                    return f"{candidate} AS {target}"
+            return f"{default} AS {target}"
+
+        select_clauses = [
+            select_expr("patient_icn", ["patient_icn", "patienticn"], default="''"),
+            select_expr("doc_id", ["doc_id"], default="''"),
+            select_expr("text", ["text", "document_text"], default="''"),
+            select_expr("date_note", ["date_note"], default="''"),
+            select_expr("notetype", ["notetype"], default="''"),
+            select_expr(
+                "document_metadata_json",
+                ["document_metadata_json", "metadata_json"],
+                default="'{}'",
+            ),
+        ]
+
+        query = f"SELECT {', '.join(select_clauses)} FROM documents"
+        df = pd.read_sql_query(query, con)
         return df
     finally:
         con.close()
 
+
 def _read_round_aggregate(round_db: Path) -> pd.DataFrame:
     con = sqlite3.connect(str(round_db))
     try:
-        # Long-format annotations
-        df = pd.read_sql_query(            """
-            SELECT round_id, unit_id, doc_id, label_id, reviewer_id,
-                   label_value,
-                   COALESCE(reviewer_notes,'') AS reviewer_notes,
-                   COALESCE(rationales_json,'[]') AS rationales_json,
-                   COALESCE(document_text,'') AS document_text,
-                   COALESCE(document_metadata_json,'{}') AS document_metadata_json,
-                   COALESCE(label_rules,'') AS label_rules
-            FROM annotations
-            """, con)
+        con.row_factory = sqlite3.Row
+        ann_columns = {row["name"] for row in con.execute("PRAGMA table_info(annotations)")}
+
+        column_candidates: Dict[str, List[str]] = {
+            "round_id": ["round_id"],
+            "phenotype_id": ["phenotype_id"],
+            "unit_id": ["unit_id"],
+            "doc_id": ["doc_id"],
+            "patient_icn": ["patient_icn", "patienticn"],
+            "reviewer_id": ["reviewer_id"],
+            "reviewer_name": ["reviewer_name"],
+            "label_id": ["label_id"],
+            "label_name": ["label_name"],
+            "label_value": ["label_value", "value"],
+            "label_value_num": ["label_value_num", "value_num"],
+            "label_value_date": ["label_value_date", "value_date"],
+            "label_na": ["label_na", "na"],
+            "reviewer_notes": ["reviewer_notes", "notes"],
+            "rationales_json": ["rationales_json"],
+            "document_text": ["document_text", "text"],
+            "document_metadata_json": ["document_metadata_json", "metadata_json"],
+            "label_rules": ["label_rules", "rules"],
+            "label_change_history": ["label_change_history", "history"],
+        }
+
+        default_map: Dict[str, str] = {
+            "phenotype_id": "''",
+            "patient_icn": "''",
+            "reviewer_name": "''",
+            "label_name": "''",
+            "label_value": "''",
+            "label_value_num": "NULL",
+            "label_value_date": "''",
+            "label_na": "0",
+            "reviewer_notes": "''",
+            "rationales_json": "'[]'",
+            "document_text": "''",
+            "document_metadata_json": "'{}'",
+            "label_rules": "''",
+            "label_change_history": "''",
+        }
+
+        select_clauses: List[str] = []
+        for target, candidates in column_candidates.items():
+            default_expr = default_map.get(target, "''")
+            source = next((col for col in candidates if col in ann_columns), None)
+            if source:
+                select_clauses.append(f"{source} AS {target}")
+            else:
+                select_clauses.append(f"{default_expr} AS {target}")
+
+        query = f"SELECT {', '.join(select_clauses)} FROM annotations"
+        df = pd.read_sql_query(query, con)
         return df
     finally:
         con.close()
