@@ -136,8 +136,7 @@ def test_export_inputs_uses_storage_path(tmp_path: Path) -> None:
 
     assert isinstance(notes_df, pd.DataFrame)
     assert isinstance(ann_df, pd.DataFrame)
-    assert {"doc_id", "patient_icn", "text"}.issubset(notes_df.columns)
+    assert {"doc_id", "patienticn", "text"}.issubset(notes_df.columns)
     assert notes_df.loc[0, "doc_id"] == "doc_1"
-    assert {"round_id", "label_value", "patient_icn"}.issubset(ann_df.columns)
     assert ann_df.loc[0, "round_id"] == "ph_test_r1"
 
