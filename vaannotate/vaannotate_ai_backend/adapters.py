@@ -1,11 +1,24 @@
 
 from __future__ import annotations
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
-import os, json, sqlite3
+from typing import Callable, Dict, List, Optional, Tuple, Any
+import json
+import sqlite3
+
 import pandas as pd
 
+from . import __version__
 from .orchestrator import build_next_batch
+
+
+@dataclass
+class BackendResult:
+    csv_path: Path
+    dataframe: pd.DataFrame
+    artifacts: Dict[str, Any]
+    params_path: Path
 
 def _read_corpus_db(corpus_db: Path) -> pd.DataFrame:
     con = sqlite3.connect(str(corpus_db))
@@ -58,17 +71,56 @@ def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: Lis
     ])
     return notes_df, ann_df
 
-def run_ai_backend_and_collect(project_root: Path, pheno_id: str, prior_rounds: List[int], round_dir: Path, cfg_overrides: Optional[Dict[str,Any]]=None) -> Path:
+def run_ai_backend_and_collect(
+    project_root: Path,
+    pheno_id: str,
+    prior_rounds: List[int],
+    round_dir: Path,
+    level: str,
+    user: str,
+    timestamp: Optional[str] = None,
+    cfg_overrides: Optional[Dict[str, Any]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> BackendResult:
+    log = log_callback or (lambda message: None)
+    log("Preparing AI backend inputs…")
     notes_df, ann_df = export_inputs_from_repo(project_root, pheno_id, prior_rounds)
-    outdir = Path(round_dir) / "imports" / "ai"
-    outdir.mkdir(parents=True, exist_ok=True)
-    # Optional: load per-phenotype label_config.json if present
+    ai_dir = Path(round_dir) / "imports" / "ai"
+    ai_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Exported {len(notes_df)} corpus rows and {len(ann_df)} prior annotations")
+
     label_config_path = Path(project_root) / "phenotypes" / pheno_id / "ai" / "label_config.json"
     label_config = None
     if label_config_path.exists():
         try:
             label_config = json.loads(label_config_path.read_text(encoding="utf-8"))
-        except Exception:
-            label_config = None
-    final_df, artifacts = build_next_batch(notes_df, ann_df, outdir=outdir, label_config=label_config, cfg_overrides=cfg_overrides or {})
-    return Path(artifacts["ai_next_batch_csv"])
+            log("Loaded label_config.json overrides")
+        except Exception as exc:  # noqa: BLE001
+            log(f"Warning: failed to parse label_config.json ({exc})")
+
+    overrides: Dict[str, Any] = dict(cfg_overrides or {})
+    overrides.setdefault("phenotype_level", level)
+
+    final_df, artifacts = build_next_batch(
+        notes_df,
+        ann_df,
+        outdir=ai_dir,
+        label_config=label_config,
+        cfg_overrides=overrides,
+    )
+    csv_path = Path(artifacts["ai_next_batch_csv"])
+    log(f"AI backend produced {len(final_df)} candidate units")
+
+    params = {
+        "phenotype_id": pheno_id,
+        "prior_rounds": list(sorted(prior_rounds)),
+        "phenotype_level": level,
+        "invoked_by": user,
+        "timestamp": timestamp or datetime.utcnow().isoformat(),
+        "backend_version": __version__,
+    }
+    params_path = ai_dir / "params.json"
+    params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
+    log(f"Wrote parameters to {params_path}")
+
+    return BackendResult(csv_path=csv_path, dataframe=final_df, artifacts=artifacts, params_path=params_path)
