@@ -9,10 +9,11 @@ import re
 import sqlite3
 import sys
 import uuid
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -37,6 +38,8 @@ from vaannotate.shared.theme import apply_dark_palette
 from vaannotate.corpus import TABULAR_EXTENSIONS, import_tabular_corpus
 from vaannotate.project import init_project
 from vaannotate.utils import copy_sqlite_database, ensure_dir
+from vaannotate.rounds import RoundBuilder
+from vaannotate.vaannotate_ai_backend import BackendResult, run_ai_backend_and_collect
 
 PROJECT_MODELS = [
     models.Project,
@@ -81,6 +84,178 @@ class LabelDefinition:
     rules: str = ""
 
 
+@dataclass
+class RoundCreationContext:
+    pheno_id: str
+    pheno_level: str
+    project_id: str
+    seed: int
+    overlap: int
+    total_n: int
+    status: str
+    labelset_id: str
+    labelset_missing: bool
+    default_labels: List[Dict[str, object]]
+    reviewers: List[Dict[str, str]]
+    corpus_id: str
+    corpus_record: Optional[sqlite3.Row]
+    created_at: str
+    created_by: str
+    db: Database
+
+
+@dataclass
+class AIRoundJobConfig:
+    context: RoundCreationContext
+    round_number: int
+    round_id: str
+    round_dir: Path
+    prior_rounds: List[int]
+    timestamp: str
+
+
+class AIRoundWorker(QtCore.QObject):
+    finished = QtCore.Signal(object, object)
+    log_message = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        project_root: Path,
+        job: AIRoundJobConfig,
+        finalize: bool,
+        cfg_overrides: Optional[Dict[str, Any]] = None,
+        cleanup_dir: bool = False,
+    ) -> None:
+        super().__init__()
+        self.project_root = Path(project_root)
+        self.job = job
+        self.finalize = finalize
+        self.cfg_overrides = dict(cfg_overrides or {})
+        self.cleanup_dir = cleanup_dir
+
+    @QtCore.Slot()
+    def run(self) -> None:  # noqa: D401 - Qt slot
+        try:
+            ensure_dir(self.job.round_dir)
+            result = run_ai_backend_and_collect(
+                self.project_root,
+                self.job.context.pheno_id,
+                self.job.prior_rounds,
+                self.job.round_dir,
+                self.job.context.pheno_level,
+                self.job.context.created_by,
+                timestamp=self.job.timestamp,
+                cfg_overrides=self.cfg_overrides,
+                log_callback=self.log_message.emit,
+            )
+            payload: Dict[str, object] = {"backend_result": result}
+            if self.finalize:
+                self.log_message.emit("Finalizing round artifacts…")
+                self._prepare_labelset_and_reviewers()
+                config_path = self._write_round_config(result.csv_path)
+                try:
+                    builder = RoundBuilder(self.project_root)
+                    build_result = builder.generate_round(
+                        self.job.context.pheno_id,
+                        config_path,
+                        created_by=self.job.context.created_by,
+                        preselected_units_csv=result.csv_path,
+                    )
+                finally:
+                    try:
+                        config_path.unlink()
+                    except OSError:
+                        pass
+                payload["build_result"] = build_result
+            self.finished.emit(payload, None)
+        except Exception as exc:  # noqa: BLE001
+            self.finished.emit(None, exc)
+        finally:
+            if self.cleanup_dir:
+                shutil.rmtree(self.job.round_dir, ignore_errors=True)
+
+    def _prepare_labelset_and_reviewers(self) -> None:
+        context = self.job.context
+        with context.db.transaction() as conn:
+            if context.labelset_missing:
+                labelset = models.LabelSet(
+                    labelset_id=context.labelset_id,
+                    project_id=context.project_id,
+                    pheno_id=context.pheno_id,
+                    version=1,
+                    created_at=context.created_at,
+                    created_by=context.created_by,
+                    notes="Auto-generated",
+                )
+                labelset.save(conn)
+                for label in context.default_labels:
+                    label_record = models.Label(
+                        label_id=label["label_id"],
+                        labelset_id=context.labelset_id,
+                        name=label["name"],
+                        type=label["type"],
+                        required=label.get("required", False),
+                        order_index=0,
+                        rules=label.get("rules", ""),
+                        gating_expr=None,
+                        na_allowed=int(label.get("na_allowed", False)),
+                        unit=None,
+                        min=None,
+                        max=None,
+                    )
+                    label_record.save(conn)
+                    for idx, option in enumerate(label.get("options", [])):
+                        option_record = models.LabelOption(
+                            option_id=str(uuid.uuid4()),
+                            label_id=label_record.label_id,
+                            value=str(option.get("value", "")),
+                            display=str(option.get("display", option.get("value", ""))),
+                            order_index=idx,
+                            weight=option.get("weight"),
+                        )
+                        option_record.save(conn)
+            for reviewer in context.reviewers:
+                reviewer_record = models.Reviewer(
+                    reviewer_id=reviewer["id"],
+                    name=reviewer.get("name", reviewer["id"]),
+                    email=reviewer.get("email", ""),
+                    windows_account=None,
+                )
+                reviewer_record.save(conn)
+
+    def _write_round_config(self, csv_path: Path) -> Path:
+        context = self.job.context
+        payload: Dict[str, Any] = {
+            "pheno_id": context.pheno_id,
+            "labelset_id": context.labelset_id,
+            "corpus_id": context.corpus_id,
+            "round_number": self.job.round_number,
+            "round_id": self.job.round_id,
+            "rng_seed": context.seed,
+            "overlap_n": context.overlap,
+            "total_n": context.total_n,
+            "status": context.status,
+            "reviewers": context.reviewers,
+            "preselected_units_csv": str(csv_path),
+            "prior_rounds": list(self.job.prior_rounds),
+        }
+        if context.corpus_record:
+            try:
+                payload["corpus_name"] = context.corpus_record["name"]
+            except Exception:  # noqa: BLE001
+                payload["corpus_name"] = context.corpus_record.get("name")  # type: ignore[call-arg]
+            try:
+                payload["corpus_path"] = context.corpus_record["relative_path"]
+            except Exception:  # noqa: BLE001
+                payload["corpus_path"] = context.corpus_record.get("relative_path")  # type: ignore[call-arg]
+        payload["ai_backend"] = {
+            "prior_rounds": list(self.job.prior_rounds),
+            "invoked_at": self.job.timestamp,
+        }
+        handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(payload, handle, indent=2)
+        return Path(handle.name)
 class ProjectContext(QtCore.QObject):
     project_changed = QtCore.Signal()
     dirty_changed = QtCore.Signal(bool)
@@ -1444,8 +1619,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._selected_corpus_id: Optional[str] = None
         self._metadata_fields: List[MetadataField] = []
         self._metadata_lookup: Dict[str, MetadataField] = {}
+        self._ai_thread: Optional[QtCore.QThread] = None
+        self._ai_worker: Optional[AIRoundWorker] = None
+        self._ai_pending_job: Optional[AIRoundJobConfig] = None
+        self._ai_job_running = False
+        self._ai_is_preview = False
         self.ctx.project_changed.connect(self._refresh_labelset_options)
         self.ctx.project_changed.connect(self._refresh_corpus_options)
+        self.ctx.project_changed.connect(self._refresh_ai_round_options)
         self._setup_ui()
 
     @staticmethod
@@ -1595,6 +1776,34 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         strat_layout.addLayout(strat_controls)
         scroll_layout.addWidget(strat_group)
 
+        ai_group = QtWidgets.QGroupBox("AI-assisted selection")
+        ai_layout = QtWidgets.QVBoxLayout(ai_group)
+        self.use_ai_checkbox = QtWidgets.QCheckBox("Use AI/LLM backend")
+        self.use_ai_checkbox.toggled.connect(self._on_toggle_ai_backend)
+        ai_layout.addWidget(self.use_ai_checkbox)
+        self.ai_controls_container = QtWidgets.QWidget()
+        ai_controls_layout = QtWidgets.QVBoxLayout(self.ai_controls_container)
+        ai_controls_layout.setContentsMargins(0, 0, 0, 0)
+        prior_label = QtWidgets.QLabel("Prior rounds to include")
+        ai_controls_layout.addWidget(prior_label)
+        self.ai_rounds_list = QtWidgets.QListWidget()
+        self.ai_rounds_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.MultiSelection
+        )
+        ai_controls_layout.addWidget(self.ai_rounds_list)
+        ai_button_row = QtWidgets.QHBoxLayout()
+        self.ai_preview_btn = QtWidgets.QPushButton("Preview selection")
+        self.ai_preview_btn.clicked.connect(self._on_ai_preview)
+        ai_button_row.addWidget(self.ai_preview_btn)
+        ai_button_row.addStretch()
+        ai_controls_layout.addLayout(ai_button_row)
+        self.ai_log_output = QtWidgets.QPlainTextEdit()
+        self.ai_log_output.setReadOnly(True)
+        self.ai_log_output.setPlaceholderText("AI backend logs will appear here…")
+        ai_controls_layout.addWidget(self.ai_log_output)
+        ai_layout.addWidget(self.ai_controls_container)
+        scroll_layout.addWidget(ai_group)
+
         scroll_layout.addStretch()
         scroll.setWidget(container)
         layout.addWidget(scroll)
@@ -1609,6 +1818,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._refresh_corpus_options()
         self._refresh_labelset_options()
         self._refresh_reviewer_options()
+        self._refresh_ai_round_options()
+        self._on_toggle_ai_backend(False)
 
     def _collect_filters(self) -> SamplingFilters:
         conditions: List[MetadataFilterCondition] = []
@@ -1728,6 +1939,266 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             display = f"{reviewer['name']} ({reviewer['id']})"
             self.reviewer_combo.addItem(display, reviewer)
         self.reviewer_combo.blockSignals(False)
+
+    def _refresh_ai_round_options(self) -> None:
+        if not hasattr(self, "ai_rounds_list"):
+            return
+        self.ai_rounds_list.clear()
+        try:
+            rounds = self.ctx.list_rounds(self.pheno_row["pheno_id"])
+        except Exception:  # noqa: BLE001
+            rounds = []
+        for round_row in rounds:
+            round_number = self._safe_mapping_get(round_row, "round_number")
+            if round_number is None:
+                continue
+            item = QtWidgets.QListWidgetItem(f"Round {round_number}")
+            try:
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, int(round_number))
+            except Exception:  # noqa: BLE001
+                continue
+            self.ai_rounds_list.addItem(item)
+
+    def _on_toggle_ai_backend(self, checked: bool) -> None:
+        if hasattr(self, "ai_controls_container"):
+            self.ai_controls_container.setEnabled(checked and not self._ai_job_running)
+        self._update_ai_buttons()
+
+    def _update_ai_buttons(self) -> None:
+        enabled = getattr(self, "use_ai_checkbox", None) and self.use_ai_checkbox.isChecked()
+        active = bool(enabled and not self._ai_job_running)
+        if hasattr(self, "ai_preview_btn"):
+            self.ai_preview_btn.setEnabled(active)
+        if hasattr(self, "ai_rounds_list"):
+            self.ai_rounds_list.setEnabled(active)
+        if hasattr(self, "ai_controls_container") and getattr(self, "use_ai_checkbox", None):
+            self.ai_controls_container.setEnabled(self.use_ai_checkbox.isChecked() and not self._ai_job_running)
+
+    def _on_ai_preview(self) -> None:
+        if self._ai_job_running:
+            return
+        self._start_ai_round(finalize=False)
+
+    def _append_ai_log(self, message: str) -> None:
+        if not hasattr(self, "ai_log_output"):
+            return
+        stamp = datetime.utcnow().strftime("%H:%M:%S")
+        self.ai_log_output.appendPlainText(f"[{stamp}] {message}")
+
+    def _selected_prior_round_numbers(self) -> List[int]:
+        rounds: List[int] = []
+        if not hasattr(self, "ai_rounds_list"):
+            return rounds
+        for index in range(self.ai_rounds_list.count()):
+            item = self.ai_rounds_list.item(index)
+            if item and item.isSelected():
+                value = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(value, int):
+                    rounds.append(value)
+        return rounds
+
+    def _build_ai_context(self) -> Optional[RoundCreationContext]:
+        pheno_id = self.pheno_row["pheno_id"]
+        pheno_level = str(self.pheno_row["level"] or "single_doc")
+        ctx = self.ctx
+        project_id = ctx.current_project_id()
+        if not project_id:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Round",
+                "Project metadata is missing; reload the project and try again.",
+            )
+            return None
+        db = ctx.require_db()
+        reviewers = self._prompt_reviewers()
+        if not reviewers:
+            return None
+        labelset_id = self.labelset_combo.currentText().strip() or f"auto_{pheno_id}"
+        created_at = QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate)
+        with db.connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM label_sets WHERE labelset_id=?",
+                (labelset_id,),
+            ).fetchone()
+        labelset_missing = not bool(exists)
+        default_labels: List[Dict[str, object]] = []
+        if labelset_missing:
+            default_labels.append(
+                {
+                    "label_id": str(uuid.uuid4()),
+                    "name": "Has_phenotype",
+                    "type": "boolean",
+                    "required": 1,
+                    "na_allowed": 0,
+                    "options": [
+                        {"value": "yes", "display": "Yes"},
+                        {"value": "no", "display": "No"},
+                        {"value": "unknown", "display": "Unknown"},
+                    ],
+                }
+            )
+        seed = self.seed_spin.value()
+        overlap = self.overlap_spin.value()
+        total_n = self.total_n_spin.value()
+        if total_n < overlap:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Round",
+                "Total N must be greater than or equal to the overlap count.",
+            )
+            return None
+        corpus_id = self._selected_corpus_id
+        if not corpus_id:
+            QtWidgets.QMessageBox.warning(self, "Round", "Select a corpus for this round.")
+            return None
+        try:
+            corpus_record = self.ctx.get_corpus(corpus_id)
+        except Exception:  # noqa: BLE001
+            corpus_record = None
+        created_by = "admin"
+        project_row = ctx.project_row or ctx._load_project_row()
+        if project_row and project_row.get("created_by"):
+            created_by = str(project_row["created_by"])
+        status = self.status_combo.currentText()
+        return RoundCreationContext(
+            pheno_id=pheno_id,
+            pheno_level=pheno_level,
+            project_id=project_id,
+            seed=seed,
+            overlap=overlap,
+            total_n=total_n,
+            status=status,
+            labelset_id=labelset_id,
+            labelset_missing=labelset_missing,
+            default_labels=default_labels,
+            reviewers=reviewers,
+            corpus_id=corpus_id,
+            corpus_record=corpus_record,
+            created_at=created_at,
+            created_by=created_by,
+            db=db,
+        )
+
+    def _start_ai_round(self, finalize: bool) -> bool:
+        context = self._build_ai_context()
+        if not context:
+            return False
+        prior_rounds = self._selected_prior_round_numbers()
+        if not prior_rounds:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "AI backend",
+                "Select one or more prior rounds to seed the AI backend.",
+            )
+            return False
+        timestamp = datetime.utcnow().isoformat()
+        round_number = self._next_round_number()
+        if finalize:
+            try:
+                round_dir = ensure_dir(self.ctx.resolve_round_dir(context.pheno_id, round_number))
+            except Exception as exc:  # noqa: BLE001
+                QtWidgets.QMessageBox.critical(self, "Round", str(exc))
+                return False
+            cleanup = False
+        else:
+            round_dir = Path(tempfile.mkdtemp(prefix="vaannotate_ai_preview_"))
+            cleanup = True
+        round_id = f"{context.pheno_id}_r{round_number}"
+        job = AIRoundJobConfig(
+            context=context,
+            round_number=round_number,
+            round_id=round_id,
+            round_dir=round_dir,
+            prior_rounds=prior_rounds,
+            timestamp=timestamp,
+        )
+        project_root = self.ctx.require_project()
+        worker = AIRoundWorker(
+            project_root,
+            job,
+            finalize=finalize,
+            cleanup_dir=cleanup,
+        )
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        worker.log_message.connect(self._append_ai_log)
+        worker.finished.connect(self._handle_ai_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_ai_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.started.connect(worker.run)
+        self._ai_thread = thread
+        self._ai_worker = worker
+        self._ai_pending_job = job
+        self._ai_job_running = True
+        self._ai_is_preview = not finalize
+        if hasattr(self, "ai_log_output"):
+            self.ai_log_output.clear()
+        self._append_ai_log("Starting AI backend…")
+        self._update_ai_buttons()
+        ok_button = self.button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        if ok_button:
+            ok_button.setEnabled(False)
+        thread.start()
+        return True
+
+    def _on_ai_thread_finished(self) -> None:
+        self._ai_thread = None
+        self._ai_worker = None
+
+    def _handle_ai_finished(self, payload: object, error: object) -> None:
+        self._ai_job_running = False
+        ok_button = self.button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        if ok_button:
+            ok_button.setEnabled(True)
+        self._update_ai_buttons()
+        if error:
+            QtWidgets.QMessageBox.critical(self, "AI backend", str(error))
+            self._ai_pending_job = None
+            return
+        if not isinstance(payload, dict):
+            self._ai_pending_job = None
+            return
+        backend_result = payload.get("backend_result")
+        if isinstance(backend_result, BackendResult) and self._ai_is_preview:
+            self._show_ai_preview(backend_result)
+            self._ai_pending_job = None
+            self._ai_is_preview = False
+            return
+        build_result = payload.get("build_result")
+        job = self._ai_pending_job
+        self._ai_pending_job = None
+        if not isinstance(backend_result, BackendResult) or job is None or not isinstance(build_result, dict):
+            return
+        self.created_round_id = build_result.get("round_id") or job.round_id
+        self.created_round_number = job.round_number
+        try:
+            self.ctx.mark_dirty()
+            self.ctx.update_cache_after_round(job.context.corpus_id)
+        except Exception:  # noqa: BLE001
+            pass
+        self._ai_is_preview = False
+        super().accept()
+
+    def _show_ai_preview(self, result: BackendResult) -> None:
+        df = result.dataframe.head(10)
+        lines: List[str] = []
+        for _, row in df.iterrows():
+            unit = str(row.get("unit_id", ""))
+            patient = str(row.get("patient_icn") or row.get("patienticn") or "")
+            doc_id = row.get("doc_id") or ""
+            reason = row.get("selection_reason") or ""
+            display = unit
+            if patient:
+                display += f" • {patient}"
+            if doc_id:
+                display += f" • {doc_id}"
+            if reason:
+                display += f" — {reason}"
+            lines.append(display)
+        message = "\n".join(lines) if lines else "No units were returned by the AI backend."
+        QtWidgets.QMessageBox.information(self, "AI preview", message)
 
     def _load_labelset_ids(self) -> List[str]:
         rows = self.ctx.list_label_sets()
@@ -2117,6 +2588,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return fetch(connection)
 
     def accept(self) -> None:  # noqa: D401 - Qt override
+        if getattr(self, "use_ai_checkbox", None) and self.use_ai_checkbox.isChecked():
+            if self._ai_job_running:
+                return
+            if not self._start_ai_round(finalize=True):
+                return
+            return
         if not self._create_round():
             return
         super().accept()

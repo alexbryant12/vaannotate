@@ -41,22 +41,33 @@ def build_next_batch(
     orch = engine.ActiveLearningLLMFirst(paths=paths, cfg=cfg, label_config=label_config or {})
     final_df = orch.run()  # engine returns DataFrame
 
-    # Also write ai_next_batch.csv to a standard location
-    ai_dir = Path(outdir) / "imports" / "ai"
-    _ensure_dir(ai_dir)
-    csv_path = ai_dir / "ai_next_batch.csv"
-    # Minimal CSV for RoundBuilder
-    cols = [c for c in ["unit_id","label_id","doc_id","patienticn","selection_reason"] if c in final_df.columns]
-    final_df[cols].to_csv(csv_path, index=False)
+    normalized = final_df.copy()
+    rename_map = {}
+    if "patienticn" in normalized.columns:
+        rename_map["patienticn"] = "patient_icn"
+    if rename_map:
+        normalized = normalized.rename(columns=rename_map)
+    csv_path = outdir / "ai_next_batch.csv"
+    csv_columns = [
+        col
+        for col in ["unit_id", "patient_icn", "doc_id", "label_id", "selection_reason", "strata_key"]
+        if col in normalized.columns
+    ]
+    if csv_columns:
+        normalized.to_csv(csv_path, columns=csv_columns, index=False)
+    else:
+        normalized.to_csv(csv_path, index=False)
 
     artifacts = {
         "ai_next_batch_csv": str(csv_path),
         "buckets": {
-            "disagreement": str(Path(outdir)/"bucket_disagreement.parquet"),
-            "llm_uncertain": str(Path(outdir)/"bucket_llm_uncertain.parquet"),
-            "llm_certain": str(Path(outdir)/"bucket_llm_certain.parquet"),
-            "diversity": str(Path(outdir)/"bucket_diversity.parquet"),
+            "disagreement": str(Path(outdir) / "bucket_disagreement.parquet"),
+            "llm_uncertain": str(Path(outdir) / "bucket_llm_uncertain.parquet"),
+            "llm_certain": str(Path(outdir) / "bucket_llm_certain.parquet"),
+            "diversity": str(Path(outdir) / "bucket_diversity.parquet"),
         },
-        "final_labels": str(Path(outdir)/"final_llm_labels.parquet") if (Path(outdir)/"final_llm_labels.parquet").exists() else None
+        "final_labels": str(Path(outdir) / "final_llm_labels.parquet")
+        if (Path(outdir) / "final_llm_labels.parquet").exists()
+        else None,
     }
-    return final_df, artifacts
+    return normalized, artifacts

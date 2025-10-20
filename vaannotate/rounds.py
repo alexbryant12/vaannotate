@@ -70,7 +70,13 @@ class RoundBuilder:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def generate_round(self, pheno_id: str, config_path: Path, created_by: str) -> dict:
+    def generate_round(
+        self,
+        pheno_id: str,
+        config_path: Path,
+        created_by: str,
+        preselected_units_csv: Path | str | None = None,
+    ) -> dict:
         config = json.loads(Path(config_path).read_text("utf-8"))
         with self._connect_project() as project_conn:
             pheno = project_conn.execute(
@@ -104,7 +110,19 @@ class RoundBuilder:
             with self._connect_corpus(corpus_path) as corpus_conn:
                 labelset = fetch_labelset(project_conn, config["labelset_id"])
                 round_number = config.get("round_number")
-            round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
+                csv_override: Path | None = None
+                if not preselected_units_csv:
+                    csv_value = config.get("preselected_units_csv")
+                    if csv_value:
+                        csv_override = Path(csv_value)
+                        if not csv_override.is_absolute():
+                            csv_override = (Path(config_path).parent / csv_override).resolve()
+                else:
+                    csv_override = Path(preselected_units_csv)
+                round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
+                status = str(config.get("status") or "active")
+                if csv_override and not csv_override.exists():
+                    raise FileNotFoundError(csv_override)
             rng_seed = config.get("rng_seed", 0)
             config_hash = stable_hash(canonical_json(config))
             phenotype_dir = storage_dir
@@ -115,7 +133,12 @@ class RoundBuilder:
             ensure_dir(round_dir / "reports" / "confusion_matrices")
             ensure_dir(round_dir / "reports" / "exports")
 
-            candidates = list(self._build_candidates(corpus_conn, pheno, config))
+            if csv_override:
+                candidates = list(
+                    self._build_preselected_candidates(corpus_conn, pheno, csv_override)
+                )
+            else:
+                candidates = list(self._build_candidates(corpus_conn, pheno, config))
             if not candidates:
                 raise ValueError("No candidates matched filters")
 
@@ -127,7 +150,12 @@ class RoundBuilder:
                 config.get("overlap_n", 0),
                 config.get("total_n"),
                 config.get("stratification"),
+                preserve_input_order=bool(csv_override),
             )
+
+            if csv_override:
+                config["preselected_units_csv"] = str(csv_override)
+            config["status"] = status
 
             manifest_path = round_dir / "manifest.csv"
             with manifest_path.open("w", encoding="utf-8", newline="") as fh:
@@ -161,7 +189,7 @@ class RoundBuilder:
                     labelset["labelset_id"],
                     config_hash,
                     rng_seed,
-                    "active",
+                    status,
                     datetime.utcnow().isoformat(),
                 ),
             )
@@ -469,6 +497,208 @@ class RoundBuilder:
                 }
                 yield CandidateUnit(patient_icn, patient_icn, None, strata_key, payload)
 
+    def _build_preselected_candidates(
+        self,
+        corpus_conn: sqlite3.Connection,
+        pheno_row: sqlite3.Row,
+        csv_path: Path,
+    ) -> Iterator[CandidateUnit]:
+        level = str(pheno_row["level"] or "single_doc")
+        rows_by_unit: dict[str, dict] = {}
+        unit_order: list[str] = []
+        with Path(csv_path).open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for position, row in enumerate(reader):
+                if not isinstance(row, Mapping):
+                    continue
+                normalized: dict[str, str] = {}
+                for key, value in row.items():
+                    if key is None:
+                        continue
+                    normalized[key.strip().lower()] = (value or "").strip()
+                raw_unit = (
+                    normalized.get("unit_id")
+                    or normalized.get("doc_id")
+                    or normalized.get("patient_icn")
+                    or normalized.get("patienticn")
+                )
+                if not raw_unit:
+                    continue
+                unit_id = str(raw_unit)
+                entry = rows_by_unit.get(unit_id)
+                if not entry:
+                    entry = {
+                        "unit_id": unit_id,
+                        "patient_icn": normalized.get("patient_icn")
+                        or normalized.get("patienticn"),
+                        "doc_ids": [],
+                        "strata_key": normalized.get("strata_key") or "ai_import",
+                        "selection_reasons": [],
+                        "doc_order": [],
+                        "first_index": position,
+                    }
+                    rows_by_unit[unit_id] = entry
+                    unit_order.append(unit_id)
+                if not entry.get("patient_icn"):
+                    patient_value = normalized.get("patient_icn") or normalized.get("patienticn")
+                    if patient_value:
+                        entry["patient_icn"] = patient_value
+                doc_id = normalized.get("doc_id") or normalized.get("document_id")
+                if doc_id:
+                    doc_id = str(doc_id)
+                    entry["doc_ids"].append(doc_id)
+                    entry["doc_order"].append(doc_id)
+                reason = normalized.get("selection_reason") or normalized.get("reason")
+                if reason:
+                    entry["selection_reasons"].append(reason)
+                strata_value = normalized.get("strata_key")
+                if strata_value:
+                    entry["strata_key"] = str(strata_value)
+
+        if not rows_by_unit:
+            return
+
+        doc_ids: list[str] = []
+        for entry in rows_by_unit.values():
+            doc_ids.extend(entry.get("doc_ids", []))
+        doc_map = self._fetch_documents_by_ids(corpus_conn, doc_ids)
+
+        for unit_id in unit_order:
+            entry = rows_by_unit[unit_id]
+            strata_key = str(entry.get("strata_key") or "ai_import")
+            selection_reason = next(
+                (reason for reason in entry.get("selection_reasons", []) if reason),
+                None,
+            )
+            if level == "single_doc":
+                doc_id = entry["doc_ids"][0] if entry["doc_ids"] else unit_id
+                doc_row = doc_map.get(doc_id)
+                if not doc_row:
+                    raise ValueError(
+                        f"Document {doc_id} referenced in {csv_path} was not found in the corpus"
+                    )
+                row_dict = dict(doc_row)
+                patient_icn = str(
+                    entry.get("patient_icn")
+                    or row_dict.get("patient_icn")
+                    or row_dict.get("patienticn")
+                    or ""
+                )
+                metadata = extract_document_metadata(row_dict)
+                documents = [
+                    {
+                        "doc_id": row_dict.get("doc_id"),
+                        "hash": row_dict.get("hash"),
+                        "text": row_dict.get("text"),
+                        "order_index": 0,
+                        "metadata_json": row_dict.get("metadata_json"),
+                        "metadata": metadata,
+                        "date_note": row_dict.get("date_note"),
+                    }
+                ]
+                payload = {
+                    "date_note": row_dict.get("date_note"),
+                    "hash": row_dict.get("hash"),
+                    "metadata_json": row_dict.get("metadata_json"),
+                    "metadata": metadata,
+                    "strata_key": strata_key,
+                    "note_count": 1,
+                    "documents": documents,
+                    "display_label": row_dict.get("doc_id") or unit_id,
+                }
+                if selection_reason:
+                    payload["selection_reason"] = selection_reason
+                yield CandidateUnit(str(unit_id), patient_icn, row_dict.get("doc_id"), strata_key, payload)
+                continue
+
+            patient_icn = entry.get("patient_icn")
+            doc_rows: list[sqlite3.Row] = []
+            if entry["doc_ids"]:
+                for doc_id in entry["doc_ids"]:
+                    doc_row = doc_map.get(doc_id)
+                    if not doc_row:
+                        raise ValueError(
+                            f"Document {doc_id} referenced in {csv_path} was not found in the corpus"
+                        )
+                    doc_rows.append(doc_row)
+            else:
+                if not patient_icn:
+                    raise ValueError(
+                        f"Preselected unit {unit_id} is missing patient identifier and document IDs"
+                    )
+                doc_rows = self._fetch_patient_documents(corpus_conn, str(patient_icn))
+                if not doc_rows:
+                    raise ValueError(
+                        f"No documents found for patient {patient_icn} referenced by {unit_id}"
+                    )
+
+            ordered = []
+            for index, doc_row in enumerate(doc_rows):
+                doc_dict = dict(doc_row)
+                metadata = extract_document_metadata(doc_dict)
+                ordered.append(
+                    {
+                        "doc_id": doc_dict.get("doc_id"),
+                        "hash": doc_dict.get("hash"),
+                        "text": doc_dict.get("text"),
+                        "order_index": index,
+                        "metadata_json": doc_dict.get("metadata_json"),
+                        "metadata": metadata,
+                        "date_note": doc_dict.get("date_note"),
+                    }
+                )
+                if not patient_icn and doc_dict.get("patient_icn"):
+                    patient_icn = doc_dict.get("patient_icn")
+            if not patient_icn:
+                raise ValueError(
+                    f"Could not determine patient identifier for preselected unit {unit_id}"
+                )
+            payload = {
+                "metadata_json": ordered[0].get("metadata_json") if ordered else None,
+                "metadata": ordered[0].get("metadata") if ordered else None,
+                "strata_key": strata_key,
+                "note_count": len(ordered),
+                "documents": ordered,
+                "display_label": unit_id,
+            }
+            if selection_reason:
+                payload["selection_reason"] = selection_reason
+            yield CandidateUnit(str(unit_id), str(patient_icn), None, strata_key, payload)
+
+    def _fetch_documents_by_ids(
+        self, corpus_conn: sqlite3.Connection, doc_ids: Sequence[str]
+    ) -> dict[str, sqlite3.Row]:
+        unique_ids = [doc_id for doc_id in dict.fromkeys(doc_ids) if doc_id]
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unique_ids)
+        cursor = corpus_conn.execute(
+            f"""
+            SELECT doc_id, patient_icn, date_note, hash, text, metadata_json
+            FROM documents
+            WHERE doc_id IN ({placeholders})
+            """,
+            unique_ids,
+        )
+        return {str(row["doc_id"]): row for row in cursor.fetchall()}
+
+    def _fetch_patient_documents(
+        self, corpus_conn: sqlite3.Connection, patient_icn: str
+    ) -> list[sqlite3.Row]:
+        cursor = corpus_conn.execute(
+            """
+            SELECT doc_id, patient_icn, date_note, hash, text, metadata_json
+            FROM documents
+            WHERE patient_icn=?
+            """,
+            (patient_icn,),
+        )
+        rows = cursor.fetchall()
+        return sorted(
+            rows,
+            key=lambda item: (_date_sort_value(item["date_note"]), item["doc_id"]),
+        )
+
     def _compute_strata_key(self, row: sqlite3.Row | dict, aliases: Sequence[str]) -> str:
         if not aliases:
             return "default"
@@ -495,10 +725,14 @@ class RoundBuilder:
         overlap_n: int,
         total_n: int | None,
         strat_config: dict | None,
+        preserve_input_order: bool = False,
     ) -> dict[str, list[AssignmentUnit]]:
         by_strata: dict[str, list[CandidateUnit]] = defaultdict(list)
+        strata_order: list[str] = []
         for candidate in candidates:
             by_strata[candidate.strata_key].append(candidate)
+            if preserve_input_order and candidate.strata_key not in strata_order:
+                strata_order.append(candidate.strata_key)
         assignments: dict[str, list[AssignmentUnit]] = {rid: [] for rid in reviewers}
         stratified = self._stratification_requested(strat_config)
         if stratified and total_n is not None and len(by_strata) > total_n:
@@ -531,9 +765,13 @@ class RoundBuilder:
                 active = next_active if remaining > 0 else []
         assigned_total = 0
         selected_by_strata: dict[str, list[CandidateUnit]] = {}
-        for strata_key in sorted(by_strata.keys()):
+        strata_keys = strata_order if preserve_input_order and strata_order else sorted(by_strata.keys())
+        for strata_key in strata_keys:
             strata_candidates = by_strata[strata_key]
-            shuffled = deterministic_choice(strata_candidates, stable_hash(rng_seed, strata_key))
+            if preserve_input_order:
+                shuffled = list(strata_candidates)
+            else:
+                shuffled = deterministic_choice(strata_candidates, stable_hash(rng_seed, strata_key))
             take = allocations.get(strata_key, len(strata_candidates))
             if total_n is not None and assigned_total + take > target_total:
                 take = max(0, target_total - assigned_total)

@@ -146,6 +146,49 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
     return builder, project_root
 
 
+def test_generate_round_with_preselected_csv(seeded_project: tuple[RoundBuilder, Path], tmp_path: Path) -> None:
+    builder, project_root = seeded_project
+    config = {
+        "round_number": 2,
+        "round_id": "ph_test_r2",
+        "labelset_id": "ls_test",
+        "corpus_id": "cor_ph_test",
+        "reviewers": [
+            {"id": "rev_one", "name": "Reviewer One"},
+            {"id": "rev_two", "name": "Reviewer Two"},
+        ],
+        "overlap_n": 0,
+        "rng_seed": 321,
+        "total_n": 2,
+        "status": "draft",
+    }
+    config_path = tmp_path / "ph_test_r2.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    csv_path = tmp_path / "ai_next_batch.csv"
+    csv_path.write_text(
+        "unit_id,doc_id,patient_icn,selection_reason\n"
+        "doc_0,doc_0,p0,seeded\n"
+        "doc_2,doc_2,p2,seeded\n",
+        encoding="utf-8",
+    )
+
+    result = builder.generate_round(
+        "ph_test",
+        config_path,
+        created_by="tester",
+        preselected_units_csv=csv_path,
+    )
+
+    round_dir = Path(result["round_dir"])
+    manifest_path = round_dir / "manifest.csv"
+    rows = list(csv.DictReader(manifest_path.open("r", encoding="utf-8")))
+    unit_ids = [row["unit_id"] for row in rows]
+    assert unit_ids == ["doc_0", "doc_2"]
+    stored_config = json.loads((round_dir / "round_config.json").read_text("utf-8"))
+    assert stored_config.get("preselected_units_csv") == str(csv_path)
+
+
 def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
     project_root = tmp_path / "Project"
     paths = init_project(project_root, "proj", "Project", "tester")
@@ -278,6 +321,118 @@ def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
                 ).fetchone()
                 assert doc_row is not None
                 assert doc_row["text"]
+
+
+def test_generate_round_with_preselected_multi_doc(tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    with get_connection(paths.project_db) as conn:
+        register_reviewer(conn, "rev_one", "Reviewer One")
+        add_project_corpus(
+            conn,
+            corpus_id="cor_multi",
+            project_id="proj",
+            name="Multi corpus",
+            relative_path="corpora/multi/corpus.db",
+        )
+        add_phenotype(
+            conn,
+            pheno_id="ph_multi",
+            project_id="proj",
+            name="Multi phenotype",
+            level="multi_doc",
+            storage_path="phenotypes/ph_multi",
+        )
+        add_labelset(
+            conn,
+            labelset_id="ls_multi",
+            project_id="proj",
+            pheno_id="ph_multi",
+            version=1,
+            created_by="tester",
+            notes=None,
+            labels=[
+                {
+                    "label_id": "Flag",
+                    "name": "Flag",
+                    "type": "boolean",
+                    "required": False,
+                    "options": [
+                        {"value": "yes", "display": "Yes"},
+                        {"value": "no", "display": "No"},
+                    ],
+                }
+            ],
+        )
+        conn.commit()
+
+    corpus_db = project_root / "corpora" / "multi" / "corpus.db"
+    corpus_db.parent.mkdir(parents=True, exist_ok=True)
+    with initialize_corpus_db(corpus_db) as corpus_conn:
+        corpus_conn.execute(
+            "INSERT INTO patients(patient_icn) VALUES (?)",
+            ("multi_p0",),
+        )
+        for idx in range(2):
+            corpus_conn.execute(
+                """
+                INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (
+                    f"doc_m_{idx}",
+                    "multi_p0",
+                    f"2020-01-0{idx+1}",
+                    f"hash{idx}",
+                    f"Example text {idx}",
+                    json.dumps({"note_idx": idx}, sort_keys=True),
+                ),
+            )
+        corpus_conn.commit()
+
+    builder = RoundBuilder(project_root)
+    config = {
+        "round_number": 1,
+        "labelset_id": "ls_multi",
+        "corpus_id": "cor_multi",
+        "reviewers": [{"id": "rev_one", "name": "Reviewer One"}],
+        "overlap_n": 0,
+        "rng_seed": 5,
+        "total_n": 1,
+    }
+    config_path = tmp_path / "ph_multi_round.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    csv_path = tmp_path / "ai_multi.csv"
+    csv_path.write_text(
+        "unit_id,doc_id,patient_icn\n"
+        "multi_p0,doc_m_0,multi_p0\n"
+        "multi_p0,doc_m_1,multi_p0\n",
+        encoding="utf-8",
+    )
+
+    result = builder.generate_round(
+        "ph_multi",
+        config_path,
+        created_by="tester",
+        preselected_units_csv=csv_path,
+    )
+
+    round_dir = Path(result["round_dir"])
+    assignment_db = round_dir / "assignments" / "rev_one" / "assignment.db"
+    with sqlite3.connect(assignment_db) as conn:
+        conn.row_factory = sqlite3.Row
+        note_count = conn.execute(
+            "SELECT note_count FROM units WHERE unit_id=?",
+            ("multi_p0",),
+        ).fetchone()
+        assert note_count is not None and note_count["note_count"] == 2
+        doc_rows = conn.execute(
+            "SELECT doc_id FROM unit_notes WHERE unit_id=? ORDER BY order_index",
+            ("multi_p0",),
+        ).fetchall()
+        assert [row["doc_id"] for row in doc_rows] == ["doc_m_0", "doc_m_1"]
 
 
 def test_round_builder_metadata_filters_single_doc(seeded_project: tuple[RoundBuilder, Path]) -> None:
