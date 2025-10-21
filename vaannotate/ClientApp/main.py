@@ -1679,21 +1679,33 @@ class AnnotationForm(QtWidgets.QScrollArea):
 
     def _current_values(self) -> Dict[str, object]:
         values: Dict[str, object] = {}
+
+        def _record_value(definition: LabelDefinition, value: object) -> None:
+            keys = {definition.name}
+            if definition.label_id:
+                keys.add(definition.label_id)
+            for key in keys:
+                values[key] = value
+
         for label_id, widgets in self.label_widgets.items():
             definition: LabelDefinition = widgets["definition"]  # type: ignore[index]
             if "button_group" in widgets:
                 group: QtWidgets.QButtonGroup = widgets["button_group"]  # type: ignore[assignment]
                 for button in group.buttons():
                     if button.isChecked():
-                        values[definition.name] = button.property("option_value")
+                        _record_value(definition, button.property("option_value"))
                         break
             if "checkboxes" in widgets:
-                selected = [cb.property("option_value") for cb in widgets["checkboxes"] if cb.isChecked()]  # type: ignore[index]
-                values[definition.name] = selected
+                selected = [
+                    cb.property("option_value")
+                    for cb in widgets["checkboxes"]
+                    if cb.isChecked()
+                ]  # type: ignore[index]
+                _record_value(definition, selected)
             if "line_edit" in widgets:
-                values[definition.name] = widgets["line_edit"].text()  # type: ignore[index]
+                _record_value(definition, widgets["line_edit"].text())  # type: ignore[index]
             if "text_edit" in widgets:
-                values[definition.name] = widgets["text_edit"].toPlainText()  # type: ignore[index]
+                _record_value(definition, widgets["text_edit"].toPlainText())  # type: ignore[index]
         return values
 
     def _is_label_visible(self, definition: LabelDefinition, values: Dict[str, object]) -> bool:
@@ -1702,11 +1714,14 @@ class AnnotationForm(QtWidgets.QScrollArea):
             return True
         try:
             field, expected = expr.split("==")
-            field = field.strip()
-            expected = expected.strip().strip("'\"")
-            return str(values.get(field, "")) == expected
         except ValueError:
             return True
+        field = field.strip()
+        expected = expected.strip().strip("'\"")
+        value = values.get(field, "")
+        if isinstance(value, list):
+            return expected in value
+        return str(value) == expected
 
     def _has_value(self, widgets: Dict[str, object]) -> bool:
         if "na_box" in widgets and widgets["na_box"].isChecked():  # type: ignore[index]
