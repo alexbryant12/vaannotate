@@ -197,9 +197,75 @@ def _normalize_reviewer_id(assignment_path: Path) -> str:
     return name
 
 
-def _read_round_annotations(round_dir: Path, pheno_id: str, round_number: int) -> pd.DataFrame:
+def _load_label_rules(project_root: Path, pheno_id: str, round_number: int) -> Dict[str, str]:
+    project_db = Path(project_root) / "project.db"
+    if not project_db.exists():
+        return {}
+
+    con = sqlite3.connect(str(project_db))
+    try:
+        con.row_factory = sqlite3.Row
+        labelset_row = con.execute(
+            "SELECT labelset_id FROM rounds WHERE pheno_id=? AND round_number=?",
+            (pheno_id, round_number),
+        ).fetchone()
+        if not labelset_row:
+            return {}
+
+        labelset_id = labelset_row["labelset_id"]
+        if not labelset_id:
+            return {}
+
+        rows = con.execute(
+            "SELECT label_id, rules FROM labels WHERE labelset_id=?",
+            (labelset_id,),
+        ).fetchall()
+    finally:
+        con.close()
+
+    return {
+        str(row["label_id"] or ""): str(row["rules"] or "")
+        for row in rows
+        if row["label_id"]
+    }
+
+
+def _load_change_history(round_dir: Path, round_id: str) -> Dict[Tuple[str, str, str], str]:
+    agg_path = round_dir / "round_aggregate.db"
+    if not agg_path.exists():
+        return {}
+
+    con = sqlite3.connect(str(agg_path))
+    try:
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                "SELECT unit_id, reviewer_id, label_id, history FROM annotation_change_history WHERE round_id=?",
+                (round_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+    finally:
+        con.close()
+
+    history: Dict[Tuple[str, str, str], str] = {}
+    for row in rows:
+        unit_id = str(row["unit_id"] or "")
+        reviewer_id = str(row["reviewer_id"] or "")
+        label_id = str(row["label_id"] or "")
+        if not unit_id or not reviewer_id or not label_id:
+            continue
+        history[(unit_id, reviewer_id, label_id)] = str(row["history"] or "")
+    return history
+
+
+def _read_round_annotations(
+    round_dir: Path, pheno_id: str, round_number: int, project_root: Path
+) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     round_id = f"{pheno_id}_r{round_number}"
+    label_rules = _load_label_rules(project_root, pheno_id, round_number)
+    change_history = _load_change_history(round_dir, round_id)
 
     for assignment_path in _iter_assignment_dbs(round_dir):
         reviewer_id = _normalize_reviewer_id(assignment_path)
@@ -212,40 +278,6 @@ def _read_round_annotations(round_dir: Path, pheno_id: str, round_number: int) -
                     "doc_id": str(row["doc_id"] or ""),
                 }
                 for row in con.execute("SELECT unit_id, patient_icn, doc_id FROM units")
-            }
-
-            doc_rows = con.execute(
-                """
-                SELECT unit_notes.unit_id, unit_notes.doc_id, unit_notes.order_index,
-                       documents.text, documents.metadata_json
-                FROM unit_notes
-                LEFT JOIN documents ON documents.doc_id = unit_notes.doc_id
-                ORDER BY unit_notes.unit_id, unit_notes.order_index
-                """
-            ).fetchall()
-
-            docs_by_unit: Dict[str, List[Dict[str, Any]]] = {}
-            for row in doc_rows:
-                unit_id = str(row["unit_id"] or "")
-                doc_id = str(row["doc_id"] or "")
-                if not unit_id:
-                    continue
-                entries = docs_by_unit.setdefault(unit_id, [])
-                entries.append(
-                    {
-                        "doc_id": doc_id,
-                        "order_index": int(row["order_index"] or 0),
-                        "text": str(row["text"] or ""),
-                        "metadata_json": str(row["metadata_json"] or ""),
-                    }
-                )
-
-            documents = {
-                str(row["doc_id"] or ""): {
-                    "text": str(row["text"] or ""),
-                    "metadata_json": str(row["metadata_json"] or ""),
-                }
-                for row in con.execute("SELECT doc_id, text, metadata_json FROM documents")
             }
 
             rationale_rows = con.execute(
@@ -272,60 +304,6 @@ def _read_round_annotations(round_dir: Path, pheno_id: str, round_number: int) -
                 label_id = str(ann["label_id"] or "")
                 if not unit_id or not label_id:
                     continue
-                unit_meta = units.get(unit_id, {})
-                patient_icn = unit_meta.get("patient_icn", "")
-                primary_doc_id = unit_meta.get("doc_id", "")
-                doc_entries = sorted(
-                    docs_by_unit.get(unit_id, []), key=lambda entry: entry.get("order_index", 0)
-                )
-                ordered_doc_ids = [entry.get("doc_id", "") for entry in doc_entries if entry.get("doc_id")]
-
-                if primary_doc_id and primary_doc_id not in ordered_doc_ids:
-                    ordered_doc_ids.append(primary_doc_id)
-                    doc_entries.append(
-                        {
-                            "doc_id": primary_doc_id,
-                            "order_index": len(doc_entries),
-                            **documents.get(primary_doc_id, {"text": "", "metadata_json": ""}),
-                        }
-                    )
-
-                normalized_rationales = rationales.get((unit_id, label_id), [])
-                rationale_doc_ids = {
-                    entry.get("doc_id") or "" for entry in normalized_rationales if entry is not None
-                }
-                for doc_id in rationale_doc_ids:
-                    if doc_id and doc_id not in ordered_doc_ids:
-                        ordered_doc_ids.append(doc_id)
-                        doc_entries.append(
-                            {
-                                "doc_id": doc_id,
-                                "order_index": len(doc_entries),
-                                **documents.get(doc_id, {"text": "", "metadata_json": ""}),
-                            }
-                        )
-
-                if not ordered_doc_ids:
-                    ordered_doc_ids = [""]
-                    doc_entries.append(
-                        {
-                            "doc_id": "",
-                            "order_index": 0,
-                            "text": "",
-                            "metadata_json": "",
-                        }
-                    )
-
-                # Deduplicate doc entries while preserving order
-                seen_docs: set[str] = set()
-                ordered_entries: List[Dict[str, Any]] = []
-                for entry in doc_entries:
-                    doc_id = str(entry.get("doc_id") or "")
-                    if doc_id in seen_docs:
-                        continue
-                    seen_docs.add(doc_id)
-                    ordered_entries.append(entry)
-
                 value = ann["value"]
                 value_str = "" if value is None else str(value)
                 value_num = ann["value_num"]
@@ -339,48 +317,39 @@ def _read_round_annotations(round_dir: Path, pheno_id: str, round_number: int) -
                 value_date = "" if ann["value_date"] is None else str(ann["value_date"])
                 notes = "" if ann["notes"] is None else str(ann["notes"])
                 na_flag = 1 if ann["na"] else 0
+                unit_meta = units.get(unit_id, {})
+                patient_icn = unit_meta.get("patient_icn", "")
+                doc_id = unit_meta.get("doc_id", "")
+                normalized_rationales = rationales.get((unit_id, label_id), [])
+                rationale_json = (
+                    json.dumps(normalized_rationales, ensure_ascii=False)
+                    if normalized_rationales
+                    else ""
+                )
 
-                for entry in ordered_entries:
-                    doc_id = str(entry.get("doc_id") or "")
-                    doc_text = str(entry.get("text") or "")
-                    metadata_json = str(entry.get("metadata_json") or "")
-                    if doc_id:
-                        doc_specific_rationales = [
-                            r
-                            for r in normalized_rationales
-                            if (r or {}).get("doc_id") == doc_id
-                        ]
-                    else:
-                        doc_specific_rationales = normalized_rationales
-                    rationale_json = (
-                        json.dumps(doc_specific_rationales, ensure_ascii=False)
-                        if doc_specific_rationales
-                        else ""
-                    )
-
-                    rows.append(
-                        {
-                            "round_id": round_id,
-                            "phenotype_id": pheno_id,
-                            "unit_id": unit_id,
-                            "doc_id": doc_id,
-                            "patient_icn": patient_icn,
-                            "reviewer_id": reviewer_id,
-                            "reviewer_name": "",
-                            "label_id": label_id,
-                            "label_name": "",
-                            "label_value": value_str,
-                            "label_value_num": value_num_str,
-                            "label_value_date": value_date,
-                            "label_na": na_flag,
-                            "reviewer_notes": notes,
-                            "rationales_json": rationale_json,
-                            "document_text": doc_text,
-                            "document_metadata_json": metadata_json,
-                            "label_rules": "",
-                            "label_change_history": "",
-                        }
-                    )
+                rows.append(
+                    {
+                        "round_id": round_id,
+                        "phenotype_id": pheno_id,
+                        "unit_id": unit_id,
+                        "doc_id": doc_id,
+                        "patient_icn": patient_icn,
+                        "reviewer_id": reviewer_id,
+                        "reviewer_name": "",
+                        "label_id": label_id,
+                        "label_name": "",
+                        "label_value": value_str,
+                        "label_value_num": value_num_str,
+                        "label_value_date": value_date,
+                        "label_na": na_flag,
+                        "reviewer_notes": notes,
+                        "rationales_json": rationale_json,
+                        "document_text": "",
+                        "document_metadata_json": "",
+                        "label_rules": label_rules.get(label_id, ""),
+                        "label_change_history": change_history.get((unit_id, reviewer_id, label_id), ""),
+                    }
+                )
         finally:
             con.close()
 
@@ -419,7 +388,7 @@ def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: Lis
         round_dir = phenotype_dir / "rounds" / f"round_{r}"
         if not round_dir.exists():
             continue
-        frame = _read_round_annotations(round_dir, pheno_id, r)
+        frame = _read_round_annotations(round_dir, pheno_id, r, root)
         if not frame.empty:
             ann_frames.append(frame)
 
