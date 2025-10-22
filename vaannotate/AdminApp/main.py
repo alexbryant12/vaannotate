@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import uuid
 import tempfile
+from collections.abc import Mapping as ABCMapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +37,7 @@ from vaannotate.shared.sampling import (
 from vaannotate.shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
 from vaannotate.shared.theme import apply_dark_palette
 from vaannotate.corpus import TABULAR_EXTENSIONS, import_tabular_corpus
-from vaannotate.project import init_project
+from vaannotate.project import build_label_config, fetch_labelset, init_project
 from vaannotate.utils import copy_sqlite_database, ensure_dir
 from vaannotate.rounds import RoundBuilder
 from vaannotate.vaannotate_ai_backend import BackendResult, run_ai_backend_and_collect
@@ -137,6 +138,12 @@ class AIRoundWorker(QtCore.QObject):
     def run(self) -> None:  # noqa: D401 - Qt slot
         try:
             ensure_dir(self.job.round_dir)
+            label_config_payload, label_config_path = self._prepare_label_config()
+            if self.finalize and label_config_payload and label_config_path:
+                try:
+                    self._write_label_config(label_config_path, label_config_payload)
+                except Exception as exc:  # noqa: BLE001
+                    self.log_message.emit(f"Warning: failed to write label_config.json ({exc})")
             result = run_ai_backend_and_collect(
                 self.project_root,
                 self.job.context.pheno_id,
@@ -146,6 +153,7 @@ class AIRoundWorker(QtCore.QObject):
                 self.job.context.created_by,
                 timestamp=self.job.timestamp,
                 cfg_overrides=self.cfg_overrides,
+                label_config=label_config_payload,
                 log_callback=self.log_message.emit,
             )
             payload: Dict[str, object] = {"backend_result": result}
@@ -173,6 +181,60 @@ class AIRoundWorker(QtCore.QObject):
         finally:
             if self.cleanup_dir:
                 shutil.rmtree(self.job.round_dir, ignore_errors=True)
+
+    def _prepare_label_config(self) -> Tuple[Optional[Dict[str, object]], Optional[Path]]:
+        context = self.job.context
+        project_db = self.project_root / "project.db"
+        try:
+            with sqlite3.connect(project_db) as conn:
+                conn.row_factory = sqlite3.Row
+                labelset = fetch_labelset(conn, context.labelset_id)
+        except Exception as exc:  # noqa: BLE001
+            self.log_message.emit(f"Warning: unable to build label_config ({exc})")
+            return None, None
+        generated = build_label_config(labelset)
+        config_path = self.project_root / "phenotypes" / context.pheno_id / "ai" / "label_config.json"
+        existing_payload: Dict[str, object] = {}
+        if config_path.exists():
+            try:
+                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing_payload = loaded
+            except Exception as exc:  # noqa: BLE001
+                self.log_message.emit(f"Warning: failed to parse existing label_config.json ({exc})")
+        merged = self._merge_label_config(existing_payload, generated)
+        return merged, config_path
+
+    @staticmethod
+    def _merge_label_config(
+        existing: Dict[str, object], generated: Dict[str, object]
+    ) -> Dict[str, object]:
+        merged: Dict[str, object] = dict(existing)
+        for key, value in generated.items():
+            if key == "_meta":
+                meta: Dict[str, object] = {}
+                existing_meta = merged.get("_meta")
+                if isinstance(existing_meta, dict):
+                    meta.update(existing_meta)
+                if isinstance(value, dict):
+                    meta.update(value)
+                merged["_meta"] = meta
+                continue
+            if isinstance(value, dict):
+                entry: Dict[str, object] = {}
+                existing_entry = merged.get(key)
+                if isinstance(existing_entry, dict):
+                    entry.update(existing_entry)
+                entry.update(value)
+                merged[key] = entry
+            else:
+                merged[key] = value
+        return merged
+
+    def _write_label_config(self, path: Path, payload: Dict[str, object]) -> None:
+        ensure_dir(path.parent)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.log_message.emit(f"Updated label_config.json at {path}")
 
     def _prepare_labelset_and_reviewers(self) -> None:
         context = self.job.context
@@ -686,6 +748,63 @@ class ProjectContext(QtCore.QObject):
                 (labelset_id,),
             ).fetchone()
         return row
+
+    def load_labelset_details(self, labelset_id: str) -> Optional[Dict[str, object]]:
+        db = self.require_db()
+        with db.connect() as conn:
+            try:
+                return fetch_labelset(conn, labelset_id)
+            except ValueError:
+                return None
+
+    def list_all_label_ids(self) -> Set[str]:
+        db = self.require_db()
+        with db.connect() as conn:
+            rows = conn.execute("SELECT label_id FROM labels").fetchall()
+        return {str(row["label_id"]) for row in rows if row["label_id"]}
+
+    def list_label_sets_for_pheno(self, pheno_id: str) -> List[Dict[str, object]]:
+        db = self.require_db()
+        with db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ls.*, COUNT(lbl.label_id) AS label_count
+                FROM label_sets ls
+                LEFT JOIN labels lbl ON lbl.labelset_id = ls.labelset_id
+                WHERE ls.pheno_id = ? OR ls.labelset_id IN (
+                    SELECT labelset_id FROM rounds WHERE pheno_id = ?
+                )
+                GROUP BY ls.labelset_id
+                ORDER BY ls.created_at DESC
+                """,
+                (pheno_id, pheno_id),
+            ).fetchall()
+            round_counts = conn.execute(
+                """
+                SELECT labelset_id, COUNT(*) AS round_count
+                FROM rounds
+                WHERE pheno_id=?
+                GROUP BY labelset_id
+                """,
+                (pheno_id,),
+            ).fetchall()
+        round_map = {str(row["labelset_id"]): int(row["round_count"]) for row in round_counts}
+        results: List[Dict[str, object]] = []
+        for row in rows:
+            record = dict(row)
+            labelset_id = str(record.get("labelset_id") or "")
+            label_count = int(record.get("label_count") or 0)
+            assigned = str(record.get("pheno_id") or "") == pheno_id
+            results.append(
+                {
+                    "labelset": record,
+                    "labelset_id": labelset_id,
+                    "label_count": label_count,
+                    "round_count": round_map.get(labelset_id, 0),
+                    "assigned_to_pheno": assigned,
+                }
+            )
+        return results
 
     def get_round(self, round_id: str) -> Optional[sqlite3.Row]:
         db = self.require_db()
@@ -1309,6 +1428,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         self.setWindowTitle("Create label set")
         self.resize(520, 640)
         self._setup_ui()
+        self._populate_copy_sources()
 
     def _setup_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
@@ -1316,6 +1436,10 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         self.id_edit = QtWidgets.QLineEdit()
         self.id_edit.setPlaceholderText("Unique label set ID")
         form.addRow("Label set ID", self.id_edit)
+        self.copy_combo = QtWidgets.QComboBox()
+        self.copy_combo.addItem("Start from blank", None)
+        self.copy_combo.currentIndexChanged.connect(self._on_copy_source_changed)
+        form.addRow("Copy from", self.copy_combo)
         self.creator_edit = QtWidgets.QLineEdit()
         creator_default = "admin"
         if self.ctx.project_row and self.ctx.project_row.get("created_by"):
@@ -1356,12 +1480,250 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
 
+    def _populate_copy_sources(self) -> None:
+        if not hasattr(self, "copy_combo"):
+            return
+        self.copy_combo.blockSignals(True)
+        self.copy_combo.clear()
+        self.copy_combo.addItem("Start from blank", None)
+        for row in self.ctx.list_label_sets():
+            labelset_id = str(row["labelset_id"])
+            created_at = ""
+            if "created_at" in row.keys() and row["created_at"]:
+                created_at = str(row["created_at"])
+            notes = ""
+            if "notes" in row.keys() and row["notes"]:
+                notes = str(row["notes"]).strip()
+            display = labelset_id
+            if created_at:
+                display += f" ({created_at})"
+            if notes:
+                display += f" — {notes}"
+            self.copy_combo.addItem(display, labelset_id)
+        self.copy_combo.blockSignals(False)
+        self.copy_combo.setCurrentIndex(0)
+
+    def _on_copy_source_changed(self, index: int) -> None:
+        if index <= 0:
+            return
+        labelset_id = self.copy_combo.itemData(index)
+        if not isinstance(labelset_id, str):
+            return
+        payload = self.ctx.load_labelset_details(labelset_id)
+        if not payload:
+            return
+        self._apply_copied_labelset(payload)
+
+    def _generate_unique_label_id(self, base_id: str, used_ids: Set[str]) -> str:
+        sanitized = re.sub(r"\s+", "_", base_id.strip()) if base_id.strip() else "label"
+        candidate = sanitized
+        if candidate in used_ids:
+            suffix = 2
+            candidate = f"{sanitized}_copy"
+            while candidate in used_ids:
+                candidate = f"{sanitized}_{suffix}"
+                suffix += 1
+        used_ids.add(candidate)
+        return candidate
+
+    def _apply_copied_labelset(self, payload: Dict[str, object]) -> None:
+        used_ids = set(self.ctx.list_all_label_ids())
+        new_labels: List[Dict[str, object]] = []
+        id_map: Dict[str, str] = {}
+        raw_labels = payload.get("labels") or []
+        if isinstance(raw_labels, list):
+            for label in raw_labels:
+                if not isinstance(label, (dict, ABCMapping)):
+                    continue
+                label_data = dict(label)
+                old_id = str(label_data.get("label_id") or "")
+                new_id = self._generate_unique_label_id(old_id, used_ids)
+                id_map[old_id] = new_id
+                label_data["label_id"] = new_id
+                options_payload: List[Dict[str, object]] = []
+                options = label_data.get("options")
+                if isinstance(options, list):
+                    for option in options:
+                        if not isinstance(option, (dict, ABCMapping)):
+                            continue
+                        option_data = dict(option)
+                        option_data.pop("option_id", None)
+                        options_payload.append(option_data)
+                label_data["options"] = options_payload
+                new_labels.append(label_data)
+        for label in new_labels:
+            expr = label.get("gating_expr")
+            if not isinstance(expr, str) or not expr.strip():
+                continue
+            updated = expr
+            for old_id, new_id in id_map.items():
+                if not old_id:
+                    continue
+                updated = re.sub(rf"\b{re.escape(old_id)}\b", new_id, updated)
+            label["gating_expr"] = updated
+        self.labels = new_labels
+        self._refresh_label_list()
+        if self.labels:
+            self.label_list.setCurrentRow(0)
+        notes_text = str(payload.get("notes") or "").strip()
+        self.notes_edit.setPlainText(notes_text)
+        creator_text = str(payload.get("created_by") or "").strip()
+        if creator_text:
+            self.creator_edit.setText(creator_text)
+        base_labelset_id = str(payload.get("labelset_id") or "").strip()
+        if base_labelset_id:
+            self.id_edit.setPlaceholderText(f"{base_labelset_id}_copy")
+
     def _refresh_label_list(self) -> None:
         self.label_list.clear()
         for label in self.labels:
             summary = f"{label['name']} ({label['type']})"
             item = QtWidgets.QListWidgetItem(summary)
             self.label_list.addItem(item)
+
+
+class PhenotypeLabelSetsDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        ctx: ProjectContext,
+        pheno: Dict[str, object],
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.ctx = ctx
+        self.pheno = dict(pheno)
+        self.pheno_id = str(self.pheno.get("pheno_id") or "")
+        self.pheno_name = str(self.pheno.get("name") or self.pheno_id)
+        self._entries: List[Dict[str, object]] = []
+        self.setWindowTitle(f"Label sets • {self.pheno_name}")
+        self.resize(720, 520)
+        self._setup_ui()
+        self._load_labelsets()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        description = QtWidgets.QLabel(
+            "View label sets associated with this phenotype, including gating dependencies."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setHorizontalHeaderLabels(
+            ["Label set", "Labels", "Created", "Created by", "Association"]
+        )
+        layout.addWidget(self.table)
+
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setHeaderLabels(["Label", "Type", "Gate"])
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        layout.addWidget(self.tree)
+
+        self.notes_view = QtWidgets.QPlainTextEdit()
+        self.notes_view.setPlaceholderText("Notes")
+        self.notes_view.setReadOnly(True)
+        layout.addWidget(self.notes_view)
+
+        self.button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
+
+    def _load_labelsets(self) -> None:
+        self._entries = self.ctx.list_label_sets_for_pheno(self.pheno_id)
+        self.table.setRowCount(len(self._entries))
+        for row_index, entry in enumerate(self._entries):
+            record = entry.get("labelset", {})
+            labelset_id = entry.get("labelset_id", "")
+            label_count = entry.get("label_count", 0)
+            created = str(record.get("created_at") or "")
+            created_by = str(record.get("created_by") or "")
+            association_parts: List[str] = []
+            if entry.get("assigned_to_pheno"):
+                association_parts.append("Assigned")
+            rounds_used = entry.get("round_count", 0)
+            if rounds_used:
+                association_parts.append(f"Used in {rounds_used} round(s)")
+            association = ", ".join(association_parts) if association_parts else "Available"
+            item = QtWidgets.QTableWidgetItem(labelset_id)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, labelset_id)
+            self.table.setItem(row_index, 0, item)
+            self.table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(str(label_count)))
+            self.table.setItem(row_index, 2, QtWidgets.QTableWidgetItem(created))
+            self.table.setItem(row_index, 3, QtWidgets.QTableWidgetItem(created_by))
+            self.table.setItem(row_index, 4, QtWidgets.QTableWidgetItem(association))
+        self.table.resizeColumnsToContents()
+        if self._entries:
+            self.table.selectRow(0)
+            self._show_labelset_details(0)
+        else:
+            self._show_labelset_details(None)
+
+    def _on_selection_changed(self) -> None:
+        selection = self.table.selectionModel().selectedRows()
+        if selection:
+            self._show_labelset_details(selection[0].row())
+        else:
+            self._show_labelset_details(None)
+
+    def _show_labelset_details(self, row: Optional[int]) -> None:
+        self.tree.clear()
+        self.notes_view.clear()
+        if row is None or row < 0 or row >= len(self._entries):
+            return
+        entry = self._entries[row]
+        labelset_id = entry.get("labelset_id")
+        if not isinstance(labelset_id, str):
+            return
+        details = self.ctx.load_labelset_details(labelset_id)
+        if not isinstance(details, dict):
+            return
+        notes = str(details.get("notes") or "").strip()
+        if notes:
+            self.notes_view.setPlainText(notes)
+        config = build_label_config(details)
+        meta = config.get("_meta") if isinstance(config, dict) else {}
+        tree_payload = meta.get("dependency_tree") if isinstance(meta, dict) else None
+        if isinstance(tree_payload, list) and tree_payload:
+            for node in tree_payload:
+                if isinstance(node, dict):
+                    item = self._build_tree_item(node)
+                    self.tree.addTopLevelItem(item)
+            self.tree.expandAll()
+        else:
+            labels = details.get("labels") if isinstance(details.get("labels"), list) else []
+            for label in labels:  # type: ignore[assignment]
+                if not isinstance(label, dict):
+                    continue
+                label_id = str(label.get("label_id") or "")
+                name = str(label.get("name") or "")
+                display = f"{label_id} — {name}" if name else label_id
+                gate = str(label.get("gating_expr") or "")
+                item = QtWidgets.QTreeWidgetItem([display, str(label.get("type") or ""), gate])
+                self.tree.addTopLevelItem(item)
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+
+    def _build_tree_item(self, node: Dict[str, object]) -> QtWidgets.QTreeWidgetItem:
+        label_id = str(node.get("label_id") or "")
+        name = str(node.get("name") or "")
+        display = f"{label_id} — {name}" if name else label_id
+        gate = str(node.get("condition") or "")
+        item = QtWidgets.QTreeWidgetItem([display, str(node.get("type") or ""), gate])
+        children = node.get("children")
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    child_item = self._build_tree_item(child)
+                    item.addChild(child_item)
+        return item
 
     def _add_label(self) -> None:
         existing_ids = {label["label_id"] for label in self.labels}
@@ -2979,6 +3341,8 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             delete_action = menu.addAction("Delete corpus…")
             delete_action.triggered.connect(lambda: self._delete_corpus(item))
         elif node_type == "phenotype":
+            view_labelsets_action = menu.addAction("View label sets…")
+            view_labelsets_action.triggered.connect(lambda: self._view_labelsets(item))
             action = menu.addAction("Add round…")
             action.triggered.connect(lambda: self._add_round(item))
             delete_action = menu.addAction("Delete phenotype…")
@@ -3054,6 +3418,24 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             "Label set",
             f"Label set '{values.get('labelset_id')}' created.",
         )
+
+    def _view_labelsets(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
+        pheno = data.get("pheno")
+        if isinstance(pheno, dict):
+            pheno_data = pheno
+        elif pheno is not None:
+            try:
+                pheno_data = dict(pheno)
+            except Exception:  # noqa: BLE001
+                pheno_data = {}
+        else:
+            pheno_data = {}
+        pheno_id = str(pheno_data.get("pheno_id") or "")
+        if not pheno_id:
+            return
+        dialog = PhenotypeLabelSetsDialog(self.ctx, pheno_data, self)
+        dialog.exec()
 
     def _add_round(self, item: QtWidgets.QTreeWidgetItem) -> None:
         data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
