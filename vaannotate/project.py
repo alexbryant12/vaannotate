@@ -1,11 +1,13 @@
 """Project level helpers."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .schema import initialize_project_db
 from .utils import ensure_dir, canonical_json
@@ -200,3 +202,139 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
     labelset = dict(labelset_row)
     labelset["labels"] = label_dicts
     return labelset
+
+
+def _normalize_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip()).casefold()
+
+
+def _extract_condition_value(raw: str) -> Optional[str]:
+    text = raw.strip()
+    if not text:
+        return None
+    if text.startswith(("'", '"')) and text.endswith(("'", '"')) and len(text) >= 2:
+        return text[1:-1]
+    return text
+
+
+def build_label_config(labelset: dict) -> Dict[str, object]:
+    labels: Sequence[Dict[str, object]] = labelset.get("labels", [])  # type: ignore[assignment]
+    label_lookup: Dict[str, Dict[str, object]] = {}
+    name_lookup: Dict[str, str] = {}
+    order: List[str] = []
+    for entry in labels:
+        label_id = str(entry.get("label_id", "")).strip()
+        if not label_id:
+            continue
+        label_lookup[label_id] = dict(entry)
+        order.append(label_id)
+        name = str(entry.get("name", "")).strip()
+        if name:
+            name_lookup[_normalize_name(name)] = label_id
+
+    parent_map: Dict[str, List[Dict[str, object]]] = {}
+    children_map: Dict[str, List[Dict[str, object]]] = {}
+    for entry in labels:
+        label_id = str(entry.get("label_id", "")).strip()
+        if not label_id:
+            continue
+        gating_expr = str(entry.get("gating_expr") or "").strip()
+        if "==" not in gating_expr:
+            continue
+        lhs, _, rhs = gating_expr.partition("==")
+        field_key = lhs.strip()
+        if not field_key:
+            continue
+        parent_id: Optional[str] = None
+        if field_key in label_lookup:
+            parent_id = field_key
+        else:
+            normalized = _normalize_name(field_key)
+            parent_id = name_lookup.get(normalized)
+        if not parent_id or parent_id == label_id:
+            continue
+        condition_value = _extract_condition_value(rhs)
+        relationship = {"label_id": parent_id, "expression": gating_expr}
+        if condition_value is not None:
+            relationship["value"] = condition_value
+        parent_map.setdefault(label_id, []).append(relationship)
+        child_rel = {"label_id": label_id, "expression": gating_expr}
+        if condition_value is not None:
+            child_rel["value"] = condition_value
+        children_map.setdefault(parent_id, []).append(child_rel)
+
+    def build_branch(label_id: str, visited: Tuple[str, ...]) -> Dict[str, object]:
+        node: Dict[str, object] = {
+            "label_id": label_id,
+            "name": label_lookup.get(label_id, {}).get("name"),
+            "type": label_lookup.get(label_id, {}).get("type"),
+            "children": [],
+        }
+        for rel in children_map.get(label_id, []):
+            child_id = str(rel.get("label_id"))
+            if not child_id or child_id in visited:
+                continue
+            branch = build_branch(child_id, visited + (child_id,))
+            branch["condition"] = rel.get("expression")
+            if rel.get("value") is not None:
+                branch["condition_value"] = rel.get("value")
+            node.setdefault("children", []).append(branch)
+        return node
+
+    root_candidates = [label_id for label_id in order if label_id not in parent_map]
+    if not root_candidates:
+        root_candidates = list(order)
+    dependency_tree = [build_branch(label_id, (label_id,)) for label_id in root_candidates]
+
+    config: Dict[str, object] = {
+        "_meta": {
+            "labelset_id": labelset.get("labelset_id"),
+            "labelset_name": labelset.get("labelset_name") or labelset.get("labelset_id"),
+            "notes": labelset.get("notes"),
+            "created_by": labelset.get("created_by"),
+            "created_at": labelset.get("created_at"),
+            "generated_at": datetime.utcnow().isoformat(),
+            "dependency_tree": dependency_tree,
+        }
+    }
+
+    for label_id in order:
+        label = label_lookup[label_id]
+        option_details = [
+            {
+                "value": opt.get("value"),
+                "display": opt.get("display"),
+                "weight": opt.get("weight"),
+                "order_index": opt.get("order_index"),
+            }
+            for opt in label.get("options", [])  # type: ignore[assignment]
+            if isinstance(opt, Mapping)
+        ]
+        options = [str(opt.get("value")) for opt in option_details if opt.get("value") is not None]
+        parents_payload = [
+            {k: rel[k] for k in ("label_id", "expression", "value") if k in rel}
+            for rel in parent_map.get(label_id, [])
+        ]
+        children_payload = [
+            {k: rel[k] for k in ("label_id", "expression", "value") if k in rel}
+            for rel in children_map.get(label_id, [])
+        ]
+        entry_payload: Dict[str, object] = {
+            "name": label.get("name"),
+            "type": label.get("type"),
+            "required": bool(label.get("required")),
+            "na_allowed": bool(label.get("na_allowed")),
+            "gating_expr": label.get("gating_expr"),
+            "rules": label.get("rules"),
+            "unit": label.get("unit"),
+            "range": {"min": label.get("min"), "max": label.get("max")},
+            "options": options,
+            "option_details": option_details,
+        }
+        if parents_payload:
+            entry_payload["parents"] = parents_payload
+        if children_payload:
+            entry_payload["children"] = children_payload
+        config[label_id] = entry_payload
+
+    return config
