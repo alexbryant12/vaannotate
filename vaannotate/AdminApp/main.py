@@ -1582,7 +1582,16 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             self.label_list.addItem(item)
 
     def _add_label(self) -> None:
-        existing_ids = {label.get("label_id") for label in self.labels if "label_id" in label}
+        existing_ids = {
+            str(label_id)
+            for label_id in self.ctx.list_all_label_ids()
+            if isinstance(label_id, str) and label_id
+        }
+        existing_ids.update(
+            str(label.get("label_id"))
+            for label in self.labels
+            if isinstance(label.get("label_id"), str) and label.get("label_id")
+        )
         dialog = LabelEditorDialog(existing_ids=existing_ids, parent=self)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
@@ -1594,7 +1603,16 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         row = self.label_list.currentRow()
         if row < 0 or row >= len(self.labels):
             return
-        existing_ids = {label.get("label_id") for label in self.labels if "label_id" in label}
+        existing_ids = {
+            str(label_id)
+            for label_id in self.ctx.list_all_label_ids()
+            if isinstance(label_id, str) and label_id
+        }
+        existing_ids.update(
+            str(label.get("label_id"))
+            for index, label in enumerate(self.labels)
+            if index != row and isinstance(label.get("label_id"), str) and label.get("label_id")
+        )
         dialog = LabelEditorDialog(existing_ids=existing_ids, data=self.labels[row], parent=self)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
