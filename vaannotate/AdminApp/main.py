@@ -1581,6 +1581,67 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             item = QtWidgets.QListWidgetItem(summary)
             self.label_list.addItem(item)
 
+    def _add_label(self) -> None:
+        existing_ids = {label.get("label_id") for label in self.labels if "label_id" in label}
+        dialog = LabelEditorDialog(existing_ids=existing_ids, parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self.labels.append(dialog.values())
+        self._refresh_label_list()
+        self.label_list.setCurrentRow(self.label_list.count() - 1)
+
+    def _edit_label(self) -> None:
+        row = self.label_list.currentRow()
+        if row < 0 or row >= len(self.labels):
+            return
+        existing_ids = {label.get("label_id") for label in self.labels if "label_id" in label}
+        dialog = LabelEditorDialog(existing_ids=existing_ids, data=self.labels[row], parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self.labels[row] = dialog.values()
+        self._refresh_label_list()
+        self.label_list.setCurrentRow(row)
+
+    def _remove_label(self) -> None:
+        row = self.label_list.currentRow()
+        if row < 0 or row >= len(self.labels):
+            return
+        del self.labels[row]
+        self._refresh_label_list()
+        if self.labels:
+            self.label_list.setCurrentRow(min(row, len(self.labels) - 1))
+
+    def _move_label(self, delta: int) -> None:
+        row = self.label_list.currentRow()
+        target = row + delta
+        if row < 0 or target < 0 or target >= len(self.labels):
+            return
+        self.labels[row], self.labels[target] = self.labels[target], self.labels[row]
+        self._refresh_label_list()
+        self.label_list.setCurrentRow(target)
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        labelset_id = self.id_edit.text().strip()
+        if not labelset_id:
+            QtWidgets.QMessageBox.warning(self, "Label set", "Enter a label set ID.")
+            return
+        existing = self.ctx.get_labelset(labelset_id)
+        if existing:
+            QtWidgets.QMessageBox.warning(self, "Label set", "A label set with this ID already exists.")
+            return
+        if not self.labels:
+            QtWidgets.QMessageBox.warning(self, "Label set", "Add at least one label.")
+            return
+        super().accept()
+
+    def values(self) -> Dict[str, object]:
+        return {
+            "labelset_id": self.id_edit.text().strip(),
+            "created_by": self.creator_edit.text().strip() or "admin",
+            "notes": self.notes_edit.toPlainText().strip() or "",
+            "labels": self.labels,
+        }
+
 
 class PhenotypeLabelSetsDialog(QtWidgets.QDialog):
     def __init__(
