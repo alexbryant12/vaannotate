@@ -2108,6 +2108,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_progress_active = False
         self._ai_progress_stamp: str = ""
         self._ai_progress_text: str = ""
+        self._ai_progress_block_number: Optional[int] = None
         self.ctx.project_changed.connect(self._refresh_labelset_options)
         self.ctx.project_changed.connect(self._refresh_corpus_options)
         self.ctx.project_changed.connect(self._refresh_ai_round_options)
@@ -2610,11 +2611,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if not self._ai_progress_active:
                 stamp = datetime.utcnow().strftime("%H:%M:%S")
                 self._ai_progress_stamp = stamp
-                self._write_ai_log_line(text, stamp, append_newline=True)
+                block_number = self._write_ai_log_line(text, stamp, append_newline=True)
                 self._ai_progress_active = True
+                self._ai_progress_block_number = block_number
             else:
                 stamp = self._ai_progress_stamp or datetime.utcnow().strftime("%H:%M:%S")
-                self._replace_last_ai_log_line(text, stamp)
+                self._ai_progress_block_number = self._replace_last_ai_log_line(
+                    text,
+                    stamp,
+                    self._ai_progress_block_number,
+                )
             self._ai_progress_text = text
             return
 
@@ -2623,18 +2629,21 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if clean_message == self._ai_progress_text:
                 self._ai_progress_active = False
                 self._ai_progress_text = clean_message
+                self._ai_progress_block_number = None
                 return
             self._ai_progress_active = False
+            self._ai_progress_block_number = None
 
         stamp = datetime.utcnow().strftime("%H:%M:%S")
         self._ai_progress_active = False
         self._ai_progress_stamp = stamp
         self._ai_progress_text = ""
+        self._ai_progress_block_number = None
         self._write_ai_log_line(message, stamp, append_newline=True)
 
-    def _write_ai_log_line(self, text: str, stamp: str, append_newline: bool = False) -> None:
+    def _write_ai_log_line(self, text: str, stamp: str, append_newline: bool = False) -> int:
         if not hasattr(self, "ai_log_output"):
-            return
+            return -1
         doc = self.ai_log_output.document()
         cursor = self.ai_log_output.textCursor()
         cursor.movePosition(QtGui.QTextCursor.End)
@@ -2643,22 +2652,30 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         cursor.insertText(f"[{stamp}] {text}")
         self.ai_log_output.setTextCursor(cursor)
         self.ai_log_output.ensureCursorVisible()
+        return cursor.blockNumber()
 
-    def _replace_last_ai_log_line(self, text: str, stamp: str) -> None:
+    def _replace_last_ai_log_line(
+        self,
+        text: str,
+        stamp: str,
+        block_number: Optional[int],
+    ) -> Optional[int]:
         if not hasattr(self, "ai_log_output"):
-            return
+            return None
         doc = self.ai_log_output.document()
-        cursor = self.ai_log_output.textCursor()
-        cursor.movePosition(QtGui.QTextCursor.End)
-        if doc.blockCount() == 0:
-            cursor.insertText(f"[{stamp}] {text}")
+        if block_number is None:
+            target_block = doc.lastBlock()
         else:
-            cursor.movePosition(QtGui.QTextCursor.StartOfBlock, QtGui.QTextCursor.MoveAnchor)
-            cursor.select(QtGui.QTextCursor.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.insertText(f"[{stamp}] {text}")
+            target_block = doc.findBlockByNumber(block_number)
+            if not target_block.isValid():
+                target_block = doc.lastBlock()
+        cursor = QtGui.QTextCursor(target_block)
+        cursor.select(QtGui.QTextCursor.BlockUnderCursor)
+        cursor.removeSelectedText()
+        cursor.insertText(f"[{stamp}] {text}")
         self.ai_log_output.setTextCursor(cursor)
         self.ai_log_output.ensureCursorVisible()
+        return cursor.blockNumber()
 
     def reject(self) -> None:  # type: ignore[override]
         if self._ai_job_running:
