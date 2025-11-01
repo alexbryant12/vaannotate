@@ -187,8 +187,6 @@ def test_generate_round_with_preselected_csv(seeded_project: tuple[RoundBuilder,
     assert unit_ids == ["doc_0", "doc_2"]
     stored_config = json.loads((round_dir / "round_config.json").read_text("utf-8"))
     assert stored_config.get("preselected_units_csv") == str(csv_path)
-
-
 def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
     project_root = tmp_path / "Project"
     paths = init_project(project_root, "proj", "Project", "tester")
