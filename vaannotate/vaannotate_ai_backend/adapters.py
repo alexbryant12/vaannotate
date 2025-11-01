@@ -432,6 +432,7 @@ def run_ai_backend_and_collect(
     cfg_overrides: Optional[Dict[str, Any]] = None,
     label_config: Optional[Dict[str, Any]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
@@ -466,6 +467,8 @@ def run_ai_backend_and_collect(
         outdir=ai_dir,
         label_config=label_config_payload,
         cfg_overrides=overrides,
+        cancel_callback=cancel_callback,
+        log_callback=log_callback,
     )
     csv_path = Path(artifacts["ai_next_batch_csv"])
     log(f"AI backend produced {len(final_df)} candidate units")

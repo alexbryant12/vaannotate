@@ -39,7 +39,8 @@ from __future__ import annotations
 import os, re, json, math, time, random, hashlib
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
-from typing import List, Dict, Tuple, Optional, Any
+from contextlib import contextmanager
+from typing import Callable, List, Dict, Tuple, Optional, Any
 import numpy as np
 import logging
 import pandas as pd
@@ -247,6 +248,30 @@ def setup_logging(level=logging.INFO):
     logger.addHandler(ch)
     return logger
 
+class CancelledError(RuntimeError):
+    """Raised when a cancellation request is received."""
+
+
+_cancel_check: Optional[Callable[[], bool]] = None
+
+
+@contextmanager
+def cancellation_scope(callback: Optional[Callable[[], bool]]):
+    """Temporarily install a cancellation callback for long-running loops."""
+    global _cancel_check
+    previous = _cancel_check
+    _cancel_check = callback
+    try:
+        yield
+    finally:
+        _cancel_check = previous
+
+
+def check_cancelled() -> None:
+    if _cancel_check and _cancel_check():
+        raise CancelledError("AI backend run cancelled")
+
+
 LOGGER = setup_logging()
 
 # ---- Pretty progress logging (ETA) -------------------------------------------
@@ -288,6 +313,7 @@ def iter_with_bar(step: str, iterable, *, total: int | None = None,
     if ascii_only is None: ascii_only = not tty  # default: Unicode in TTY
 
     for i, item in enumerate(iterable, 1):
+        check_cancelled()
         now = _time.time()
         if tty and (i == 1 or now - last >= min_interval_s or (total and i == total)):
             last = now
@@ -3612,8 +3638,10 @@ class ActiveLearningLLMFirst:
         )
 
         print("Indexing chunks ...")
+        check_cancelled()
         self.store.build_chunk_index(self.repo.notes, self.cfg.rag, self.cfg.index)
         print("Building label prototypes ...")
+        check_cancelled()
         self.pooler.build_prototypes()
     
         rules_map   = self.repo.label_rules_by_label
@@ -3660,6 +3688,7 @@ class ActiveLearningLLMFirst:
     
         # 1) Disagreement (unit-level, excluding seen + already-picked)
         print("[1/4] Expanded disagreement ...")
+        check_cancelled()
         dis_pairs = self.build_disagreement_bucket(seen_pairs, rules_map, label_types)
         dis_pairs = _filter_units(dis_pairs, seen_units | selected_units)
         dis_units = _head_units(_to_unit_only(dis_pairs), n_dis)
@@ -3669,6 +3698,7 @@ class ActiveLearningLLMFirst:
 
         # 2) Diversity (exclude seen + already-picked via both unseen_pairs filter and seed set)
         print("[2/4] Diversity ...")
+        check_cancelled()
         want_div = min(n_div, max(0, total - len(selected_units)))
         fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
         sel_div_pairs = build_diversity_bucket(
@@ -3701,6 +3731,7 @@ class ActiveLearningLLMFirst:
         # 3) LLM-uncertain (gated); exclude seen + prior-picked
         if self.cfg.llmfirst.use_llm_probe:
             print("[3/4] LLM-uncertain ...")
+            check_cancelled()
             want_unc = min(n_unc, max(0, total - len(selected_units)))
             if want_unc > 0:
                 sel_unc_pairs = self.build_llm_uncertain_bucket(
@@ -3718,6 +3749,7 @@ class ActiveLearningLLMFirst:
         # 4) LLM-certain (gated); exclude seen + prior-picked
         if self.cfg.llmfirst.use_llm_probe:
             print("[4/4] LLM-certain ...")
+            check_cancelled()
             want_cer = min(n_cer, max(0, total - len(selected_units)))
             if want_cer > 0:
                 sel_cer_pairs = self.build_llm_certain_bucket(

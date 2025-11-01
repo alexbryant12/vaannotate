@@ -1,7 +1,11 @@
 from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Callable, Optional, Dict, Any, Tuple
+import contextlib
+import io
+import logging
+import sys
 import pandas as pd
 
 from . import engine
@@ -35,12 +39,92 @@ def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
     return p
 
+class _CallbackTee(io.TextIOBase):
+    """Write to the original stream and emit complete lines to a callback."""
+
+    def __init__(self, stream: io.TextIOBase, callback: Callable[[str], None]):
+        super().__init__()
+        self._stream = stream
+        self._callback = callback
+        self._buffer = ""
+
+    def writable(self) -> bool:  # type: ignore[override]
+        return True
+
+    def write(self, data: str) -> int:  # type: ignore[override]
+        if not data:
+            return 0
+        self._stream.write(data)
+        self._stream.flush()
+        text = data.replace("\r", "\n")
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.strip()
+            if line:
+                self._callback(line)
+        return len(data)
+
+    def flush(self) -> None:  # type: ignore[override]
+        self._stream.flush()
+        if self._buffer.strip():
+            self._callback(self._buffer.strip())
+        self._buffer = ""
+
+
+class _CallbackHandler(logging.Handler):
+    def __init__(self, callback: Callable[[str], None]) -> None:
+        super().__init__()
+        self._callback = callback
+
+    def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
+        try:
+            message = self.format(record)
+        except Exception:  # noqa: BLE001
+            message = record.getMessage()
+        message = message.strip()
+        if message:
+            self._callback(message)
+
+
+@contextlib.contextmanager
+def _capture_logs(callback: Optional[Callable[[str], None]]):
+    if not callback:
+        yield
+        return
+
+    stack = contextlib.ExitStack()
+    stdout_tee = _CallbackTee(sys.__stdout__, callback)
+    stderr_tee = _CallbackTee(sys.__stderr__, callback)
+    stack.enter_context(contextlib.redirect_stdout(stdout_tee))
+    stack.enter_context(contextlib.redirect_stderr(stderr_tee))
+
+    handler = _CallbackHandler(callback)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root_logger = logging.getLogger()
+
+    def _remove_handler() -> None:
+        root_logger.removeHandler(handler)
+
+    root_logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        try:
+            stack.close()
+        finally:
+            _remove_handler()
+
+
 def build_next_batch(
     notes_df: pd.DataFrame,
     ann_df: pd.DataFrame,
     outdir: Path,
     label_config: Optional[dict] = None,
     cfg_overrides: Optional[Dict[str, Any]] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[pd.DataFrame, dict]:
     """High-level entrypoint consumed by AdminApp/RoundBuilder.
     Writes intermediates under outdir and returns (final_df, artifacts).
@@ -59,8 +143,10 @@ def build_next_batch(
     if cfg_overrides:
         _apply_overrides(cfg, cfg_overrides)
 
-    orch = engine.ActiveLearningLLMFirst(paths=paths, cfg=cfg, label_config=label_config or {})
-    final_df = orch.run()  # engine returns DataFrame
+    with _capture_logs(log_callback):
+        with engine.cancellation_scope(cancel_callback):
+            orch = engine.ActiveLearningLLMFirst(paths=paths, cfg=cfg, label_config=label_config or {})
+            final_df = orch.run()  # engine returns DataFrame
 
     normalized = final_df.copy()
     rename_map = {}
