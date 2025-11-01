@@ -3257,16 +3257,22 @@ def direct_uncertainty_selection(
 # ------------------------------
 # Orchestrator
 def _detect_device():
+    import os
+    if os.getenv("CPU_ONLY", "0") == "1":
+        return "cpu"
     try:
         import torch
-        return 'cuda' if torch.cuda.is_available() else 'cpu'
+        if getattr(torch, "cuda", None) and torch.cuda.is_available():
+            return "cuda"
     except Exception:
-        return 'cpu'
+        pass
+    return "cpu"
 
 # ------------------------------
 
 class ActiveLearningLLMFirst:
     def __init__(self, paths: Paths, cfg: OrchestratorConfig, label_config: Optional[dict]=None):
+        import os
         self.paths = paths; self.cfg = cfg
         notes_df = read_table(paths.notes_path); ann_df = read_table(paths.annotations_path)
         self.repo = DataRepository(notes_df, ann_df)
@@ -3276,8 +3282,8 @@ class ActiveLearningLLMFirst:
         device = _detect_device()
         embedder = SentenceTransformer(embed_name, device=device)
         reranker = CrossEncoder(rerank_name, device=device)
-        emb_bs = int(os.getenv('EMB_BATCH', '64'))
-        rr_bs = int(os.getenv('RERANK_BATCH', '64'))
+        emb_bs = int(os.getenv('EMB_BATCH', '32' if device == "cpu" else "64"))
+        rr_bs = int(os.getenv('RERANK_BATCH', '16' if device == "cpu" else "64"))
         self.models = Models(embedder, reranker, device=device, emb_batch=emb_bs, rerank_batch=rr_bs)
 
         self.store = EmbeddingStore(self.models, cache_dir=self.paths.cache_dir, normalize=self.cfg.rag.normalize_embeddings)
