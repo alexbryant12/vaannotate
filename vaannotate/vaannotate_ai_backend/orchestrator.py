@@ -46,7 +46,9 @@ class _CallbackTee(io.TextIOBase):
         super().__init__()
         self._stream = stream
         self._callback = callback
-        self._buffer = ""
+        self._current_line = ""
+        self._last_was_cr = False
+        self._last_emitted_progress = ""
 
     def writable(self) -> bool:  # type: ignore[override]
         return True
@@ -56,20 +58,64 @@ class _CallbackTee(io.TextIOBase):
             return 0
         self._stream.write(data)
         self._stream.flush()
-        text = data.replace("\r", "\n")
-        self._buffer += text
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            line = line.strip()
-            if line:
-                self._callback(line)
+
+        text = data
+        while text:
+            next_newline = text.find("\n")
+            next_return = text.find("\r")
+            if next_newline == -1 and next_return == -1:
+                self._current_line += text
+                if self._last_was_cr and self._current_line.strip():
+                    text_line = self._current_line.strip()
+                    self._callback("\r" + text_line)
+                    self._last_emitted_progress = text_line
+                break
+
+            if next_newline == -1 or (0 <= next_return < next_newline):
+                idx = next_return
+                marker = "\r"
+            else:
+                idx = next_newline
+                marker = "\n"
+
+            segment = text[:idx]
+            text = text[idx + 1 :]
+            if segment:
+                self._current_line += segment
+                if self._last_was_cr and self._current_line.strip():
+                    text_line = self._current_line.strip()
+                    self._callback("\r" + text_line)
+                    self._last_emitted_progress = text_line
+
+            if marker == "\n":
+                if self._current_line.strip():
+                    self._callback(self._current_line.strip())
+                self._last_emitted_progress = ""
+                self._current_line = ""
+                self._last_was_cr = False
+            else:  # carriage return → in-place update
+                text_line = self._current_line.strip()
+                if text_line and text_line != self._last_emitted_progress:
+                    self._callback("\r" + text_line)
+                    self._last_emitted_progress = text_line
+                self._current_line = ""
+                self._last_was_cr = True
+
         return len(data)
 
     def flush(self) -> None:  # type: ignore[override]
         self._stream.flush()
-        if self._buffer.strip():
-            self._callback(self._buffer.strip())
-        self._buffer = ""
+        if self._current_line.strip():
+            text_line = self._current_line.strip()
+            if self._last_was_cr:
+                if text_line != self._last_emitted_progress:
+                    self._callback("\r" + text_line)
+                    self._last_emitted_progress = text_line
+            else:
+                self._callback(text_line)
+                self._last_emitted_progress = ""
+        self._current_line = ""
+        self._last_was_cr = False
 
 
 class _CallbackHandler(logging.Handler):
