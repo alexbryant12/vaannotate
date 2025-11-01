@@ -2276,6 +2276,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
         )
         ai_config_layout.addRow("Batch size", self.ai_batch_size_label)
+        self.ai_azure_key_edit = QtWidgets.QLineEdit()
+        self.ai_azure_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.ai_azure_key_edit.setPlaceholderText("Enter Azure OpenAI API key")
+        ai_config_layout.addRow("Azure API key", self.ai_azure_key_edit)
+        self.ai_azure_version_edit = QtWidgets.QLineEdit()
+        self.ai_azure_version_edit.setPlaceholderText(
+            "Enter Azure OpenAI API version (e.g. 2024-06-01)"
+        )
+        ai_config_layout.addRow("Azure API version", self.ai_azure_version_edit)
+        self.ai_azure_endpoint_edit = QtWidgets.QLineEdit()
+        self.ai_azure_endpoint_edit.setPlaceholderText("Enter Azure OpenAI endpoint URL")
+        ai_config_layout.addRow("Azure endpoint", self.ai_azure_endpoint_edit)
         embed_row = QtWidgets.QHBoxLayout()
         self.ai_embedding_path_edit = QtWidgets.QLineEdit()
         self.ai_embedding_path_edit.setPlaceholderText("Select embedding model directory")
@@ -2367,6 +2379,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.ai_embedding_path_edit.setText(os.getenv("MED_EMBED_MODEL_NAME", ""))
         if hasattr(self, "ai_reranker_path_edit"):
             self.ai_reranker_path_edit.setText(os.getenv("RERANKER_MODEL_NAME", ""))
+        if hasattr(self, "ai_azure_key_edit"):
+            self.ai_azure_key_edit.setText(os.getenv("AZURE_OPENAI_API_KEY", ""))
+        if hasattr(self, "ai_azure_version_edit"):
+            self.ai_azure_version_edit.setText(
+                os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+            )
+        if hasattr(self, "ai_azure_endpoint_edit"):
+            self.ai_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", ""))
         self.total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
         self._on_toggle_ai_backend(False)
 
@@ -2704,6 +2724,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         rerank_path = ""
         if hasattr(self, "ai_reranker_path_edit"):
             rerank_path = self.ai_reranker_path_edit.text().strip()
+        azure_key = ""
+        if hasattr(self, "ai_azure_key_edit"):
+            azure_key = self.ai_azure_key_edit.text().strip()
+        azure_version = ""
+        if hasattr(self, "ai_azure_version_edit"):
+            azure_version = self.ai_azure_version_edit.text().strip()
+        azure_endpoint = ""
+        if hasattr(self, "ai_azure_endpoint_edit"):
+            azure_endpoint = self.ai_azure_endpoint_edit.text().strip()
         if not embed_path:
             missing.append("embedding model directory")
         else:
@@ -2728,11 +2757,23 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 )
                 return None
             env["RERANKER_MODEL_NAME"] = str(rerank_dir)
+        if not azure_key:
+            missing.append("Azure API key")
+        else:
+            env["AZURE_OPENAI_API_KEY"] = azure_key
+        if not azure_version:
+            missing.append("Azure API version")
+        else:
+            env["AZURE_OPENAI_API_VERSION"] = azure_version
+        if not azure_endpoint:
+            missing.append("Azure endpoint")
+        else:
+            env["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
         if missing:
             QtWidgets.QMessageBox.warning(
                 self,
                 "AI backend",
-                f"Select the {' and '.join(missing)} before running the AI backend.",
+                f"Provide the {' and '.join(missing)} before running the AI backend.",
             )
             return None
         return env
