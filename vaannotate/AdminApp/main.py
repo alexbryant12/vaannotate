@@ -2101,6 +2101,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_pending_job: Optional[AIRoundJobConfig] = None
         self._ai_job_running = False
         self._ai_is_preview = False
+        self._ai_progress_active = False
+        self._ai_progress_stamp: str = ""
+        self._ai_progress_text: str = ""
         self.ctx.project_changed.connect(self._refresh_labelset_options)
         self.ctx.project_changed.connect(self._refresh_corpus_options)
         self.ctx.project_changed.connect(self._refresh_ai_round_options)
@@ -2554,7 +2557,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _on_toggle_ai_backend(self, checked: bool) -> None:
         if hasattr(self, "ai_controls_container"):
-            self.ai_controls_container.setEnabled(checked and not self._ai_job_running)
+            should_enable = checked or self._ai_job_running
+            self.ai_controls_container.setEnabled(should_enable)
         self._update_ai_buttons()
 
     def _update_ai_buttons(self) -> None:
@@ -2567,7 +2571,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if hasattr(self, "ai_rounds_list"):
             self.ai_rounds_list.setEnabled(active)
         if hasattr(self, "ai_controls_container") and getattr(self, "use_ai_checkbox", None):
-            self.ai_controls_container.setEnabled(self.use_ai_checkbox.isChecked() and not self._ai_job_running)
+            container_enabled = self.use_ai_checkbox.isChecked()
+            self.ai_controls_container.setEnabled(container_enabled or self._ai_job_running)
 
     def _on_ai_preview(self) -> None:
         if self._ai_job_running:
@@ -2587,8 +2592,76 @@ class RoundBuilderDialog(QtWidgets.QDialog):
     def _append_ai_log(self, message: str) -> None:
         if not hasattr(self, "ai_log_output"):
             return
+        if message.startswith("\r"):
+            text = message[1:].strip()
+            if not text:
+                return
+            if not self._ai_progress_active:
+                stamp = datetime.utcnow().strftime("%H:%M:%S")
+                self._ai_progress_stamp = stamp
+                self._write_ai_log_line(text, stamp, append_newline=True)
+                self._ai_progress_active = True
+            else:
+                stamp = self._ai_progress_stamp or datetime.utcnow().strftime("%H:%M:%S")
+                self._replace_last_ai_log_line(text, stamp)
+            self._ai_progress_text = text
+            return
+
+        clean_message = message.strip()
+        if self._ai_progress_active:
+            if clean_message == self._ai_progress_text:
+                self._ai_progress_active = False
+                self._ai_progress_text = clean_message
+                return
+            self._ai_progress_active = False
+
         stamp = datetime.utcnow().strftime("%H:%M:%S")
-        self.ai_log_output.appendPlainText(f"[{stamp}] {message}")
+        self._ai_progress_active = False
+        self._ai_progress_stamp = stamp
+        self._ai_progress_text = ""
+        self._write_ai_log_line(message, stamp, append_newline=True)
+
+    def _write_ai_log_line(self, text: str, stamp: str, append_newline: bool = False) -> None:
+        if not hasattr(self, "ai_log_output"):
+            return
+        doc = self.ai_log_output.document()
+        cursor = self.ai_log_output.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        if append_newline and not doc.isEmpty():
+            cursor.insertBlock()
+        cursor.insertText(f"[{stamp}] {text}")
+        self.ai_log_output.setTextCursor(cursor)
+        self.ai_log_output.ensureCursorVisible()
+
+    def _replace_last_ai_log_line(self, text: str, stamp: str) -> None:
+        if not hasattr(self, "ai_log_output"):
+            return
+        doc = self.ai_log_output.document()
+        cursor = self.ai_log_output.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        if doc.blockCount() == 0:
+            cursor.insertText(f"[{stamp}] {text}")
+        else:
+            cursor.movePosition(QtGui.QTextCursor.StartOfBlock, QtGui.QTextCursor.MoveAnchor)
+            cursor.select(QtGui.QTextCursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.insertText(f"[{stamp}] {text}")
+        self.ai_log_output.setTextCursor(cursor)
+        self.ai_log_output.ensureCursorVisible()
+
+    def reject(self) -> None:  # type: ignore[override]
+        if self._ai_job_running:
+            confirm = QtWidgets.QMessageBox.question(
+                self,
+                "Cancel AI run",
+                "The AI backend is still running. Cancel the run before closing?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if confirm == QtWidgets.QMessageBox.StandardButton.Yes:
+                self._on_cancel_ai_job()
+            return
+        super().reject()
 
     def _selected_prior_round_numbers(self) -> List[int]:
         rounds: List[int] = []
@@ -2741,6 +2814,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_is_preview = not finalize
         if hasattr(self, "ai_log_output"):
             self.ai_log_output.clear()
+        self._ai_progress_active = False
+        self._ai_progress_stamp = ""
+        self._ai_progress_text = ""
         self._append_ai_log("Starting AI backend…")
         self._update_ai_buttons()
         ok_button = self.button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
@@ -2839,6 +2915,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _handle_ai_finished(self, payload: object, error: object) -> None:
         self._ai_job_running = False
+        self._ai_progress_active = False
+        self._ai_progress_stamp = ""
+        self._ai_progress_text = ""
         ok_button = self.button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
         if ok_button:
             ok_button.setEnabled(True)
