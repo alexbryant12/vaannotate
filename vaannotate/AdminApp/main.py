@@ -141,6 +141,10 @@ class AIRoundWorker(QtCore.QObject):
                               if str(value)}
         self._cancel_event = threading.Event()
 
+    @property
+    def cancel_event(self) -> threading.Event:
+        return self._cancel_event
+
     @QtCore.Slot()
     def cancel(self) -> None:  # noqa: D401 - Qt slot
         if not self._cancel_event.is_set():
@@ -2581,6 +2585,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _on_cancel_ai_job(self) -> None:
         if not self._ai_job_running or not self._ai_worker:
+            return
+        cancel_event = getattr(self._ai_worker, "cancel_event", None)
+        already_set = False
+        if isinstance(cancel_event, threading.Event):
+            already_set = cancel_event.is_set()
+            cancel_event.set()
+        if already_set:
             return
         self._append_ai_log("Cancellation requested by user…")
         QtCore.QMetaObject.invokeMethod(
