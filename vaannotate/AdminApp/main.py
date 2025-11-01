@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import os
 import shutil
 import re
 import sqlite3
@@ -126,6 +127,7 @@ class AIRoundWorker(QtCore.QObject):
         finalize: bool,
         cfg_overrides: Optional[Dict[str, Any]] = None,
         cleanup_dir: bool = False,
+        env_overrides: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
         self.project_root = Path(project_root)
@@ -133,6 +135,9 @@ class AIRoundWorker(QtCore.QObject):
         self.finalize = finalize
         self.cfg_overrides = dict(cfg_overrides or {})
         self.cleanup_dir = cleanup_dir
+        self.env_overrides = {str(key): str(value)
+                              for key, value in (env_overrides or {}).items()
+                              if str(value)}
 
     @QtCore.Slot()
     def run(self) -> None:  # noqa: D401 - Qt slot
@@ -144,18 +149,29 @@ class AIRoundWorker(QtCore.QObject):
                     self._write_label_config(label_config_path, label_config_payload)
                 except Exception as exc:  # noqa: BLE001
                     self.log_message.emit(f"Warning: failed to write label_config.json ({exc})")
-            result = run_ai_backend_and_collect(
-                self.project_root,
-                self.job.context.pheno_id,
-                self.job.prior_rounds,
-                self.job.round_dir,
-                self.job.context.pheno_level,
-                self.job.context.created_by,
-                timestamp=self.job.timestamp,
-                cfg_overrides=self.cfg_overrides,
-                label_config=label_config_payload,
-                log_callback=self.log_message.emit,
-            )
+            original_env: Dict[str, Optional[str]] = {}
+            try:
+                for key, value in self.env_overrides.items():
+                    original_env[key] = os.environ.get(key)
+                    os.environ[key] = value
+                result = run_ai_backend_and_collect(
+                    self.project_root,
+                    self.job.context.pheno_id,
+                    self.job.prior_rounds,
+                    self.job.round_dir,
+                    self.job.context.pheno_level,
+                    self.job.context.created_by,
+                    timestamp=self.job.timestamp,
+                    cfg_overrides=self.cfg_overrides,
+                    label_config=label_config_payload,
+                    log_callback=self.log_message.emit,
+                )
+            finally:
+                for key, prior in original_env.items():
+                    if prior is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = prior
             payload: Dict[str, object] = {"backend_result": result}
             if self.finalize:
                 self.log_message.emit("Finalizing round artifacts…")
@@ -2089,6 +2105,33 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         except Exception:
             return default
 
+    def _update_ai_batch_size_label(self) -> None:
+        if not hasattr(self, "ai_batch_size_label"):
+            return
+        value = self.total_n_spin.value() if hasattr(self, "total_n_spin") else 0
+        self.ai_batch_size_label.setText(f"{value} (matches Total N)")
+
+    def _browse_for_directory(self, title: str, current: str = "") -> Optional[str]:
+        initial = current or ""
+        if not initial and getattr(self.ctx, "project_root", None):
+            initial = str(self.ctx.project_root)
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, title, initial)
+        if directory:
+            return directory
+        return None
+
+    def _on_select_embedding_model(self) -> None:
+        current = self.ai_embedding_path_edit.text().strip() if hasattr(self, "ai_embedding_path_edit") else ""
+        directory = self._browse_for_directory("Select embedding model directory", current)
+        if directory and hasattr(self, "ai_embedding_path_edit"):
+            self.ai_embedding_path_edit.setText(directory)
+
+    def _on_select_reranker_model(self) -> None:
+        current = self.ai_reranker_path_edit.text().strip() if hasattr(self, "ai_reranker_path_edit") else ""
+        directory = self._browse_for_directory("Select re-ranker model directory", current)
+        if directory and hasattr(self, "ai_reranker_path_edit"):
+            self.ai_reranker_path_edit.setText(directory)
+
     def _setup_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         scroll = QtWidgets.QScrollArea()
@@ -2228,10 +2271,31 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         ai_config_group = QtWidgets.QGroupBox("Backend configuration")
         ai_config_layout = QtWidgets.QFormLayout(ai_config_group)
         ai_config_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        self.ai_batch_size_spin = QtWidgets.QSpinBox()
-        self.ai_batch_size_spin.setRange(1, 1_000_000)
-        self.ai_batch_size_spin.setValue(self.total_n_spin.value())
-        ai_config_layout.addRow("Batch size", self.ai_batch_size_spin)
+        self.ai_batch_size_label = QtWidgets.QLabel()
+        self.ai_batch_size_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        ai_config_layout.addRow("Batch size", self.ai_batch_size_label)
+        embed_row = QtWidgets.QHBoxLayout()
+        self.ai_embedding_path_edit = QtWidgets.QLineEdit()
+        self.ai_embedding_path_edit.setPlaceholderText("Select embedding model directory")
+        embed_row.addWidget(self.ai_embedding_path_edit)
+        self.ai_embedding_browse_btn = QtWidgets.QPushButton("Choose…")
+        self.ai_embedding_browse_btn.clicked.connect(self._on_select_embedding_model)
+        embed_row.addWidget(self.ai_embedding_browse_btn)
+        embed_row.setStretch(0, 1)
+        embed_row.setStretch(1, 0)
+        ai_config_layout.addRow("Embedding model", embed_row)
+        rerank_row = QtWidgets.QHBoxLayout()
+        self.ai_reranker_path_edit = QtWidgets.QLineEdit()
+        self.ai_reranker_path_edit.setPlaceholderText("Select re-ranker model directory")
+        rerank_row.addWidget(self.ai_reranker_path_edit)
+        self.ai_reranker_browse_btn = QtWidgets.QPushButton("Choose…")
+        self.ai_reranker_browse_btn.clicked.connect(self._on_select_reranker_model)
+        rerank_row.addWidget(self.ai_reranker_browse_btn)
+        rerank_row.setStretch(0, 1)
+        rerank_row.setStretch(1, 0)
+        ai_config_layout.addRow("Re-ranker model", rerank_row)
         self.ai_disagreement_pct = QtWidgets.QDoubleSpinBox()
         self.ai_disagreement_pct.setRange(0.0, 1.0)
         self.ai_disagreement_pct.setDecimals(2)
@@ -2298,6 +2362,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._refresh_labelset_options()
         self._refresh_reviewer_options()
         self._refresh_ai_round_options()
+        self._update_ai_batch_size_label()
+        if hasattr(self, "ai_embedding_path_edit"):
+            self.ai_embedding_path_edit.setText(os.getenv("MED_EMBED_MODEL_NAME", ""))
+        if hasattr(self, "ai_reranker_path_edit"):
+            self.ai_reranker_path_edit.setText(os.getenv("RERANKER_MODEL_NAME", ""))
+        self.total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
         self._on_toggle_ai_backend(False)
 
     def _collect_filters(self) -> SamplingFilters:
@@ -2588,12 +2658,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         )
         project_root = self.ctx.require_project()
         cfg_overrides = self._collect_ai_overrides()
+        env_overrides = self._collect_ai_environment()
+        if env_overrides is None:
+            return False
         worker = AIRoundWorker(
             project_root,
             job,
             finalize=finalize,
             cfg_overrides=cfg_overrides,
             cleanup_dir=cleanup,
+            env_overrides=env_overrides,
         )
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
@@ -2619,11 +2693,55 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         thread.start()
         return True
 
+    def _collect_ai_environment(self) -> Optional[Dict[str, str]]:
+        if not getattr(self, "use_ai_checkbox", None) or not self.use_ai_checkbox.isChecked():
+            return {}
+        env: Dict[str, str] = {}
+        missing: List[str] = []
+        embed_path = ""
+        if hasattr(self, "ai_embedding_path_edit"):
+            embed_path = self.ai_embedding_path_edit.text().strip()
+        rerank_path = ""
+        if hasattr(self, "ai_reranker_path_edit"):
+            rerank_path = self.ai_reranker_path_edit.text().strip()
+        if not embed_path:
+            missing.append("embedding model directory")
+        else:
+            embed_dir = Path(embed_path).expanduser()
+            if not embed_dir.exists() or not embed_dir.is_dir():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "AI backend",
+                    "The selected embedding model directory does not exist or is not a directory.",
+                )
+                return None
+            env["MED_EMBED_MODEL_NAME"] = str(embed_dir)
+        if not rerank_path:
+            missing.append("re-ranker model directory")
+        else:
+            rerank_dir = Path(rerank_path).expanduser()
+            if not rerank_dir.exists() or not rerank_dir.is_dir():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "AI backend",
+                    "The selected re-ranker model directory does not exist or is not a directory.",
+                )
+                return None
+            env["RERANKER_MODEL_NAME"] = str(rerank_dir)
+        if missing:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "AI backend",
+                f"Select the {' and '.join(missing)} before running the AI backend.",
+            )
+            return None
+        return env
+
     def _collect_ai_overrides(self) -> Dict[str, Any]:
         overrides: Dict[str, Any] = {}
         select: Dict[str, Any] = {}
-        if hasattr(self, "ai_batch_size_spin"):
-            select["batch_size"] = self.ai_batch_size_spin.value()
+        if hasattr(self, "total_n_spin"):
+            select["batch_size"] = int(self.total_n_spin.value())
         if hasattr(self, "ai_disagreement_pct"):
             select["pct_disagreement"] = float(self.ai_disagreement_pct.value())
         if hasattr(self, "ai_uncertain_pct"):
