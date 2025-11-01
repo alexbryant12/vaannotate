@@ -2669,13 +2669,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             target_block = doc.findBlockByNumber(block_number)
             if not target_block.isValid():
                 target_block = doc.lastBlock()
+        target_block_number = target_block.blockNumber()
         cursor = QtGui.QTextCursor(target_block)
         cursor.select(QtGui.QTextCursor.BlockUnderCursor)
-        cursor.removeSelectedText()
         cursor.insertText(f"[{stamp}] {text}")
         self.ai_log_output.setTextCursor(cursor)
         self.ai_log_output.ensureCursorVisible()
-        return cursor.blockNumber()
+        return target_block_number
 
     def reject(self) -> None:  # type: ignore[override]
         if self._ai_job_running:
