@@ -129,8 +129,23 @@ class _CallbackHandler(logging.Handler):
         except Exception:  # noqa: BLE001
             message = record.getMessage()
         message = message.strip()
-        if message:
-            self._callback(message)
+        if not message:
+            return
+
+        step = getattr(record, "step", None)
+        done = getattr(record, "done", None)
+        total = getattr(record, "total", None)
+
+        if step is not None and done is not None:
+            self._callback("\r" + message)
+            if total is not None and done == total:
+                # Emit a trailing message without the carriage return so the
+                # UI can finalize the in-place progress line without adding a
+                # duplicate entry.
+                self._callback(message)
+            return
+
+        self._callback(message)
 
 
 @contextlib.contextmanager
