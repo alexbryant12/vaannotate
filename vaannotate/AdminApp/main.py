@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import shutil
+import threading
 import re
 import sqlite3
 import sys
@@ -41,7 +42,7 @@ from vaannotate.corpus import TABULAR_EXTENSIONS, import_tabular_corpus
 from vaannotate.project import build_label_config, fetch_labelset, init_project
 from vaannotate.utils import copy_sqlite_database, ensure_dir
 from vaannotate.rounds import RoundBuilder
-from vaannotate.vaannotate_ai_backend import BackendResult, run_ai_backend_and_collect
+from vaannotate.vaannotate_ai_backend import CancelledError, BackendResult, run_ai_backend_and_collect
 
 PROJECT_MODELS = [
     models.Project,
@@ -138,6 +139,13 @@ class AIRoundWorker(QtCore.QObject):
         self.env_overrides = {str(key): str(value)
                               for key, value in (env_overrides or {}).items()
                               if str(value)}
+        self._cancel_event = threading.Event()
+
+    @QtCore.Slot()
+    def cancel(self) -> None:  # noqa: D401 - Qt slot
+        if not self._cancel_event.is_set():
+            self._cancel_event.set()
+            self.log_message.emit("Cancellation requested…")
 
     @QtCore.Slot()
     def run(self) -> None:  # noqa: D401 - Qt slot
@@ -165,6 +173,7 @@ class AIRoundWorker(QtCore.QObject):
                     cfg_overrides=self.cfg_overrides,
                     label_config=label_config_payload,
                     log_callback=self.log_message.emit,
+                    cancel_callback=self._cancel_event.is_set,
                 )
             finally:
                 for key, prior in original_env.items():
@@ -172,12 +181,20 @@ class AIRoundWorker(QtCore.QObject):
                         os.environ.pop(key, None)
                     else:
                         os.environ[key] = prior
+            if self._cancel_event.is_set():
+                raise CancelledError("AI backend run cancelled")
             payload: Dict[str, object] = {"backend_result": result}
             if self.finalize:
+                if self._cancel_event.is_set():
+                    raise CancelledError("AI backend run cancelled")
                 self.log_message.emit("Finalizing round artifacts…")
                 self._prepare_labelset_and_reviewers()
+                if self._cancel_event.is_set():
+                    raise CancelledError("AI backend run cancelled")
                 config_path = self._write_round_config(result.csv_path)
                 try:
+                    if self._cancel_event.is_set():
+                        raise CancelledError("AI backend run cancelled")
                     builder = RoundBuilder(self.project_root)
                     build_result = builder.generate_round(
                         self.job.context.pheno_id,
@@ -192,6 +209,9 @@ class AIRoundWorker(QtCore.QObject):
                         pass
                 payload["build_result"] = build_result
             self.finished.emit(payload, None)
+        except CancelledError:
+            self.log_message.emit("AI backend run cancelled.")
+            self.finished.emit({"cancelled": True}, None)
         except Exception as exc:  # noqa: BLE001
             self.finished.emit(None, exc)
         finally:
@@ -2350,6 +2370,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_preview_btn = QtWidgets.QPushButton("Preview selection")
         self.ai_preview_btn.clicked.connect(self._on_ai_preview)
         ai_button_row.addWidget(self.ai_preview_btn)
+        self.ai_cancel_btn = QtWidgets.QPushButton("Cancel run")
+        self.ai_cancel_btn.clicked.connect(self._on_cancel_ai_job)
+        self.ai_cancel_btn.setEnabled(False)
+        ai_button_row.addWidget(self.ai_cancel_btn)
         ai_button_row.addStretch()
         ai_controls_layout.addLayout(ai_button_row)
         self.ai_log_output = QtWidgets.QPlainTextEdit()
@@ -2538,6 +2562,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         active = bool(enabled and not self._ai_job_running)
         if hasattr(self, "ai_preview_btn"):
             self.ai_preview_btn.setEnabled(active)
+        if hasattr(self, "ai_cancel_btn"):
+            self.ai_cancel_btn.setEnabled(self._ai_job_running)
         if hasattr(self, "ai_rounds_list"):
             self.ai_rounds_list.setEnabled(active)
         if hasattr(self, "ai_controls_container") and getattr(self, "use_ai_checkbox", None):
@@ -2547,6 +2573,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if self._ai_job_running:
             return
         self._start_ai_round(finalize=False)
+
+    def _on_cancel_ai_job(self) -> None:
+        if not self._ai_job_running or not self._ai_worker:
+            return
+        self._append_ai_log("Cancellation requested by user…")
+        QtCore.QMetaObject.invokeMethod(
+            self._ai_worker,
+            "cancel",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
 
     def _append_ai_log(self, message: str) -> None:
         if not hasattr(self, "ai_log_output"):
@@ -2813,6 +2849,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return
         if not isinstance(payload, dict):
             self._ai_pending_job = None
+            return
+        if payload.get("cancelled"):
+            self._ai_pending_job = None
+            self._ai_is_preview = False
             return
         backend_result = payload.get("backend_result")
         if isinstance(backend_result, BackendResult) and self._ai_is_preview:
