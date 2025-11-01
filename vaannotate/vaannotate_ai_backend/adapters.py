@@ -430,6 +430,7 @@ def run_ai_backend_and_collect(
     user: str,
     timestamp: Optional[str] = None,
     cfg_overrides: Optional[Dict[str, Any]] = None,
+    label_config: Optional[Dict[str, Any]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
@@ -439,23 +440,31 @@ def run_ai_backend_and_collect(
     ai_dir.mkdir(parents=True, exist_ok=True)
     log(f"Exported {len(notes_df)} corpus rows and {len(ann_df)} prior annotations")
 
-    label_config_path = Path(project_root) / "phenotypes" / pheno_id / "ai" / "label_config.json"
-    label_config = None
-    if label_config_path.exists():
-        try:
-            label_config = json.loads(label_config_path.read_text(encoding="utf-8"))
-            log("Loaded label_config.json overrides")
-        except Exception as exc:  # noqa: BLE001
-            log(f"Warning: failed to parse label_config.json ({exc})")
+    label_config_payload: Optional[Dict[str, Any]] = label_config
+    if label_config_payload is None:
+        label_config_path = Path(project_root) / "phenotypes" / pheno_id / "ai" / "label_config.json"
+        if label_config_path.exists():
+            try:
+                label_config_payload = json.loads(label_config_path.read_text(encoding="utf-8"))
+                log("Loaded label_config.json overrides")
+            except Exception as exc:  # noqa: BLE001
+                log(f"Warning: failed to parse label_config.json ({exc})")
 
     overrides: Dict[str, Any] = dict(cfg_overrides or {})
+    select_overrides: Dict[str, Any] = dict(overrides.get("select", {}))
+    if not prior_rounds:
+        # Cold start: no reviewer disagreements yet, skip the bucket entirely.
+        if select_overrides.get("pct_disagreement") is None:
+            select_overrides["pct_disagreement"] = 0.0
+        log("No prior rounds detected; skipping disagreement bucket for round zero.")
+    overrides["select"] = select_overrides
     overrides.setdefault("phenotype_level", level)
 
     final_df, artifacts = build_next_batch(
         notes_df,
         ann_df,
         outdir=ai_dir,
-        label_config=label_config,
+        label_config=label_config_payload,
         cfg_overrides=overrides,
     )
     csv_path = Path(artifacts["ai_next_batch_csv"])

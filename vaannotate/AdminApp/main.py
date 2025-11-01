@@ -2225,6 +2225,44 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_controls_container = QtWidgets.QWidget()
         ai_controls_layout = QtWidgets.QVBoxLayout(self.ai_controls_container)
         ai_controls_layout.setContentsMargins(0, 0, 0, 0)
+        ai_config_group = QtWidgets.QGroupBox("Backend configuration")
+        ai_config_layout = QtWidgets.QFormLayout(ai_config_group)
+        ai_config_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.ai_batch_size_spin = QtWidgets.QSpinBox()
+        self.ai_batch_size_spin.setRange(1, 1_000_000)
+        self.ai_batch_size_spin.setValue(self.total_n_spin.value())
+        ai_config_layout.addRow("Batch size", self.ai_batch_size_spin)
+        self.ai_disagreement_pct = QtWidgets.QDoubleSpinBox()
+        self.ai_disagreement_pct.setRange(0.0, 1.0)
+        self.ai_disagreement_pct.setDecimals(2)
+        self.ai_disagreement_pct.setSingleStep(0.05)
+        self.ai_disagreement_pct.setValue(0.30)
+        ai_config_layout.addRow("Disagreement pct", self.ai_disagreement_pct)
+        self.ai_uncertain_pct = QtWidgets.QDoubleSpinBox()
+        self.ai_uncertain_pct.setRange(0.0, 1.0)
+        self.ai_uncertain_pct.setDecimals(2)
+        self.ai_uncertain_pct.setSingleStep(0.05)
+        self.ai_uncertain_pct.setValue(0.30)
+        ai_config_layout.addRow("LLM uncertain pct", self.ai_uncertain_pct)
+        self.ai_easy_pct = QtWidgets.QDoubleSpinBox()
+        self.ai_easy_pct.setRange(0.0, 1.0)
+        self.ai_easy_pct.setDecimals(2)
+        self.ai_easy_pct.setSingleStep(0.05)
+        self.ai_easy_pct.setValue(0.10)
+        ai_config_layout.addRow("LLM certain pct", self.ai_easy_pct)
+        self.ai_diversity_pct = QtWidgets.QDoubleSpinBox()
+        self.ai_diversity_pct.setRange(0.0, 1.0)
+        self.ai_diversity_pct.setDecimals(2)
+        self.ai_diversity_pct.setSingleStep(0.05)
+        self.ai_diversity_pct.setValue(0.30)
+        ai_config_layout.addRow("Diversity pct", self.ai_diversity_pct)
+        self.ai_final_llm_checkbox = QtWidgets.QCheckBox("Run final LLM labeling")
+        self.ai_final_llm_checkbox.setChecked(True)
+        ai_config_layout.addRow("Final LLM labeling", self.ai_final_llm_checkbox)
+        pct_hint = QtWidgets.QLabel("Fractions should sum to ≤ 1.0; remaining slots are auto-filled.")
+        pct_hint.setWordWrap(True)
+        ai_config_layout.addRow(pct_hint)
+        ai_controls_layout.addWidget(ai_config_group)
         prior_label = QtWidgets.QLabel("Prior rounds to include")
         ai_controls_layout.addWidget(prior_label)
         self.ai_rounds_list = QtWidgets.QListWidget()
@@ -2526,12 +2564,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return False
         prior_rounds = self._selected_prior_round_numbers()
         if not prior_rounds:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "AI backend",
-                "Select one or more prior rounds to seed the AI backend.",
-            )
-            return False
+            self._append_ai_log("No prior rounds selected; running cold-start configuration.")
         timestamp = datetime.utcnow().isoformat()
         round_number = self._next_round_number()
         if finalize:
@@ -2554,10 +2587,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             timestamp=timestamp,
         )
         project_root = self.ctx.require_project()
+        cfg_overrides = self._collect_ai_overrides()
         worker = AIRoundWorker(
             project_root,
             job,
             finalize=finalize,
+            cfg_overrides=cfg_overrides,
             cleanup_dir=cleanup,
         )
         thread = QtCore.QThread(self)
@@ -2583,6 +2618,25 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             ok_button.setEnabled(False)
         thread.start()
         return True
+
+    def _collect_ai_overrides(self) -> Dict[str, Any]:
+        overrides: Dict[str, Any] = {}
+        select: Dict[str, Any] = {}
+        if hasattr(self, "ai_batch_size_spin"):
+            select["batch_size"] = self.ai_batch_size_spin.value()
+        if hasattr(self, "ai_disagreement_pct"):
+            select["pct_disagreement"] = float(self.ai_disagreement_pct.value())
+        if hasattr(self, "ai_uncertain_pct"):
+            select["pct_uncertain"] = float(self.ai_uncertain_pct.value())
+        if hasattr(self, "ai_easy_pct"):
+            select["pct_easy_qc"] = float(self.ai_easy_pct.value())
+        if hasattr(self, "ai_diversity_pct"):
+            select["pct_diversity"] = float(self.ai_diversity_pct.value())
+        if select:
+            overrides["select"] = select
+        if hasattr(self, "ai_final_llm_checkbox"):
+            overrides["final_llm_labeling"] = bool(self.ai_final_llm_checkbox.isChecked())
+        return overrides
 
     def _on_ai_thread_finished(self) -> None:
         self._ai_thread = None

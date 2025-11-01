@@ -3729,7 +3729,7 @@ class ActiveLearningLLMFirst:
         # ---------- Compose final (units only) + top-off ----------
         final = pd.concat(selected_rows, ignore_index=True) if selected_rows else pd.DataFrame(columns=["unit_id","label_id","label_type","selection_reason"])
         final = final.drop_duplicates(subset=["unit_id"], keep="first").copy()
-    
+
         if len(final) < total:
             print("Topping off to target batch_size ...")
             excluded = seen_units | set(final["unit_id"])
