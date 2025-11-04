@@ -117,6 +117,58 @@ class AIRoundJobConfig:
     timestamp: str
 
 
+class AIRoundLogDialog(QtWidgets.QDialog):
+    cancel_requested = QtCore.Signal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AI backend progress")
+        self.resize(640, 480)
+        self._allow_close = False
+        layout = QtWidgets.QVBoxLayout(self)
+        self.log_output = QtWidgets.QPlainTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Close
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(self.button_box)
+        self._close_button = self.button_box.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Close
+        )
+        self._cancel_button = self.button_box.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        if self._close_button:
+            self._close_button.setEnabled(False)
+        if self._cancel_button:
+            self._cancel_button.clicked.connect(self.cancel_requested.emit)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
+        if not self._allow_close:
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def reset_for_run(self) -> None:
+        self.log_output.clear()
+        self._allow_close = False
+        if self._close_button:
+            self._close_button.setEnabled(False)
+        if self._cancel_button:
+            self._cancel_button.setEnabled(True)
+
+    def mark_complete(self) -> None:
+        self._allow_close = True
+        if self._close_button:
+            self._close_button.setEnabled(True)
+        if self._cancel_button:
+            self._cancel_button.setEnabled(False)
+
+
 class AIRoundWorker(QtCore.QObject):
     finished = QtCore.Signal(object, object)
     log_message = QtCore.Signal(str)
@@ -2104,11 +2156,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_worker: Optional[AIRoundWorker] = None
         self._ai_pending_job: Optional[AIRoundJobConfig] = None
         self._ai_job_running = False
-        self._ai_is_preview = False
         self._ai_progress_active = False
         self._ai_progress_stamp: str = ""
         self._ai_progress_text: str = ""
         self._ai_progress_block_number: Optional[int] = None
+        self._ai_log_dialog: Optional[AIRoundLogDialog] = None
+        self.ai_log_output: Optional[QtWidgets.QPlainTextEdit] = None
         self.ctx.project_changed.connect(self._refresh_labelset_options)
         self.ctx.project_changed.connect(self._refresh_corpus_options)
         self.ctx.project_changed.connect(self._refresh_ai_round_options)
@@ -2375,19 +2428,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         )
         ai_controls_layout.addWidget(self.ai_rounds_list)
         ai_button_row = QtWidgets.QHBoxLayout()
-        self.ai_preview_btn = QtWidgets.QPushButton("Preview selection")
-        self.ai_preview_btn.clicked.connect(self._on_ai_preview)
-        ai_button_row.addWidget(self.ai_preview_btn)
+        self.ai_generate_btn = QtWidgets.QPushButton("Generate AI round")
+        self.ai_generate_btn.clicked.connect(self._on_ai_generate)
+        ai_button_row.addWidget(self.ai_generate_btn)
         self.ai_cancel_btn = QtWidgets.QPushButton("Cancel run")
         self.ai_cancel_btn.clicked.connect(self._on_cancel_ai_job)
         self.ai_cancel_btn.setEnabled(False)
         ai_button_row.addWidget(self.ai_cancel_btn)
         ai_button_row.addStretch()
         ai_controls_layout.addLayout(ai_button_row)
-        self.ai_log_output = QtWidgets.QPlainTextEdit()
-        self.ai_log_output.setReadOnly(True)
-        self.ai_log_output.setPlaceholderText("AI backend logs will appear here…")
-        ai_controls_layout.addWidget(self.ai_log_output)
         ai_layout.addWidget(self.ai_controls_container)
         scroll_layout.addWidget(ai_group)
 
@@ -2569,8 +2618,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
     def _update_ai_buttons(self) -> None:
         enabled = getattr(self, "use_ai_checkbox", None) and self.use_ai_checkbox.isChecked()
         active = bool(enabled and not self._ai_job_running)
-        if hasattr(self, "ai_preview_btn"):
-            self.ai_preview_btn.setEnabled(active)
+        if hasattr(self, "ai_generate_btn"):
+            self.ai_generate_btn.setEnabled(active)
         if hasattr(self, "ai_cancel_btn"):
             self.ai_cancel_btn.setEnabled(self._ai_job_running)
         if hasattr(self, "ai_rounds_list"):
@@ -2579,10 +2628,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             container_enabled = self.use_ai_checkbox.isChecked()
             self.ai_controls_container.setEnabled(container_enabled or self._ai_job_running)
 
-    def _on_ai_preview(self) -> None:
+    def _on_ai_generate(self) -> None:
         if self._ai_job_running:
             return
-        self._start_ai_round(finalize=False)
+        self._start_ai_round()
 
     def _on_cancel_ai_job(self) -> None:
         if not self._ai_job_running or not self._ai_worker:
@@ -2602,7 +2651,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         )
 
     def _append_ai_log(self, message: str) -> None:
-        if not hasattr(self, "ai_log_output"):
+        if not self.ai_log_output:
             return
         if message.startswith("\r"):
             text = message[1:].strip()
@@ -2642,7 +2691,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._write_ai_log_line(message, stamp, append_newline=True)
 
     def _write_ai_log_line(self, text: str, stamp: str, append_newline: bool = False) -> int:
-        if not hasattr(self, "ai_log_output"):
+        if not self.ai_log_output:
             return -1
         doc = self.ai_log_output.document()
         cursor = self.ai_log_output.textCursor()
@@ -2660,7 +2709,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         stamp: str,
         block_number: Optional[int],
     ) -> Optional[int]:
-        if not hasattr(self, "ai_log_output"):
+        if not self.ai_log_output:
             return None
         doc = self.ai_log_output.document()
         if block_number is None:
@@ -2785,25 +2834,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             db=db,
         )
 
-    def _start_ai_round(self, finalize: bool) -> bool:
+    def _start_ai_round(self) -> bool:
         context = self._build_ai_context()
         if not context:
             return False
         prior_rounds = self._selected_prior_round_numbers()
-        if not prior_rounds:
-            self._append_ai_log("No prior rounds selected; running cold-start configuration.")
         timestamp = datetime.utcnow().isoformat()
         round_number = self._next_round_number()
-        if finalize:
-            try:
-                round_dir = ensure_dir(self.ctx.resolve_round_dir(context.pheno_id, round_number))
-            except Exception as exc:  # noqa: BLE001
-                QtWidgets.QMessageBox.critical(self, "Round", str(exc))
-                return False
-            cleanup = False
-        else:
-            round_dir = Path(tempfile.mkdtemp(prefix="vaannotate_ai_preview_"))
-            cleanup = True
+        try:
+            round_dir = ensure_dir(self.ctx.resolve_round_dir(context.pheno_id, round_number))
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Round", str(exc))
+            return False
         round_id = f"{context.pheno_id}_r{round_number}"
         job = AIRoundJobConfig(
             context=context,
@@ -2818,12 +2860,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         env_overrides = self._collect_ai_environment()
         if env_overrides is None:
             return False
+        self._open_ai_log_dialog()
+        if not prior_rounds:
+            self._append_ai_log("No prior rounds selected; running cold-start configuration.")
         worker = AIRoundWorker(
             project_root,
             job,
-            finalize=finalize,
+            finalize=True,
             cfg_overrides=cfg_overrides,
-            cleanup_dir=cleanup,
+            cleanup_dir=False,
             env_overrides=env_overrides,
         )
         thread = QtCore.QThread(self)
@@ -2839,8 +2884,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_worker = worker
         self._ai_pending_job = job
         self._ai_job_running = True
-        self._ai_is_preview = not finalize
-        if hasattr(self, "ai_log_output"):
+        if self.ai_log_output:
             self.ai_log_output.clear()
         self._ai_progress_active = False
         self._ai_progress_stamp = ""
@@ -2852,6 +2896,37 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             ok_button.setEnabled(False)
         thread.start()
         return True
+
+    def _open_ai_log_dialog(self) -> None:
+        dialog = self._ai_log_dialog
+        if dialog is None:
+            dialog = AIRoundLogDialog(self)
+            dialog.cancel_requested.connect(self._on_cancel_ai_job)
+            dialog.finished.connect(self._on_ai_log_dialog_closed)
+            self._ai_log_dialog = dialog
+        dialog.reset_for_run()
+        self.ai_log_output = dialog.log_output
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _mark_ai_log_complete(self) -> None:
+        if self._ai_log_dialog is None:
+            return
+        self._ai_log_dialog.mark_complete()
+
+    def _close_ai_log_dialog(self) -> None:
+        if self._ai_log_dialog is None:
+            return
+        dialog = self._ai_log_dialog
+        self._ai_log_dialog = None
+        self.ai_log_output = None
+        dialog.close()
+        dialog.deleteLater()
+
+    def _on_ai_log_dialog_closed(self) -> None:
+        self._ai_log_dialog = None
+        self.ai_log_output = None
 
     def _collect_ai_environment(self) -> Optional[Dict[str, str]]:
         if not getattr(self, "use_ai_checkbox", None) or not self.use_ai_checkbox.isChecked():
@@ -2946,6 +3021,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_progress_active = False
         self._ai_progress_stamp = ""
         self._ai_progress_text = ""
+        self._mark_ai_log_complete()
         ok_button = self.button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
         if ok_button:
             ok_button.setEnabled(True)
@@ -2959,14 +3035,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return
         if payload.get("cancelled"):
             self._ai_pending_job = None
-            self._ai_is_preview = False
+            self._close_ai_log_dialog()
             return
         backend_result = payload.get("backend_result")
-        if isinstance(backend_result, BackendResult) and self._ai_is_preview:
-            self._show_ai_preview(backend_result)
-            self._ai_pending_job = None
-            self._ai_is_preview = False
-            return
         build_result = payload.get("build_result")
         job = self._ai_pending_job
         self._ai_pending_job = None
@@ -2979,27 +3050,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.ctx.update_cache_after_round(job.context.corpus_id)
         except Exception:  # noqa: BLE001
             pass
-        self._ai_is_preview = False
+        self._close_ai_log_dialog()
         super().accept()
-
-    def _show_ai_preview(self, result: BackendResult) -> None:
-        df = result.dataframe.head(10)
-        lines: List[str] = []
-        for _, row in df.iterrows():
-            unit = str(row.get("unit_id", ""))
-            patient = str(row.get("patient_icn") or row.get("patienticn") or "")
-            doc_id = row.get("doc_id") or ""
-            reason = row.get("selection_reason") or ""
-            display = unit
-            if patient:
-                display += f" • {patient}"
-            if doc_id:
-                display += f" • {doc_id}"
-            if reason:
-                display += f" — {reason}"
-            lines.append(display)
-        message = "\n".join(lines) if lines else "No units were returned by the AI backend."
-        QtWidgets.QMessageBox.information(self, "AI preview", message)
 
     def _load_labelset_ids(self) -> List[str]:
         rows = self.ctx.list_label_sets()
@@ -3392,7 +3444,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if getattr(self, "use_ai_checkbox", None) and self.use_ai_checkbox.isChecked():
             if self._ai_job_running:
                 return
-            if not self._start_ai_round(finalize=True):
+            if not self._start_ai_round():
                 return
             return
         if not self._create_round():
