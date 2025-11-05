@@ -3,7 +3,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vaannotate.project import build_label_config
+import pytest
+
+from vaannotate.project import (
+    add_labelset,
+    add_phenotype,
+    build_label_config,
+    get_connection,
+    init_project,
+    resolve_label_config_path,
+)
 
 
 def test_build_label_config_dependency_tree() -> None:
@@ -79,3 +88,85 @@ def test_build_label_config_dependency_tree() -> None:
     assert isinstance(grules, list) and grules
     assert grules[0]["parent"] == "ChildA"
     assert grules[0]["values"] == ["positive"]
+
+
+def test_resolve_label_config_path_in_labelsets_dir(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    target = resolve_label_config_path(paths.root, "ls_demo")
+
+    assert target == paths.root / "label_sets" / "ls_demo" / "label_config.json"
+
+
+def test_add_labelset_enforces_uniqueness_within_set(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj"
+    paths = init_project(project_root, "proj", "Project", "tester")
+    with get_connection(paths.project_db) as conn:
+        add_phenotype(
+            conn,
+            pheno_id="phen",
+            project_id="proj",
+            name="Phenotype",
+            level="single_doc",
+            storage_path="phenotypes/phen",
+        )
+        with pytest.raises(ValueError):
+            add_labelset(
+                conn,
+                labelset_id="ls_dup",
+                project_id="proj",
+                pheno_id="phen",
+                version=1,
+                created_by="tester",
+                notes=None,
+                labels=[
+                    {"label_id": "dup", "name": "A", "type": "text", "required": False},
+                    {"label_id": "dup", "name": "B", "type": "text", "required": False},
+                ],
+            )
+
+
+def test_add_labelset_allows_duplicate_ids_across_sets(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj"
+    paths = init_project(project_root, "proj", "Project", "tester")
+    with get_connection(paths.project_db) as conn:
+        add_phenotype(
+            conn,
+            pheno_id="phen",
+            project_id="proj",
+            name="Phenotype",
+            level="single_doc",
+            storage_path="phenotypes/phen",
+        )
+        add_labelset(
+            conn,
+            labelset_id="ls_one",
+            project_id="proj",
+            pheno_id="phen",
+            version=1,
+            created_by="tester",
+            notes=None,
+            labels=[
+                {"label_id": "shared", "name": "Shared", "type": "text", "required": False}
+            ],
+        )
+        add_labelset(
+            conn,
+            labelset_id="ls_two",
+            project_id="proj",
+            pheno_id="phen",
+            version=1,
+            created_by="tester",
+            notes=None,
+            labels=[
+                {"label_id": "shared", "name": "Shared", "type": "text", "required": False}
+            ],
+        )
+        rows = conn.execute(
+            "SELECT labelset_id, label_id FROM labels ORDER BY labelset_id"
+        ).fetchall()
+        assert [(row["labelset_id"], row["label_id"]) for row in rows] == [
+            ("ls_one", "shared"),
+            ("ls_two", "shared"),
+        ]

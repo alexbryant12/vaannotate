@@ -39,7 +39,12 @@ from vaannotate.shared.sampling import (
 from vaannotate.shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
 from vaannotate.shared.theme import apply_dark_palette
 from vaannotate.corpus import TABULAR_EXTENSIONS, import_tabular_corpus
-from vaannotate.project import build_label_config, fetch_labelset, init_project
+from vaannotate.project import (
+    build_label_config,
+    fetch_labelset,
+    init_project,
+    resolve_label_config_path,
+)
 from vaannotate.utils import copy_sqlite_database, ensure_dir
 from vaannotate.rounds import RoundBuilder
 from vaannotate.vaannotate_ai_backend import CancelledError, BackendResult, run_ai_backend_and_collect
@@ -222,6 +227,7 @@ class AIRoundWorker(QtCore.QObject):
                 result = run_ai_backend_and_collect(
                     self.project_root,
                     self.job.context.pheno_id,
+                    self.job.context.labelset_id,
                     self.job.prior_rounds,
                     self.job.round_dir,
                     self.job.context.pheno_level,
@@ -286,18 +292,34 @@ class AIRoundWorker(QtCore.QObject):
             self.log_message.emit(f"Warning: unable to build label_config ({exc})")
             return None, None
         generated = build_label_config(labelset)
-        phenotype_dir = self._resolve_phenotype_dir(context)
-        config_path = phenotype_dir / "ai" / "label_config.json"
+        config_path = resolve_label_config_path(self.project_root, context.labelset_id)
         existing_payload: Dict[str, object] = {}
-        if config_path.exists():
+        for candidate in self._label_config_candidates(context, config_path):
+            if not candidate.exists():
+                continue
             try:
-                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+                loaded = json.loads(candidate.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     existing_payload = loaded
+                    if candidate != config_path:
+                        self.log_message.emit(
+                            f"Info: loaded legacy label_config.json from {candidate}"
+                        )
+                    break
             except Exception as exc:  # noqa: BLE001
-                self.log_message.emit(f"Warning: failed to parse existing label_config.json ({exc})")
+                self.log_message.emit(
+                    f"Warning: failed to parse existing label_config.json ({exc})"
+                )
         merged = self._merge_label_config(existing_payload, generated)
         return merged, config_path
+
+    def _label_config_candidates(
+        self, context: RoundCreationContext, new_path: Path
+    ) -> Iterable[Path]:
+        yield new_path
+        legacy = self._resolve_phenotype_dir(context) / "ai" / "label_config.json"
+        if legacy != new_path:
+            yield legacy
 
     def _resolve_phenotype_dir(self, context: RoundCreationContext) -> Path:
         storage = context.phenotype_storage_path
@@ -373,6 +395,7 @@ class AIRoundWorker(QtCore.QObject):
                     for idx, option in enumerate(label.get("options", [])):
                         option_record = models.LabelOption(
                             option_id=str(uuid.uuid4()),
+                            labelset_id=context.labelset_id,
                             label_id=label_record.label_id,
                             value=str(option.get("value", "")),
                             display=str(option.get("display", option.get("value", ""))),
@@ -1097,6 +1120,7 @@ class ProjectContext(QtCore.QObject):
                 for opt_index, option in enumerate(label.get("options", [])):
                     option_record = models.LabelOption(
                         option_id=option.get("option_id") or str(uuid.uuid4()),
+                        labelset_id=labelset_id,
                         label_id=label_record.label_id,
                         value=str(option.get("value", "")),
                         display=str(option.get("display", option.get("value", ""))),
@@ -3420,7 +3444,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 (labelset_id,),
             ).fetchall()
             options = connection.execute(
-                "SELECT * FROM label_options WHERE label_id IN (SELECT label_id FROM labels WHERE labelset_id=?)",
+                "SELECT * FROM label_options WHERE labelset_id=?",
                 (labelset_id,),
             ).fetchall()
             option_map: Dict[str, List[Dict[str, object]]] = {}
@@ -3654,6 +3678,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     for idx, option in enumerate(label["options"]):
                         option_record = models.LabelOption(
                             option_id=str(uuid.uuid4()),
+                            labelset_id=labelset_id,
                             label_id=label_record.label_id,
                             value=option["value"],
                             display=option["display"],
@@ -4896,8 +4921,8 @@ class IaaWidget(QtWidgets.QWidget):
             if label_ids:
                 placeholders = ",".join(["?"] * len(label_ids))
                 option_rows = conn.execute(
-                    f"SELECT label_id, value, display, order_index FROM label_options WHERE label_id IN ({placeholders}) ORDER BY label_id, order_index",
-                    label_ids,
+                    f"SELECT label_id, value, display, order_index FROM label_options WHERE labelset_id=? AND label_id IN ({placeholders}) ORDER BY label_id, order_index",
+                    (self.current_round.get("labelset_id"), *label_ids),
                 ).fetchall()
                 for opt in option_rows:
                     options_map.setdefault(opt["label_id"], []).append(

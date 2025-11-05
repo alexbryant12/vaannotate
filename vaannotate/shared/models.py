@@ -175,7 +175,7 @@ class Label(Record):
     __schema__ = (
         """
         CREATE TABLE IF NOT EXISTS labels (
-            label_id TEXT PRIMARY KEY,
+            label_id TEXT NOT NULL,
             labelset_id TEXT NOT NULL,
             name TEXT NOT NULL,
             type TEXT NOT NULL,
@@ -187,6 +187,7 @@ class Label(Record):
             unit TEXT NULL,
             min REAL NULL,
             max REAL NULL,
+            PRIMARY KEY(labelset_id, label_id),
             FOREIGN KEY(labelset_id) REFERENCES label_sets(labelset_id)
         )
         """
@@ -196,6 +197,7 @@ class Label(Record):
 @dataclass
 class LabelOption(Record):
     option_id: str
+    labelset_id: str
     label_id: str
     value: str
     display: str
@@ -207,12 +209,14 @@ class LabelOption(Record):
         """
         CREATE TABLE IF NOT EXISTS label_options (
             option_id TEXT PRIMARY KEY,
+            labelset_id TEXT NOT NULL,
             label_id TEXT NOT NULL,
             value TEXT NOT NULL,
             display TEXT NOT NULL,
             order_index INTEGER NOT NULL,
             weight REAL NULL,
-            FOREIGN KEY(label_id) REFERENCES labels(label_id)
+            FOREIGN KEY(labelset_id) REFERENCES label_sets(labelset_id),
+            FOREIGN KEY(labelset_id, label_id) REFERENCES labels(labelset_id, label_id)
         )
         """
     )

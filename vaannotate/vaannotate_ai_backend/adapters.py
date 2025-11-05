@@ -11,6 +11,7 @@ import pandas as pd
 
 from . import __version__
 from .orchestrator import build_next_batch
+from vaannotate.project import resolve_label_config_path
 
 
 @dataclass
@@ -436,6 +437,7 @@ def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: Lis
 def run_ai_backend_and_collect(
     project_root: Path,
     pheno_id: str,
+    labelset_id: Optional[str],
     prior_rounds: List[int],
     round_dir: Path,
     level: str,
@@ -462,11 +464,17 @@ def run_ai_backend_and_collect(
 
     label_config_payload: Optional[Dict[str, Any]] = label_config
     if label_config_payload is None:
-        label_config_path = Path(project_root) / "phenotypes" / pheno_id / "ai" / "label_config.json"
-        if label_config_path.exists():
+        candidates: List[Path] = []
+        if labelset_id:
+            candidates.append(resolve_label_config_path(project_root, labelset_id))
+        candidates.append(Path(project_root) / "phenotypes" / pheno_id / "ai" / "label_config.json")
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
             try:
-                label_config_payload = json.loads(label_config_path.read_text(encoding="utf-8"))
-                log("Loaded label_config.json overrides")
+                label_config_payload = json.loads(candidate.read_text(encoding="utf-8"))
+                log(f"Loaded label_config.json overrides from {candidate}")
+                break
             except Exception as exc:  # noqa: BLE001
                 log(f"Warning: failed to parse label_config.json ({exc})")
 
