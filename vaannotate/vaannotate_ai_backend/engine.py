@@ -3892,8 +3892,10 @@ class ActiveLearningLLMFirst:
             ).drop_duplicates(subset=["unit_id"], keep="first")
     
         final.to_parquet(os.path.join(self.paths.outdir, "final_selection.parquet"), index=False)
+        result_df = final
 
         # (Optional) run family labeling on the final units for transparency/audit
+        final_out = None
         if self.cfg.final_llm_labeling:
             fam_rows = []
             fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
@@ -3944,6 +3946,8 @@ class ActiveLearningLLMFirst:
                 final_units = final[["unit_id", "label_id", "label_type", "selection_reason"]].drop_duplicates()
                 final_out = final_units.merge(fam_wide, on="unit_id", how="left")
                 final_out.to_parquet(os.path.join(self.paths.outdir, "final_selection_with_llm.parquet"), index=False)
+        if final_out is not None:
+            result_df = final_out
         
         diagnostics = {
             "total_selected": int(len(final)),
@@ -3967,6 +3971,8 @@ class ActiveLearningLLMFirst:
         hours, remainder = divmod(total_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         print(f"Done. Total elapsed: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
+
+        return result_df
         
         
 # ------------------------------
