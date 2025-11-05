@@ -33,7 +33,12 @@ if "langchain" not in sys.modules:
     sys.modules["langchain.text_splitter"] = text_splitter_stub
 
 
-from vaannotate.vaannotate_ai_backend.engine import ActiveLearningLLMFirst, DataRepository
+from vaannotate.vaannotate_ai_backend.engine import (
+    ActiveLearningLLMFirst,
+    DataRepository,
+    build_label_dependencies,
+    sanitize_label_config,
+)
 
 
 def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -> None:
@@ -56,7 +61,7 @@ def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -
         ]
     )
 
-    repo = DataRepository(notes_df, ann_df)
+    repo = DataRepository(notes_df, ann_df, level="multi_doc")
 
     label_config = {
         "_meta": {"labelset_id": "ls"},
@@ -66,7 +71,7 @@ def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -
 
     orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
     orchestrator.repo = repo
-    orchestrator.label_config = label_config
+    orchestrator.label_config = sanitize_label_config(label_config)[0]
 
     legacy_rules, legacy_types, current_rules, current_types = orchestrator._label_maps()
 
@@ -92,3 +97,33 @@ def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -
     )
     assert list(topoff["label_id"]) == ["new_label"]
     assert topoff.loc[topoff.index[0], "label_type"] == "binary"
+
+
+def test_build_label_dependencies_skips_meta_keys() -> None:
+    config = {
+        "_meta": {"labelset_id": "ls"},
+        "parent": {"label_id": "parent"},
+        "child": {"label_id": "child", "gated_by": "parent"},
+        "_debug": {},
+    }
+
+    parent_to_children, child_to_parents, roots = build_label_dependencies(config)
+
+    assert "_meta" not in parent_to_children
+    assert child_to_parents["child"] == ["parent"]
+    assert "_meta" not in roots
+    assert "child" in parent_to_children["parent"]
+
+
+def test_sanitize_label_config_returns_meta() -> None:
+    raw = {
+        "_meta": {"labelset_id": "ls"},
+        "keep": {"label_id": "keep"},
+        "_ignore": {"label_id": "ignored"},
+    }
+
+    sanitized, meta = sanitize_label_config(raw)
+
+    assert "keep" in sanitized
+    assert "_ignore" not in sanitized
+    assert meta == {"labelset_id": "ls"}

@@ -24,9 +24,6 @@ def _default_paths(outdir: Path, cache_dir: Path | None = None) -> engine.Paths:
 
 def _apply_overrides(target: object, overrides: Mapping[str, Any]) -> None:
     for key, value in overrides.items():
-        if key == "phenotype_level":
-            # Not currently consumed directly by the engine config.
-            continue
         if isinstance(value, Mapping):
             current = getattr(target, key, None)
             if current is not None and not isinstance(current, (str, bytes, int, float, bool)):

@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, List, Dict, Tuple, Optional, Any
+from typing import Callable, List, Dict, Tuple, Optional, Any, Mapping
 import numpy as np
 import logging
 import pandas as pd
@@ -215,6 +215,7 @@ class OrchestratorConfig:
     scjitter: SCJitterConfig = field(default_factory=SCJitterConfig)
     final_llm_labeling: bool = True
     final_llm_labeling_n_consistency: int = 1
+    phenotype_level: str = "single_doc"
 
 
 # ------------------------------
@@ -456,7 +457,7 @@ def _jsonify_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 # ------------------------------
 
 class DataRepository:
-    def __init__(self, notes_df: pd.DataFrame, ann_df: pd.DataFrame):
+    def __init__(self, notes_df: pd.DataFrame, ann_df: pd.DataFrame, *, level: str = "single_doc"):
         required_notes = {"patient_icn","doc_id","text"}
         if not required_notes.issubset(set(notes_df.columns)):
             raise ValueError(f"Notes missing {required_notes}")
@@ -464,8 +465,12 @@ class DataRepository:
         if not required_ann.issubset(set(ann_df.columns)):
             raise ValueError(f"Annotations missing {required_ann}")
 
+        self.level = str(level or "single_doc").lower()
         self.notes = notes_df.copy()
-        self.notes["unit_id"] = self.notes["patient_icn"].astype(str)
+        if self.level == "single_doc":
+            self.notes["unit_id"] = self.notes["doc_id"].astype(str)
+        else:
+            self.notes["unit_id"] = self.notes["patient_icn"].astype(str)
         self.notes["doc_id"] = self.notes["doc_id"].astype(str)
         self.notes["text"] = self.notes["text"].astype(str).map(normalize_text)
 
@@ -509,6 +514,8 @@ class DataRepository:
                 self.ann[col] = ""
 
         self.label_rules_by_label = self._collect_label_rules()
+        self._unit_patients = self._build_unit_patients()
+        self._unit_primary_docs = self._build_unit_primary_docs()
 
     def _collect_label_rules(self) -> Dict[str,str]:
         rules = {}
@@ -519,6 +526,48 @@ class DataRepository:
                 if vals:
                     rules[lid] = vals[-1]
         return rules
+
+    def _build_unit_patients(self) -> Dict[str, str]:
+        pairs: Dict[str, str] = {}
+        if {"unit_id", "patient_icn"}.issubset(self.notes.columns):
+            for row in self.notes[["unit_id", "patient_icn"]].itertuples(index=False):
+                uid = str(getattr(row, "unit_id", "") or "").strip()
+                patient = str(getattr(row, "patient_icn", "") or "").strip()
+                if not uid:
+                    continue
+                if uid not in pairs or not pairs[uid]:
+                    pairs[uid] = patient
+        return pairs
+
+    def _build_unit_primary_docs(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        if {"unit_id", "doc_id"}.issubset(self.notes.columns):
+            grouped = self.notes[["unit_id", "doc_id"]].dropna()
+            if not grouped.empty:
+                for uid, group in grouped.groupby("unit_id", sort=False):
+                    docs = [str(doc).strip() for doc in group["doc_id"].tolist() if str(doc).strip()]
+                    uniq = sorted(set(docs))
+                    if len(uniq) == 1:
+                        mapping[str(uid)] = uniq[0]
+        return mapping
+
+    def unit_summary(self) -> pd.DataFrame:
+        rows = []
+        for uid, patient in self._unit_patients.items():
+            rows.append(
+                {
+                    "unit_id": uid,
+                    "patient_icn": patient or uid,
+                    "doc_id": self._unit_primary_docs.get(uid, ""),
+                }
+            )
+        return pd.DataFrame(rows, columns=["unit_id", "patient_icn", "doc_id"])
+
+    def patient_for_unit(self, unit_id: str) -> str:
+        return self._unit_patients.get(str(unit_id), "")
+
+    def primary_doc_for_unit(self, unit_id: str) -> str:
+        return self._unit_primary_docs.get(str(unit_id), "")
 
     def notes_by_doc(self) -> Dict[str,str]:
         return dict(zip(self.notes["doc_id"].tolist(), self.notes["text"].tolist()))
@@ -551,6 +600,23 @@ class DataRepository:
             else:
                 types[str(lid)] = "categorical"  # use 'categorical' instead of 'text'
         return types
+
+
+def sanitize_label_config(config: Optional[Mapping[str, object]]) -> tuple[dict, dict]:
+    if not isinstance(config, Mapping):
+        return {}, {}
+    sanitized: dict[str, object] = {}
+    meta: dict = {}
+    for key, value in config.items():
+        key_text = str(key)
+        if key_text == "_meta":
+            if isinstance(value, Mapping):
+                meta = dict(value)
+            continue
+        if key_text.startswith("_"):
+            continue
+        sanitized[key_text] = value
+    return sanitized, meta
 
     def reviewer_disagreement(self, round_policy: str = 'last',
                           decay_half_life: float = 2.0) -> pd.DataFrame:
@@ -2124,7 +2190,10 @@ def build_label_dependencies(label_config: dict) -> tuple[dict, dict, list]:
     if not isinstance(label_config, dict):
         return {}, {}, []
     for lid, cfg in label_config.items():
-        if not isinstance(cfg, dict): 
+        lid_str = str(lid)
+        if lid_str.startswith("_"):
+            continue
+        if not isinstance(cfg, dict):
             continue
         gb = cfg.get('gated_by')
         # Normalize to list
@@ -2146,9 +2215,9 @@ def build_label_dependencies(label_config: dict) -> tuple[dict, dict, list]:
                     parents.append(p)
         if parents:
             for p in parents:
-                parent_to_children.setdefault(str(p), []).append(str(lid))
-                child_to_parents.setdefault(str(lid), []).append(str(p))
-    all_labels = {str(k) for k in label_config.keys()}
+                parent_to_children.setdefault(str(p), []).append(str(lid_str))
+                child_to_parents.setdefault(str(lid_str), []).append(str(p))
+    all_labels = {str(k) for k in label_config.keys() if not str(k).startswith("_")}
     roots = [lid for lid in all_labels if lid not in child_to_parents]
     return parent_to_children, child_to_parents, roots
 
@@ -3309,7 +3378,10 @@ class ActiveLearningLLMFirst:
         import os
         self.paths = paths; self.cfg = cfg
         notes_df = read_table(paths.notes_path); ann_df = read_table(paths.annotations_path)
-        self.repo = DataRepository(notes_df, ann_df)
+        level = getattr(self.cfg, "phenotype_level", "single_doc")
+        self.phenotype_level = str(level or "single_doc")
+        self.repo = DataRepository(notes_df, ann_df, level=self.phenotype_level)
+        sanitized_label_config, meta = sanitize_label_config(label_config or {})
 
         embed_name = os.getenv("MED_EMBED_MODEL_NAME")
         rerank_name = os.getenv("RERANKER_MODEL_NAME")
@@ -3321,10 +3393,11 @@ class ActiveLearningLLMFirst:
         self.models = Models(embedder, reranker, device=device, emb_batch=emb_bs, rerank_batch=rr_bs)
 
         self.store = EmbeddingStore(self.models, cache_dir=self.paths.cache_dir, normalize=self.cfg.rag.normalize_embeddings)
-        self.rag = RAGRetriever(self.store, self.models, self.cfg.rag, label_configs=label_config or {}, notes_by_doc=self.repo.notes_by_doc(), repo=self.repo)
+        self.rag = RAGRetriever(self.store, self.models, self.cfg.rag, label_configs=sanitized_label_config, notes_by_doc=self.repo.notes_by_doc(), repo=self.repo)
         self.llm = LLMAnnotator(self.cfg.llm, self.cfg.scjitter, cache_dir=self.paths.cache_dir)
         self.pooler = LabelAwarePooler(self.repo, self.store, self.models, beta=float(os.getenv('POOLER_BETA', 5.0)), kmeans_k=int(os.getenv('POOLER_K', 8)), persist_dir=os.path.join(self.paths.cache_dir, 'prototypes'), version='v1', use_negative=bool(int(os.getenv('POOLER_USE_NEG', '0'))))
-        self.label_config = label_config or {}
+        self.label_config = sanitized_label_config
+        self.label_config_meta = meta
 
     def _label_maps(self) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
         """Return legacy and current rule/type maps with latest label config overlays."""
@@ -3948,7 +4021,37 @@ class ActiveLearningLLMFirst:
                 final_out.to_parquet(os.path.join(self.paths.outdir, "final_selection_with_llm.parquet"), index=False)
         if final_out is not None:
             result_df = final_out
-        
+
+        result_df = result_df.copy()
+        unit_summary = self.repo.unit_summary()
+        patient_lookup: Dict[str, str] = {}
+        doc_lookup: Dict[str, str] = {}
+        if not unit_summary.empty:
+            summary_indexed = unit_summary.set_index("unit_id")
+            patient_lookup = summary_indexed["patient_icn"].to_dict()
+            doc_lookup = summary_indexed["doc_id"].to_dict()
+
+        if "patient_icn" not in result_df.columns:
+            result_df["patient_icn"] = ""
+        result_df["patient_icn"] = result_df["patient_icn"].fillna("")
+        if patient_lookup:
+            missing_patient = result_df["patient_icn"].astype(str).str.strip() == ""
+            result_df.loc[missing_patient, "patient_icn"] = (
+                result_df.loc[missing_patient, "unit_id"].map(patient_lookup).fillna("")
+            )
+        still_missing_patient = result_df["patient_icn"].astype(str).str.strip() == ""
+        result_df.loc[still_missing_patient, "patient_icn"] = result_df.loc[still_missing_patient, "unit_id"].astype(str)
+
+        if "doc_id" not in result_df.columns:
+            result_df["doc_id"] = ""
+        result_df["doc_id"] = result_df["doc_id"].fillna("")
+        if doc_lookup:
+            missing_doc = result_df["doc_id"].astype(str).str.strip() == ""
+            result_df.loc[missing_doc, "doc_id"] = (
+                result_df.loc[missing_doc, "unit_id"].map(doc_lookup).fillna("")
+            )
+        result_df["doc_id"] = result_df["doc_id"].fillna("")
+
         diagnostics = {
             "total_selected": int(len(final)),
             "bucket_sizes": {
