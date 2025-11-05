@@ -20,6 +20,7 @@ class ProjectPaths:
     admin_dir: Path
     phenotypes_dir: Path
     corpora_dir: Path
+    labelsets_dir: Path
 
 
 def build_project_paths(root: Path) -> ProjectPaths:
@@ -29,7 +30,14 @@ def build_project_paths(root: Path) -> ProjectPaths:
         admin_dir=root / "admin_tools",
         phenotypes_dir=root / "phenotypes",
         corpora_dir=root / "corpora",
+        labelsets_dir=root / "label_sets",
     )
+
+
+def resolve_label_config_path(project_root: Path, labelset_id: str) -> Path:
+    """Return the canonical path for a label set's label_config.json file."""
+
+    return Path(project_root) / "label_sets" / labelset_id / "label_config.json"
 
 
 def init_project(root: Path, project_id: str, name: str, created_by: str) -> ProjectPaths:
@@ -38,6 +46,7 @@ def init_project(root: Path, project_id: str, name: str, created_by: str) -> Pro
     ensure_dir(paths.admin_dir)
     ensure_dir(paths.phenotypes_dir)
     ensure_dir(paths.corpora_dir)
+    ensure_dir(paths.labelsets_dir)
     with initialize_project_db(paths.project_db) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO projects(project_id, name, created_at, created_by) VALUES (?,?,?,?)",
@@ -112,7 +121,7 @@ def add_labelset(
     created_by: str,
     notes: str | None,
     labels: Iterable[dict],
-) -> None:
+    ) -> None:
     created_at = datetime.utcnow().isoformat()
     conn.execute(
         """
@@ -122,8 +131,16 @@ def add_labelset(
         """,
         (labelset_id, project_id, pheno_id, version, created_at, created_by, notes),
     )
+    seen_label_ids: set[str] = set()
     for idx, label in enumerate(labels):
-        label_id = label["label_id"]
+        label_id = str(label["label_id"]).strip()
+        if not label_id:
+            raise ValueError("Labels must define a non-empty label_id")
+        if label_id in seen_label_ids:
+            raise ValueError(
+                f"Duplicate label_id '{label_id}' detected in label set '{labelset_id}'"
+            )
+        seen_label_ids.add(label_id)
         conn.execute(
             """
             INSERT OR REPLACE INTO labels(
@@ -149,11 +166,14 @@ def add_labelset(
             option_id = option.get("option_id") or f"{label_id}_opt{o_idx}"
             conn.execute(
                 """
-                INSERT OR REPLACE INTO label_options(option_id,label_id,value,display,order_index,weight)
-                VALUES (?,?,?,?,?,?)
+                INSERT OR REPLACE INTO label_options(
+                    option_id,labelset_id,label_id,value,display,order_index,weight
+                )
+                VALUES (?,?,?,?,?,?,?)
                 """,
                 (
                     option_id,
+                    labelset_id,
                     label_id,
                     option["value"],
                     option.get("display", option["value"]),
@@ -175,7 +195,11 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
         (labelset_id,),
     ).fetchall()
     options_rows = conn.execute(
-        "SELECT * FROM label_options WHERE label_id IN (SELECT label_id FROM labels WHERE labelset_id=?) ORDER BY order_index",
+        """
+        SELECT * FROM label_options
+        WHERE labelset_id=?
+        ORDER BY label_id, order_index
+        """,
         (labelset_id,),
     ).fetchall()
     options_map: dict[str, list[sqlite3.Row]] = {}

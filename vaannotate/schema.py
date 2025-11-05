@@ -53,7 +53,7 @@ PROJECT_SCHEMA = [
     """,
     """
     CREATE TABLE IF NOT EXISTS labels(
-        label_id TEXT PRIMARY KEY,
+        label_id TEXT NOT NULL,
         labelset_id TEXT NOT NULL,
         name TEXT NOT NULL,
         type TEXT NOT NULL,
@@ -64,17 +64,21 @@ PROJECT_SCHEMA = [
         na_allowed INTEGER DEFAULT 0,
         unit TEXT,
         min REAL,
-        max REAL
+        max REAL,
+        PRIMARY KEY(labelset_id, label_id)
     );
     """,
     """
     CREATE TABLE IF NOT EXISTS label_options(
         option_id TEXT PRIMARY KEY,
+        labelset_id TEXT NOT NULL,
         label_id TEXT NOT NULL,
         value TEXT NOT NULL,
         display TEXT NOT NULL,
         order_index INTEGER NOT NULL,
-        weight REAL
+        weight REAL,
+        FOREIGN KEY(labelset_id) REFERENCES label_sets(labelset_id),
+        FOREIGN KEY(labelset_id, label_id) REFERENCES labels(labelset_id, label_id)
     );
     """,
     """
