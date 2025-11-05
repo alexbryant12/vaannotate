@@ -11,13 +11,14 @@ import pandas as pd
 from . import engine
 
 
-def _default_paths(outdir: Path) -> engine.Paths:
+def _default_paths(outdir: Path, cache_dir: Path | None = None) -> engine.Paths:
     notes_path = outdir / "notes.parquet"
     annotations_path = outdir / "annotations.parquet"
     return engine.Paths(
         notes_path=str(notes_path),
         annotations_path=str(annotations_path),
         outdir=str(outdir),
+        cache_dir_override=str(cache_dir) if cache_dir else None,
     )
 
 
@@ -186,13 +187,15 @@ def build_next_batch(
     cfg_overrides: Optional[Dict[str, Any]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    cache_dir: Path | None = None,
 ) -> Tuple[pd.DataFrame, dict]:
     """High-level entrypoint consumed by AdminApp/RoundBuilder.
     Writes intermediates under outdir and returns (final_df, artifacts).
     """
     outdir = Path(outdir)
     _ensure_dir(outdir)
-    paths = _default_paths(outdir)
+    cache_dir_path = Path(cache_dir) if cache_dir else None
+    paths = _default_paths(outdir, cache_dir=cache_dir_path)
     # Persist inputs to the files expected by the engine
     notes_path = Path(paths.notes_path)
     ann_path = Path(paths.annotations_path)

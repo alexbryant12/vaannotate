@@ -40,6 +40,7 @@ import os, re, json, math, time, random, hashlib
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Callable, List, Dict, Tuple, Optional, Any
 import numpy as np
 import logging
@@ -189,11 +190,18 @@ class Paths:
     notes_path: str
     annotations_path: str
     outdir: str
+    cache_dir_override: str | None = None
     cache_dir: str = field(init=False)
+
     def __post_init__(self):
-        self.cache_dir = os.path.join(self.outdir, "cache")
-        os.makedirs(self.outdir, exist_ok=True)
-        os.makedirs(self.cache_dir, exist_ok=True)
+        outdir_path = Path(self.outdir)
+        outdir_path.mkdir(parents=True, exist_ok=True)
+        if self.cache_dir_override:
+            cache_dir_path = Path(self.cache_dir_override)
+        else:
+            cache_dir_path = outdir_path / "cache"
+        cache_dir_path.mkdir(parents=True, exist_ok=True)
+        self.cache_dir = str(cache_dir_path)
 
 @dataclass
 class OrchestratorConfig:

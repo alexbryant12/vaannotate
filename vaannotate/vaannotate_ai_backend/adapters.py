@@ -419,6 +419,18 @@ def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: Lis
             ]
         )
     )
+    if not ann_df.empty and "doc_id" in ann_df.columns and "document_text" in ann_df.columns:
+        try:
+            doc_lookup = (
+                notes_df.copy()
+                .assign(doc_id=notes_df["doc_id"].astype(str))
+                .set_index("doc_id")["text"]
+            )
+            ann_df = ann_df.copy()
+            ann_df["doc_id"] = ann_df["doc_id"].astype(str)
+            ann_df["document_text"] = ann_df["doc_id"].map(doc_lookup).fillna(ann_df["document_text"])
+        except Exception:  # noqa: BLE001
+            pass
     return notes_df, ann_df
 
 def run_ai_backend_and_collect(
@@ -436,6 +448,13 @@ def run_ai_backend_and_collect(
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
+    shared_cache_dir: Optional[Path] = None
+    try:
+        corpus_db_path = _find_corpus_db(project_root, pheno_id, prior_rounds)
+    except FileNotFoundError:
+        corpus_db_path = None
+    else:
+        shared_cache_dir = corpus_db_path.parent / "ai_cache"
     notes_df, ann_df = export_inputs_from_repo(project_root, pheno_id, prior_rounds)
     ai_dir = Path(round_dir) / "imports" / "ai"
     ai_dir.mkdir(parents=True, exist_ok=True)
@@ -469,6 +488,7 @@ def run_ai_backend_and_collect(
         cfg_overrides=overrides,
         cancel_callback=cancel_callback,
         log_callback=log_callback,
+        cache_dir=shared_cache_dir,
     )
     csv_path = Path(artifacts["ai_next_batch_csv"])
     log(f"AI backend produced {len(final_df)} candidate units")
