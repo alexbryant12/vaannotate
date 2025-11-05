@@ -3326,10 +3326,110 @@ class ActiveLearningLLMFirst:
         self.pooler = LabelAwarePooler(self.repo, self.store, self.models, beta=float(os.getenv('POOLER_BETA', 5.0)), kmeans_k=int(os.getenv('POOLER_K', 8)), persist_dir=os.path.join(self.paths.cache_dir, 'prototypes'), version='v1', use_negative=bool(int(os.getenv('POOLER_USE_NEG', '0'))))
         self.label_config = label_config or {}
 
+    def _label_maps(self) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
+        """Return legacy and current rule/type maps with latest label config overlays."""
+
+        def _normalize_type(raw: Optional[object]) -> Optional[str]:
+            if raw is None:
+                return None
+            text = str(raw).strip().lower()
+            if not text:
+                return None
+            mapping = {
+                "boolean": "binary",
+                "bool": "binary",
+                "yes/no": "binary",
+                "yesno": "binary",
+                "y/n": "binary",
+                "yn": "binary",
+                "binary": "binary",
+                "categorical": "categorical",
+                "category": "categorical",
+                "multiclass": "categorical",
+                "multi": "categorical",
+                "options": "categorical",
+                "option": "categorical",
+                "text": "categorical",
+                "string": "categorical",
+                "free_text": "categorical",
+                "numeric": "numeric",
+                "number": "numeric",
+                "int": "numeric",
+                "integer": "numeric",
+                "float": "numeric",
+                "double": "numeric",
+                "date": "date",
+                "datetime": "date",
+                "timestamp": "date",
+            }
+            return mapping.get(text, text)
+
+        def _extract_rule_text(entry: Dict[str, object]) -> Optional[str]:
+            candidates = []
+            for key in ("rule_text", "rules", "prompt"):
+                val = entry.get(key) if isinstance(entry, dict) else None
+                if isinstance(val, str):
+                    val = val.strip()
+                    if val:
+                        return val
+                elif isinstance(val, list):
+                    for item in reversed(val):
+                        if isinstance(item, str):
+                            text = item.strip()
+                            if text:
+                                return text
+                        elif isinstance(item, dict):
+                            text = str(item.get("text") or item.get("rule") or "").strip()
+                            if text:
+                                return text
+                elif isinstance(val, dict):
+                    text = str(val.get("text") or val.get("rule") or "").strip()
+                    if text:
+                        return text
+            return None
+
+        legacy_rules_map = {str(k): v for k, v in (self.repo.label_rules_by_label or {}).items() if v}
+        legacy_label_types = {str(k): str(v) for k, v in (self.repo.label_types() or {}).items()}
+
+        current_rules_map = dict(legacy_rules_map)
+        current_label_types = dict(legacy_label_types)
+
+        for key, entry in (self.label_config or {}).items():
+            if str(key) == "_meta":
+                continue
+            label_entry = entry if isinstance(entry, dict) else {}
+            raw_id = label_entry.get("label_id") if isinstance(label_entry, dict) else None
+            label_id = str(raw_id or key).strip()
+            if not label_id:
+                continue
+
+            rule_text = _extract_rule_text(label_entry) if isinstance(label_entry, dict) else None
+            if rule_text:
+                current_rules_map[label_id] = rule_text
+
+            normalized_type = _normalize_type(label_entry.get("type") if isinstance(label_entry, dict) else None)
+            if normalized_type:
+                current_label_types[label_id] = normalized_type
+            elif label_id not in current_label_types:
+                current_label_types[label_id] = "categorical"
+
+        return legacy_rules_map, legacy_label_types, current_rules_map, current_label_types
+
     def build_unseen_pairs(self) -> List[Tuple[str,str]]:
         seen = set(zip(self.repo.ann["unit_id"], self.repo.ann["label_id"]))
         all_units = sorted(self.repo.notes["unit_id"].unique().tolist())
-        all_labels = sorted(self.repo.ann["label_id"].unique().tolist())
+        legacy_labels = set(self.repo.ann["label_id"].unique().tolist())
+        config_labels: set[str] = set()
+        for key, entry in (self.label_config or {}).items():
+            if str(key) == "_meta":
+                continue
+            if isinstance(entry, dict):
+                lid = str(entry.get("label_id") or key).strip()
+            else:
+                lid = str(key).strip()
+            if lid:
+                config_labels.add(lid)
+        all_labels = sorted({str(l) for l in legacy_labels} | config_labels)
         pairs = [(u,l) for u in all_units for l in all_labels if (u,l) not in seen]
         return pairs
 
@@ -3652,8 +3752,12 @@ class ActiveLearningLLMFirst:
         check_cancelled()
         self.pooler.build_prototypes()
     
-        rules_map   = self.repo.label_rules_by_label
-        label_types = self.repo.label_types()
+        (
+            legacy_rules_map,
+            legacy_label_types,
+            current_rules_map,
+            current_label_types,
+        ) = self._label_maps()
     
         # ---------- small helpers ----------
         def _to_unit_only(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -3697,7 +3801,7 @@ class ActiveLearningLLMFirst:
         # 1) Disagreement (unit-level, excluding seen + already-picked)
         print("[1/4] Expanded disagreement ...")
         check_cancelled()
-        dis_pairs = self.build_disagreement_bucket(seen_pairs, rules_map, label_types)
+        dis_pairs = self.build_disagreement_bucket(seen_pairs, legacy_rules_map, legacy_label_types)
         dis_pairs = _filter_units(dis_pairs, seen_units | selected_units)
         dis_units = _head_units(_to_unit_only(dis_pairs), n_dis)
         dis_units.to_parquet(os.path.join(self.paths.outdir, "bucket_disagreement.parquet"), index=False)
@@ -3715,8 +3819,8 @@ class ActiveLearningLLMFirst:
             n_div=want_div,
             pooler=self.pooler,
             retriever=self.rag,
-            rules_map=rules_map,
-            label_types=label_types,
+            rules_map=current_rules_map,
+            label_types=current_label_types,
             label_config=self.label_config,
             rag_k=getattr(self.cfg.diversity, "rag_topk", 4),
             min_rel_quantile=getattr(self.cfg.diversity, "min_rel_quantile", 0.30),
@@ -3743,7 +3847,7 @@ class ActiveLearningLLMFirst:
             want_unc = min(n_unc, max(0, total - len(selected_units)))
             if want_unc > 0:
                 sel_unc_pairs = self.build_llm_uncertain_bucket(
-                    label_types, rules_map,
+                    current_label_types, current_rules_map,
                     exclude_units=seen_units | selected_units,   # <- sampler-level exclusion
                 )
                 sel_unc_pairs = _filter_units(sel_unc_pairs, seen_units | selected_units)
@@ -3761,7 +3865,7 @@ class ActiveLearningLLMFirst:
             want_cer = min(n_cer, max(0, total - len(selected_units)))
             if want_cer > 0:
                 sel_cer_pairs = self.build_llm_certain_bucket(
-                    label_types, rules_map,
+                    current_label_types, current_rules_map,
                     exclude_units=seen_units | selected_units,   # <- sampler-level exclusion
                 )
                 sel_cer_pairs = _filter_units(sel_cer_pairs, seen_units | selected_units)
@@ -3783,7 +3887,7 @@ class ActiveLearningLLMFirst:
             final = self.top_off_random(
                 current_sel=final,
                 unseen_pairs=unseen_pairs_topoff,
-                label_types=label_types,
+                label_types=current_label_types,
                 target_n=total,
             ).drop_duplicates(subset=["unit_id"], keep="first")
     
@@ -3794,8 +3898,8 @@ class ActiveLearningLLMFirst:
             fam_rows = []
             fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
             unit_ids = final["unit_id"].tolist()
-            rules_map = self.repo.label_rules_by_label
-            types = self.repo.label_types()
+            rules_map = current_rules_map
+            types = current_label_types
             _progress_every = float(fam.cfg.progress_min_interval_s or 1)
             for uid in iter_with_bar(
                     step="Final family labeling",
