@@ -62,8 +62,20 @@ def test_build_label_config_dependency_tree() -> None:
     assert isinstance(child_entry, dict)
     assert child_entry.get("parents")[0]["label_id"] == "Root"
     assert child_entry.get("children")[0]["label_id"] == "ChildB"
+    assert child_entry.get("gated_by") == "Root"
+    rules = child_entry.get("gating_rules")
+    assert isinstance(rules, list) and rules
+    assert rules[0]["parent"] == "Root"
+    assert rules[0]["type"] == "categorical"
+    assert rules[0]["op"] == "in"
+    assert rules[0]["values"] == ["yes"]
 
     grandchild_entry = config.get("ChildB")
     assert isinstance(grandchild_entry, dict)
     assert grandchild_entry.get("parents")[0]["label_id"] == "ChildA"
     assert grandchild_entry.get("gating_expr") == "Child A == 'positive'"
+    assert grandchild_entry.get("gated_by") == "ChildA"
+    grules = grandchild_entry.get("gating_rules")
+    assert isinstance(grules, list) and grules
+    assert grules[0]["parent"] == "ChildA"
+    assert grules[0]["values"] == ["positive"]
