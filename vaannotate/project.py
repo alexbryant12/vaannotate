@@ -263,6 +263,14 @@ def build_label_config(labelset: dict) -> Dict[str, object]:
             child_rel["value"] = condition_value
         children_map.setdefault(parent_id, []).append(child_rel)
 
+    def _gating_type_for(label_id: str) -> str:
+        raw_type = str(label_lookup.get(label_id, {}).get("type") or "").casefold()
+        if raw_type in {"integer", "int", "float", "double", "number", "numeric"}:
+            return "numeric"
+        if raw_type in {"date", "datetime"}:
+            return "date"
+        return "categorical"
+
     def build_branch(label_id: str, visited: Tuple[str, ...]) -> Dict[str, object]:
         node: Dict[str, object] = {
             "label_id": label_id,
@@ -331,6 +339,38 @@ def build_label_config(labelset: dict) -> Dict[str, object]:
             "options": options,
             "option_details": option_details,
         }
+        gating_parents = [
+            str(rel.get("label_id"))
+            for rel in parent_map.get(label_id, [])
+            if rel.get("label_id")
+        ]
+        if gating_parents:
+            unique_parents: List[str] = []
+            for parent_id in gating_parents:
+                if parent_id not in unique_parents:
+                    unique_parents.append(parent_id)
+            if len(unique_parents) == 1:
+                entry_payload["gated_by"] = unique_parents[0]
+            else:
+                entry_payload["gated_by"] = unique_parents
+            gating_rules: List[Dict[str, object]] = []
+            for rel in parent_map.get(label_id, []):
+                parent_id = str(rel.get("label_id") or "").strip()
+                if not parent_id:
+                    continue
+                value = rel.get("value")
+                if value is None:
+                    continue
+                parent_type = _gating_type_for(parent_id)
+                rule: Dict[str, object] = {
+                    "parent": parent_id,
+                    "type": parent_type,
+                    "op": "in",
+                    "values": [value],
+                }
+                gating_rules.append(rule)
+            if gating_rules:
+                entry_payload["gating_rules"] = gating_rules
         if parents_payload:
             entry_payload["parents"] = parents_payload
         if children_payload:

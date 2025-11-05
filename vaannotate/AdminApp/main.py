@@ -92,6 +92,7 @@ class RoundCreationContext:
     pheno_id: str
     pheno_level: str
     project_id: str
+    phenotype_storage_path: Optional[str]
     seed: int
     overlap: int
     total_n: int
@@ -285,7 +286,8 @@ class AIRoundWorker(QtCore.QObject):
             self.log_message.emit(f"Warning: unable to build label_config ({exc})")
             return None, None
         generated = build_label_config(labelset)
-        config_path = self.project_root / "phenotypes" / context.pheno_id / "ai" / "label_config.json"
+        phenotype_dir = self._resolve_phenotype_dir(context)
+        config_path = phenotype_dir / "ai" / "label_config.json"
         existing_payload: Dict[str, object] = {}
         if config_path.exists():
             try:
@@ -296,6 +298,16 @@ class AIRoundWorker(QtCore.QObject):
                 self.log_message.emit(f"Warning: failed to parse existing label_config.json ({exc})")
         merged = self._merge_label_config(existing_payload, generated)
         return merged, config_path
+
+    def _resolve_phenotype_dir(self, context: RoundCreationContext) -> Path:
+        storage = context.phenotype_storage_path
+        if storage:
+            candidate = Path(storage)
+            if not candidate.is_absolute():
+                candidate = (self.project_root / candidate).resolve()
+        else:
+            candidate = self.project_root / "phenotypes" / context.pheno_id
+        return ensure_dir(candidate)
 
     @staticmethod
     def _merge_label_config(
@@ -2815,10 +2827,20 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if project_row and project_row.get("created_by"):
             created_by = str(project_row["created_by"])
         status = self.status_combo.currentText()
+        storage_path: Optional[str] = None
+        try:
+            if "storage_path" in self.pheno_row.keys():
+                raw_storage = self.pheno_row["storage_path"]
+                if raw_storage:
+                    storage_path = str(raw_storage)
+        except Exception:  # noqa: BLE001
+            storage_path = None
+
         return RoundCreationContext(
             pheno_id=pheno_id,
             pheno_level=pheno_level,
             project_id=project_id,
+            phenotype_storage_path=storage_path,
             seed=seed,
             overlap=overlap,
             total_n=total_n,
