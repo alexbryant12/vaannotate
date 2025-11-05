@@ -2701,7 +2701,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         cursor.insertText(f"[{stamp}] {text}")
         self.ai_log_output.setTextCursor(cursor)
         self.ai_log_output.ensureCursorVisible()
-        return cursor.blockNumber()
+        return doc.blockCount() - 1
 
     def _replace_last_ai_log_line(
         self,

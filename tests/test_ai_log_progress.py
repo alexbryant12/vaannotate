@@ -68,3 +68,30 @@ def test_progress_updates_preserve_prior_logs(monkeypatch, qt_app):
     assert len(lines) == 2
     assert lines[0].endswith("Initial message")
     assert lines[1].endswith("Progress update 2/3")
+
+
+def test_progress_followed_by_new_entries(monkeypatch, qt_app):
+    collector = _LogCollector()
+
+    fake_datetime = _datetime_generator(
+        "12:10:00",
+        "12:10:01",
+        "12:10:02",
+        "12:10:03",
+        "12:10:04",
+    )
+    monkeypatch.setattr("vaannotate.AdminApp.main.datetime", fake_datetime)
+
+    collector._append_ai_log("First message")
+    collector._append_ai_log("\rProgress 1/2")
+    collector._append_ai_log("\rProgress 2/2")
+    collector._append_ai_log("Second message")
+    collector._append_ai_log("\rFinal step")
+
+    lines = collector.ai_log_output.toPlainText().splitlines()
+
+    assert len(lines) == 4
+    assert lines[0].endswith("First message")
+    assert lines[1].endswith("Progress 2/2")
+    assert lines[2].endswith("Second message")
+    assert lines[3].endswith("Final step")
