@@ -126,7 +126,7 @@ class LLMConfig:
     
 @dataclass
 class SelectionConfig:
-    batch_size: int = 50
+    batch_size: int = 10
     pct_disagreement: float = 0.3
     pct_uncertain: float = 0.3    # LLM-uncertain
     pct_easy_qc: float = 0.1      # LLM-certain
@@ -135,7 +135,7 @@ class SelectionConfig:
 @dataclass
 class LLMFirstConfig:
     use_llm_probe: bool = True
-    n_probe_units: int = 100
+    n_probe_units: int = 10
     topk: int = 6
     json_trace_policy: str = 'fallback'
     progress_min_interval_s: float = 1.0
