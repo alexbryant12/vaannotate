@@ -652,7 +652,7 @@ class DataRepository:
                 "disagreement_score": float(score),
                 "n_reviewers": int(g["reviewer_id"].nunique())
             })
-    
+        print(rows)
         return _pd.DataFrame(rows)
 
     def hard_disagree(self, label_types: dict, *, date_days: int = 14, num_abs: float = 1.0, num_rel: float = 0.20) -> pd.DataFrame:
@@ -3512,6 +3512,8 @@ class ActiveLearningLLMFirst:
         roots = set(str(x) for x in (roots or []))
         consensus = self.repo.last_round_consensus()  # {(unit_id,label_id)-> str}
         types = self.repo.label_types()
+
+        print("disagreement parent/child mapping", parent_to_children, child_to_parents)
     
         def _gate_ok_expanded(uid: str, lid: str) -> bool:
             """
@@ -3539,6 +3541,7 @@ class ActiveLearningLLMFirst:
         df["label_id"] = df["label_id"].astype(str)
         df["is_root_parent"] = df["label_id"].isin(roots)
         df = df[df["is_root_parent"] | df.apply(lambda r: _gate_ok_expanded(r["unit_id"], r["label_id"]), axis=1)].reset_index(drop=True)
+        print(head(df))
         if df.empty:
             return df
     
