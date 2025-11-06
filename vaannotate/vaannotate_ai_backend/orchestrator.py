@@ -246,16 +246,26 @@ def build_next_batch(
     else:
         normalized.to_csv(csv_path, index=False)
 
+    outdir_path = Path(outdir)
     artifacts = {
         "ai_next_batch_csv": str(csv_path),
         "buckets": {
-            "disagreement": str(Path(outdir) / "bucket_disagreement.parquet"),
-            "llm_uncertain": str(Path(outdir) / "bucket_llm_uncertain.parquet"),
-            "llm_certain": str(Path(outdir) / "bucket_llm_certain.parquet"),
-            "diversity": str(Path(outdir) / "bucket_diversity.parquet"),
+            "disagreement": str(outdir_path / "bucket_disagreement.parquet"),
+            "llm_uncertain": str(outdir_path / "bucket_llm_uncertain.parquet"),
+            "llm_certain": str(outdir_path / "bucket_llm_certain.parquet"),
+            "diversity": str(outdir_path / "bucket_diversity.parquet"),
         },
-        "final_labels": str(Path(outdir) / "final_llm_labels.parquet")
-        if (Path(outdir) / "final_llm_labels.parquet").exists()
+        "final_labels": str(outdir_path / "final_llm_labels.parquet")
+        if (outdir_path / "final_llm_labels.parquet").exists()
+        else None,
+        "final_labels_json": str(outdir_path / "final_llm_labels.json")
+        if (outdir_path / "final_llm_labels.json").exists()
+        else None,
+        "final_family_probe": str(outdir_path / "final_llm_family_probe.parquet")
+        if (outdir_path / "final_llm_family_probe.parquet").exists()
+        else None,
+        "final_family_probe_json": str(outdir_path / "final_llm_family_probe.json")
+        if (outdir_path / "final_llm_family_probe.json").exists()
         else None,
     }
     return normalized, artifacts
