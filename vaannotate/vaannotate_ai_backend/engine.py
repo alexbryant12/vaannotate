@@ -3391,8 +3391,8 @@ class ActiveLearningLLMFirst:
         legacy_rules_map = {str(k): v for k, v in (self.repo.label_rules_by_label or {}).items() if v}
         legacy_label_types = {str(k): str(v) for k, v in (self.repo.label_types() or {}).items()}
 
-        current_rules_map = dict(legacy_rules_map)
-        current_label_types = dict(legacy_label_types)
+        current_rules_map: dict[str, str] = {}
+        current_label_types: dict[str, str] = {}
 
         for key, entry in (self.label_config or {}).items():
             if str(key) == "_meta":
@@ -3404,8 +3404,10 @@ class ActiveLearningLLMFirst:
                 continue
 
             rule_text = _extract_rule_text(label_entry) if isinstance(label_entry, dict) else None
-            if rule_text:
+            if rule_text is not None:
                 current_rules_map[label_id] = rule_text
+            elif label_id not in current_rules_map:
+                current_rules_map[label_id] = ""
 
             normalized_type = _normalize_type(label_entry.get("type") if isinstance(label_entry, dict) else None)
             if normalized_type:
@@ -3413,23 +3415,34 @@ class ActiveLearningLLMFirst:
             elif label_id not in current_label_types:
                 current_label_types[label_id] = "categorical"
 
+        if not current_rules_map:
+            current_rules_map = dict(legacy_rules_map)
+        if not current_label_types:
+            current_label_types = dict(legacy_label_types)
+
         return legacy_rules_map, legacy_label_types, current_rules_map, current_label_types
 
-    def build_unseen_pairs(self) -> List[Tuple[str,str]]:
+    def build_unseen_pairs(self, label_ids: Optional[set[str]] = None) -> List[Tuple[str,str]]:
         seen = set(zip(self.repo.ann["unit_id"], self.repo.ann["label_id"]))
         all_units = sorted(self.repo.notes["unit_id"].unique().tolist())
-        legacy_labels = set(self.repo.ann["label_id"].unique().tolist())
-        config_labels: set[str] = set()
-        for key, entry in (self.label_config or {}).items():
-            if str(key) == "_meta":
-                continue
-            if isinstance(entry, dict):
-                lid = str(entry.get("label_id") or key).strip()
-            else:
-                lid = str(key).strip()
-            if lid:
-                config_labels.add(lid)
-        all_labels = sorted({str(l) for l in legacy_labels} | config_labels)
+
+        if label_ids is None:
+            legacy_labels = {str(l) for l in self.repo.ann["label_id"].unique().tolist()}
+            config_labels: set[str] = set()
+            for key, entry in (self.label_config or {}).items():
+                if str(key) == "_meta":
+                    continue
+                if isinstance(entry, dict):
+                    lid = str(entry.get("label_id") or key).strip()
+                else:
+                    lid = str(key).strip()
+                if lid:
+                    config_labels.add(lid)
+            use_labels = legacy_labels | config_labels
+        else:
+            use_labels = {str(l) for l in label_ids if str(l)}
+
+        all_labels = sorted(use_labels)
         pairs = [(u,l) for u in all_units for l in all_labels if (u,l) not in seen]
         return pairs
 
@@ -3758,6 +3771,13 @@ class ActiveLearningLLMFirst:
             current_rules_map,
             current_label_types,
         ) = self._label_maps()
+
+        legacy_label_ids = {str(l) for l in self.repo.ann["label_id"].unique().tolist()}
+        if not legacy_label_ids:
+            legacy_label_ids = set(legacy_rules_map.keys())
+        current_label_ids = set(current_rules_map.keys())
+        if not current_label_ids:
+            current_label_ids = set(legacy_label_ids)
     
         # ---------- small helpers ----------
         def _to_unit_only(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -3780,7 +3800,7 @@ class ActiveLearningLLMFirst:
         # ---------- seen/unseen and quotas ----------
         seen_units = set(self.repo.ann["unit_id"].unique().tolist())
         seen_pairs = set(zip(self.repo.ann["unit_id"], self.repo.ann["label_id"]))
-        unseen_pairs_all = self.build_unseen_pairs()
+        unseen_pairs_current = self.build_unseen_pairs(label_ids=current_label_ids)
     
         total = int(self.cfg.select.batch_size)
         n_dis = int(total * self.cfg.select.pct_disagreement)
@@ -3814,7 +3834,7 @@ class ActiveLearningLLMFirst:
         want_div = min(n_div, max(0, total - len(selected_units)))
         fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
         sel_div_pairs = build_diversity_bucket(
-            unseen_pairs=unseen_pairs_all,
+            unseen_pairs=unseen_pairs_current,
             already_selected=[(r.unit_id, getattr(r, "label_id", "")) for r in dis_units.itertuples(index=False)],
             n_div=want_div,
             pooler=self.pooler,
@@ -3883,7 +3903,9 @@ class ActiveLearningLLMFirst:
         if len(final) < total:
             print("Topping off to target batch_size ...")
             excluded = seen_units | set(final["unit_id"])
-            unseen_pairs_topoff = [(u, l) for (u, l) in self.build_unseen_pairs() if u not in excluded]
+            unseen_pairs_topoff = [
+                (u, l) for (u, l) in self.build_unseen_pairs(label_ids=current_label_ids) if u not in excluded
+            ]
             final = self.top_off_random(
                 current_sel=final,
                 unseen_pairs=unseen_pairs_topoff,

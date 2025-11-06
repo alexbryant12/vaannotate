@@ -92,3 +92,46 @@ def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -
     )
     assert list(topoff["label_id"]) == ["new_label"]
     assert topoff.loc[topoff.index[0], "label_type"] == "binary"
+
+
+def test_current_round_rules_ignore_legacy_when_not_selected() -> None:
+    notes_df = pd.DataFrame(
+        [
+            {"patient_icn": "p1", "doc_id": "d1", "text": "note one"},
+        ]
+    )
+    ann_df = pd.DataFrame(
+        [
+            {
+                "round_id": "r1",
+                "unit_id": "p1",
+                "doc_id": "d1",
+                "label_id": "legacy_label",
+                "reviewer_id": "rev1",
+                "label_value": "yes",
+                "label_rules": "legacy rule",
+            }
+        ]
+    )
+
+    repo = DataRepository(notes_df, ann_df)
+
+    label_config = {
+        "_meta": {"labelset_id": "ls"},
+        "new_label": {"label_id": "new_label", "type": "boolean", "rules": "fresh rule"},
+    }
+
+    orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
+    orchestrator.repo = repo
+    orchestrator.label_config = label_config
+
+    legacy_rules, _, current_rules, current_types = orchestrator._label_maps()
+
+    assert "legacy_label" in legacy_rules
+    assert "legacy_label" not in current_rules
+    assert current_types == {"new_label": "binary"}
+
+    current_label_ids = set(current_rules.keys())
+    unseen_pairs = orchestrator.build_unseen_pairs(label_ids=current_label_ids)
+    assert unseen_pairs == [("p1", "new_label")]
+
