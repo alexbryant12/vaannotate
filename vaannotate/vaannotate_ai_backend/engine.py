@@ -3772,6 +3772,13 @@ class ActiveLearningLLMFirst:
             current_label_types,
         ) = self._label_maps()
 
+        print(legacy_rules_map,
+            legacy_label_types,
+            current_rules_map,
+            current_label_types)
+
+        print(self.label_config)
+
         legacy_label_ids = {str(l) for l in self.repo.ann["label_id"].unique().tolist()}
         if not legacy_label_ids:
             legacy_label_ids = set(legacy_rules_map.keys())
