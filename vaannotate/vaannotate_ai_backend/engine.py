@@ -47,6 +47,8 @@ import logging
 import pandas as pd
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
+from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
+
 try:
     import faiss  # faiss-cpu
 except Exception:
@@ -493,6 +495,10 @@ class DataRepository:
         
         for col in ("unit_id","doc_id","label_id","reviewer_id"):
             self.ann[col] = self.ann[col].astype(str)
+        if "labelset_id" in self.ann.columns:
+            self.ann["labelset_id"] = self.ann["labelset_id"].astype(str)
+        else:
+            self.ann["labelset_id"] = ""
         if "document_text" in self.ann.columns:
             self.ann["document_text"] = self.ann["document_text"].astype(str).map(normalize_text)
         else:
@@ -509,6 +515,7 @@ class DataRepository:
                 self.ann[col] = ""
 
         self.label_rules_by_label = self._collect_label_rules()
+        self._round_labelset_map = self._collect_round_labelsets()
 
     def _collect_label_rules(self) -> Dict[str,str]:
         rules = {}
@@ -519,6 +526,40 @@ class DataRepository:
                 if vals:
                     rules[lid] = vals[-1]
         return rules
+
+    def _collect_round_labelsets(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        if {"round_id", "labelset_id"}.issubset(self.ann.columns):
+            subset = self.ann[["round_id", "labelset_id"]].dropna()
+            if not subset.empty:
+                subset = subset.astype({"round_id": str, "labelset_id": str})
+                for row in subset.drop_duplicates().itertuples(index=False):
+                    if row.labelset_id:
+                        mapping[str(row.round_id)] = str(row.labelset_id)
+        return mapping
+
+    def labelset_for_round(self, round_identifier: str) -> Optional[str]:
+        return self._round_labelset_map.get(str(round_identifier))
+
+    def labelset_for_annotation(
+        self,
+        unit_id: str,
+        label_id: str,
+        *,
+        round_id: Optional[str] = None,
+    ) -> Optional[str]:
+        sub = self.ann
+        if round_id is not None:
+            sub = sub[sub["round_id"].astype(str) == str(round_id)]
+        sub = sub[(sub["unit_id"].astype(str) == str(unit_id)) & (sub["label_id"].astype(str) == str(label_id))]
+        if sub.empty:
+            return None
+        first = sub["labelset_id"].dropna().astype(str)
+        for value in first:
+            text = value.strip()
+            if text:
+                return text
+        return None
 
     def notes_by_doc(self) -> Dict[str,str]:
         return dict(zip(self.notes["doc_id"].tolist(), self.notes["text"].tolist()))
@@ -645,12 +686,26 @@ class DataRepository:
                 delta = (last_ord - int(g["_round_ord"].max())) if len(g) else 0
                 w = float(_np.exp(-float(delta) / max(1e-6, float(decay_half_life))))
                 score *= w
-    
+
+            labelset_value = ""
+            if "labelset_id" in g.columns:
+                non_empty = g["labelset_id"].dropna().astype(str).str.strip()
+                if not non_empty.empty:
+                    labelset_value = str(non_empty.iloc[-1])
+
+            round_value = ""
+            if "round_id" in g.columns:
+                round_non_empty = g["round_id"].dropna().astype(str).str.strip()
+                if not round_non_empty.empty:
+                    round_value = str(round_non_empty.iloc[-1])
+
             rows.append({
                 "unit_id": str(uid),
                 "label_id": str(lid),
                 "disagreement_score": float(score),
-                "n_reviewers": int(g["reviewer_id"].nunique())
+                "n_reviewers": int(g["reviewer_id"].nunique()),
+                "round_id": round_value,
+                "labelset_id": labelset_value,
             })
         print(rows)
         return _pd.DataFrame(rows)
@@ -1080,8 +1135,29 @@ class EmbeddingStore:
 
 
 class DisagreementExpander:
-    def __init__(self, cfg: DisagreementConfig, repo: DataRepository, retriever: RAGRetriever, label_config: Optional[dict]=None):
-        self.cfg = cfg; self.repo = repo; self.retriever = retriever; self.label_config = label_config or {}
+    def __init__(
+        self,
+        cfg: DisagreementConfig,
+        repo: DataRepository,
+        retriever: RAGRetriever,
+        label_config_bundle: LabelConfigBundle | None = None,
+    ):
+        self.cfg = cfg
+        self.repo = repo
+        self.retriever = retriever
+        self.label_config_bundle = label_config_bundle or EMPTY_BUNDLE
+        self._dependency_cache: Dict[str, tuple[dict, dict, list]] = {}
+
+    def _dependencies_for(self, labelset_id: Optional[str]) -> tuple[dict, dict, list]:
+        key = str(labelset_id or "__current__")
+        if key not in self._dependency_cache:
+            config = self.label_config_bundle.config_for_labelset(labelset_id)
+            try:
+                deps = build_label_dependencies(config)
+            except Exception:
+                deps = ({}, {}, [])
+            self._dependency_cache[key] = deps
+        return self._dependency_cache[key]
 
     def high_entropy_seeds(self) -> pd.DataFrame:
         dis = self.repo.reviewer_disagreement(round_policy=self.cfg.round_policy, decay_half_life=self.cfg.decay_half_life)
@@ -1094,31 +1170,46 @@ class DisagreementExpander:
                 add = dis[[ (str(r.unit_id), str(r.label_id)) in hard_pairs for r in dis.itertuples(index=False) ]].copy()
                 seeds = pd.concat([seeds, add], ignore_index=True).drop_duplicates(subset=['unit_id','label_id'])
         seeds = seeds.sort_values("disagreement_score", ascending=False)
-        
+
         # ---- Parent→child gating on seeds (use prior-round consensus) ----
-        try:
-            parent_to_children, child_to_parents, roots = build_label_dependencies(self.label_config)
-        except Exception:
-            parent_to_children, child_to_parents, roots = {}, {}, []
-        roots = set(str(x) for x in (roots or []))
+        seeds = seeds.copy()
+        if "labelset_id" not in seeds.columns:
+            seeds["labelset_id"] = seeds.apply(
+                lambda r: self.repo.labelset_for_annotation(
+                    r.get("unit_id", ""),
+                    r.get("label_id", ""),
+                    round_id=r.get("round_id"),
+                )
+                or "",
+                axis=1,
+            )
+        else:
+            seeds["labelset_id"] = seeds["labelset_id"].fillna("").astype(str)
+        seeds["round_id"] = seeds.get("round_id", "").astype(str)
         types = self.repo.label_types()
         consensus = self.repo.last_round_consensus()  # {(unit_id,label_id)-> value str}
-        
-        def _gate_seed(uid: str, lid: str) -> bool:
+
+        def _gate_seed(row: pd.Series) -> bool:
+            uid = str(row["unit_id"])
+            lid = str(row["label_id"])
+            labelset_id = str(row.get("labelset_id") or "").strip() or None
+            parent_to_children, child_to_parents, roots = self._dependencies_for(labelset_id)
+            roots_set = set(str(x) for x in (roots or []))
             # Parents (roots) are always eligible; children need parent gate pass
-            if str(lid) in roots:
+            if str(lid) in roots_set:
                 return True
             parents = child_to_parents.get(str(lid), [])
             if not parents:
                 return True  # not marked as child → treat as eligible
             parent_preds = {(str(uid), str(p)): consensus.get((str(uid), str(p)), None) for p in parents}
             # IMPORTANT: evaluate by prior-round consensus; robust evaluator handles casing/types
-            return evaluate_gating(str(lid), str(uid), parent_preds, types, self.label_config)
-        
+            config = self.label_config_bundle.config_for_labelset(labelset_id)
+            return evaluate_gating(str(lid), str(uid), parent_preds, types, config)
+
         if not seeds.empty:
             seeds["unit_id"] = seeds["unit_id"].astype(str)
             seeds["label_id"] = seeds["label_id"].astype(str)
-            seeds = seeds[seeds.apply(lambda r: _gate_seed(r["unit_id"], r["label_id"]), axis=1)]
+            seeds = seeds[seeds.apply(_gate_seed, axis=1)]
         
         rows = []
         for lid, grp in seeds.groupby("label_id"):
@@ -1136,6 +1227,16 @@ class DisagreementExpander:
         seeds = self.high_entropy_seeds()
         rows = []
         for lid, grp in seeds.groupby("label_id"):
+            labelset_value = ""
+            if "labelset_id" in grp.columns:
+                non_empty = grp["labelset_id"].dropna().astype(str).str.strip()
+                if not non_empty.empty:
+                    labelset_value = str(non_empty.iloc[0])
+            round_value = ""
+            if "round_id" in grp.columns:
+                round_non_empty = grp["round_id"].dropna().astype(str).str.strip()
+                if not round_non_empty.empty:
+                    round_value = str(round_non_empty.iloc[0])
             snips = []
             for r in grp.itertuples(index=False):
                 snips.extend(self.seed_snippets(r.unit_id, lid, rules_map.get(lid,"")))
@@ -1144,7 +1245,14 @@ class DisagreementExpander:
             cand = self.retriever.expand_from_snippets(lid, snips, seen_pairs, per_seed_k=self.cfg.similar_chunks_per_seed)
             items = sorted(cand.items(), key=lambda kv: kv[1], reverse=True)[: self.cfg.expanded_per_label]
             for uid, sc in items:
-                rows.append({"unit_id": uid, "label_id": lid, "score": float(sc), "bucket": "disagreement_expanded"})
+                rows.append({
+                    "unit_id": uid,
+                    "label_id": lid,
+                    "score": float(sc),
+                    "bucket": "disagreement_expanded",
+                    "labelset_id": labelset_value,
+                    "round_id": round_value,
+                })
         df = pd.DataFrame(rows)
         if df.empty: return df
         out = []
@@ -2124,7 +2232,9 @@ def build_label_dependencies(label_config: dict) -> tuple[dict, dict, list]:
     if not isinstance(label_config, dict):
         return {}, {}, []
     for lid, cfg in label_config.items():
-        if not isinstance(cfg, dict): 
+        if str(lid) == "_meta":
+            continue
+        if not isinstance(cfg, dict):
             continue
         gb = cfg.get('gated_by')
         # Normalize to list
@@ -2148,7 +2258,7 @@ def build_label_dependencies(label_config: dict) -> tuple[dict, dict, list]:
             for p in parents:
                 parent_to_children.setdefault(str(p), []).append(str(lid))
                 child_to_parents.setdefault(str(lid), []).append(str(p))
-    all_labels = {str(k) for k in label_config.keys()}
+    all_labels = {str(k) for k in label_config.keys() if str(k) != "_meta"}
     roots = [lid for lid in all_labels if lid not in child_to_parents]
     return parent_to_children, child_to_parents, roots
 
@@ -3305,10 +3415,20 @@ def _detect_device():
 # ------------------------------
 
 class ActiveLearningLLMFirst:
-    def __init__(self, paths: Paths, cfg: OrchestratorConfig, label_config: Optional[dict]=None):
+    def __init__(
+        self,
+        paths: Paths,
+        cfg: OrchestratorConfig,
+        label_config_bundle: LabelConfigBundle | None = None,
+        *,
+        label_config: Optional[dict] = None,
+    ):
         import os
-        self.paths = paths; self.cfg = cfg
-        notes_df = read_table(paths.notes_path); ann_df = read_table(paths.annotations_path)
+
+        self.paths = paths
+        self.cfg = cfg
+        notes_df = read_table(paths.notes_path)
+        ann_df = read_table(paths.annotations_path)
         self.repo = DataRepository(notes_df, ann_df)
 
         embed_name = os.getenv("MED_EMBED_MODEL_NAME")
@@ -3320,11 +3440,27 @@ class ActiveLearningLLMFirst:
         rr_bs = int(os.getenv('RERANK_BATCH', '16' if device == "cpu" else "64"))
         self.models = Models(embedder, reranker, device=device, emb_batch=emb_bs, rerank_batch=rr_bs)
 
+        bundle = (label_config_bundle or EMPTY_BUNDLE).with_current_fallback(label_config)
+        self.label_config_bundle = bundle
+        self.label_config = bundle.current or {}
+        self.legacy_label_configs = dict(bundle.legacy)
+
         self.store = EmbeddingStore(self.models, cache_dir=self.paths.cache_dir, normalize=self.cfg.rag.normalize_embeddings)
-        self.rag = RAGRetriever(self.store, self.models, self.cfg.rag, label_configs=label_config or {}, notes_by_doc=self.repo.notes_by_doc(), repo=self.repo)
+        self.rag = RAGRetriever(
+            self.store,
+            self.models,
+            self.cfg.rag,
+            label_configs=self.label_config,
+            notes_by_doc=self.repo.notes_by_doc(),
+            repo=self.repo,
+        )
         self.llm = LLMAnnotator(self.cfg.llm, self.cfg.scjitter, cache_dir=self.paths.cache_dir)
         self.pooler = LabelAwarePooler(self.repo, self.store, self.models, beta=float(os.getenv('POOLER_BETA', 5.0)), kmeans_k=int(os.getenv('POOLER_K', 8)), persist_dir=os.path.join(self.paths.cache_dir, 'prototypes'), version='v1', use_negative=bool(int(os.getenv('POOLER_USE_NEG', '0'))))
-        self.label_config = label_config or {}
+    def config_for_labelset(self, labelset_id: Optional[str]) -> Dict[str, object]:
+        return self.label_config_bundle.config_for_labelset(labelset_id)
+
+    def config_for_round(self, round_identifier: Optional[str]) -> Dict[str, object]:
+        return self.label_config_bundle.config_for_round(round_identifier)
 
     def _label_maps(self) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
         """Return legacy and current rule/type maps with latest label config overlays."""
@@ -3499,48 +3635,83 @@ class ActiveLearningLLMFirst:
             return sel.head(k)
     
         # ---------- expand candidates (assumes seed-time gating in expander) ----------
-        expander = DisagreementExpander(self.cfg.disagree, self.repo, self.rag, self.label_config)
+        expander = DisagreementExpander(
+            self.cfg.disagree,
+            self.repo,
+            self.rag,
+            label_config_bundle=self.label_config_bundle,
+        )
         expanded = expander.expand(rules_map, seen_pairs)
         if expanded is None or expanded.empty:
             return expanded
     
-        # ---------- dependencies & (fail-open) gating for expanded pool ----------
-        try:
-            parent_to_children, child_to_parents, roots = build_label_dependencies(self.label_config)
-        except Exception:
-            parent_to_children, child_to_parents, roots = {}, {}, []
-        roots = set(str(x) for x in (roots or []))
+        dep_cache: Dict[str, tuple[dict, dict, list]] = {}
+
+        def _dependencies_for(labelset_id: Optional[str]) -> tuple[dict, dict, list]:
+            key = str(labelset_id or "__current__")
+            if key not in dep_cache:
+                config = self.label_config_bundle.config_for_labelset(labelset_id)
+                try:
+                    dep_cache[key] = build_label_dependencies(config)
+                except Exception:
+                    dep_cache[key] = ({}, {}, [])
+            return dep_cache[key]
+
         consensus = self.repo.last_round_consensus()  # {(unit_id,label_id)-> str}
         types = self.repo.label_types()
 
-        print("disagreement parent/child mapping", parent_to_children, child_to_parents)
-    
-        def _gate_ok_expanded(uid: str, lid: str) -> bool:
+        def _resolve_labelset(row: pd.Series) -> str:
+            existing = str(row.get("labelset_id") or "").strip()
+            if existing:
+                return existing
+            fallback = self.repo.labelset_for_annotation(
+                row.get("unit_id", ""),
+                row.get("label_id", ""),
+                round_id=row.get("round_id"),
+            )
+            return str(fallback).strip() if fallback else ""
+
+        df = expanded.copy()
+        df["unit_id"] = df["unit_id"].astype(str)
+        df["label_id"] = df["label_id"].astype(str)
+        if "round_id" in df.columns:
+            df["round_id"] = df["round_id"].fillna("").astype(str)
+        else:
+            df["round_id"] = ""
+        df["labelset_id"] = df.apply(_resolve_labelset, axis=1)
+
+        def _is_root(row: pd.Series) -> bool:
+            _, _, roots = _dependencies_for(str(row["labelset_id"]) or None)
+            roots_set = set(str(x) for x in (roots or []))
+            return str(row["label_id"]) in roots_set
+
+        def _gate_ok_expanded(row: pd.Series) -> bool:
             """
             Fail-open for expanded pool:
               - parents: True
               - children: if ANY parent consensus exists, evaluate; if none, allow.
             """
-            parents = child_to_parents.get(str(lid), [])
+
+            labelset_id = str(row.get("labelset_id") or "").strip() or None
+            _, child_to_parents, _ = _dependencies_for(labelset_id)
+            parents = child_to_parents.get(str(row["label_id"]), [])
             if not parents:
                 return True
             parent_preds = {}
             have_any = False
             for p in parents:
-                key = (str(uid), str(p))
+                key = (str(row["unit_id"]), str(p))
                 val = consensus.get(key, None)
                 parent_preds[key] = val
                 if val is not None and str(val).strip() != "":
                     have_any = True
             if not have_any:
                 return True
-            return evaluate_gating(str(lid), str(uid), parent_preds, types, self.label_config)
-    
-        df = expanded.copy()
-        df["unit_id"] = df["unit_id"].astype(str)
-        df["label_id"] = df["label_id"].astype(str)
-        df["is_root_parent"] = df["label_id"].isin(roots)
-        df = df[df["is_root_parent"] | df.apply(lambda r: _gate_ok_expanded(r["unit_id"], r["label_id"]), axis=1)].reset_index(drop=True)
+            config = self.label_config_bundle.config_for_labelset(labelset_id)
+            return evaluate_gating(str(row["label_id"]), str(row["unit_id"]), parent_preds, types, config)
+
+        df["is_root_parent"] = df.apply(_is_root, axis=1)
+        df = df[df["is_root_parent"] | df.apply(_gate_ok_expanded, axis=1)].reset_index(drop=True)
         
         if df.empty:
             return df
@@ -3553,36 +3724,50 @@ class ActiveLearningLLMFirst:
             valid = last_dis[last_dis["disagreement_score"] >= thr].copy()
         else:
             valid = last_dis.copy()  # fallback if column name differs
-    
+
         # Count by label from last-round disagreements:
         #   - parents: any valid disagreement on that parent label
         #   - children: valid disagreement AND gate(child) passes by consensus
         valid["unit_id"] = valid["unit_id"].astype(str)
         valid["label_id"] = valid["label_id"].astype(str)
-    
-        def _gate_by_cons(uid: str, lid: str) -> bool:
+
+        if "round_id" in valid.columns:
+            valid["round_id"] = valid["round_id"].fillna("").astype(str)
+        else:
+            valid["round_id"] = ""
+        if "labelset_id" in valid.columns:
+            valid["labelset_id"] = valid["labelset_id"].fillna("").astype(str)
+        else:
+            valid["labelset_id"] = valid.apply(_resolve_labelset, axis=1)
+
+        def _gate_by_cons(uid: str, lid: str, labelset_id: Optional[str]) -> bool:
+            _, child_to_parents, _ = _dependencies_for(labelset_id)
             parents = child_to_parents.get(str(lid), [])
             if not parents:
                 return True
             parent_preds = {(uid, str(p)): consensus.get((uid, str(p)), None) for p in parents}
-            return evaluate_gating(str(lid), uid, parent_preds, types, self.label_config)
-    
+            config = self.label_config_bundle.config_for_labelset(labelset_id)
+            return evaluate_gating(str(lid), uid, parent_preds, types, config)
+
         counts_dict: Dict[str, int] = {}
         present_labels = set(df["label_id"].unique().tolist())  # only apportion among labels actually available in this round
-        for lid, grp in valid.groupby("label_id"):
+        for (lid, lset), grp in valid.groupby(["label_id", "labelset_id"], dropna=False):
             lid = str(lid)
             if lid not in present_labels:
                 continue
-            if lid in roots or not child_to_parents.get(lid, []):
+            labelset_id = str(lset).strip() or None
+            _, child_to_parents, roots = _dependencies_for(labelset_id)
+            roots_set = set(str(x) for x in (roots or []))
+            if lid in roots_set or not child_to_parents.get(lid, []):
                 cnt = int(len(grp))
             else:
                 # children: only those units whose parent(s) pass the gate by LAST round consensus
                 c = 0
-                for uid in grp["unit_id"].unique():
-                    if _gate_by_cons(str(uid), lid):
+                for uid in grp["unit_id"].astype(str).unique():
+                    if _gate_by_cons(str(uid), lid, labelset_id):
                         c += 1
                 cnt = c
-            counts_dict[lid] = cnt
+            counts_dict[lid] = counts_dict.get(lid, 0) + cnt
     
         counts_series = pd.Series(counts_dict, dtype="int64")
         n_dis = int(self.cfg.select.batch_size * self.cfg.select.pct_disagreement)

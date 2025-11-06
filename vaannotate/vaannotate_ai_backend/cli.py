@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse, json
 from pathlib import Path
 import pandas as pd
+
+from .label_configs import LabelConfigBundle
 from .orchestrator import build_next_batch
 
 def main():
@@ -25,7 +27,14 @@ def main():
     label_config = json.loads(Path(args.label_config).read_text()) if args.label_config else None
     cfg_overrides = json.loads(Path(args.cfg).read_text()) if args.cfg else None
 
-    final_df, artifacts = build_next_batch(notes_df, ann_df, outdir=Path(args.outdir), label_config=label_config, cfg_overrides=cfg_overrides)
+    bundle = LabelConfigBundle(current=label_config) if label_config else None
+    final_df, artifacts = build_next_batch(
+        notes_df,
+        ann_df,
+        outdir=Path(args.outdir),
+        label_config_bundle=bundle,
+        cfg_overrides=cfg_overrides,
+    )
     print(str(artifacts["ai_next_batch_csv"]))
 
 if __name__ == "__main__":

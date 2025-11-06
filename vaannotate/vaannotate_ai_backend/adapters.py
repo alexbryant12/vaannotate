@@ -10,8 +10,13 @@ import sqlite3
 import pandas as pd
 
 from . import __version__
+from .label_configs import LabelConfigBundle, EMPTY_BUNDLE
 from .orchestrator import build_next_batch
-from vaannotate.project import resolve_label_config_path
+from vaannotate.project import (
+    build_label_config,
+    fetch_labelset,
+    resolve_label_config_path,
+)
 
 
 @dataclass
@@ -20,6 +25,117 @@ class BackendResult:
     dataframe: pd.DataFrame
     artifacts: Dict[str, Any]
     params_path: Path
+
+
+def _materialize_label_config(conn: sqlite3.Connection, labelset_id: str) -> Optional[Dict[str, Any]]:
+    if not labelset_id:
+        return None
+    try:
+        labelset = fetch_labelset(conn, labelset_id)
+    except ValueError:
+        return None
+    try:
+        return build_label_config(labelset)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_round_details(
+    project_root: Path,
+    pheno_id: str,
+    round_numbers: List[int],
+) -> Dict[int, Dict[str, Optional[str]]]:
+    project_db = Path(project_root) / "project.db"
+    if not project_db.exists() or not round_numbers:
+        return {}
+
+    placeholders = ",".join(["?"] * len(round_numbers))
+    query = (
+        "SELECT round_number, round_id, labelset_id "
+        "FROM rounds WHERE pheno_id=? AND round_number IN (" + placeholders + ")"
+    )
+    con = sqlite3.connect(str(project_db))
+    try:
+        con.row_factory = sqlite3.Row
+        params: Tuple[Any, ...] = (pheno_id, *round_numbers)
+        rows = con.execute(query, params).fetchall()
+    finally:
+        con.close()
+
+    details: Dict[int, Dict[str, Optional[str]]] = {}
+    for row in rows:
+        number = int(row["round_number"])
+        details[number] = {
+            "round_id": row["round_id"],
+            "labelset_id": row["labelset_id"],
+        }
+    return details
+
+
+def _load_label_config_bundle(
+    project_root: Path,
+    pheno_id: str,
+    labelset_id: Optional[str],
+    prior_rounds: List[int],
+    *,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> LabelConfigBundle:
+    project_db = Path(project_root) / "project.db"
+    legacy_configs: Dict[str, Dict[str, Any]] = {}
+    round_labelsets: Dict[str, str] = {}
+    current_config: Optional[Dict[str, Any]] = overrides.copy() if overrides else None
+    current_labelset_id = labelset_id
+
+    if not project_db.exists():
+        return LabelConfigBundle(
+            current=current_config,
+            current_labelset_id=current_labelset_id,
+            legacy=legacy_configs,
+            round_labelsets=round_labelsets,
+        )
+
+    con = sqlite3.connect(str(project_db))
+    try:
+        con.row_factory = sqlite3.Row
+
+        def _ensure_labelset_config(target_labelset_id: Optional[str]) -> None:
+            if not target_labelset_id:
+                return
+            normalized = str(target_labelset_id)
+            if normalized in legacy_configs:
+                return
+            cfg = _materialize_label_config(con, normalized)
+            if cfg is not None:
+                legacy_configs[normalized] = cfg
+
+        if current_config is None and labelset_id:
+            current_config = _materialize_label_config(con, labelset_id) or {}
+        if labelset_id:
+            _ensure_labelset_config(labelset_id)
+
+        round_details = _load_round_details(project_root, pheno_id, prior_rounds)
+        for round_number, detail in round_details.items():
+            round_id = detail.get("round_id")
+            round_labelset_id = detail.get("labelset_id")
+            if round_labelset_id:
+                round_labelsets[str(round_number)] = str(round_labelset_id)
+                if round_id:
+                    round_labelsets[str(round_id)] = str(round_labelset_id)
+                fallback_round_id = f"{pheno_id}_r{round_number}"
+                round_labelsets.setdefault(fallback_round_id, str(round_labelset_id))
+                _ensure_labelset_config(round_labelset_id)
+            elif round_id:
+                round_labelsets[str(round_id)] = ""
+
+    finally:
+        con.close()
+
+    return LabelConfigBundle(
+        current=current_config,
+        current_labelset_id=current_labelset_id,
+        legacy=legacy_configs,
+        round_labelsets=round_labelsets,
+    )
 
 def _resolve_phenotype_dir(project_root: Path, pheno_id: str) -> Path:
     project_db = Path(project_root) / "project.db"
@@ -198,7 +314,13 @@ def _normalize_reviewer_id(assignment_path: Path) -> str:
     return name
 
 
-def _load_label_rules(project_root: Path, pheno_id: str, round_number: int) -> Dict[str, str]:
+def _load_label_rules(
+    project_root: Path,
+    pheno_id: str,
+    round_number: int,
+    *,
+    labelset_id: Optional[str] = None,
+) -> Dict[str, str]:
     project_db = Path(project_root) / "project.db"
     if not project_db.exists():
         return {}
@@ -206,14 +328,14 @@ def _load_label_rules(project_root: Path, pheno_id: str, round_number: int) -> D
     con = sqlite3.connect(str(project_db))
     try:
         con.row_factory = sqlite3.Row
-        labelset_row = con.execute(
-            "SELECT labelset_id FROM rounds WHERE pheno_id=? AND round_number=?",
-            (pheno_id, round_number),
-        ).fetchone()
-        if not labelset_row:
-            return {}
-
-        labelset_id = labelset_row["labelset_id"]
+        if not labelset_id:
+            labelset_row = con.execute(
+                "SELECT labelset_id FROM rounds WHERE pheno_id=? AND round_number=?",
+                (pheno_id, round_number),
+            ).fetchone()
+            if not labelset_row:
+                return {}
+            labelset_id = labelset_row["labelset_id"]
         if not labelset_id:
             return {}
 
@@ -261,12 +383,23 @@ def _load_change_history(round_dir: Path, round_id: str) -> Dict[Tuple[str, str,
 
 
 def _read_round_annotations(
-    round_dir: Path, pheno_id: str, round_number: int, project_root: Path
+    round_dir: Path,
+    pheno_id: str,
+    round_number: int,
+    project_root: Path,
+    *,
+    round_id: Optional[str] = None,
+    labelset_id: Optional[str] = None,
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    round_id = f"{pheno_id}_r{round_number}"
-    label_rules = _load_label_rules(project_root, pheno_id, round_number)
-    change_history = _load_change_history(round_dir, round_id)
+    resolved_round_id = round_id or f"{pheno_id}_r{round_number}"
+    label_rules = _load_label_rules(
+        project_root,
+        pheno_id,
+        round_number,
+        labelset_id=labelset_id,
+    )
+    change_history = _load_change_history(round_dir, resolved_round_id)
 
     for assignment_path in _iter_assignment_dbs(round_dir):
         reviewer_id = _normalize_reviewer_id(assignment_path)
@@ -330,7 +463,7 @@ def _read_round_annotations(
 
                 rows.append(
                     {
-                        "round_id": round_id,
+                        "round_id": resolved_round_id,
                         "phenotype_id": pheno_id,
                         "unit_id": unit_id,
                         "doc_id": doc_id,
@@ -338,6 +471,7 @@ def _read_round_annotations(
                         "reviewer_id": reviewer_id,
                         "reviewer_name": "",
                         "label_id": label_id,
+                        "labelset_id": labelset_id or "",
                         "label_name": "",
                         "label_value": value_str,
                         "label_value_num": value_num_str,
@@ -363,6 +497,7 @@ def _read_round_annotations(
         "reviewer_id",
         "reviewer_name",
         "label_id",
+        "labelset_id",
         "label_name",
         "label_value",
         "label_value_num",
@@ -385,11 +520,20 @@ def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: Lis
     notes_df = _read_corpus_db(corpus_db)
 
     ann_frames = []
+    round_details = _load_round_details(project_root, pheno_id, prior_rounds)
     for r in prior_rounds:
         round_dir = phenotype_dir / "rounds" / f"round_{r}"
         if not round_dir.exists():
             continue
-        frame = _read_round_annotations(round_dir, pheno_id, r, root)
+        detail = round_details.get(r, {})
+        frame = _read_round_annotations(
+            round_dir,
+            pheno_id,
+            r,
+            root,
+            round_id=detail.get("round_id"),
+            labelset_id=detail.get("labelset_id"),
+        )
         if not frame.empty:
             ann_frames.append(frame)
 
@@ -406,6 +550,7 @@ def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: Lis
                 "reviewer_id",
                 "reviewer_name",
                 "label_id",
+                "labelset_id",
                 "label_name",
                 "label_value",
                 "label_value_num",
@@ -488,11 +633,19 @@ def run_ai_backend_and_collect(
     overrides["select"] = select_overrides
     overrides.setdefault("phenotype_level", level)
 
+    bundle = _load_label_config_bundle(
+        project_root,
+        pheno_id,
+        labelset_id,
+        prior_rounds,
+        overrides=label_config_payload,
+    )
+
     final_df, artifacts = build_next_batch(
         notes_df,
         ann_df,
         outdir=ai_dir,
-        label_config=label_config_payload,
+        label_config_bundle=bundle,
         cfg_overrides=overrides,
         cancel_callback=cancel_callback,
         log_callback=log_callback,
@@ -508,6 +661,11 @@ def run_ai_backend_and_collect(
         "invoked_by": user,
         "timestamp": timestamp or datetime.utcnow().isoformat(),
         "backend_version": __version__,
+        "labelsets": {
+            "current": bundle.current_labelset_id,
+            "legacy": sorted(bundle.legacy.keys()),
+            "rounds": bundle.round_labelsets,
+        },
     }
     params_path = ai_dir / "params.json"
     params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")

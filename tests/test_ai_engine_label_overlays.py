@@ -34,6 +34,7 @@ if "langchain" not in sys.modules:
 
 
 from vaannotate.vaannotate_ai_backend.engine import ActiveLearningLLMFirst, DataRepository
+from vaannotate.vaannotate_ai_backend.label_configs import LabelConfigBundle
 
 
 def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -> None:
@@ -67,6 +68,7 @@ def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -
     orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
     orchestrator.repo = repo
     orchestrator.label_config = label_config
+    orchestrator.label_config_bundle = LabelConfigBundle(current=label_config)
 
     legacy_rules, legacy_types, current_rules, current_types = orchestrator._label_maps()
 
@@ -124,6 +126,7 @@ def test_current_round_rules_ignore_legacy_when_not_selected() -> None:
     orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
     orchestrator.repo = repo
     orchestrator.label_config = label_config
+    orchestrator.label_config_bundle = LabelConfigBundle(current=label_config)
 
     legacy_rules, _, current_rules, current_types = orchestrator._label_maps()
 
@@ -134,4 +137,24 @@ def test_current_round_rules_ignore_legacy_when_not_selected() -> None:
     current_label_ids = set(current_rules.keys())
     unseen_pairs = orchestrator.build_unseen_pairs(label_ids=current_label_ids)
     assert unseen_pairs == [("p1", "new_label")]
+
+
+def test_label_config_bundle_strips_meta_entries() -> None:
+    bundle = LabelConfigBundle(
+        current={
+            "_meta": {"labelset_id": "ls_new"},
+            "current_label": {"label_id": "current_label"},
+        },
+        legacy={
+            "legacy": {
+                "_meta": {"labelset_id": "ls_legacy"},
+                "legacy_label": {"label_id": "legacy_label"},
+            }
+        },
+    )
+
+    assert "_meta" not in bundle.current
+    legacy_config = bundle.config_for_labelset("legacy")
+    assert "_meta" not in legacy_config
+    assert "legacy_label" in legacy_config
 
