@@ -2108,75 +2108,6 @@ def _canon_cat(x):
         return "no"
     return s
 
-_LABEL_TYPE_CANON: dict[str, str] = {
-    "boolean": "binary",
-    "bool": "binary",
-    "yes/no": "binary",
-    "yesno": "binary",
-    "y/n": "binary",
-    "yn": "binary",
-    "binary": "binary",
-    "categorical": "categorical",
-    "category": "categorical",
-    "categorical_single": "categorical",
-    "categorical_multi": "categorical",
-    "multiclass": "categorical",
-    "multi": "categorical",
-    "ordinal": "categorical",
-    "options": "categorical",
-    "option": "categorical",
-    "text": "categorical",
-    "string": "categorical",
-    "free_text": "categorical",
-    "numeric": "numeric",
-    "number": "numeric",
-    "int": "numeric",
-    "integer": "numeric",
-    "float": "numeric",
-    "double": "numeric",
-    "date": "date",
-    "datetime": "date",
-    "timestamp": "date",
-}
-
-
-def _normalize_label_type(raw: object) -> Optional[str]:
-    if raw is None:
-        return None
-    text = str(raw).strip().lower()
-    if not text:
-        return None
-    return _LABEL_TYPE_CANON.get(text, text)
-
-
-def _canonical_label_id(key: object, cfg: object) -> str:
-    if isinstance(cfg, dict):
-        raw_id = cfg.get("label_id")
-        if raw_id is not None:
-            lid = str(raw_id).strip()
-            if lid:
-                return lid
-    return str(key).strip()
-
-
-def _config_label_types(label_config: dict | None) -> dict[str, str]:
-    out: dict[str, str] = {}
-    if not isinstance(label_config, dict):
-        return out
-    for key, cfg in label_config.items():
-        if str(key).startswith("_"):
-            continue
-        if not isinstance(cfg, dict):
-            continue
-        lid = _canonical_label_id(key, cfg)
-        if not lid:
-            continue
-        typ = _normalize_label_type(cfg.get("type"))
-        if typ:
-            out[str(lid)] = typ
-    return out
-
-
 def build_label_dependencies(label_config: dict) -> tuple[dict, dict, list]:
     """Return (parent->children, child->parents, roots) from label_config.
     Supports either:
@@ -2192,76 +2123,32 @@ def build_label_dependencies(label_config: dict) -> tuple[dict, dict, list]:
     child_to_parents: dict[str, list[str]] = {}
     if not isinstance(label_config, dict):
         return {}, {}, []
-
-    id_lookup: dict[str, str] = {}
-    for key, cfg in label_config.items():
-        if str(key).startswith("_"):
+    for lid, cfg in label_config.items():
+        if not isinstance(cfg, dict): 
             continue
-        lid = _canonical_label_id(key, cfg)
-        if not lid:
-            continue
-        canonical = str(lid)
-        id_lookup[str(key)] = canonical
-        id_lookup[canonical] = canonical
-
-    def _resolve(raw: object) -> Optional[str]:
-        if raw is None:
-            return None
-        text = str(raw).strip()
-        if not text:
-            return None
-        return id_lookup.get(text, text)
-
-    for key, cfg in label_config.items():
-        if str(key).startswith("_"):
-            continue
-        lid = _resolve(key)
-        if not lid:
-            continue
-        entry = cfg if isinstance(cfg, dict) else {}
-        gb = entry.get('gated_by') if isinstance(entry, dict) else None
-        parents: list[str] = []
+        gb = cfg.get('gated_by')
+        # Normalize to list
+        parents = []
         if gb:
             if isinstance(gb, (list, tuple, set)):
-                parents.extend(filter(None, (_resolve(x) for x in gb)))
+                parents.extend([str(x) for x in gb])
             else:
-                resolved = _resolve(gb)
-                if resolved:
-                    parents.append(resolved)
-        rules = entry.get('gating_rules') or [] if isinstance(entry, dict) else []
-        iterable = rules if isinstance(rules, list) else [rules]
-        for r in iterable:
+                parents.append(str(gb))
+        # Also scan rules to pick parent fields
+        rules = cfg.get('gating_rules') or []
+        for r in (rules if isinstance(rules, list) else [rules]):
+            p = None
             if isinstance(r, dict):
                 p = r.get('parent') or r.get('gated_by') or r.get('field')
-            else:
-                p = None
-            resolved = _resolve(p)
-            if resolved and resolved not in parents:
-                parents.append(resolved)
-        for p in parents:
-            parent_to_children.setdefault(str(p), []).append(str(lid))
-            child_to_parents.setdefault(str(lid), []).append(str(p))
-
-    for k, v in list(parent_to_children.items()):
-        # ensure uniqueness and stable order per parent
-        seen = set()
-        dedup = []
-        for child in v:
-            if child not in seen:
-                seen.add(child)
-                dedup.append(child)
-        parent_to_children[k] = dedup
-
-    for k, v in list(child_to_parents.items()):
-        seen = set()
-        dedup = []
-        for parent in v:
-            if parent not in seen:
-                seen.add(parent)
-                dedup.append(parent)
-        child_to_parents[k] = dedup
-
-    all_labels = set(id_lookup.values())
+            if p:
+                p = str(p)
+                if p not in parents:
+                    parents.append(p)
+        if parents:
+            for p in parents:
+                parent_to_children.setdefault(str(p), []).append(str(lid))
+                child_to_parents.setdefault(str(lid), []).append(str(p))
+    all_labels = {str(k) for k in label_config.keys()}
     roots = [lid for lid in all_labels if lid not in child_to_parents]
     return parent_to_children, child_to_parents, roots
 
@@ -2394,7 +2281,6 @@ class FamilyLabeler:
         self.scCfg = scCfg
         self.cfg = llmfirst_cfg
         self.parent_to_children, self.child_to_parents, self.roots = build_label_dependencies(self.label_config)
-        self._config_label_types = _config_label_types(self.label_config)
         
     
     def ensure_label_exemplars(self, rules_map: dict[str, str], K: int = 6):
@@ -2710,15 +2596,12 @@ class FamilyLabeler:
         """Label all parents then gated children for a unit. Returns list of probe rows."""
         self.ensure_label_exemplars(per_label_rules)
         results = []
-        effective_label_types = dict(label_types or {})
-        if self._config_label_types:
-            effective_label_types.update(self._config_label_types)
         # We'll process in a BFS: queue starts with roots, then expand children once parent gating satisfied
         # Maintain map of parent predictions for gating evaluation
         parent_preds: dict[tuple[str,str], Any] = {}
         # Determine an evaluation order by repeatedly scanning for labels whose parents are satisfied or none
         # But to preserve minimal disruption, we simply try roots then others with gating check at point of execution.
-        all_labels = list({*self.roots, *[str(lid) for lid in effective_label_types.keys()]})
+        all_labels = list({*self.roots, *[str(lid) for lid in label_types.keys()]})
         # We'll ensure unique and stable order
         seen = set()
         order = []
@@ -2726,10 +2609,10 @@ class FamilyLabeler:
             if lid not in seen:
                 seen.add(lid); order.append(lid)
         for lid in order:
-            ltype = effective_label_types.get(lid, 'categorical')
+            ltype = label_types.get(lid, 'categorical')
             rules = per_label_rules.get(lid, "")
             # if this label is gated (is a child), check gating
-            allowed = evaluate_gating(lid, unit_id, parent_preds, effective_label_types, self.label_config)
+            allowed = evaluate_gating(lid, unit_id, parent_preds, label_types, self.label_config)
             if not allowed:
                 # record gated-out for transparency but do not include in probe_df to avoid selection noise
                 continue
@@ -3446,6 +3329,41 @@ class ActiveLearningLLMFirst:
     def _label_maps(self) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
         """Return legacy and current rule/type maps with latest label config overlays."""
 
+        def _normalize_type(raw: Optional[object]) -> Optional[str]:
+            if raw is None:
+                return None
+            text = str(raw).strip().lower()
+            if not text:
+                return None
+            mapping = {
+                "boolean": "binary",
+                "bool": "binary",
+                "yes/no": "binary",
+                "yesno": "binary",
+                "y/n": "binary",
+                "yn": "binary",
+                "binary": "binary",
+                "categorical": "categorical",
+                "category": "categorical",
+                "multiclass": "categorical",
+                "multi": "categorical",
+                "options": "categorical",
+                "option": "categorical",
+                "text": "categorical",
+                "string": "categorical",
+                "free_text": "categorical",
+                "numeric": "numeric",
+                "number": "numeric",
+                "int": "numeric",
+                "integer": "numeric",
+                "float": "numeric",
+                "double": "numeric",
+                "date": "date",
+                "datetime": "date",
+                "timestamp": "date",
+            }
+            return mapping.get(text, text)
+
         def _extract_rule_text(entry: Dict[str, object]) -> Optional[str]:
             candidates = []
             for key in ("rule_text", "rules", "prompt"):
@@ -3489,7 +3407,7 @@ class ActiveLearningLLMFirst:
             if rule_text:
                 current_rules_map[label_id] = rule_text
 
-            normalized_type = _normalize_label_type(label_entry.get("type") if isinstance(label_entry, dict) else None)
+            normalized_type = _normalize_type(label_entry.get("type") if isinstance(label_entry, dict) else None)
             if normalized_type:
                 current_label_types[label_id] = normalized_type
             elif label_id not in current_label_types:
