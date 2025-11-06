@@ -159,10 +159,10 @@ class DisagreementConfig:
     round_policy: str = 'last'       # 'last' | 'all' | 'decay'
     decay_half_life: float = 2.0     # if round_policy='decay'
     high_entropy_threshold: float = 0.0001 #very low = any disagreements included
-    seeds_per_label: int = 20
+    seeds_per_label: int = 5
     snippets_per_seed: int = 3
-    similar_chunks_per_seed: int = 150
-    expanded_per_label: int = 50
+    similar_chunks_per_seed: int = 50
+    expanded_per_label: int = 10
     # Hard-disagreement thresholds
     date_disagree_days: int = 5
     numeric_disagree_abs: float = 1.0
@@ -173,7 +173,7 @@ class DiversityConfig:
     rag_k: int = 4
     min_rel_quantile: float = 0.30
     mmr_lambda: float = 0.7
-    sample_cap: int = 500
+    sample_cap: int = 50
     adaptive_relax: bool = True
     use_proto: bool = False
 
