@@ -9,6 +9,7 @@ import sys
 import pandas as pd
 
 from . import engine
+from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
 
 
 def _default_paths(outdir: Path, cache_dir: Path | None = None) -> engine.Paths:
@@ -183,6 +184,8 @@ def build_next_batch(
     notes_df: pd.DataFrame,
     ann_df: pd.DataFrame,
     outdir: Path,
+    label_config_bundle: LabelConfigBundle | None = None,
+    *,
     label_config: Optional[dict] = None,
     cfg_overrides: Optional[Dict[str, Any]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
@@ -207,9 +210,15 @@ def build_next_batch(
     if cfg_overrides:
         _apply_overrides(cfg, cfg_overrides)
 
+    bundle = (label_config_bundle or EMPTY_BUNDLE).with_current_fallback(label_config)
+
     with _capture_logs(log_callback):
         with engine.cancellation_scope(cancel_callback):
-            orch = engine.ActiveLearningLLMFirst(paths=paths, cfg=cfg, label_config=label_config or {})
+            orch = engine.ActiveLearningLLMFirst(
+                paths=paths,
+                cfg=cfg,
+                label_config_bundle=bundle,
+            )
             final_df = orch.run()  # engine returns DataFrame
 
     normalized = final_df.copy()
