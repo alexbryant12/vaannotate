@@ -25,9 +25,6 @@ def _default_paths(outdir: Path, cache_dir: Path | None = None) -> engine.Paths:
 
 def _apply_overrides(target: object, overrides: Mapping[str, Any]) -> None:
     for key, value in overrides.items():
-        if key == "phenotype_level":
-            # Not currently consumed directly by the engine config.
-            continue
         if isinstance(value, Mapping):
             current = getattr(target, key, None)
             if current is not None and not isinstance(current, (str, bytes, int, float, bool)):
@@ -207,8 +204,10 @@ def build_next_batch(
 
     # Build config
     cfg = engine.OrchestratorConfig()
-    if cfg_overrides:
-        _apply_overrides(cfg, cfg_overrides)
+    overrides = dict(cfg_overrides or {})
+    phenotype_level = overrides.pop("phenotype_level", None)
+    if overrides:
+        _apply_overrides(cfg, overrides)
 
     bundle = (label_config_bundle or EMPTY_BUNDLE).with_current_fallback(label_config)
 
@@ -218,6 +217,7 @@ def build_next_batch(
                 paths=paths,
                 cfg=cfg,
                 label_config_bundle=bundle,
+                phenotype_level=phenotype_level,
             )
             final_df = orch.run()  # engine returns DataFrame
 
