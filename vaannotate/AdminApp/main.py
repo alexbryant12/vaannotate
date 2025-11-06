@@ -2256,6 +2256,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         value = self.total_n_spin.value() if hasattr(self, "total_n_spin") else 0
         self.ai_batch_size_label.setText(f"{value} (matches Total N)")
 
+    def _on_random_final_llm_toggled(self, checked: bool) -> None:
+        if hasattr(self, "random_final_llm_group"):
+            self.random_final_llm_group.setEnabled(bool(checked))
+
     def _browse_for_directory(self, title: str, current: str = "") -> Optional[str]:
         initial = current or ""
         if not initial and getattr(self.ctx, "project_root", None):
@@ -2266,16 +2270,32 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         return None
 
     def _on_select_embedding_model(self) -> None:
-        current = self.ai_embedding_path_edit.text().strip() if hasattr(self, "ai_embedding_path_edit") else ""
+        sender = self.sender()
+        edit: Optional[QtWidgets.QLineEdit] = None
+        if sender is getattr(self, "random_embedding_browse_btn", None):
+            edit = getattr(self, "random_embedding_path_edit", None)
+        elif sender is getattr(self, "ai_embedding_browse_btn", None):
+            edit = getattr(self, "ai_embedding_path_edit", None)
+        else:
+            edit = getattr(self, "ai_embedding_path_edit", None)
+        current = edit.text().strip() if isinstance(edit, QtWidgets.QLineEdit) else ""
         directory = self._browse_for_directory("Select embedding model directory", current)
-        if directory and hasattr(self, "ai_embedding_path_edit"):
-            self.ai_embedding_path_edit.setText(directory)
+        if directory and isinstance(edit, QtWidgets.QLineEdit):
+            edit.setText(directory)
 
     def _on_select_reranker_model(self) -> None:
-        current = self.ai_reranker_path_edit.text().strip() if hasattr(self, "ai_reranker_path_edit") else ""
+        sender = self.sender()
+        edit: Optional[QtWidgets.QLineEdit] = None
+        if sender is getattr(self, "random_reranker_browse_btn", None):
+            edit = getattr(self, "random_reranker_path_edit", None)
+        elif sender is getattr(self, "ai_reranker_browse_btn", None):
+            edit = getattr(self, "ai_reranker_path_edit", None)
+        else:
+            edit = getattr(self, "ai_reranker_path_edit", None)
+        current = edit.text().strip() if isinstance(edit, QtWidgets.QLineEdit) else ""
         directory = self._browse_for_directory("Select re-ranker model directory", current)
-        if directory and hasattr(self, "ai_reranker_path_edit"):
-            self.ai_reranker_path_edit.setText(directory)
+        if directory and isinstance(edit, QtWidgets.QLineEdit):
+            edit.setText(directory)
 
     def _setup_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
@@ -2424,9 +2444,55 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         final_llm_row = QtWidgets.QHBoxLayout()
         self.random_final_llm_checkbox = QtWidgets.QCheckBox("Run final LLM labeling")
         self.random_final_llm_checkbox.setChecked(True)
+        self.random_final_llm_checkbox.toggled.connect(self._on_random_final_llm_toggled)
         final_llm_row.addWidget(self.random_final_llm_checkbox)
         final_llm_row.addStretch()
         random_layout.addLayout(final_llm_row)
+
+        self.random_final_llm_group = QtWidgets.QGroupBox("Final LLM configuration")
+        random_llm_layout = QtWidgets.QFormLayout(self.random_final_llm_group)
+        random_llm_layout.setFieldGrowthPolicy(
+            QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+
+        self.random_azure_key_edit = QtWidgets.QLineEdit()
+        self.random_azure_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.random_azure_key_edit.setPlaceholderText("Enter Azure OpenAI API key")
+        random_llm_layout.addRow("Azure API key", self.random_azure_key_edit)
+
+        self.random_azure_version_edit = QtWidgets.QLineEdit()
+        self.random_azure_version_edit.setPlaceholderText(
+            "Enter Azure OpenAI API version (e.g. 2024-06-01)"
+        )
+        random_llm_layout.addRow("Azure API version", self.random_azure_version_edit)
+
+        self.random_azure_endpoint_edit = QtWidgets.QLineEdit()
+        self.random_azure_endpoint_edit.setPlaceholderText("Enter Azure OpenAI endpoint URL")
+        random_llm_layout.addRow("Azure endpoint", self.random_azure_endpoint_edit)
+
+        random_embed_row = QtWidgets.QHBoxLayout()
+        self.random_embedding_path_edit = QtWidgets.QLineEdit()
+        self.random_embedding_path_edit.setPlaceholderText("Select embedding model directory")
+        random_embed_row.addWidget(self.random_embedding_path_edit)
+        self.random_embedding_browse_btn = QtWidgets.QPushButton("Choose…")
+        self.random_embedding_browse_btn.clicked.connect(self._on_select_embedding_model)
+        random_embed_row.addWidget(self.random_embedding_browse_btn)
+        random_embed_row.setStretch(0, 1)
+        random_embed_row.setStretch(1, 0)
+        random_llm_layout.addRow("Embedding model", random_embed_row)
+
+        random_rerank_row = QtWidgets.QHBoxLayout()
+        self.random_reranker_path_edit = QtWidgets.QLineEdit()
+        self.random_reranker_path_edit.setPlaceholderText("Select re-ranker model directory")
+        random_rerank_row.addWidget(self.random_reranker_path_edit)
+        self.random_reranker_browse_btn = QtWidgets.QPushButton("Choose…")
+        self.random_reranker_browse_btn.clicked.connect(self._on_select_reranker_model)
+        random_rerank_row.addWidget(self.random_reranker_browse_btn)
+        random_rerank_row.setStretch(0, 1)
+        random_rerank_row.setStretch(1, 0)
+        random_llm_layout.addRow("Re-ranker model", random_rerank_row)
+
+        random_layout.addWidget(self.random_final_llm_group)
         scroll_layout.addWidget(self.random_config_container)
 
         self.ai_group = QtWidgets.QGroupBox("Active learning configuration")
@@ -2553,6 +2619,20 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             )
         if hasattr(self, "ai_azure_endpoint_edit"):
             self.ai_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", ""))
+        if hasattr(self, "random_embedding_path_edit"):
+            self.random_embedding_path_edit.setText(os.getenv("MED_EMBED_MODEL_NAME", ""))
+        if hasattr(self, "random_reranker_path_edit"):
+            self.random_reranker_path_edit.setText(os.getenv("RERANKER_MODEL_NAME", ""))
+        if hasattr(self, "random_azure_key_edit"):
+            self.random_azure_key_edit.setText(os.getenv("AZURE_OPENAI_API_KEY", ""))
+        if hasattr(self, "random_azure_version_edit"):
+            self.random_azure_version_edit.setText(
+                os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+            )
+        if hasattr(self, "random_azure_endpoint_edit"):
+            self.random_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", ""))
+        if hasattr(self, "random_final_llm_checkbox"):
+            self._on_random_final_llm_toggled(self.random_final_llm_checkbox.isChecked())
         self.total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
         self._on_generation_mode_changed()
 
@@ -3094,6 +3174,81 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 self,
                 "AI backend",
                 f"Provide the {' and '.join(missing)} before running the AI backend.",
+            )
+            return None
+        return env
+
+    def _collect_random_final_llm_environment(self) -> Optional[Dict[str, str]]:
+        if not hasattr(self, "random_final_llm_checkbox") or not self.random_final_llm_checkbox.isChecked():
+            return {}
+        env: Dict[str, str] = {}
+        missing: List[str] = []
+        embed_path = (
+            self.random_embedding_path_edit.text().strip()
+            if hasattr(self, "random_embedding_path_edit")
+            else ""
+        )
+        rerank_path = (
+            self.random_reranker_path_edit.text().strip()
+            if hasattr(self, "random_reranker_path_edit")
+            else ""
+        )
+        azure_key = (
+            self.random_azure_key_edit.text().strip()
+            if hasattr(self, "random_azure_key_edit")
+            else ""
+        )
+        azure_version = (
+            self.random_azure_version_edit.text().strip()
+            if hasattr(self, "random_azure_version_edit")
+            else ""
+        )
+        azure_endpoint = (
+            self.random_azure_endpoint_edit.text().strip()
+            if hasattr(self, "random_azure_endpoint_edit")
+            else ""
+        )
+        if not embed_path:
+            missing.append("embedding model directory")
+        else:
+            embed_dir = Path(embed_path).expanduser()
+            if not embed_dir.exists() or not embed_dir.is_dir():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Final LLM labeling",
+                    "The selected embedding model directory does not exist or is not a directory.",
+                )
+                return None
+            env["MED_EMBED_MODEL_NAME"] = str(embed_dir)
+        if not rerank_path:
+            missing.append("re-ranker model directory")
+        else:
+            rerank_dir = Path(rerank_path).expanduser()
+            if not rerank_dir.exists() or not rerank_dir.is_dir():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Final LLM labeling",
+                    "The selected re-ranker model directory does not exist or is not a directory.",
+                )
+                return None
+            env["RERANKER_MODEL_NAME"] = str(rerank_dir)
+        if not azure_key:
+            missing.append("Azure API key")
+        else:
+            env["AZURE_OPENAI_API_KEY"] = azure_key
+        if not azure_version:
+            missing.append("Azure API version")
+        else:
+            env["AZURE_OPENAI_API_VERSION"] = azure_version
+        if not azure_endpoint:
+            missing.append("Azure endpoint")
+        else:
+            env["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
+        if missing:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Final LLM labeling",
+                f"Provide the {' and '.join(missing)} before running final LLM labeling.",
             )
             return None
         return env
@@ -3762,9 +3917,40 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "reviewers": reviewers,
             }
             if hasattr(self, "random_final_llm_checkbox"):
-                config_payload["final_llm_labeling"] = bool(
-                    self.random_final_llm_checkbox.isChecked()
-                )
+                final_llm_enabled = bool(self.random_final_llm_checkbox.isChecked())
+                config_payload["final_llm_labeling"] = final_llm_enabled
+                if final_llm_enabled:
+                    backend_cfg: Dict[str, object] = {}
+                    embed_path = (
+                        self.random_embedding_path_edit.text().strip()
+                        if hasattr(self, "random_embedding_path_edit")
+                        else ""
+                    )
+                    rerank_path = (
+                        self.random_reranker_path_edit.text().strip()
+                        if hasattr(self, "random_reranker_path_edit")
+                        else ""
+                    )
+                    azure_version = (
+                        self.random_azure_version_edit.text().strip()
+                        if hasattr(self, "random_azure_version_edit")
+                        else ""
+                    )
+                    azure_endpoint = (
+                        self.random_azure_endpoint_edit.text().strip()
+                        if hasattr(self, "random_azure_endpoint_edit")
+                        else ""
+                    )
+                    if embed_path:
+                        backend_cfg["embedding_model_dir"] = embed_path
+                    if rerank_path:
+                        backend_cfg["reranker_model_dir"] = rerank_path
+                    if azure_version:
+                        backend_cfg["azure_api_version"] = azure_version
+                    if azure_endpoint:
+                        backend_cfg["azure_endpoint"] = azure_endpoint
+                    if backend_cfg:
+                        config_payload.setdefault("ai_backend", {}).update(backend_cfg)
             if corpus_record:
                 config_payload["corpus_name"] = corpus_record["name"]
                 config_payload["corpus_path"] = corpus_record["relative_path"]
@@ -3918,6 +4104,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         config_payload = dict(config_payload)
         config_payload["final_llm_labeling"] = True
 
+        env_overrides = self._collect_random_final_llm_environment()
+        if env_overrides is None:
+            raise RuntimeError("Final LLM labeling configuration is incomplete")
+        previous_env: Dict[str, Optional[str]] = {}
+        for key, value in env_overrides.items():
+            previous_env[key] = os.environ.get(key)
+            os.environ[key] = value
+
         self._open_ai_log_dialog()
         self._ai_progress_active = False
         self._ai_progress_stamp = ""
@@ -3944,6 +4138,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 self._append_ai_log("Final LLM labeling finished with no outputs.")
             return outputs
         finally:
+            for key, previous in previous_env.items():
+                if previous is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous
             self._mark_ai_log_complete()
 
 
