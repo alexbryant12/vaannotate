@@ -2354,6 +2354,22 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         reviewer_layout.addWidget(remove_btn)
         scroll_layout.addWidget(reviewer_group)
 
+        method_group = QtWidgets.QGroupBox("Generation method")
+        method_layout = QtWidgets.QHBoxLayout(method_group)
+        self.random_sampling_radio = QtWidgets.QRadioButton("Random sampling")
+        self.active_learning_radio = QtWidgets.QRadioButton("Active learning backend")
+        method_layout.addWidget(self.random_sampling_radio)
+        method_layout.addWidget(self.active_learning_radio)
+        method_layout.addStretch()
+        self.random_sampling_radio.setChecked(True)
+        self.random_sampling_radio.toggled.connect(self._on_generation_mode_changed)
+        self.active_learning_radio.toggled.connect(self._on_generation_mode_changed)
+        scroll_layout.addWidget(method_group)
+
+        self.random_config_container = QtWidgets.QWidget()
+        random_layout = QtWidgets.QVBoxLayout(self.random_config_container)
+        random_layout.setContentsMargins(0, 0, 0, 0)
+
         filter_group = QtWidgets.QGroupBox("Sampling filters")
         filter_layout = QtWidgets.QVBoxLayout(filter_group)
         self.filter_list = QtWidgets.QListWidget()
@@ -2384,7 +2400,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.remove_filter_btn.clicked.connect(self._on_remove_filter)
         filter_controls.addWidget(self.remove_filter_btn)
         filter_layout.addLayout(filter_controls)
-        scroll_layout.addWidget(filter_group)
+        random_layout.addWidget(filter_group)
 
         strat_group = QtWidgets.QGroupBox("Stratification")
         strat_layout = QtWidgets.QVBoxLayout(strat_group)
@@ -2403,13 +2419,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.remove_strat_btn.clicked.connect(self._on_remove_strat_field)
         strat_controls.addWidget(self.remove_strat_btn)
         strat_layout.addLayout(strat_controls)
-        scroll_layout.addWidget(strat_group)
+        random_layout.addWidget(strat_group)
 
-        ai_group = QtWidgets.QGroupBox("AI-assisted selection")
-        ai_layout = QtWidgets.QVBoxLayout(ai_group)
-        self.use_ai_checkbox = QtWidgets.QCheckBox("Use AI/LLM backend")
-        self.use_ai_checkbox.toggled.connect(self._on_toggle_ai_backend)
-        ai_layout.addWidget(self.use_ai_checkbox)
+        final_llm_row = QtWidgets.QHBoxLayout()
+        self.random_final_llm_checkbox = QtWidgets.QCheckBox("Run final LLM labeling")
+        self.random_final_llm_checkbox.setChecked(True)
+        final_llm_row.addWidget(self.random_final_llm_checkbox)
+        final_llm_row.addStretch()
+        random_layout.addLayout(final_llm_row)
+        scroll_layout.addWidget(self.random_config_container)
+
+        self.ai_group = QtWidgets.QGroupBox("Active learning configuration")
+        ai_layout = QtWidgets.QVBoxLayout(self.ai_group)
         self.ai_controls_container = QtWidgets.QWidget()
         ai_controls_layout = QtWidgets.QVBoxLayout(self.ai_controls_container)
         ai_controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -2502,7 +2523,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         ai_button_row.addStretch()
         ai_controls_layout.addLayout(ai_button_row)
         ai_layout.addWidget(self.ai_controls_container)
-        scroll_layout.addWidget(ai_group)
+        scroll_layout.addWidget(self.ai_group)
 
         scroll_layout.addStretch()
         scroll.setWidget(container)
@@ -2533,7 +2554,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if hasattr(self, "ai_azure_endpoint_edit"):
             self.ai_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", ""))
         self.total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
-        self._on_toggle_ai_backend(False)
+        self._on_generation_mode_changed()
 
     def _collect_filters(self) -> SamplingFilters:
         conditions: List[MetadataFilterCondition] = []
@@ -2673,14 +2694,24 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 continue
             self.ai_rounds_list.addItem(item)
 
-    def _on_toggle_ai_backend(self, checked: bool) -> None:
+    def _using_ai_backend(self) -> bool:
+        radio = getattr(self, "active_learning_radio", None)
+        return bool(radio and radio.isChecked())
+
+    def _on_generation_mode_changed(self) -> None:
+        using_ai = self._using_ai_backend()
+        if hasattr(self, "random_config_container"):
+            self.random_config_container.setVisible(not using_ai)
+        if hasattr(self, "ai_group"):
+            show_ai = using_ai or self._ai_job_running
+            self.ai_group.setVisible(show_ai)
         if hasattr(self, "ai_controls_container"):
-            should_enable = checked or self._ai_job_running
+            should_enable = using_ai or self._ai_job_running
             self.ai_controls_container.setEnabled(should_enable)
         self._update_ai_buttons()
 
     def _update_ai_buttons(self) -> None:
-        enabled = getattr(self, "use_ai_checkbox", None) and self.use_ai_checkbox.isChecked()
+        enabled = self._using_ai_backend()
         active = bool(enabled and not self._ai_job_running)
         if hasattr(self, "ai_generate_btn"):
             self.ai_generate_btn.setEnabled(active)
@@ -2688,9 +2719,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.ai_cancel_btn.setEnabled(self._ai_job_running)
         if hasattr(self, "ai_rounds_list"):
             self.ai_rounds_list.setEnabled(active)
-        if hasattr(self, "ai_controls_container") and getattr(self, "use_ai_checkbox", None):
-            container_enabled = self.use_ai_checkbox.isChecked()
-            self.ai_controls_container.setEnabled(container_enabled or self._ai_job_running)
+        if hasattr(self, "ai_controls_container"):
+            container_enabled = enabled or self._ai_job_running
+            self.ai_controls_container.setEnabled(container_enabled)
 
     def _on_ai_generate(self) -> None:
         if self._ai_job_running:
@@ -3003,7 +3034,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_log_output = None
 
     def _collect_ai_environment(self) -> Optional[Dict[str, str]]:
-        if not getattr(self, "use_ai_checkbox", None) or not self.use_ai_checkbox.isChecked():
+        if not self._using_ai_backend():
             return {}
         env: Dict[str, str] = {}
         missing: List[str] = []
@@ -3069,6 +3100,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _collect_ai_overrides(self) -> Dict[str, Any]:
         overrides: Dict[str, Any] = {}
+        if not self._using_ai_backend():
+            return overrides
         select: Dict[str, Any] = {}
         if hasattr(self, "total_n_spin"):
             select["batch_size"] = int(self.total_n_spin.value())
@@ -3515,7 +3548,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return fetch(connection)
 
     def accept(self) -> None:  # noqa: D401 - Qt override
-        if getattr(self, "use_ai_checkbox", None) and self.use_ai_checkbox.isChecked():
+        if self._using_ai_backend():
             if self._ai_job_running:
                 return
             if not self._start_ai_round():
@@ -3728,6 +3761,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "status": self.status_combo.currentText(),
                 "reviewers": reviewers,
             }
+            if hasattr(self, "random_final_llm_checkbox"):
+                config_payload["final_llm_labeling"] = bool(
+                    self.random_final_llm_checkbox.isChecked()
+                )
             if corpus_record:
                 config_payload["corpus_name"] = corpus_record["name"]
                 config_payload["corpus_path"] = corpus_record["relative_path"]
