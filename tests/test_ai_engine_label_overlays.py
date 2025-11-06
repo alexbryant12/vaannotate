@@ -158,3 +158,72 @@ def test_label_config_bundle_strips_meta_entries() -> None:
     assert "_meta" not in legacy_config
     assert "legacy_label" in legacy_config
 
+
+def test_attach_metadata_for_multi_doc_units() -> None:
+    notes_df = pd.DataFrame(
+        [
+            {"patient_icn": "p1", "doc_id": "d1", "text": "note one"},
+            {"patient_icn": "p1", "doc_id": "d2", "text": "note two"},
+        ]
+    )
+    ann_df = pd.DataFrame(
+        [
+            {
+                "round_id": "r1",
+                "unit_id": "p1",
+                "doc_id": "d1",
+                "label_id": "legacy_label",
+                "reviewer_id": "rev1",
+                "label_value": "yes",
+            }
+        ]
+    )
+
+    repo = DataRepository(notes_df, ann_df, phenotype_level="multi_doc")
+    orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
+    orchestrator.repo = repo
+
+    selection = pd.DataFrame(
+        [{"unit_id": "p1", "label_id": "legacy_label", "selection_reason": "bucket"}]
+    )
+    augmented = orchestrator._attach_unit_metadata(selection)
+
+    assert list(augmented.columns).count("patient_icn") == 1
+    assert "doc_id" not in augmented.columns
+    assert augmented.loc[0, "patient_icn"] == "p1"
+
+
+def test_attach_metadata_for_single_doc_units() -> None:
+    notes_df = pd.DataFrame(
+        [
+            {"patient_icn": "p1", "doc_id": "d1", "text": "note one"},
+            {"patient_icn": "p2", "doc_id": "d2", "text": "note two"},
+        ]
+    )
+    ann_df = pd.DataFrame(
+        [
+            {
+                "round_id": "r1",
+                "unit_id": "d1",
+                "doc_id": "d1",
+                "label_id": "legacy_label",
+                "reviewer_id": "rev1",
+                "label_value": "yes",
+            }
+        ]
+    )
+
+    repo = DataRepository(notes_df, ann_df, phenotype_level="single_doc")
+    orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
+    orchestrator.repo = repo
+
+    selection = pd.DataFrame(
+        [{"unit_id": "d1", "label_id": "legacy_label", "selection_reason": "bucket"}]
+    )
+    augmented = orchestrator._attach_unit_metadata(selection)
+
+    assert "patient_icn" in augmented.columns
+    assert "doc_id" in augmented.columns
+    assert augmented.loc[0, "patient_icn"] == "p1"
+    assert augmented.loc[0, "doc_id"] == "d1"
+

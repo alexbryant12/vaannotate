@@ -458,7 +458,17 @@ def _jsonify_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 # ------------------------------
 
 class DataRepository:
-    def __init__(self, notes_df: pd.DataFrame, ann_df: pd.DataFrame):
+    def __init__(
+        self,
+        notes_df: pd.DataFrame,
+        ann_df: pd.DataFrame,
+        *,
+        phenotype_level: str | None = None,
+    ):
+        level = (phenotype_level or "multi_doc").strip().lower()
+        if level not in {"single_doc", "multi_doc"}:
+            level = "multi_doc"
+        self.phenotype_level = level
         required_notes = {"patient_icn","doc_id","text"}
         if not required_notes.issubset(set(notes_df.columns)):
             raise ValueError(f"Notes missing {required_notes}")
@@ -467,9 +477,15 @@ class DataRepository:
             raise ValueError(f"Annotations missing {required_ann}")
 
         self.notes = notes_df.copy()
-        self.notes["unit_id"] = self.notes["patient_icn"].astype(str)
+        self.notes["patient_icn"] = self.notes["patient_icn"].astype(str)
         self.notes["doc_id"] = self.notes["doc_id"].astype(str)
         self.notes["text"] = self.notes["text"].astype(str).map(normalize_text)
+
+        if self.phenotype_level == "single_doc":
+            unit_ids = self.notes["doc_id"]
+        else:
+            unit_ids = self.notes["patient_icn"]
+        self.notes["unit_id"] = unit_ids.astype(str)
 
         self.ann = ann_df.copy()
         # --- Normalize multi-typed label_value columns ---
@@ -516,6 +532,13 @@ class DataRepository:
 
         self.label_rules_by_label = self._collect_label_rules()
         self._round_labelset_map = self._collect_round_labelsets()
+
+    def unit_metadata(self) -> pd.DataFrame:
+        columns = ["unit_id", "patient_icn"]
+        if self.phenotype_level == "single_doc":
+            columns.append("doc_id")
+        meta = self.notes[columns].drop_duplicates(subset=["unit_id"]).copy()
+        return meta
 
     def _collect_label_rules(self) -> Dict[str,str]:
         rules = {}
@@ -3422,6 +3445,7 @@ class ActiveLearningLLMFirst:
         label_config_bundle: LabelConfigBundle | None = None,
         *,
         label_config: Optional[dict] = None,
+        phenotype_level: str | None = None,
     ):
         import os
 
@@ -3429,7 +3453,8 @@ class ActiveLearningLLMFirst:
         self.cfg = cfg
         notes_df = read_table(paths.notes_path)
         ann_df = read_table(paths.annotations_path)
-        self.repo = DataRepository(notes_df, ann_df)
+        self.phenotype_level = (phenotype_level or "multi_doc").strip().lower()
+        self.repo = DataRepository(notes_df, ann_df, phenotype_level=self.phenotype_level)
 
         embed_name = os.getenv("MED_EMBED_MODEL_NAME")
         rerank_name = os.getenv("RERANKER_MODEL_NAME")
@@ -3461,6 +3486,19 @@ class ActiveLearningLLMFirst:
 
     def config_for_round(self, round_identifier: Optional[str]) -> Dict[str, object]:
         return self.label_config_bundle.config_for_round(round_identifier)
+
+    def _attach_unit_metadata(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        if df is None or getattr(self, "repo", None) is None:
+            return df
+        meta = self.repo.unit_metadata()
+        if meta.empty:
+            return df
+        # Avoid duplicating metadata columns if they already exist in df.
+        meta = meta[[c for c in meta.columns if c == "unit_id" or c not in df.columns]]
+        if meta.shape[1] <= 1:  # only unit_id
+            return df
+        merged = df.merge(meta, on="unit_id", how="left")
+        return merged
 
     def _label_maps(self) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
         """Return legacy and current rule/type maps with latest label config overlays."""
@@ -4189,6 +4227,7 @@ class ActiveLearningLLMFirst:
         minutes, seconds = divmod(remainder, 60)
         print(f"Done. Total elapsed: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
 
+        result_df = self._attach_unit_metadata(result_df)
         return result_df
         
         
