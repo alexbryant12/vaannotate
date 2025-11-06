@@ -18,11 +18,12 @@ from vaannotate.project import (
     add_labelset,
     add_phenotype,
     add_project_corpus,
+    fetch_labelset,
     get_connection,
     init_project,
     register_reviewer,
 )
-from vaannotate.rounds import CandidateUnit, RoundBuilder
+from vaannotate.rounds import AssignmentUnit, CandidateUnit, RoundBuilder
 from vaannotate.schema import initialize_corpus_db
 from vaannotate.shared.database import Database
 from vaannotate.shared.sampling import (
@@ -909,4 +910,62 @@ def test_import_preserves_all_reviewer_annotations(seeded_project: tuple[RoundBu
                 assert score_row["value"] is None
                 assert score_row["value_num"] is None
                 assert score_row["na"] == 1
+
+
+def test_run_final_llm_labeling_forwards_logs(
+    seeded_project: tuple[RoundBuilder, Path],
+    monkeypatch,
+) -> None:
+    builder, project_root = seeded_project
+    round_dir = project_root / "phenotypes" / "ph_test" / "rounds" / "round_test"
+    round_dir.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(project_root / "project.db") as conn:
+        conn.row_factory = sqlite3.Row
+        pheno_row = conn.execute(
+            "SELECT * FROM phenotypes WHERE pheno_id=?",
+            ("ph_test",),
+        ).fetchone()
+        assert pheno_row is not None
+        labelset = fetch_labelset(conn, "ls_test")
+
+    assignments = {
+        "rev_one": [
+            AssignmentUnit(
+                unit_id="doc_0",
+                patient_icn="p0",
+                doc_id="doc_0",
+                payload={
+                    "unit_id": "doc_0",
+                    "patient_icn": "p0",
+                    "doc_id": "doc_0",
+                    "documents": [{"doc_id": "doc_0", "text": "Example text 0"}],
+                    "strata_key": "random_sampling",
+                },
+            )
+        ]
+    }
+
+    messages: list[str] = []
+
+    def _fake_apply(self, **kwargs):  # type: ignore[no-untyped-def]
+        from vaannotate.vaannotate_ai_backend import engine
+
+        engine.LOGGER.info("[FinalLLM] 1/1 complete")
+        return {"final_llm_labels": "dummy"}
+
+    monkeypatch.setattr(RoundBuilder, "_apply_final_llm_labeling", _fake_apply)
+
+    outputs = builder.run_final_llm_labeling(
+        pheno_row=pheno_row,
+        labelset=labelset,
+        round_dir=round_dir,
+        reviewer_assignments=assignments,
+        config={"ai_backend": {}, "final_llm_labeling": True},
+        config_base=round_dir,
+        log_callback=messages.append,
+    )
+
+    assert outputs == {"final_llm_labels": "dummy"}
+    assert any("[FinalLLM]" in message for message in messages)
 

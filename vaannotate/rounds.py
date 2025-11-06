@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 import random
 import re
@@ -364,6 +365,68 @@ class RoundBuilder:
 
         exports_dir = ensure_dir(Path(round_dir) / "reports" / "exports")
         return self._write_final_llm_outputs(labels_df=labels_df, probe_df=probe_df, exports_dir=exports_dir)
+
+    def run_final_llm_labeling(
+        self,
+        *,
+        pheno_row: sqlite3.Row,
+        labelset: Mapping[str, object],
+        round_dir: Path,
+        reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]],
+        config: Mapping[str, Any],
+        config_base: Path,
+        log_callback: callable | None = None,
+    ) -> Dict[str, str]:
+        """Execute final LLM labeling while forwarding progress logs."""
+
+        handler: logging.Handler | None = None
+        logger = None
+        original_level: int | None = None
+        if log_callback:
+            try:
+                from vaannotate.vaannotate_ai_backend import engine
+            except ImportError:  # pragma: no cover - runtime guard
+                handler = None
+            else:
+                class _ForwardHandler(logging.Handler):
+                    def __init__(self, callback: callable) -> None:
+                        super().__init__(level=logging.INFO)
+                        self._callback = callback
+
+                    def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
+                        try:
+                            message = record.getMessage()
+                        except Exception:  # noqa: BLE001
+                            message = str(record.msg)
+                        if not message:
+                            return
+                        try:
+                            self._callback(message)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                logger = engine.LOGGER
+                original_level = logger.level
+                if original_level is None or original_level > logging.INFO:
+                    logger.setLevel(logging.INFO)
+                handler = _ForwardHandler(log_callback)
+                handler.setLevel(logging.INFO)
+                logger.addHandler(handler)
+
+        try:
+            return self._apply_final_llm_labeling(
+                pheno_row=pheno_row,
+                labelset=labelset,
+                round_dir=round_dir,
+                reviewer_assignments=reviewer_assignments,
+                config=config,
+                config_base=config_base,
+            )
+        finally:
+            if handler and logger:
+                logger.removeHandler(handler)
+                if original_level is not None:
+                    logger.setLevel(original_level)
 
     def _resolve_optional_path(self, raw: Any, base_dir: Path) -> Path | None:
         if raw is None:

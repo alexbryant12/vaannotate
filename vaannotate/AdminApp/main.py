@@ -46,7 +46,7 @@ from vaannotate.project import (
     resolve_label_config_path,
 )
 from vaannotate.utils import copy_sqlite_database, ensure_dir
-from vaannotate.rounds import RoundBuilder
+from vaannotate.rounds import AssignmentUnit as RoundAssignmentUnit, RoundBuilder
 from vaannotate.vaannotate_ai_backend import CancelledError, BackendResult, run_ai_backend_and_collect
 
 PROJECT_MODELS = [
@@ -3811,6 +3811,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     status="open",
                 )
                 assignment.save(conn)
+        ctx.register_text_file(round_dir / "round_config.json", json.dumps(config_payload, indent=2))
         if label_schema is None:
             label_schema = self._build_label_schema(labelset_id, db)
         for reviewer in reviewers:
@@ -3820,11 +3821,130 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             populate_assignment_db(assignment_db, reviewer["id"], assignments[reviewer["id"]].units)
             schema_path = assignment_dir / "label_schema.json"
             ctx.register_text_file(schema_path, json.dumps(label_schema, indent=2))
+        final_llm_outputs: Dict[str, str] = {}
+        if hasattr(self, "random_final_llm_checkbox") and self.random_final_llm_checkbox.isChecked():
+            try:
+                final_llm_outputs = self._run_random_final_llm_labeling(
+                    round_id=round_id,
+                    round_dir=round_dir,
+                    config_payload=config_payload,
+                    assignments=assignments,
+                )
+            except Exception as exc:  # noqa: BLE001
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Final LLM labeling",
+                    f"Failed to run final LLM labeling: {exc}",
+                )
+                return False
+            if final_llm_outputs:
+                config_payload.setdefault("final_llm_outputs", {}).update(final_llm_outputs)
+                updated_config = json.dumps(config_payload, indent=2)
+                ctx.register_text_file(round_dir / "round_config.json", updated_config)
+                with db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE round_configs SET config_json=? WHERE round_id=?",
+                        (updated_config, round_id),
+                    )
         self.created_round_id = round_id
         self.created_round_number = round_number
         ctx.mark_dirty()
         ctx.update_cache_after_round(corpus_id)
         return True
+
+    def _run_random_final_llm_labeling(
+        self,
+        *,
+        round_id: str,
+        round_dir: Path,
+        config_payload: Dict[str, object],
+        assignments: Dict[str, ReviewerAssignment],
+    ) -> Dict[str, str]:
+        project_root = getattr(self.ctx, "project_root", None)
+        if not project_root:
+            raise RuntimeError("Project root is not available")
+        builder = RoundBuilder(project_root)
+        db = self.ctx.require_db()
+        pheno_id = str(config_payload.get("pheno_id") or self.pheno_row["pheno_id"])
+        labelset_id = str(config_payload.get("labelset_id") or "")
+        if not labelset_id:
+            raise RuntimeError("Label set ID is required for final LLM labeling")
+        with db.connect() as conn:
+            conn.row_factory = sqlite3.Row
+            pheno_row = conn.execute(
+                "SELECT * FROM phenotypes WHERE pheno_id=?",
+                (pheno_id,),
+            ).fetchone()
+            if not pheno_row:
+                raise RuntimeError(f"Phenotype {pheno_id} not found")
+            labelset = fetch_labelset(conn, labelset_id)
+
+        reviewer_assignments: Dict[str, List[RoundAssignmentUnit]] = {}
+        for reviewer_id, assignment in assignments.items():
+            units: List[RoundAssignmentUnit] = []
+            for unit in assignment.units:
+                payload = dict(unit)
+                payload.setdefault("documents", payload.get("documents") or [])
+                payload.setdefault(
+                    "strata_key",
+                    payload.get("strata_key")
+                    or payload.get("strata")
+                    or "random_sampling",
+                )
+                unit_identifier = (
+                    payload.get("unit_id")
+                    or payload.get("doc_id")
+                    or payload.get("patient_icn")
+                )
+                unit_id = str(unit_identifier or "")
+                if not unit_id:
+                    continue
+                doc_id_value = payload.get("doc_id")
+                doc_id = None if doc_id_value is None else str(doc_id_value)
+                patient_icn = str(payload.get("patient_icn") or "")
+                units.append(
+                    RoundAssignmentUnit(
+                        unit_id,
+                        patient_icn,
+                        doc_id,
+                        payload,
+                    )
+                )
+            if units:
+                reviewer_assignments[reviewer_id] = units
+        if not reviewer_assignments:
+            raise RuntimeError("No assignments available for final LLM labeling")
+
+        config_payload = dict(config_payload)
+        config_payload["final_llm_labeling"] = True
+
+        self._open_ai_log_dialog()
+        self._ai_progress_active = False
+        self._ai_progress_stamp = ""
+        self._ai_progress_text = ""
+        self._ai_progress_block_number = None
+        self._append_ai_log(f"Running final LLM labeling for round {round_id}…")
+        try:
+            outputs = builder.run_final_llm_labeling(
+                pheno_row=pheno_row,
+                labelset=labelset,
+                round_dir=round_dir,
+                reviewer_assignments=reviewer_assignments,
+                config=config_payload,
+                config_base=round_dir,
+                log_callback=self._append_ai_log,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_ai_log(f"Final LLM labeling failed: {exc}")
+            raise
+        else:
+            if outputs:
+                self._append_ai_log("Final LLM labeling complete.")
+            else:
+                self._append_ai_log("Final LLM labeling finished with no outputs.")
+            return outputs
+        finally:
+            self._mark_ai_log_complete()
 
 
 class ProjectTreeWidget(QtWidgets.QTreeWidget):
