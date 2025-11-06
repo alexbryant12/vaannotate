@@ -562,6 +562,17 @@ class RoundBuilder:
             phenotype_level=phenotype_level,
         )
 
+        # Ensure the RAG retriever has access to corpus embeddings. The AI backend
+        # pathway builds the chunk index prior to any LLM labeling so that each
+        # call has patient-level context with reranking. The random sampling
+        # pathway skips the orchestrator run loop, so we need to explicitly build
+        # the embeddings/index here as well.
+        orchestrator.store.build_chunk_index(
+            orchestrator.repo.notes,
+            orchestrator.cfg.rag,
+            orchestrator.cfg.index,
+        )
+
         _, _, current_rules_map, current_label_types = orchestrator._label_maps()
         family_labeler = FamilyLabeler(
             orchestrator.llm,
