@@ -148,7 +148,7 @@ class LLMFirstConfig:
     enrich: bool = True
     probe_enrichment_mix: float = 1.00          # fraction of enriched vs uniform
     probe_enrichment_equalize: bool = True      # equal per parent; else proportional
-    probe_ce_unit_sample: int = 1300
+    probe_ce_unit_sample: int = 75
     probe_ce_search_topk_per_unit: int = 15
     probe_ce_rerank_m: int = 3        # aggregate top-3 CE
     probe_ce_unit_agg: str = "max"    # or "mean"
