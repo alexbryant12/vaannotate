@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import random
 import re
 import sqlite3
@@ -10,9 +11,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterator, Mapping, Sequence
+from typing import Any, Dict, Iterator, Mapping, Sequence
 
-from .project import fetch_labelset
+from .project import build_label_config, fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
 from .shared.metadata import (
     MetadataFilterCondition,
@@ -77,7 +78,19 @@ class RoundBuilder:
         created_by: str,
         preselected_units_csv: Path | str | None = None,
     ) -> dict:
-        config = json.loads(Path(config_path).read_text("utf-8"))
+        config_path = Path(config_path)
+        config = json.loads(config_path.read_text("utf-8"))
+        config_base = config_path.parent
+        ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        final_llm_flag = config.get("final_llm_labeling")
+        if final_llm_flag is None:
+            final_llm_enabled = bool(ai_backend_config.get("final_llm_labels")) or bool(
+                ai_backend_config.get("final_llm_labels_json")
+            )
+        else:
+            final_llm_enabled = bool(final_llm_flag)
+        config["final_llm_labeling"] = final_llm_enabled
+        final_llm_outputs: Dict[str, str] = {}
         with self._connect_project() as project_conn:
             pheno = project_conn.execute(
                 "SELECT * FROM phenotypes WHERE pheno_id=?",
@@ -116,7 +129,7 @@ class RoundBuilder:
                     if csv_value:
                         csv_override = Path(csv_value)
                         if not csv_override.is_absolute():
-                            csv_override = (Path(config_path).parent / csv_override).resolve()
+                            csv_override = (config_base / csv_override).resolve()
                 else:
                     csv_override = Path(preselected_units_csv)
                 round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
@@ -270,12 +283,388 @@ class RoundBuilder:
                     ),
                 )
 
+            if final_llm_enabled:
+                try:
+                    outputs = self._apply_final_llm_labeling(
+                        pheno_row=pheno,
+                        labelset=labelset,
+                        round_dir=round_dir,
+                        reviewer_assignments=reviewer_assignments,
+                        config=config,
+                        config_base=config_base,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(f"Final LLM labeling failed: {exc}") from exc
+                else:
+                    final_llm_outputs.update(outputs)
+                    config.setdefault("final_llm_outputs", {}).update(outputs)
+                    (round_dir / "round_config.json").write_text(
+                        canonical_json(config),
+                        encoding="utf-8",
+                    )
+
             project_conn.commit()
-            return {
+            result_payload: Dict[str, Any] = {
                 "round_id": round_id,
                 "round_dir": str(round_dir),
                 "assignment_counts": {rid: len(units) for rid, units in reviewer_assignments.items()},
             }
+            if final_llm_outputs:
+                result_payload["final_llm_outputs"] = dict(final_llm_outputs)
+            return result_payload
+
+    def _apply_final_llm_labeling(
+        self,
+        *,
+        pheno_row: sqlite3.Row,
+        labelset: Mapping[str, object],
+        round_dir: Path,
+        reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]],
+        config: Mapping[str, Any],
+        config_base: Path,
+    ) -> Dict[str, str]:
+        try:
+            import pandas as pd
+        except ImportError as exc:  # pragma: no cover - runtime guard
+            raise RuntimeError("pandas is required for final LLM labeling") from exc
+
+        ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+
+        labels_df = None
+        probe_df = None
+
+        labels_path = self._resolve_optional_path(ai_backend_config.get("final_llm_labels"), config_base)
+        if labels_path and labels_path.exists():
+            labels_df = pd.read_parquet(labels_path)
+        else:
+            labels_json_path = self._resolve_optional_path(
+                ai_backend_config.get("final_llm_labels_json"), config_base
+            )
+            if labels_json_path and labels_json_path.exists():
+                labels_df = pd.read_json(labels_json_path)
+
+        probe_path = self._resolve_optional_path(ai_backend_config.get("final_llm_family_probe"), config_base)
+        if probe_path and probe_path.exists():
+            probe_df = pd.read_parquet(probe_path)
+        else:
+            probe_json_path = self._resolve_optional_path(
+                ai_backend_config.get("final_llm_family_probe_json"), config_base
+            )
+            if probe_json_path and probe_json_path.exists():
+                probe_df = pd.read_json(probe_json_path)
+
+        if labels_df is None or probe_df is None:
+            labels_df, probe_df = self._run_final_llm_labeling_inference(
+                pheno_row=pheno_row,
+                labelset=labelset,
+                round_dir=round_dir,
+                reviewer_assignments=reviewer_assignments,
+                config=config,
+            )
+
+        exports_dir = ensure_dir(Path(round_dir) / "reports" / "exports")
+        return self._write_final_llm_outputs(labels_df=labels_df, probe_df=probe_df, exports_dir=exports_dir)
+
+    def _resolve_optional_path(self, raw: Any, base_dir: Path) -> Path | None:
+        if raw is None:
+            return None
+        try:
+            candidate = Path(str(raw))
+        except Exception:  # noqa: BLE001
+            return None
+        if not candidate.is_absolute():
+            candidate = (base_dir / candidate).resolve()
+        return candidate
+
+    def _run_final_llm_labeling_inference(
+        self,
+        *,
+        pheno_row: sqlite3.Row,
+        labelset: Mapping[str, object],
+        round_dir: Path,
+        reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]],
+        config: Mapping[str, Any],
+    ) -> tuple["pd.DataFrame", "pd.DataFrame"]:
+        try:
+            import pandas as pd
+        except ImportError as exc:  # pragma: no cover - runtime guard
+            raise RuntimeError("pandas is required for final LLM labeling") from exc
+        try:
+            from vaannotate.vaannotate_ai_backend.engine import (
+                ActiveLearningLLMFirst,
+                FamilyLabeler,
+                OrchestratorConfig,
+                Paths,
+                _jsonify_cols,
+            )
+        except ImportError as exc:  # pragma: no cover - runtime guard
+            raise RuntimeError("AI backend components are required for final LLM labeling") from exc
+
+        units_by_id: Dict[str, AssignmentUnit] = {}
+        for assignments in reviewer_assignments.values():
+            for unit in assignments:
+                units_by_id.setdefault(unit.unit_id, unit)
+
+        if not units_by_id:
+            raise RuntimeError("No assignment units available for final LLM labeling")
+
+        notes_rows: list[dict[str, Any]] = []
+        for unit in units_by_id.values():
+            documents = unit.payload.get("documents") if isinstance(unit.payload, Mapping) else None
+            docs_list = list(documents) if isinstance(documents, (list, tuple)) else []
+            if not docs_list:
+                doc_identifier = unit.doc_id or f"{unit.unit_id}_doc"
+                notes_rows.append(
+                    {
+                        "patient_icn": str(unit.patient_icn or ""),
+                        "doc_id": str(doc_identifier or unit.unit_id),
+                        "text": str(unit.payload.get("text", "") if isinstance(unit.payload, Mapping) else ""),
+                        "unit_id": str(unit.unit_id),
+                    }
+                )
+                continue
+            for index, doc in enumerate(docs_list):
+                if not isinstance(doc, Mapping):
+                    continue
+                doc_id = doc.get("doc_id") or f"{unit.unit_id}_{index}"
+                notes_rows.append(
+                    {
+                        "patient_icn": str(unit.patient_icn or doc.get("patient_icn") or ""),
+                        "doc_id": str(doc_id),
+                        "text": str(doc.get("text", "")),
+                        "unit_id": str(unit.unit_id),
+                        "order_index": index,
+                        "metadata_json": doc.get("metadata_json"),
+                        "date_note": doc.get("date_note"),
+                    }
+                )
+
+        if not notes_rows:
+            raise RuntimeError("Unable to assemble corpus notes for final LLM labeling")
+
+        notes_df = pd.DataFrame(notes_rows)
+        notes_df["patient_icn"] = notes_df["patient_icn"].astype(str)
+        notes_df["doc_id"] = notes_df["doc_id"].astype(str)
+        notes_df["text"] = notes_df["text"].astype(str)
+        notes_df["unit_id"] = notes_df["unit_id"].astype(str)
+
+        ann_df = pd.DataFrame(
+            {
+                "round_id": pd.Series(dtype="object"),
+                "unit_id": pd.Series(dtype="object"),
+                "doc_id": pd.Series(dtype="object"),
+                "label_id": pd.Series(dtype="object"),
+                "reviewer_id": pd.Series(dtype="object"),
+                "label_value": pd.Series(dtype="object"),
+                "label_value_num": pd.Series(dtype="float64"),
+                "label_value_date": pd.Series(dtype="datetime64[ns]"),
+            }
+        )
+
+        work_dir = ensure_dir(Path(round_dir) / "imports" / "final_llm_labeling")
+        notes_path = work_dir / "notes.parquet"
+        ann_path = work_dir / "annotations.parquet"
+        notes_df.to_parquet(notes_path, index=False)
+        ann_df.to_parquet(ann_path, index=False)
+
+        consistency = 1
+        candidates: list[Any] = [config.get("final_llm_labeling_n_consistency")]
+        llm_cfg = config.get("llm_labeling")
+        if isinstance(llm_cfg, Mapping):
+            for key in ("consistency_runs", "n_consistency", "final_llm_label_consistency"):
+                candidates.append(llm_cfg.get(key))
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                value = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                consistency = value
+                break
+
+        cfg = OrchestratorConfig()
+        cfg.final_llm_labeling = True
+        cfg.final_llm_labeling_n_consistency = max(1, consistency)
+        setattr(cfg.llmfirst, "final_llm_label_consistency", cfg.final_llm_labeling_n_consistency)
+
+        phenotype_level = str(pheno_row["level"] or "multi_doc")
+        label_config_payload = build_label_config(labelset)
+        paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
+        orchestrator = ActiveLearningLLMFirst(
+            paths=paths,
+            cfg=cfg,
+            label_config=label_config_payload,
+            phenotype_level=phenotype_level,
+        )
+
+        _, _, current_rules_map, current_label_types = orchestrator._label_maps()
+        family_labeler = FamilyLabeler(
+            orchestrator.llm,
+            orchestrator.rag,
+            orchestrator.repo,
+            orchestrator.label_config,
+            orchestrator.cfg.scjitter,
+            orchestrator.cfg.llmfirst,
+        )
+
+        fam_rows: list[dict[str, Any]] = []
+        for unit_id in units_by_id.keys():
+            fam_rows.extend(
+                family_labeler.label_family_for_unit(
+                    unit_id,
+                    current_label_types,
+                    current_rules_map,
+                    json_only=True,
+                    json_n_consistency=cfg.final_llm_labeling_n_consistency,
+                    json_jitter=False,
+                )
+            )
+
+        fam_df = pd.DataFrame(fam_rows)
+        if not fam_df.empty:
+            if "runs" in fam_df.columns:
+                fam_df.rename(columns={"runs": "llm_runs"}, inplace=True)
+            if "consistency" in fam_df.columns:
+                fam_df.rename(columns={"consistency": "llm_consistency"}, inplace=True)
+            if "prediction" in fam_df.columns:
+                fam_df.rename(columns={"prediction": "llm_prediction"}, inplace=True)
+            if "llm_runs" in fam_df.columns:
+                fam_df["llm_reasoning"] = fam_df["llm_runs"].map(
+                    lambda runs: (runs[0].get("raw", {}).get("reasoning") if isinstance(runs, list) and runs else None)
+                )
+            fam_df = _jsonify_cols(
+                fam_df,
+                [col for col in ("rag_context", "llm_runs", "fc_probs") if col in fam_df.columns],
+            )
+
+        if fam_df.empty:
+            labels_df = pd.DataFrame(columns=["unit_id"])
+            return labels_df, fam_df
+
+        pivot = fam_df[["unit_id", "label_id", "llm_prediction"]].copy()
+        pivot["col"] = pivot["label_id"].astype(str) + "_llm"
+        fam_wide = (
+            pivot.pivot_table(index="unit_id", columns="col", values="llm_prediction", aggfunc="first")
+            .reset_index()
+        )
+        if "llm_reasoning" in fam_df.columns:
+            reasoning = fam_df[["unit_id", "label_id", "llm_reasoning"]].copy()
+            reasoning["colr"] = reasoning["label_id"].astype(str) + "_llm_reason"
+            fam_reason = (
+                reasoning.pivot_table(index="unit_id", columns="colr", values="llm_reasoning", aggfunc="first")
+                .reset_index()
+            )
+            fam_wide = fam_wide.merge(fam_reason, on="unit_id", how="left")
+
+        return fam_wide, fam_df
+
+    def _write_final_llm_outputs(
+        self,
+        *,
+        labels_df: "pd.DataFrame" | None,
+        probe_df: "pd.DataFrame" | None,
+        exports_dir: Path,
+    ) -> Dict[str, str]:
+        import pandas as pd
+
+        outputs: Dict[str, str] = {}
+
+        if labels_df is not None:
+            labels_df = labels_df.copy()
+            labels_df = labels_df.replace({pd.NA: None}).where(pd.notnull(labels_df), None)
+            labels_path = exports_dir / "final_llm_labels.parquet"
+            labels_df.to_parquet(labels_path, index=False)
+            outputs["final_llm_labels"] = str(labels_path)
+            labels_json_path = labels_path.with_suffix(".json")
+            labels_json_path.write_text(
+                self._json_dumps(labels_df.to_dict(orient="records")),
+                encoding="utf-8",
+            )
+            outputs["final_llm_labels_json"] = str(labels_json_path)
+
+        if probe_df is not None:
+            probe_df = probe_df.copy()
+            probe_df = probe_df.replace({pd.NA: None}).where(pd.notnull(probe_df), None)
+            probe_path = exports_dir / "final_llm_family_probe.parquet"
+            probe_df.to_parquet(probe_path, index=False)
+            outputs["final_llm_family_probe"] = str(probe_path)
+            probe_json_path = probe_path.with_suffix(".json")
+            probe_json_path.write_text(
+                self._json_dumps(probe_df.to_dict(orient="records")),
+                encoding="utf-8",
+            )
+            outputs["final_llm_family_probe_json"] = str(probe_json_path)
+            nested = self._family_probe_to_nested(probe_df)
+            nested_path = exports_dir / "final_llm_labels_by_unit.json"
+            nested_path.write_text(self._json_dumps(nested), encoding="utf-8")
+            outputs["final_llm_labels_by_unit"] = str(nested_path)
+
+        return outputs
+
+    def _family_probe_to_nested(self, probe_df: "pd.DataFrame") -> Dict[str, list[dict[str, Any]]]:
+        import pandas as pd
+
+        result: Dict[str, list[dict[str, Any]]] = {}
+        if probe_df is None or probe_df.empty:
+            return result
+        normalized = probe_df.replace({pd.NA: None}).where(pd.notnull(probe_df), None)
+        for row in normalized.to_dict(orient="records"):
+            unit_id = str(row.get("unit_id") or "")
+            if not unit_id:
+                continue
+            entry = {
+                key: self._normalize_for_json(value)
+                for key, value in row.items()
+                if key != "unit_id" and value is not None
+            }
+            if not entry:
+                continue
+            result.setdefault(unit_id, []).append(entry)
+        return result
+
+    def _json_dumps(self, payload: object) -> str:
+        normalized = self._normalize_for_json(payload)
+        return json.dumps(normalized, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _normalize_for_json(value: object) -> object:
+        import numpy as np
+        import pandas as pd
+
+        if value is None:
+            return None
+        if isinstance(value, (str, bool)):
+            return value
+        if isinstance(value, (int,)):
+            return value
+        if isinstance(value, float):
+            if math.isnan(value):
+                return None
+            return value
+        if isinstance(value, np.generic):
+            try:
+                return RoundBuilder._normalize_for_json(value.item())
+            except Exception:  # noqa: BLE001
+                return float(value)
+        if isinstance(value, (pd.Timestamp, datetime)):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {str(k): RoundBuilder._normalize_for_json(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [RoundBuilder._normalize_for_json(v) for v in value]
+        if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+            try:
+                return RoundBuilder._normalize_for_json(value.tolist())
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+            try:
+                return RoundBuilder._normalize_for_json(value.item())
+            except Exception:  # noqa: BLE001
+                pass
+        return value
 
     @staticmethod
     def _build_label_schema_payload(labelset: Mapping[str, object]) -> Dict[str, object]:

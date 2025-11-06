@@ -4201,6 +4201,29 @@ class ActiveLearningLLMFirst:
                 final_units = final[["unit_id", "label_id", "label_type", "selection_reason"]].drop_duplicates()
                 final_out = final_units.merge(fam_wide, on="unit_id", how="left")
                 final_out.to_parquet(os.path.join(self.paths.outdir, "final_selection_with_llm.parquet"), index=False)
+
+                labels_path = Path(self.paths.outdir) / "final_llm_labels.parquet"
+                try:
+                    fam_wide.to_parquet(labels_path, index=False)
+                except Exception:
+                    pass
+                else:
+                    try:
+                        labels_path.with_suffix(".json").write_text(
+                            fam_wide.to_json(orient="records", indent=2, force_ascii=False),
+                            encoding="utf-8",
+                        )
+                    except TypeError:
+                        labels_path.with_suffix(".json").write_text(
+                            fam_wide.to_json(orient="records"),
+                            encoding="utf-8",
+                        )
+
+            try:
+                probe_json_path = Path(self.paths.outdir) / "final_llm_family_probe.json"
+                fam_df.to_json(probe_json_path, orient="records", indent=2, force_ascii=False)
+            except TypeError:
+                fam_df.to_json(probe_json_path, orient="records")
         if final_out is not None:
             result_df = final_out
         

@@ -260,7 +260,7 @@ class AIRoundWorker(QtCore.QObject):
                     self.log_message.emit(
                         f"Warning: unable to flush project database before build ({exc})"
                     )
-                config_path = self._write_round_config(result.csv_path)
+                config_path = self._write_round_config(result)
                 try:
                     if self._cancel_event.is_set():
                         raise CancelledError("AI backend run cancelled")
@@ -424,8 +424,9 @@ class AIRoundWorker(QtCore.QObject):
                 )
                 reviewer_record.save(conn)
 
-    def _write_round_config(self, csv_path: Path) -> Path:
+    def _write_round_config(self, backend_result: BackendResult) -> Path:
         context = self.job.context
+        csv_path = backend_result.csv_path
         payload: Dict[str, Any] = {
             "pheno_id": context.pheno_id,
             "labelset_id": context.labelset_id,
@@ -453,6 +454,21 @@ class AIRoundWorker(QtCore.QObject):
             "prior_rounds": list(self.job.prior_rounds),
             "invoked_at": self.job.timestamp,
         }
+        artifacts = backend_result.artifacts or {}
+        final_labels_path = artifacts.get("final_labels")
+        if final_labels_path:
+            payload["ai_backend"]["final_llm_labels"] = str(final_labels_path)
+        final_labels_json = artifacts.get("final_labels_json")
+        if final_labels_json:
+            payload["ai_backend"]["final_llm_labels_json"] = str(final_labels_json)
+        final_probe = artifacts.get("final_family_probe")
+        if final_probe:
+            payload["ai_backend"]["final_llm_family_probe"] = str(final_probe)
+        final_probe_json = artifacts.get("final_family_probe_json")
+        if final_probe_json:
+            payload["ai_backend"]["final_llm_family_probe_json"] = str(final_probe_json)
+        if "final_llm_labeling" in self.cfg_overrides:
+            payload["final_llm_labeling"] = bool(self.cfg_overrides.get("final_llm_labeling"))
         handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
         with handle:
             json.dump(payload, handle, indent=2)
