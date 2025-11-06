@@ -108,6 +108,20 @@ class Database:
     def is_dirty(self) -> bool:
         return self._dirty
 
+    def refresh_from_disk(self) -> None:
+        """Reload the cached database contents from disk."""
+
+        if not self._cache_enabled:
+            return
+
+        if self._memory_keeper is not None:
+            self._memory_keeper.close()
+            self._memory_keeper = None
+
+        self._memory_uri = None
+        self._cache_enabled = False
+        self.enable_memory_cache()
+
 
 class Record:
     """Base class for ORM style records."""

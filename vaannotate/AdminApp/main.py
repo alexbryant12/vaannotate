@@ -254,6 +254,12 @@ class AIRoundWorker(QtCore.QObject):
                 self._prepare_labelset_and_reviewers()
                 if self._cancel_event.is_set():
                     raise CancelledError("AI backend run cancelled")
+                try:
+                    self.job.context.db.flush_to_disk()
+                except Exception as exc:  # noqa: BLE001
+                    self.log_message.emit(
+                        f"Warning: unable to flush project database before build ({exc})"
+                    )
                 config_path = self._write_round_config(result.csv_path)
                 try:
                     if self._cancel_event.is_set():
@@ -265,6 +271,12 @@ class AIRoundWorker(QtCore.QObject):
                         created_by=self.job.context.created_by,
                         preselected_units_csv=result.csv_path,
                     )
+                    try:
+                        self.job.context.db.refresh_from_disk()
+                    except Exception as exc:  # noqa: BLE001
+                        self.log_message.emit(
+                            f"Warning: unable to refresh project database after build ({exc})"
+                        )
                 finally:
                     try:
                         config_path.unlink()
