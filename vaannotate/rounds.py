@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import Dict, Iterator, Mapping, Sequence
 
 from .project import fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
@@ -198,6 +198,9 @@ class RoundBuilder:
                 (round_id, canonical_json(config)),
             )
 
+            label_schema_payload = self._build_label_schema_payload(labelset)
+            label_schema_text = json.dumps(label_schema_payload, indent=2)
+
             for reviewer in config["reviewers"]:
                 assign_dir = ensure_dir(round_dir / "assignments" / reviewer["id"])
                 assignment_db = assign_dir / "assignment.db"
@@ -247,6 +250,10 @@ class RoundBuilder:
                 (assign_dir / "client.exe").write_text("Annotator client placeholder", encoding="utf-8")
                 (assign_dir / "assignment.lock").write_text("", encoding="utf-8")
                 ensure_dir(assign_dir / "logs")
+                (assign_dir / "label_schema.json").write_text(
+                    label_schema_text,
+                    encoding="utf-8",
+                )
                 project_conn.execute(
                     """
                     INSERT OR REPLACE INTO assignments(assign_id, round_id, reviewer_id, sample_size, overlap_n, created_at, status)
@@ -269,6 +276,61 @@ class RoundBuilder:
                 "round_dir": str(round_dir),
                 "assignment_counts": {rid: len(units) for rid, units in reviewer_assignments.items()},
             }
+
+    @staticmethod
+    def _build_label_schema_payload(labelset: Mapping[str, object]) -> Dict[str, object]:
+        schema_labels = []
+        raw_labels = labelset.get("labels", []) if isinstance(labelset, Mapping) else []
+        if isinstance(raw_labels, list):
+            iterable_labels = raw_labels
+        else:
+            iterable_labels = []
+        for entry in iterable_labels:
+            if not isinstance(entry, Mapping):
+                continue
+            options = []
+            raw_options = entry.get("options", [])
+            if isinstance(raw_options, list):
+                for option in raw_options:
+                    if not isinstance(option, Mapping):
+                        continue
+                    options.append(
+                        {
+                            "value": option.get("value"),
+                            "display": option.get("display"),
+                            "order_index": option.get("order_index"),
+                            "weight": option.get("weight"),
+                        }
+                    )
+            options.sort(key=lambda opt: (opt.get("order_index") is None, opt.get("order_index", 0)))
+            schema_labels.append(
+                {
+                    "label_id": entry.get("label_id"),
+                    "name": entry.get("name"),
+                    "type": entry.get("type"),
+                    "required": bool(entry.get("required")),
+                    "na_allowed": bool(entry.get("na_allowed")),
+                    "rules": entry.get("rules"),
+                    "unit": entry.get("unit"),
+                    "range": {"min": entry.get("min"), "max": entry.get("max")},
+                    "gating_expr": entry.get("gating_expr"),
+                    "options": options,
+                }
+            )
+
+        labelset_id = labelset.get("labelset_id") if isinstance(labelset, Mapping) else None
+        payload: Dict[str, object] = {
+            "labelset_id": labelset_id,
+            "labels": schema_labels,
+        }
+        if labelset_id is not None:
+            payload["labelset_name"] = labelset_id
+        if isinstance(labelset, Mapping):
+            for key in ("created_by", "created_at", "notes"):
+                value = labelset.get(key)
+                if value is not None:
+                    payload[key] = value
+        return payload
 
     def _build_candidates(self, corpus_conn: sqlite3.Connection, pheno_row: sqlite3.Row, config: dict) -> Iterator[CandidateUnit]:
         level = pheno_row["level"]
