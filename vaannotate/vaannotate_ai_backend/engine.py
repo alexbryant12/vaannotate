@@ -3541,7 +3541,7 @@ class ActiveLearningLLMFirst:
         df["label_id"] = df["label_id"].astype(str)
         df["is_root_parent"] = df["label_id"].isin(roots)
         df = df[df["is_root_parent"] | df.apply(lambda r: _gate_ok_expanded(r["unit_id"], r["label_id"]), axis=1)].reset_index(drop=True)
-        print(head(df))
+        
         if df.empty:
             return df
     
