@@ -90,7 +90,7 @@ except Exception:
 
 @dataclass
 class IndexConfig:
-    type: str = "ivf"    # flat | hnsw | ivf
+    type: str = "flat"    # flat | hnsw | ivf
     nlist: int = 2048     # IVF lists
     nprobe: int = 32      # IVF search probes
     hnsw_M: int = 32      # HNSW graph degree
