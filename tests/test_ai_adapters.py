@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -122,4 +124,69 @@ def test_export_inputs_uses_storage_path(tmp_path: Path) -> None:
     assert ann_df.loc[0, "reviewer_id"] == "rev1"
     assert ann_df.loc[0, "document_text"] == "Sample text"
     assert ann_df.loc[0, "labelset_id"] == "ls_test"
+
+
+def test_export_inputs_cold_start_uses_selected_corpus(tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    pheno_id = "ph_cold"
+    storage_relative = Path("phenotypes") / pheno_id
+    phenotype_dir = project_root / storage_relative
+    (phenotype_dir / "rounds").mkdir(parents=True, exist_ok=True)
+
+    corpus_dir = project_root / "corpora" / pheno_id
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    corpus_db = corpus_dir / "corpus.db"
+    with initialize_corpus_db(corpus_db) as conn:
+        conn.execute("INSERT INTO patients(patient_icn) VALUES (?)", ("p1",))
+        conn.execute(
+            """
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
+            """,
+            ("doc_1", "p1", "2020-01-01", "hash1", "Sample text", "{}"),
+        )
+        conn.execute("ALTER TABLE documents ADD COLUMN patienticn TEXT")
+        conn.execute("UPDATE documents SET patienticn = patient_icn")
+        conn.execute("ALTER TABLE documents ADD COLUMN notetype TEXT")
+        conn.execute("UPDATE documents SET notetype = ''")
+        conn.commit()
+
+    relative_path = Path("corpora") / pheno_id / "corpus.db"
+
+    with get_connection(paths.project_db) as conn:
+        conn.row_factory = sqlite3.Row
+        add_phenotype(
+            conn,
+            pheno_id=pheno_id,
+            project_id="proj",
+            name="Cold phenotype",
+            level="single_doc",
+            storage_path=str(storage_relative.as_posix()),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_corpora(corpus_id, project_id, name, relative_path, created_at)
+            VALUES (?,?,?,?,?)
+            """,
+            ("cor_cold", "proj", "Cold corpus", str(relative_path.as_posix()), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        corpus_row = conn.execute(
+            "SELECT * FROM project_corpora WHERE corpus_id=?",
+            ("cor_cold",),
+        ).fetchone()
+
+    notes_df, ann_df = export_inputs_from_repo(
+        project_root,
+        pheno_id,
+        [],
+        corpus_record=corpus_row,
+        corpus_id="cor_cold",
+    )
+
+    assert not notes_df.empty
+    assert notes_df.loc[0, "doc_id"] == "doc_1"
+    assert ann_df.empty
 

@@ -237,6 +237,8 @@ class AIRoundWorker(QtCore.QObject):
                     label_config=label_config_payload,
                     log_callback=self.log_message.emit,
                     cancel_callback=self._cancel_event.is_set,
+                    corpus_record=self.job.context.corpus_record,
+                    corpus_id=self.job.context.corpus_id,
                 )
             finally:
                 for key, prior in original_env.items():
