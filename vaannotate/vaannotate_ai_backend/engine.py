@@ -4067,12 +4067,20 @@ class ActiveLearningLLMFirst:
         selected_rows: list[pd.DataFrame] = []
     
         # 1) Disagreement (unit-level, excluding seen + already-picked)
-        print("[1/4] Expanded disagreement ...")
-        check_cancelled()
-        dis_pairs = self.build_disagreement_bucket(seen_pairs, legacy_rules_map, legacy_label_types)
-        dis_pairs = _filter_units(dis_pairs, seen_units | selected_units)
-        dis_units = _head_units(_to_unit_only(dis_pairs), n_dis)
-        dis_units.to_parquet(os.path.join(self.paths.outdir, "bucket_disagreement.parquet"), index=False)
+        dis_units = pd.DataFrame(columns=["unit_id", "label_id", "label_type", "selection_reason"])
+        if n_dis > 0 and not self.repo.ann.empty:
+            print("[1/4] Expanded disagreement ...")
+            check_cancelled()
+            dis_pairs = self.build_disagreement_bucket(seen_pairs, legacy_rules_map, legacy_label_types)
+            dis_pairs = _filter_units(dis_pairs, seen_units | selected_units)
+            dis_units = _head_units(_to_unit_only(dis_pairs), n_dis)
+            if not dis_units.empty:
+                dis_units.to_parquet(
+                    os.path.join(self.paths.outdir, "bucket_disagreement.parquet"),
+                    index=False,
+                )
+        else:
+            print("[1/4] Skipping disagreement bucket (no prior rounds or quota is zero)")
         selected_rows.append(dis_units)
         selected_units |= set(dis_units["unit_id"])
 
