@@ -628,7 +628,7 @@ class DataRepository:
         import pandas as _pd
     
         ann = self.ann.copy()
-    
+
         # Round selection
         try:
             ann["_round_ord"] = _pd.to_numeric(ann["round_id"], errors="coerce")
@@ -636,6 +636,7 @@ class DataRepository:
         except Exception:
             ord_series = ann["round_id"].astype("category").cat.codes
         ann["_round_ord"] = ord_series
+        ann = ann.sort_values("_round_ord", kind="mergesort").reset_index(drop=True)
         last_ord = int(ann["_round_ord"].max()) if len(ann) else 0
         if round_policy == "last":
             ann = ann[ann["_round_ord"] == last_ord]
@@ -710,15 +711,21 @@ class DataRepository:
                 w = float(_np.exp(-float(delta) / max(1e-6, float(decay_half_life))))
                 score *= w
 
+            recent = g
+            if "_round_ord" in g.columns and len(g):
+                max_ord = g["_round_ord"].max()
+                recent = g[g["_round_ord"] == max_ord]
+                if recent.empty:
+                    recent = g.tail(1)
             labelset_value = ""
-            if "labelset_id" in g.columns:
-                non_empty = g["labelset_id"].dropna().astype(str).str.strip()
+            if "labelset_id" in recent.columns:
+                non_empty = recent["labelset_id"].dropna().astype(str).str.strip()
                 if not non_empty.empty:
                     labelset_value = str(non_empty.iloc[-1])
 
             round_value = ""
-            if "round_id" in g.columns:
-                round_non_empty = g["round_id"].dropna().astype(str).str.strip()
+            if "round_id" in recent.columns:
+                round_non_empty = recent["round_id"].dropna().astype(str).str.strip()
                 if not round_non_empty.empty:
                     round_value = str(round_non_empty.iloc[-1])
 
@@ -730,7 +737,6 @@ class DataRepository:
                 "round_id": round_value,
                 "labelset_id": labelset_value,
             })
-        print(rows)
         return _pd.DataFrame(rows)
 
     def hard_disagree(self, label_types: dict, *, date_days: int = 14, num_abs: float = 1.0, num_rel: float = 0.20) -> pd.DataFrame:
@@ -3623,10 +3629,16 @@ class ActiveLearningLLMFirst:
      # ---- Buckets ----
     def build_disagreement_bucket(self, seen_pairs: set, rules_map: Dict[str,str], label_types: Dict[str,str]) -> pd.DataFrame:
         """
-        Disagreement bucket where apportionment targets come from LAST-ROUND VALID DISAGREEMENTS:
-          • parents: all parent labels with last-round disagreement >= threshold
-          • children: last-round disagreement >= threshold AND parent's aggregated label passes gating by consensus
-        Then parent-first per label, fill with children for that label, and top-up (children-first).
+        Build the disagreement bucket using the configured prior-round policy.
+
+        The disagreement pool is expanded from high-entropy seeds according to
+        ``self.cfg.disagree.round_policy`` ("last", "all", or "decay").  The
+        apportionment step mirrors that policy so that when multiple prior
+        rounds are selected we still consider the combined disagreement signal
+        when allocating slots.
+
+        Parent labels are prioritised before children and the bucket is topped
+        up via global k-center if necessary.
         """
         import pandas as pd
         from collections import defaultdict
@@ -3754,14 +3766,17 @@ class ActiveLearningLLMFirst:
         if df.empty:
             return df
     
-        # ---------- APPORTIONMENT FROM LAST-ROUND *VALID DISAGREEMENTS* ----------
-        # Last round disagreement table
-        last_dis = self.repo.reviewer_disagreement(round_policy='last')  # has 'disagreement_score'
+        # ---------- APPORTIONMENT FROM PRIOR-ROUND DISAGREEMENTS ----------
+        policy = str(getattr(self.cfg.disagree, "round_policy", "last") or "last").lower()
+        if policy not in {"last", "all", "decay"}:
+            policy = "last"
+        decay = float(getattr(self.cfg.disagree, "decay_half_life", 2.0))
+        history = self.repo.reviewer_disagreement(round_policy=policy, decay_half_life=decay)
         thr = float(getattr(self.cfg.disagree, "high_entropy_threshold", 0.5))
-        if "disagreement_score" in last_dis.columns:
-            valid = last_dis[last_dis["disagreement_score"] >= thr].copy()
+        if "disagreement_score" in history.columns:
+            valid = history[history["disagreement_score"] >= thr].copy()
         else:
-            valid = last_dis.copy()  # fallback if column name differs
+            valid = history.copy()  # fallback if column name differs
 
         # Count by label from last-round disagreements:
         #   - parents: any valid disagreement on that parent label

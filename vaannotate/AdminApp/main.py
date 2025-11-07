@@ -3041,7 +3041,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             timestamp=timestamp,
         )
         project_root = self.ctx.require_project()
-        cfg_overrides = self._collect_ai_overrides()
+        cfg_overrides = self._collect_ai_overrides(prior_rounds=prior_rounds)
         env_overrides = self._collect_ai_environment()
         if env_overrides is None:
             return False
@@ -3253,7 +3253,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return None
         return env
 
-    def _collect_ai_overrides(self) -> Dict[str, Any]:
+    def _collect_ai_overrides(
+        self, prior_rounds: Optional[Sequence[int]] = None
+    ) -> Dict[str, Any]:
         overrides: Dict[str, Any] = {}
         if not self._using_ai_backend():
             return overrides
@@ -3272,6 +3274,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             overrides["select"] = select
         if hasattr(self, "ai_final_llm_checkbox"):
             overrides["final_llm_labeling"] = bool(self.ai_final_llm_checkbox.isChecked())
+        rounds = list(dict.fromkeys(int(r) for r in (prior_rounds or []) if isinstance(r, (int, float))))
+        disagree: Dict[str, Any] = {}
+        if rounds:
+            disagree["round_policy"] = "all" if len(rounds) > 1 else "last"
+        if disagree:
+            overrides["disagree"] = disagree
         return overrides
 
     def _on_ai_thread_finished(self) -> None:
