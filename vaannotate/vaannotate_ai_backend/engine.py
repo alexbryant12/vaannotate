@@ -4013,11 +4013,34 @@ class ActiveLearningLLMFirst:
             current_label_ids = set(legacy_label_ids)
     
         # ---------- small helpers ----------
+        def _empty_unit_frame() -> "pd.DataFrame":
+            return pd.DataFrame(
+                {
+                    "unit_id": pd.Series(dtype="string"),
+                    "label_id": pd.Series(dtype="string"),
+                    "label_type": pd.Series(dtype="string"),
+                    "selection_reason": pd.Series(dtype="string"),
+                }
+            )
+
+        def _ensure_unit_schema(df: "pd.DataFrame" | None) -> "pd.DataFrame":
+            base = _empty_unit_frame()
+            if df is None:
+                return base
+            result = df.copy()
+            for col in base.columns:
+                if col not in result.columns:
+                    result[col] = pd.Series(dtype=base[col].dtype)
+            return result[base.columns.tolist()]
+
         def _to_unit_only(df: "pd.DataFrame") -> "pd.DataFrame":
-            if df is None or df.empty:
-                return pd.DataFrame(columns=["unit_id","label_id","label_type","selection_reason"])
+            if df is None:
+                return _empty_unit_frame()
             cols = [c for c in ["unit_id","label_id","label_type","selection_reason"] if c in df.columns]
-            return df[cols].drop_duplicates(subset=["unit_id"], keep="first").copy()
+            if not cols:
+                return _empty_unit_frame()
+            subset = df[cols].drop_duplicates(subset=["unit_id"], keep="first")
+            return _ensure_unit_schema(subset)
     
         def _filter_units(df: "pd.DataFrame", excluded: set[str]) -> "pd.DataFrame":
             if df is None or df.empty or not excluded:
@@ -4025,9 +4048,10 @@ class ActiveLearningLLMFirst:
             return df[~df["unit_id"].isin(excluded)].copy()
     
         def _head_units(df: "pd.DataFrame", k: int) -> "pd.DataFrame":
-            if df is None or df.empty or k <= 0:
-                return pd.DataFrame(columns=["unit_id","label_id","label_type","selection_reason"])
-            return df.drop_duplicates(subset=["unit_id"], keep="first").head(k).copy()
+            ensured = _ensure_unit_schema(df)
+            if ensured.empty or k <= 0:
+                return ensured.iloc[0:0].copy()
+            return ensured.head(k).copy()
 
     
         # ---------- seen/unseen and quotas ----------
@@ -4052,20 +4076,20 @@ class ActiveLearningLLMFirst:
         selected_rows: list[pd.DataFrame] = []
     
         # 1) Disagreement (unit-level, excluding seen + already-picked)
-        dis_units = pd.DataFrame(columns=["unit_id", "label_id", "label_type", "selection_reason"])
-        if n_dis > 0 and not self.repo.ann.empty:
-            print("[1/4] Expanded disagreement ...")
+        dis_units = _empty_unit_frame()
+        dis_path = os.path.join(self.paths.outdir, "bucket_disagreement.parquet")
+        if self.repo.ann.empty:
+            print("[1/4] Skipping disagreement bucket (no prior rounds or quota is zero)")
+        else:
+            if n_dis > 0:
+                print("[1/4] Expanded disagreement ...")
+            else:
+                print("[1/4] Disagreement quota is zero; refreshing schema only ...")
             check_cancelled()
             dis_pairs = self.build_disagreement_bucket(seen_pairs, legacy_rules_map, legacy_label_types)
             dis_pairs = _filter_units(dis_pairs, seen_units | selected_units)
             dis_units = _head_units(_to_unit_only(dis_pairs), n_dis)
-            if not dis_units.empty:
-                dis_units.to_parquet(
-                    os.path.join(self.paths.outdir, "bucket_disagreement.parquet"),
-                    index=False,
-                )
-        else:
-            print("[1/4] Skipping disagreement bucket (no prior rounds or quota is zero)")
+        dis_units.to_parquet(dis_path, index=False)
         selected_rows.append(dis_units)
         selected_units |= set(dis_units["unit_id"])
 
