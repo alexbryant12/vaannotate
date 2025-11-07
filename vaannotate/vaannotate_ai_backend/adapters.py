@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Any
+from typing import Callable, Dict, List, Optional, Tuple, Any, Mapping
 import json
 import sqlite3
 
@@ -206,15 +206,55 @@ def _candidate_corpus_paths(
     return unique
 
 
-def _find_corpus_db(project_root: Path, pheno_id: str, prior_rounds: List[int]) -> Path:
+def _normalize_record(record: Optional[Mapping[str, Any] | sqlite3.Row | Dict[str, Any]]) -> Dict[str, Any]:
+    if record is None:
+        return {}
+    if isinstance(record, dict):
+        return record
+    try:
+        return dict(record)
+    except Exception:  # noqa: BLE001
+        data: Dict[str, Any] = {}
+        for key in ("relative_path", "corpus_id", "path"):
+            if hasattr(record, key):
+                data[key] = getattr(record, key)
+        return data
+
+
+def _find_corpus_db(
+    project_root: Path,
+    pheno_id: str,
+    prior_rounds: List[int],
+    *,
+    corpus_record: Optional[Mapping[str, Any] | sqlite3.Row | Dict[str, Any]] = None,
+    corpus_id: Optional[str] = None,
+    corpus_path: Optional[str] = None,
+) -> Path:
     phenotype_dir = _resolve_phenotype_dir(project_root, pheno_id)
     project_db = Path(project_root) / "project.db"
     hints: List[str] = []
+
+    record_dict = _normalize_record(corpus_record)
+
+    if corpus_path:
+        hints.append(corpus_path)
+    relative_hint = record_dict.get("relative_path") or record_dict.get("path")
+    if isinstance(relative_hint, str) and relative_hint.strip():
+        hints.append(relative_hint)
+    if not corpus_id:
+        corpus_id = str(record_dict.get("corpus_id") or "").strip() or None
 
     if project_db.exists():
         con = sqlite3.connect(str(project_db))
         try:
             con.row_factory = sqlite3.Row
+            if corpus_id:
+                corpus_row = con.execute(
+                    "SELECT relative_path FROM project_corpora WHERE corpus_id=?",
+                    (corpus_id,),
+                ).fetchone()
+                if corpus_row and corpus_row["relative_path"]:
+                    hints.append(corpus_row["relative_path"])
             round_ids: List[str] = []
             if prior_rounds:
                 round_ids.extend(f"{pheno_id}_r{number}" for number in sorted(prior_rounds, reverse=True))
@@ -513,10 +553,25 @@ def _read_round_annotations(
 
     return pd.DataFrame(rows, columns=columns)
 
-def export_inputs_from_repo(project_root: Path, pheno_id: str, prior_rounds: List[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def export_inputs_from_repo(
+    project_root: Path,
+    pheno_id: str,
+    prior_rounds: List[int],
+    *,
+    corpus_record: Optional[Mapping[str, Any] | sqlite3.Row | Dict[str, Any]] = None,
+    corpus_id: Optional[str] = None,
+    corpus_path: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     root = Path(project_root)
     phenotype_dir = _resolve_phenotype_dir(root, pheno_id)
-    corpus_db = _find_corpus_db(root, pheno_id, prior_rounds)
+    corpus_db = _find_corpus_db(
+        root,
+        pheno_id,
+        prior_rounds,
+        corpus_record=corpus_record,
+        corpus_id=corpus_id,
+        corpus_path=corpus_path,
+    )
     notes_df = _read_corpus_db(corpus_db)
 
     ann_frames = []
@@ -592,17 +647,36 @@ def run_ai_backend_and_collect(
     label_config: Optional[Dict[str, Any]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
+    corpus_record: Optional[Mapping[str, Any] | sqlite3.Row | Dict[str, Any]] = None,
+    corpus_id: Optional[str] = None,
+    corpus_path: Optional[str] = None,
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
     shared_cache_dir: Optional[Path] = None
+    record_dict = _normalize_record(corpus_record)
+    normalized_corpus_path = corpus_path or record_dict.get("relative_path") or record_dict.get("path")
     try:
-        corpus_db_path = _find_corpus_db(project_root, pheno_id, prior_rounds)
+        corpus_db_path = _find_corpus_db(
+            project_root,
+            pheno_id,
+            prior_rounds,
+            corpus_record=record_dict,
+            corpus_id=corpus_id,
+            corpus_path=normalized_corpus_path,
+        )
     except FileNotFoundError:
         corpus_db_path = None
     else:
         shared_cache_dir = corpus_db_path.parent / "ai_cache"
-    notes_df, ann_df = export_inputs_from_repo(project_root, pheno_id, prior_rounds)
+    notes_df, ann_df = export_inputs_from_repo(
+        project_root,
+        pheno_id,
+        prior_rounds,
+        corpus_record=record_dict,
+        corpus_id=corpus_id,
+        corpus_path=normalized_corpus_path,
+    )
     ai_dir = Path(round_dir) / "imports" / "ai"
     ai_dir.mkdir(parents=True, exist_ok=True)
     log(f"Exported {len(notes_df)} corpus rows and {len(ann_df)} prior annotations")
