@@ -7,6 +7,8 @@ import os
 import json
 import sqlite3
 import sys
+import types
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -220,6 +222,11 @@ def test_generate_round_applies_env_overrides(
         return {}
 
     monkeypatch.setattr(RoundBuilder, "_generate_assisted_review_snippets", _fake_assisted)
+    monkeypatch.setattr(
+        RoundBuilder,
+        "_normalize_for_json",
+        lambda self, value: value,
+    )
 
     assert os.getenv("AZURE_OPENAI_API_KEY") is None
 
@@ -232,6 +239,88 @@ def test_generate_round_applies_env_overrides(
 
     assert captured.get("api_key") == "test-key"
     assert os.getenv("AZURE_OPENAI_API_KEY") is None
+
+
+def test_assisted_snippets_path_is_relative(
+    seeded_project: tuple[RoundBuilder, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder, _ = seeded_project
+    config = {
+        "round_number": 4,
+        "round_id": "ph_test_r4",
+        "labelset_id": "ls_test",
+        "corpus_id": "cor_ph_test",
+        "reviewers": [
+            {"id": "rev_one", "name": "Reviewer One"},
+            {"id": "rev_two", "name": "Reviewer Two"},
+        ],
+        "overlap_n": 0,
+        "rng_seed": 77,
+        "assisted_review": {"enabled": True, "top_snippets": 1},
+    }
+    config_path = tmp_path / "ph_test_r4.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    snippet_payload = {
+        "generated_at": "2024-05-01T00:00:00Z",
+        "top_snippets": 1,
+        "unit_snippets": {
+            "doc_0": {
+                "label_1": [
+                    {
+                        "score": 0.5,
+                        "text": "Example",
+                    }
+                ]
+            }
+        },
+    }
+
+    dummy_numpy = types.ModuleType("numpy")
+    dummy_numpy.generic = float
+    monkeypatch.setitem(sys.modules, "numpy", dummy_numpy)
+
+    dummy_pandas = types.ModuleType("pandas")
+
+    class _DummyTimestamp(datetime):
+        pass
+
+    dummy_pandas.Timestamp = _DummyTimestamp
+    dummy_pandas.NA = None
+
+    def _notnull(value: object) -> bool:
+        return value is not None
+
+    dummy_pandas.notnull = _notnull
+    monkeypatch.setitem(sys.modules, "pandas", dummy_pandas)
+
+    def _fake_assisted(*args, **kwargs):
+        return snippet_payload
+
+    monkeypatch.setattr(RoundBuilder, "_generate_assisted_review_snippets", _fake_assisted)
+    monkeypatch.setattr(
+        RoundBuilder,
+        "_normalize_for_json",
+        lambda self, value: value,
+    )
+
+    result = builder.generate_round(
+        "ph_test",
+        config_path,
+        created_by="tester",
+    )
+
+    round_dir = Path(result["round_dir"])
+    stored_config = json.loads((round_dir / "round_config.json").read_text("utf-8"))
+    assist_cfg = stored_config.get("assisted_review", {})
+    snippets_value = assist_cfg.get("snippets_json")
+    assert snippets_value == "reports/assisted_review/snippets.json"
+    assert (round_dir / snippets_value).exists()
+
+    result_payload = result.get("assisted_review", {})
+    assert result_payload.get("snippets_json") == "reports/assisted_review/snippets.json"
 def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
     project_root = tmp_path / "Project"
     paths = init_project(project_root, "proj", "Project", "tester")
