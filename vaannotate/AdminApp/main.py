@@ -275,6 +275,7 @@ class AIRoundWorker(QtCore.QObject):
                         config_path,
                         created_by=self.job.context.created_by,
                         preselected_units_csv=result.csv_path,
+                        env_overrides=self.env_overrides,
                     )
                     try:
                         self.job.context.db.refresh_from_disk()
@@ -4206,10 +4207,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         env_overrides = self._collect_random_final_llm_environment()
         if env_overrides is None:
             raise RuntimeError("Final LLM labeling configuration is incomplete")
-        previous_env: Dict[str, Optional[str]] = {}
-        for key, value in env_overrides.items():
-            previous_env[key] = os.environ.get(key)
-            os.environ[key] = value
 
         self._open_ai_log_dialog()
         self._ai_progress_active = False
@@ -4226,6 +4223,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 config=config_payload,
                 config_base=round_dir,
                 log_callback=self._append_ai_log,
+                env_overrides=env_overrides,
             )
         except Exception as exc:  # noqa: BLE001
             self._append_ai_log(f"Final LLM labeling failed: {exc}")
@@ -4237,11 +4235,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 self._append_ai_log("Final LLM labeling finished with no outputs.")
             return outputs
         finally:
-            for key, previous in previous_env.items():
-                if previous is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = previous
             self._mark_ai_log_complete()
 
 
