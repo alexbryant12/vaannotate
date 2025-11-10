@@ -136,7 +136,6 @@ class SelectionConfig:
 
 @dataclass
 class LLMFirstConfig:
-    use_llm_probe: bool = True
     n_probe_units: int = 10
     topk: int = 6
     json_trace_policy: str = 'fallback'
@@ -4056,8 +4055,8 @@ class ActiveLearningLLMFirst:
         total = int(self.cfg.select.batch_size)
         n_dis = int(total * self.cfg.select.pct_disagreement)
         n_div = int(total * self.cfg.select.pct_diversity)
-        n_unc = int(total * self.cfg.select.pct_uncertain) if self.cfg.llmfirst.use_llm_probe else 0
-        n_cer = int(total * self.cfg.select.pct_easy_qc)   if self.cfg.llmfirst.use_llm_probe else 0
+        n_unc = int(total * self.cfg.select.pct_uncertain)
+        n_cer = int(total * self.cfg.select.pct_easy_qc)
     
         selected_rows: list[pd.DataFrame] = []
         selected_units: set[str] = set()
@@ -4120,7 +4119,7 @@ class ActiveLearningLLMFirst:
         selected_units |= set(sel_div_units["unit_id"])
     
         # 3) LLM-uncertain (gated); exclude seen + prior-picked
-        if self.cfg.llmfirst.use_llm_probe:
+        if n_unc > 0:
             print("[3/4] LLM-uncertain ...")
             check_cancelled()
             want_unc = min(n_unc, max(0, total - len(selected_units)))
@@ -4138,7 +4137,7 @@ class ActiveLearningLLMFirst:
                 print("Uncertain bucket skipped: no remaining quota.")
     
         # 4) LLM-certain (gated); exclude seen + prior-picked
-        if self.cfg.llmfirst.use_llm_probe:
+        if n_cer > 0:
             print("[4/4] LLM-certain ...")
             check_cancelled()
             want_cer = min(n_cer, max(0, total - len(selected_units)))
