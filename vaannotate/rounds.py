@@ -5,6 +5,7 @@ import csv
 import json
 import logging
 import math
+import os
 import random
 import re
 import sqlite3
@@ -12,7 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, Sequence
+from typing import Any, Dict, Iterator, Mapping, Optional, Sequence
 
 from .project import build_label_config, fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
@@ -304,6 +305,47 @@ class RoundBuilder:
                         encoding="utf-8",
                     )
 
+            assisted_result: Dict[str, Any] = {}
+            assisted_cfg = config.get("assisted_review") if isinstance(config.get("assisted_review"), Mapping) else None
+            if isinstance(assisted_cfg, Mapping) and assisted_cfg.get("enabled"):
+                raw_top = assisted_cfg.get("top_snippets")
+                top_snippets = 0
+                try:
+                    top_snippets = int(raw_top)
+                except (TypeError, ValueError):
+                    top_snippets = 0
+                if top_snippets > 0:
+                    assisted_data = self._generate_assisted_review_snippets(
+                        pheno_row=pheno,
+                        labelset=labelset,
+                        round_dir=round_dir,
+                        reviewer_assignments=reviewer_assignments,
+                        config=config,
+                        config_base=config_base,
+                        top_n=top_snippets,
+                    )
+                    if assisted_data:
+                        assist_dir = ensure_dir(round_dir / "reports" / "assisted_review")
+                        assist_path = assist_dir / "snippets.json"
+                        assist_path.write_text(
+                            self._json_dumps(assisted_data),
+                            encoding="utf-8",
+                        )
+                        updated_cfg = config.setdefault("assisted_review", {})
+                        updated_cfg["enabled"] = True
+                        updated_cfg["top_snippets"] = top_snippets
+                        updated_cfg["generated_at"] = assisted_data.get("generated_at")
+                        updated_cfg["snippets_json"] = str(assist_path)
+                        (round_dir / "round_config.json").write_text(
+                            canonical_json(config),
+                            encoding="utf-8",
+                        )
+                        project_conn.execute(
+                            "INSERT OR REPLACE INTO round_configs(round_id, config_json) VALUES (?, ?)",
+                            (round_id, canonical_json(config)),
+                        )
+                        assisted_result = {"snippets_json": str(assist_path)}
+
             project_conn.commit()
             result_payload: Dict[str, Any] = {
                 "round_id": round_id,
@@ -312,6 +354,8 @@ class RoundBuilder:
             }
             if final_llm_outputs:
                 result_payload["final_llm_outputs"] = dict(final_llm_outputs)
+            if assisted_result:
+                result_payload.setdefault("assisted_review", {}).update(assisted_result)
             return result_payload
 
     def _apply_final_llm_labeling(
@@ -365,6 +409,180 @@ class RoundBuilder:
 
         exports_dir = ensure_dir(Path(round_dir) / "reports" / "exports")
         return self._write_final_llm_outputs(labels_df=labels_df, probe_df=probe_df, exports_dir=exports_dir)
+
+    def _generate_assisted_review_snippets(
+        self,
+        *,
+        pheno_row: sqlite3.Row,
+        labelset: Mapping[str, object],
+        round_dir: Path,
+        reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]],
+        config: Mapping[str, Any],
+        config_base: Path,
+        top_n: int,
+    ) -> dict[str, object]:
+        if top_n <= 0:
+            return {}
+        try:
+            import pandas as pd
+        except ImportError as exc:  # pragma: no cover - runtime guard
+            raise RuntimeError("pandas is required for assisted chart review") from exc
+        try:
+            from vaannotate.vaannotate_ai_backend.engine import (
+                ActiveLearningLLMFirst,
+                FamilyLabeler,
+                OrchestratorConfig,
+                Paths,
+            )
+        except ImportError as exc:  # pragma: no cover - runtime guard
+            raise RuntimeError("AI backend components are required for assisted chart review") from exc
+
+        units_by_id, notes_rows = self._collect_round_units_and_notes(reviewer_assignments)
+        if not units_by_id:
+            return {}
+        if not notes_rows:
+            return {}
+
+        work_dir = ensure_dir(Path(round_dir) / "imports" / "assisted_review")
+        notes_path = work_dir / "notes.parquet"
+        ann_path = work_dir / "annotations.parquet"
+        notes_df = pd.DataFrame(notes_rows)
+        notes_df["patient_icn"] = notes_df["patient_icn"].astype(str)
+        notes_df["doc_id"] = notes_df["doc_id"].astype(str)
+        notes_df["text"] = notes_df["text"].astype(str)
+        notes_df["unit_id"] = notes_df["unit_id"].astype(str)
+        notes_df.to_parquet(notes_path, index=False)
+        ann_df = pd.DataFrame(
+            {
+                "round_id": pd.Series(dtype="object"),
+                "unit_id": pd.Series(dtype="object"),
+                "doc_id": pd.Series(dtype="object"),
+                "label_id": pd.Series(dtype="object"),
+                "reviewer_id": pd.Series(dtype="object"),
+                "label_value": pd.Series(dtype="object"),
+                "label_value_num": pd.Series(dtype="float64"),
+                "label_value_date": pd.Series(dtype="datetime64[ns]"),
+            }
+        )
+        ann_df.to_parquet(ann_path, index=False)
+
+        cfg = OrchestratorConfig()
+        cfg.final_llm_labeling = False
+        phenotype_level = str(pheno_row["level"] or "multi_doc")
+        label_config_payload = build_label_config(labelset)
+        paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
+
+        ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        env_overrides: Dict[str, str] = {}
+        embed_path = self._resolve_optional_path(ai_backend_config.get("embedding_model_dir"), config_base)
+        if embed_path:
+            env_overrides["MED_EMBED_MODEL_NAME"] = str(embed_path)
+        rerank_path = self._resolve_optional_path(ai_backend_config.get("reranker_model_dir"), config_base)
+        if rerank_path:
+            env_overrides["RERANKER_MODEL_NAME"] = str(rerank_path)
+        azure_version = ai_backend_config.get("azure_api_version")
+        if azure_version:
+            env_overrides["AZURE_OPENAI_API_VERSION"] = str(azure_version)
+        azure_endpoint = ai_backend_config.get("azure_endpoint")
+        if azure_endpoint:
+            env_overrides["AZURE_OPENAI_ENDPOINT"] = str(azure_endpoint)
+
+        previous_env: Dict[str, Optional[str]] = {}
+        for key, value in env_overrides.items():
+            previous_env[key] = os.environ.get(key)
+            os.environ[key] = value
+
+        try:
+            orchestrator = ActiveLearningLLMFirst(
+                paths=paths,
+                cfg=cfg,
+                label_config=label_config_payload,
+                phenotype_level=phenotype_level,
+            )
+            orchestrator.store.build_chunk_index(
+                orchestrator.repo.notes,
+                orchestrator.cfg.rag,
+                orchestrator.cfg.index,
+            )
+            _, _, current_rules_map, current_label_types = orchestrator._label_maps()
+            family_labeler = FamilyLabeler(
+                orchestrator.llm,
+                orchestrator.rag,
+                orchestrator.repo,
+                orchestrator.label_config,
+                orchestrator.cfg.scjitter,
+                orchestrator.cfg.llmfirst,
+            )
+            try:
+                family_labeler.ensure_label_exemplars(current_rules_map, K=max(1, top_n))
+            except Exception:  # noqa: BLE001 - exemplar generation best effort
+                logging.getLogger(__name__).info("Assisted review falling back to label rules for exemplars")
+
+            unit_snippets: Dict[str, Dict[str, list[dict[str, Any]]]] = {}
+            for unit_id in sorted(units_by_id.keys()):
+                unit_map: Dict[str, list[dict[str, Any]]] = {}
+                for label_id in sorted(current_label_types.keys()):
+                    rules_text = current_rules_map.get(label_id, "")
+                    contexts = orchestrator.rag.retrieve_for_patient_label(
+                        unit_id,
+                        label_id,
+                        rules_text,
+                        topk_override=top_n,
+                    )
+                    if not contexts:
+                        continue
+                    entries: list[dict[str, Any]] = []
+                    for ctx_entry in contexts[:top_n]:
+                        metadata_value = ctx_entry.get("metadata") if isinstance(ctx_entry, Mapping) else {}
+                        metadata: Dict[str, Any]
+                        if isinstance(metadata_value, Mapping):
+                            metadata = {
+                                str(key): self._normalize_for_json(value)
+                                for key, value in metadata_value.items()
+                                if value is not None
+                            }
+                        else:
+                            metadata = {}
+                        doc_id = ctx_entry.get("doc_id")
+                        chunk_id = ctx_entry.get("chunk_id")
+                        try:
+                            chunk_numeric = int(chunk_id) if chunk_id is not None else None
+                        except (TypeError, ValueError):
+                            chunk_numeric = None
+                        try:
+                            score_value = float(ctx_entry.get("score"))
+                        except (TypeError, ValueError):
+                            score_value = None
+                        entry: Dict[str, Any] = {
+                            "doc_id": str(doc_id) if doc_id is not None else "",
+                            "chunk_id": chunk_numeric,
+                            "score": score_value,
+                            "source": str(ctx_entry.get("source") or ""),
+                            "text": str(ctx_entry.get("text") or ""),
+                            "metadata": metadata,
+                        }
+                        patient_icn = units_by_id[unit_id].patient_icn
+                        if patient_icn:
+                            entry["patient_icn"] = str(patient_icn)
+                        entries.append(entry)
+                    if entries:
+                        unit_map[str(label_id)] = entries
+                if unit_map:
+                    unit_snippets[str(unit_id)] = unit_map
+        finally:
+            for key, previous in previous_env.items():
+                if previous is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous
+
+        if not unit_snippets:
+            return {}
+        return {
+            "generated_at": datetime.utcnow().isoformat(),
+            "top_snippets": int(top_n),
+            "unit_snippets": unit_snippets,
+        }
 
     def run_final_llm_labeling(
         self,
@@ -428,6 +646,46 @@ class RoundBuilder:
                 if original_level is not None:
                     logger.setLevel(original_level)
 
+    def _collect_round_units_and_notes(
+        self, reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]]
+    ) -> tuple[Dict[str, AssignmentUnit], list[dict[str, Any]]]:
+        units_by_id: Dict[str, AssignmentUnit] = {}
+        for assignments in reviewer_assignments.values():
+            for unit in assignments:
+                units_by_id.setdefault(unit.unit_id, unit)
+
+        notes_rows: list[dict[str, Any]] = []
+        for unit in units_by_id.values():
+            documents = unit.payload.get("documents") if isinstance(unit.payload, Mapping) else None
+            docs_list = list(documents) if isinstance(documents, (list, tuple)) else []
+            if not docs_list:
+                doc_identifier = unit.doc_id or f"{unit.unit_id}_doc"
+                notes_rows.append(
+                    {
+                        "patient_icn": str(unit.patient_icn or ""),
+                        "doc_id": str(doc_identifier or unit.unit_id),
+                        "text": str(unit.payload.get("text", "") if isinstance(unit.payload, Mapping) else ""),
+                        "unit_id": str(unit.unit_id),
+                    }
+                )
+                continue
+            for index, doc in enumerate(docs_list):
+                if not isinstance(doc, Mapping):
+                    continue
+                doc_id = doc.get("doc_id") or f"{unit.unit_id}_{index}"
+                notes_rows.append(
+                    {
+                        "patient_icn": str(unit.patient_icn or doc.get("patient_icn") or ""),
+                        "doc_id": str(doc_id),
+                        "text": str(doc.get("text", "")),
+                        "unit_id": str(unit.unit_id),
+                        "order_index": index,
+                        "metadata_json": doc.get("metadata_json"),
+                        "date_note": doc.get("date_note"),
+                    }
+                )
+        return units_by_id, notes_rows
+
     def _resolve_optional_path(self, raw: Any, base_dir: Path) -> Path | None:
         if raw is None:
             return None
@@ -463,44 +721,9 @@ class RoundBuilder:
         except ImportError as exc:  # pragma: no cover - runtime guard
             raise RuntimeError("AI backend components are required for final LLM labeling") from exc
 
-        units_by_id: Dict[str, AssignmentUnit] = {}
-        for assignments in reviewer_assignments.values():
-            for unit in assignments:
-                units_by_id.setdefault(unit.unit_id, unit)
-
+        units_by_id, notes_rows = self._collect_round_units_and_notes(reviewer_assignments)
         if not units_by_id:
             raise RuntimeError("No assignment units available for final LLM labeling")
-
-        notes_rows: list[dict[str, Any]] = []
-        for unit in units_by_id.values():
-            documents = unit.payload.get("documents") if isinstance(unit.payload, Mapping) else None
-            docs_list = list(documents) if isinstance(documents, (list, tuple)) else []
-            if not docs_list:
-                doc_identifier = unit.doc_id or f"{unit.unit_id}_doc"
-                notes_rows.append(
-                    {
-                        "patient_icn": str(unit.patient_icn or ""),
-                        "doc_id": str(doc_identifier or unit.unit_id),
-                        "text": str(unit.payload.get("text", "") if isinstance(unit.payload, Mapping) else ""),
-                        "unit_id": str(unit.unit_id),
-                    }
-                )
-                continue
-            for index, doc in enumerate(docs_list):
-                if not isinstance(doc, Mapping):
-                    continue
-                doc_id = doc.get("doc_id") or f"{unit.unit_id}_{index}"
-                notes_rows.append(
-                    {
-                        "patient_icn": str(unit.patient_icn or doc.get("patient_icn") or ""),
-                        "doc_id": str(doc_id),
-                        "text": str(doc.get("text", "")),
-                        "unit_id": str(unit.unit_id),
-                        "order_index": index,
-                        "metadata_json": doc.get("metadata_json"),
-                        "date_note": doc.get("date_note"),
-                    }
-                )
 
         if not notes_rows:
             raise RuntimeError("Unable to assemble corpus notes for final LLM labeling")

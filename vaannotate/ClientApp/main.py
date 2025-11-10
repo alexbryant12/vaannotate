@@ -8,7 +8,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -321,6 +321,9 @@ class AssignmentContext(QtCore.QObject):
         self._dirty: bool = False
         self._document_cache: Dict[str, Dict[str, object]] = {}
         self._unit_document_cache: Dict[str, List[Dict[str, object]]] = {}
+        self.assisted_review_enabled: bool = False
+        self.assisted_review_top_n: int = 0
+        self._assisted_review_snippets: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
 
     def open_assignment(self, directory: Path) -> None:
         directory = directory.resolve()
@@ -346,6 +349,80 @@ class AssignmentContext(QtCore.QObject):
         self._pending_completion.clear()
         self._document_cache = {}
         self._unit_document_cache = {}
+        self.assisted_review_enabled = False
+        self.assisted_review_top_n = 0
+        self._assisted_review_snippets = {}
+        round_dir: Optional[Path] = None
+        try:
+            round_dir = directory.parent.parent
+        except Exception:  # noqa: BLE001
+            round_dir = None
+        if round_dir:
+            config_path = round_dir / "round_config.json"
+            if config_path.exists():
+                try:
+                    round_config = json.loads(config_path.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    round_config = {}
+                assisted_cfg = None
+                if isinstance(round_config, Mapping):
+                    assisted_cfg = round_config.get("assisted_review") or round_config.get("assisted_chart_review")
+                if isinstance(assisted_cfg, Mapping) and assisted_cfg.get("enabled"):
+                    self.assisted_review_enabled = True
+                    raw_top = assisted_cfg.get("top_snippets")
+                    try:
+                        self.assisted_review_top_n = int(raw_top)
+                    except (TypeError, ValueError):
+                        self.assisted_review_top_n = 0
+                    snippets_path_value = assisted_cfg.get("snippets_json")
+                    if snippets_path_value:
+                        candidate = Path(str(snippets_path_value))
+                        if not candidate.is_absolute():
+                            candidate = (round_dir / candidate).resolve()
+                        if candidate.exists():
+                            try:
+                                snippet_payload = json.loads(candidate.read_text(encoding="utf-8"))
+                            except Exception:  # noqa: BLE001
+                                snippet_payload = {}
+                            unit_payload = (
+                                snippet_payload.get("unit_snippets")
+                                if isinstance(snippet_payload, Mapping)
+                                else {}
+                            )
+                            if isinstance(unit_payload, Mapping):
+                                normalized: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
+                                for unit_id, labels in unit_payload.items():
+                                    if not isinstance(labels, Mapping):
+                                        continue
+                                    label_entries: Dict[str, List[Dict[str, object]]] = {}
+                                    for label_id, entries in labels.items():
+                                        if not isinstance(entries, list):
+                                            continue
+                                        cleaned: List[Dict[str, object]] = []
+                                        for entry in entries:
+                                            if isinstance(entry, Mapping):
+                                                cleaned_entry: Dict[str, object] = {
+                                                    str(k): entry[k] for k in entry
+                                                }
+                                                metadata_val = cleaned_entry.get("metadata")
+                                                if isinstance(metadata_val, Mapping):
+                                                    cleaned_entry["metadata"] = {
+                                                        str(mk): metadata_val[mk]
+                                                        for mk in metadata_val
+                                                    }
+                                                cleaned.append(cleaned_entry)
+                                        if cleaned:
+                                            label_entries[str(label_id)] = cleaned
+                                    if label_entries:
+                                        normalized[str(unit_id)] = label_entries
+                                if normalized:
+                                    self._assisted_review_snippets = normalized
+                            if not self.assisted_review_top_n and isinstance(snippet_payload, Mapping):
+                                payload_top = snippet_payload.get("top_snippets")
+                                try:
+                                    self.assisted_review_top_n = int(payload_top)
+                                except (TypeError, ValueError):
+                                    pass
         with self.assignment_db.connect() as conn:
             ensure_schema(
                 conn,
@@ -607,6 +684,17 @@ class AssignmentContext(QtCore.QObject):
                 self._document_cache[doc_id] = existing
             cached_docs.append(doc_copy)
         self._unit_document_cache[unit_id] = cached_docs
+
+    def has_assisted_review(self) -> bool:
+        return bool(self.assisted_review_enabled)
+
+    def assisted_review_top_k(self) -> int:
+        return int(self.assisted_review_top_n)
+
+    def get_assisted_snippets(self, unit_id: str, label_id: str) -> List[Dict[str, object]]:
+        unit_map = self._assisted_review_snippets.get(str(unit_id), {})
+        entries = unit_map.get(str(label_id), [])
+        return [dict(entry) for entry in entries]
 
     def load_annotations(self, unit_id: str) -> Dict[str, Dict[str, object]]:
         self._annotation_baseline.setdefault(unit_id, {})
@@ -1175,6 +1263,7 @@ class AnnotationForm(QtWidgets.QScrollArea):
             row_widget = self._create_row(label)
             row_widget.setProperty("label_id", label.label_id)
             self.layout.addWidget(row_widget)
+            self._update_snippet_button(label.label_id)
         self.layout.addStretch()
 
     def load_unit(
@@ -1212,6 +1301,15 @@ class AnnotationForm(QtWidgets.QScrollArea):
         title_label.setProperty("label_id", label.label_id)
         header_layout.addWidget(title_label)
         header_layout.addStretch()
+        snippet_btn = QtWidgets.QPushButton("Show relevant snippets")
+        snippet_btn.setAutoDefault(False)
+        snippet_btn.clicked.connect(
+            lambda _checked, lid=label.label_id: self._show_assisted_snippets(lid)
+        )
+        snippet_btn.setVisible(self.ctx.has_assisted_review())
+        snippet_btn.setEnabled(False)
+        header_layout.addWidget(snippet_btn)
+        state["snippet_btn"] = snippet_btn
         if label.na_allowed:
             na_box = QtWidgets.QCheckBox("N/A")
             na_box.stateChanged.connect(
@@ -1386,6 +1484,110 @@ class AnnotationForm(QtWidgets.QScrollArea):
             highlight_list.addTopLevelItem(item)
         highlight_list.blockSignals(False)
         self._on_highlight_selection_changed(label_id)
+        self._update_snippet_button(label_id)
+
+    def _update_snippet_button(self, label_id: str) -> None:
+        widgets = self.label_widgets.get(label_id)
+        if not widgets:
+            return
+        button = widgets.get("snippet_btn")
+        if not isinstance(button, QtWidgets.QPushButton):
+            return
+        visible = self.ctx.has_assisted_review()
+        has_data = False
+        if visible and self.current_unit_id:
+            snippets = self.ctx.get_assisted_snippets(self.current_unit_id, label_id)
+            has_data = bool(snippets)
+        button.setVisible(visible)
+        button.setEnabled(has_data)
+
+    def _show_assisted_snippets(self, label_id: str) -> None:
+        if not self.ctx.has_assisted_review():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Assisted chart review",
+                "Assisted chart review snippets are not available for this assignment.",
+            )
+            return
+        if not self.current_unit_id:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Assisted chart review",
+                "Select a unit before viewing assisted chart review snippets.",
+            )
+            return
+        snippets = self.ctx.get_assisted_snippets(self.current_unit_id, label_id)
+        if not snippets:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Assisted chart review",
+                "No relevant snippets are available for this label.",
+            )
+            return
+        widgets = self.label_widgets.get(label_id) or {}
+        definition = widgets.get("definition")
+        label_name = label_id
+        if isinstance(definition, LabelDefinition):
+            label_name = definition.name
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Relevant snippets • {label_name}")
+        dialog.resize(520, 400)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        header_parts = [f"Unit {self.current_unit_id}"]
+        limit = self.ctx.assisted_review_top_k()
+        if limit:
+            header_parts.append(f"configured top {limit}")
+        header_label = QtWidgets.QLabel(" • ".join(header_parts))
+        header_label.setWordWrap(True)
+        layout.addWidget(header_label)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QtWidgets.QWidget()
+        container_layout = QtWidgets.QVBoxLayout(container)
+        container_layout.setContentsMargins(4, 4, 4, 4)
+        container_layout.setSpacing(12)
+        for index, entry in enumerate(snippets, 1):
+            score = entry.get("score")
+            source = entry.get("source") or ""
+            doc_id = entry.get("doc_id") or ""
+            chunk = entry.get("chunk_id")
+            title_bits = [f"Snippet {index}"]
+            if doc_id:
+                title_bits.append(f"Doc {doc_id}")
+            if chunk is not None:
+                title_bits.append(f"Chunk {chunk}")
+            if score is not None:
+                try:
+                    title_bits.append(f"Score {float(score):.3f}")
+                except (TypeError, ValueError):
+                    pass
+            if source:
+                title_bits.append(str(source))
+            group = QtWidgets.QGroupBox(" • ".join(title_bits))
+            group_layout = QtWidgets.QVBoxLayout(group)
+            metadata = entry.get("metadata") if isinstance(entry, Mapping) else {}
+            if isinstance(metadata, Mapping) and metadata:
+                meta_parts = [f"{str(k)}: {metadata[k]}" for k in metadata.keys()]
+                meta_label = QtWidgets.QLabel("; ".join(meta_parts))
+                meta_label.setWordWrap(True)
+                meta_label.setStyleSheet("color: palette(mid);")
+                group_layout.addWidget(meta_label)
+            text_label = QtWidgets.QLabel(str(entry.get("text") or ""))
+            text_label.setWordWrap(True)
+            text_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+                | QtCore.Qt.TextInteractionFlag.LinksAccessibleByMouse
+            )
+            group_layout.addWidget(text_label)
+            container_layout.addWidget(group)
+        container_layout.addStretch()
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _selected_highlight(self, label_id: str) -> Optional[Dict[str, object]]:
         widgets = self.label_widgets.get(label_id)
