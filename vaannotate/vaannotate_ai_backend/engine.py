@@ -452,6 +452,26 @@ def _jsonify_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     return out
 
 
+def _maybe_parse_jsonish(value):
+    """Best-effort JSON (or literal) parser that tolerates legacy metadata strings."""
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return None
+        try:
+            return json.loads(txt)
+        except Exception:  # noqa: BLE001
+            try:
+                import ast
+
+                return ast.literal_eval(txt)
+            except Exception:  # noqa: BLE001
+                return None
+    return None
+
+
 # ------------------------------
 # Data repository
 # ------------------------------
@@ -479,6 +499,11 @@ class DataRepository:
         self.notes["patient_icn"] = self.notes["patient_icn"].astype(str)
         self.notes["doc_id"] = self.notes["doc_id"].astype(str)
         self.notes["text"] = self.notes["text"].astype(str).map(normalize_text)
+
+        if "notetype" not in self.notes.columns:
+            self.notes["notetype"] = ""
+        else:
+            self.notes["notetype"] = self.notes["notetype"].fillna("").astype(str)
 
         if self.phenotype_level == "single_doc":
             unit_ids = self.notes["doc_id"]
@@ -838,6 +863,39 @@ class EmbeddingStore:
         self.chunk_meta: List[dict] = []
         self.X = None
         self.unit_to_chunk_idxs: Dict[str,List[int]] = {}
+
+    def _backfill_chunk_metadata(self, notes_df: "pd.DataFrame") -> None:
+        """Ensure cached chunk metadata includes key fields such as notetype."""
+        if not isinstance(notes_df, pd.DataFrame) or notes_df.empty or not self.chunk_meta:
+            return
+        if "notetype" not in notes_df.columns:
+            return
+
+        doc_to_notetype: Dict[str, str] = {}
+        for row in notes_df.itertuples(index=False):
+            if not hasattr(row, "doc_id") or not hasattr(row, "notetype"):
+                continue
+            doc_id = str(getattr(row, "doc_id"))
+            note_type_val = getattr(row, "notetype")
+            if note_type_val is None:
+                continue
+            note_type_str = str(note_type_val).strip()
+            if note_type_str:
+                doc_to_notetype[doc_id] = note_type_str
+
+        if not doc_to_notetype:
+            return
+
+        for meta in self.chunk_meta:
+            if meta.get("notetype"):
+                continue
+            doc_id = str(meta.get("doc_id"))
+            note_type_str = doc_to_notetype.get(doc_id)
+            if note_type_str:
+                meta["notetype"] = note_type_str
+
+        # Nothing else to do; chunk_meta is now enriched in-memory and will be
+        # persisted on the next cache save.
     
     def _embedder_id(self) -> str:
         try:
@@ -1038,7 +1096,7 @@ class EmbeddingStore:
                         if hasattr(row, k):
                             v = getattr(row, k)
                             if v is not None:
-                                md[k] = v
+                                md[k] = str(v) if k in {"date_note", "notetype", "doc_title", "author", "source_system"} else v
                     chunk_meta.append(md)
             
             if not chunk_meta:
@@ -1055,6 +1113,7 @@ class EmbeddingStore:
         # 3) Bind to store
         self.X = np.load(paths["emb"], mmap_mode="r") if isinstance(X, np.memmap) or isinstance(X, np.ndarray) else X
         self.chunk_meta = meta
+        self._backfill_chunk_metadata(notes_df)
         unit_to_idxs = defaultdict(list)
         for i, m in enumerate(self.chunk_meta):
             unit_to_idxs[m["unit_id"]].append(i)
@@ -1316,12 +1375,25 @@ class RAGRetriever:
         # Common fields
         if "date_note" in m and m["date_note"]:
             out["date"] = str(m["date_note"])
+
+        note_type = ""
         if "notetype" in m and m["notetype"]:
-            out["note_type"] = str(m["notetype"])
-    
-        # Try to parse richer metadata JSON if present
+            note_type = str(m["notetype"])
+
+        # Try to parse richer metadata JSON if present (may include notetype)
         meta_raw = m.get("document_metadata_json") or m.get("metadata_json")
-        out['other_meta'] = str(meta_raw)    
+        meta_obj = _maybe_parse_jsonish(meta_raw)
+        if not note_type and isinstance(meta_obj, dict):
+            for key in ("note_type", "notetype", "noteType"):
+                val = meta_obj.get(key)
+                if val:
+                    note_type = str(val)
+                    break
+
+        if note_type:
+            out["note_type"] = note_type
+
+        out['other_meta'] = str(meta_raw)
         return out
 
     def _rr_key(self, q: str, t: str) -> str:
@@ -1814,7 +1886,9 @@ class LLMAnnotator:
                 md = s.get("metadata") or {}
                 hdr_bits = [f"doc_id={s.get('doc_id')}", f"chunk_id={s.get('chunk_id')}"]
                 if md.get("date"):      hdr_bits.append(f"date={md['date']}")
-                if md.get("note_type"): hdr_bits.append(f"type={md['note_type']}")
+                note_type = md.get("note_type") or md.get("notetype")
+                if note_type:
+                    hdr_bits.append(f"type={note_type}")
                 header = "[" + ", ".join(hdr_bits) + "] "
                 text_body = (s.get("text", "") or "")
                 frag = header + text_body
@@ -2651,7 +2725,19 @@ class FamilyLabeler:
         letters = [chr(ord('A') + i) for i in range(len(options))]
         option_lines = [f"{letters[i]}. {options[i]}" for i in range(len(options))]
         system = "You are a careful clinical information extraction assistant."
-        ctx = "\n\n".join([c.get('text','') for c in self.retriever.retrieve_for_patient_label(unit_id, label_id, label_rules, topk_override=self.cfg.topk)])
+        snippets = self.retriever.retrieve_for_patient_label(unit_id, label_id, label_rules, topk_override=self.cfg.topk)
+        ctx_lines = []
+        for snip in snippets:
+            md = snip.get("metadata") or {}
+            hdr_bits = [f"doc_id={snip.get('doc_id')}", f"chunk_id={snip.get('chunk_id')}"]
+            if md.get("date"):
+                hdr_bits.append(f"date={md['date']}")
+            note_type = md.get("note_type") or md.get("notetype")
+            if note_type:
+                hdr_bits.append(f"type={note_type}")
+            header = "[" + ", ".join(hdr_bits) + "] "
+            ctx_lines.append(header + (snip.get('text', '') or ''))
+        ctx = "\n\n".join(ctx_lines)
         user = (
             f"Task: Choose the single best option for label '{label_id}' given the context snippets.\n" +
             (f"Label rules/hints: {label_rules}\n" if label_rules else "") +
