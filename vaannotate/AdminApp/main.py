@@ -4010,93 +4010,96 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "status": self.status_combo.currentText(),
                 "reviewers": reviewers,
             }
-        backend_cfg: Dict[str, object] = {}
-        final_llm_enabled = False
-        if hasattr(self, "random_final_llm_checkbox"):
-            final_llm_enabled = bool(self.random_final_llm_checkbox.isChecked())
-            config_payload["final_llm_labeling"] = final_llm_enabled
-        if final_llm_enabled or assisted_enabled:
-            embed_path = (
-                self.random_embedding_path_edit.text().strip()
-                if hasattr(self, "random_embedding_path_edit")
-                else ""
-            )
-            rerank_path = (
-                self.random_reranker_path_edit.text().strip()
-                if hasattr(self, "random_reranker_path_edit")
-                else ""
-            )
-            azure_version = (
-                self.random_azure_version_edit.text().strip()
-                if hasattr(self, "random_azure_version_edit")
-                else ""
-            )
-            azure_endpoint = (
-                self.random_azure_endpoint_edit.text().strip()
-                if hasattr(self, "random_azure_endpoint_edit")
-                else ""
-            )
-            if embed_path:
-                backend_cfg["embedding_model_dir"] = embed_path
-            if rerank_path:
-                backend_cfg["reranker_model_dir"] = rerank_path
-            if azure_version:
-                backend_cfg["azure_api_version"] = azure_version
-            if azure_endpoint:
-                backend_cfg["azure_endpoint"] = azure_endpoint
-            if backend_cfg:
-                config_payload.setdefault("ai_backend", {}).update(backend_cfg)
-        if assisted_enabled:
-            config_payload["assisted_review"] = {
-                "enabled": True,
-                "top_snippets": assisted_top_n,
-            }
-            if corpus_record:
-                config_payload["corpus_name"] = corpus_record["name"]
-                config_payload["corpus_path"] = corpus_record["relative_path"]
-            if sampling_metadata:
-                config_payload["sampling"] = sampling_metadata
-            if filters.metadata_filters:
-                metadata_payload: Dict[str, object] = {
-                    "conditions": [
-                        condition.to_payload() for condition in filters.metadata_filters
-                    ]
-                }
-                metadata_payload["logic"] = "any" if filters.match_any else "all"
-                config_payload["filters"] = {"metadata": metadata_payload}
-            if strat_field_keys:
-                config_payload["stratification"] = {
-                    "fields": strat_field_keys,
-                    "labels": [
-                        self._metadata_lookup[key].label
-                        for key in strat_field_keys
-                        if key in self._metadata_lookup
-                    ],
-                    "aliases": strat_aliases,
-                }
-            if label_schema:
-                config_payload["label_schema"] = label_schema
-            config = models.RoundConfig(round_id=round_id, config_json=json.dumps(config_payload, indent=2))
-            config.save(conn)
-            for reviewer in reviewers:
-                reviewer_record = models.Reviewer(
-                    reviewer_id=reviewer["id"],
-                    name=reviewer.get("name", reviewer["id"]),
-                    email=reviewer.get("email", ""),
-                    windows_account=None,
+            backend_cfg: Dict[str, object] = {}
+            final_llm_enabled = False
+            if hasattr(self, "random_final_llm_checkbox"):
+                final_llm_enabled = bool(self.random_final_llm_checkbox.isChecked())
+                config_payload["final_llm_labeling"] = final_llm_enabled
+            if final_llm_enabled or assisted_enabled:
+                embed_path = (
+                    self.random_embedding_path_edit.text().strip()
+                    if hasattr(self, "random_embedding_path_edit")
+                    else ""
                 )
-                reviewer_record.save(conn)
-            for reviewer in reviewers:
-                assignment = models.Assignment(
-                    assign_id=str(uuid.uuid4()),
+                rerank_path = (
+                    self.random_reranker_path_edit.text().strip()
+                    if hasattr(self, "random_reranker_path_edit")
+                    else ""
+                )
+                azure_version = (
+                    self.random_azure_version_edit.text().strip()
+                    if hasattr(self, "random_azure_version_edit")
+                    else ""
+                )
+                azure_endpoint = (
+                    self.random_azure_endpoint_edit.text().strip()
+                    if hasattr(self, "random_azure_endpoint_edit")
+                    else ""
+                )
+                if embed_path:
+                    backend_cfg["embedding_model_dir"] = embed_path
+                if rerank_path:
+                    backend_cfg["reranker_model_dir"] = rerank_path
+                if azure_version:
+                    backend_cfg["azure_api_version"] = azure_version
+                if azure_endpoint:
+                    backend_cfg["azure_endpoint"] = azure_endpoint
+                if backend_cfg:
+                    config_payload.setdefault("ai_backend", {}).update(backend_cfg)
+            if assisted_enabled:
+                config_payload["assisted_review"] = {
+                    "enabled": True,
+                    "top_snippets": assisted_top_n,
+                }
+                if corpus_record:
+                    config_payload["corpus_name"] = corpus_record["name"]
+                    config_payload["corpus_path"] = corpus_record["relative_path"]
+                if sampling_metadata:
+                    config_payload["sampling"] = sampling_metadata
+                if filters.metadata_filters:
+                    metadata_payload: Dict[str, object] = {
+                        "conditions": [
+                            condition.to_payload() for condition in filters.metadata_filters
+                        ]
+                    }
+                    metadata_payload["logic"] = "any" if filters.match_any else "all"
+                    config_payload["filters"] = {"metadata": metadata_payload}
+                if strat_field_keys:
+                    config_payload["stratification"] = {
+                        "fields": strat_field_keys,
+                        "labels": [
+                            self._metadata_lookup[key].label
+                            for key in strat_field_keys
+                            if key in self._metadata_lookup
+                        ],
+                        "aliases": strat_aliases,
+                    }
+                if label_schema:
+                    config_payload["label_schema"] = label_schema
+                config = models.RoundConfig(
                     round_id=round_id,
-                    reviewer_id=reviewer["id"],
-                    sample_size=len(assignments[reviewer["id"]].units),
-                    overlap_n=overlap,
-                    created_at=round_record.created_at,
-                    status="open",
+                    config_json=json.dumps(config_payload, indent=2),
                 )
-                assignment.save(conn)
+                config.save(conn)
+                for reviewer in reviewers:
+                    reviewer_record = models.Reviewer(
+                        reviewer_id=reviewer["id"],
+                        name=reviewer.get("name", reviewer["id"]),
+                        email=reviewer.get("email", ""),
+                        windows_account=None,
+                    )
+                    reviewer_record.save(conn)
+                for reviewer in reviewers:
+                    assignment = models.Assignment(
+                        assign_id=str(uuid.uuid4()),
+                        round_id=round_id,
+                        reviewer_id=reviewer["id"],
+                        sample_size=len(assignments[reviewer["id"]].units),
+                        overlap_n=overlap,
+                        created_at=round_record.created_at,
+                        status="open",
+                    )
+                    assignment.save(conn)
         ctx.register_text_file(round_dir / "round_config.json", json.dumps(config_payload, indent=2))
         if label_schema is None:
             label_schema = self._build_label_schema(labelset_id, db)

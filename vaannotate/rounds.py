@@ -343,11 +343,21 @@ class RoundBuilder:
                                 self._json_dumps(assisted_data),
                                 encoding="utf-8",
                             )
+                            try:
+                                relative_assist_path = assist_path.relative_to(round_dir)
+                            except ValueError:
+                                try:
+                                    relative_assist_path = assist_path.resolve().relative_to(
+                                        round_dir.resolve()
+                                    )
+                                except ValueError:
+                                    relative_assist_path = assist_path
+                            assist_path_value = str(relative_assist_path)
                             updated_cfg = config.setdefault("assisted_review", {})
                             updated_cfg["enabled"] = True
                             updated_cfg["top_snippets"] = top_snippets
                             updated_cfg["generated_at"] = assisted_data.get("generated_at")
-                            updated_cfg["snippets_json"] = str(assist_path)
+                            updated_cfg["snippets_json"] = assist_path_value
                             (round_dir / "round_config.json").write_text(
                                 canonical_json(config),
                                 encoding="utf-8",
@@ -356,7 +366,7 @@ class RoundBuilder:
                                 "INSERT OR REPLACE INTO round_configs(round_id, config_json) VALUES (?, ?)",
                                 (round_id, canonical_json(config)),
                             )
-                            assisted_result = {"snippets_json": str(assist_path)}
+                            assisted_result = {"snippets_json": assist_path_value}
     
                 project_conn.commit()
                 result_payload: Dict[str, Any] = {
