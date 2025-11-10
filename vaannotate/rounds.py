@@ -79,6 +79,7 @@ class RoundBuilder:
         config_path: Path,
         created_by: str,
         preselected_units_csv: Path | str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
     ) -> dict:
         config_path = Path(config_path)
         config = json.loads(config_path.read_text("utf-8"))
@@ -93,270 +94,287 @@ class RoundBuilder:
             final_llm_enabled = bool(final_llm_flag)
         config["final_llm_labeling"] = final_llm_enabled
         final_llm_outputs: Dict[str, str] = {}
-        with self._connect_project() as project_conn:
-            pheno = project_conn.execute(
-                "SELECT * FROM phenotypes WHERE pheno_id=?",
-                (pheno_id,),
-            ).fetchone()
-            if not pheno:
-                raise ValueError(f"Phenotype {pheno_id} not found")
-            storage_path = pheno["storage_path"]
-            if not storage_path:
-                raise ValueError("Phenotype storage path is not defined")
-            storage_dir = Path(storage_path)
-            if not storage_dir.is_absolute():
-                storage_dir = (self.project_root / storage_dir).resolve()
-            corpus_id = config.get("corpus_id")
-            corpus_row = None
-            if corpus_id:
-                corpus_row = project_conn.execute(
-                    "SELECT * FROM project_corpora WHERE corpus_id=?",
-                    (corpus_id,),
+        overrides = {
+            str(key): str(value)
+            for key, value in (env_overrides or {}).items()
+            if value is not None and str(value)
+        }
+        previous_env: Dict[str, Optional[str]] = {}
+        for key, value in overrides.items():
+            previous_env[key] = os.environ.get(key)
+            os.environ[key] = value
+
+        try:
+            with self._connect_project() as project_conn:
+                pheno = project_conn.execute(
+                    "SELECT * FROM phenotypes WHERE pheno_id=?",
+                    (pheno_id,),
                 ).fetchone()
-            if corpus_row:
-                corpus_path = self.project_root / corpus_row["relative_path"]
-            else:
-                legacy_path = config.get("corpus_path")
-                if not legacy_path:
-                    raise ValueError("Round configuration does not specify a corpus")
-                corpus_path = Path(legacy_path)
-                if not corpus_path.is_absolute():
-                    corpus_path = (self.project_root / corpus_path).resolve()
-            with self._connect_corpus(corpus_path) as corpus_conn:
-                labelset = fetch_labelset(project_conn, config["labelset_id"])
-                round_number = config.get("round_number")
-                csv_override: Path | None = None
-                if not preselected_units_csv:
-                    csv_value = config.get("preselected_units_csv")
-                    if csv_value:
-                        csv_override = Path(csv_value)
-                        if not csv_override.is_absolute():
-                            csv_override = (config_base / csv_override).resolve()
+                if not pheno:
+                    raise ValueError(f"Phenotype {pheno_id} not found")
+                storage_path = pheno["storage_path"]
+                if not storage_path:
+                    raise ValueError("Phenotype storage path is not defined")
+                storage_dir = Path(storage_path)
+                if not storage_dir.is_absolute():
+                    storage_dir = (self.project_root / storage_dir).resolve()
+                corpus_id = config.get("corpus_id")
+                corpus_row = None
+                if corpus_id:
+                    corpus_row = project_conn.execute(
+                        "SELECT * FROM project_corpora WHERE corpus_id=?",
+                        (corpus_id,),
+                    ).fetchone()
+                if corpus_row:
+                    corpus_path = self.project_root / corpus_row["relative_path"]
                 else:
-                    csv_override = Path(preselected_units_csv)
-                round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
-                status = str(config.get("status") or "active")
-                if csv_override and not csv_override.exists():
-                    raise FileNotFoundError(csv_override)
-            rng_seed = config.get("rng_seed", 0)
-            config_hash = stable_hash(canonical_json(config))
-            phenotype_dir = storage_dir
-            round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
-            ensure_dir(round_dir)
-            ensure_dir(round_dir / "assignments")
-            ensure_dir(round_dir / "imports")
-            ensure_dir(round_dir / "reports" / "confusion_matrices")
-            ensure_dir(round_dir / "reports" / "exports")
-
-            if csv_override:
-                candidates = list(
-                    self._build_preselected_candidates(corpus_conn, pheno, csv_override)
-                )
-            else:
-                candidates = list(self._build_candidates(corpus_conn, pheno, config))
-            if not candidates:
-                raise ValueError("No candidates matched filters")
-
-            reviewer_ids = [reviewer["id"] for reviewer in config["reviewers"]]
-            reviewer_assignments = self._allocate_units(
-                candidates,
-                reviewer_ids,
-                rng_seed,
-                config.get("overlap_n", 0),
-                config.get("total_n"),
-                config.get("stratification"),
-                preserve_input_order=bool(csv_override),
-            )
-
-            if csv_override:
-                config["preselected_units_csv"] = str(csv_override)
-            config["status"] = status
-
-            manifest_path = round_dir / "manifest.csv"
-            with manifest_path.open("w", encoding="utf-8", newline="") as fh:
-                fieldnames = ["unit_id", "patient_icn", "doc_id", "strata_key", "assigned_to", "is_overlap"]
-                writer = csv.DictWriter(fh, fieldnames=fieldnames)
-                writer.writeheader()
-                for reviewer_id, assignments in reviewer_assignments.items():
-                    for unit in assignments:
-                        writer.writerow(
-                            {
-                                "unit_id": unit.unit_id,
-                                "patient_icn": unit.patient_icn,
-                                "doc_id": unit.doc_id,
-                                "strata_key": unit.payload["strata_key"],
-                                "assigned_to": reviewer_id,
-                                "is_overlap": 1 if unit.payload.get("is_overlap") else 0,
-                            }
-                        )
-
-            (round_dir / "round_config.json").write_text(canonical_json(config), encoding="utf-8")
-
-            project_conn.execute(
-                """
-                INSERT OR REPLACE INTO rounds(round_id, pheno_id, round_number, labelset_id, config_hash, rng_seed, status, created_at)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                (
-                    round_id,
-                    pheno_id,
-                    round_number,
-                    labelset["labelset_id"],
-                    config_hash,
+                    legacy_path = config.get("corpus_path")
+                    if not legacy_path:
+                        raise ValueError("Round configuration does not specify a corpus")
+                    corpus_path = Path(legacy_path)
+                    if not corpus_path.is_absolute():
+                        corpus_path = (self.project_root / corpus_path).resolve()
+                with self._connect_corpus(corpus_path) as corpus_conn:
+                    labelset = fetch_labelset(project_conn, config["labelset_id"])
+                    round_number = config.get("round_number")
+                    csv_override: Path | None = None
+                    if not preselected_units_csv:
+                        csv_value = config.get("preselected_units_csv")
+                        if csv_value:
+                            csv_override = Path(csv_value)
+                            if not csv_override.is_absolute():
+                                csv_override = (config_base / csv_override).resolve()
+                    else:
+                        csv_override = Path(preselected_units_csv)
+                    round_id = config.get("round_id") or f"{pheno_id}_r{round_number}"
+                    status = str(config.get("status") or "active")
+                    if csv_override and not csv_override.exists():
+                        raise FileNotFoundError(csv_override)
+                rng_seed = config.get("rng_seed", 0)
+                config_hash = stable_hash(canonical_json(config))
+                phenotype_dir = storage_dir
+                round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
+                ensure_dir(round_dir)
+                ensure_dir(round_dir / "assignments")
+                ensure_dir(round_dir / "imports")
+                ensure_dir(round_dir / "reports" / "confusion_matrices")
+                ensure_dir(round_dir / "reports" / "exports")
+    
+                if csv_override:
+                    candidates = list(
+                        self._build_preselected_candidates(corpus_conn, pheno, csv_override)
+                    )
+                else:
+                    candidates = list(self._build_candidates(corpus_conn, pheno, config))
+                if not candidates:
+                    raise ValueError("No candidates matched filters")
+    
+                reviewer_ids = [reviewer["id"] for reviewer in config["reviewers"]]
+                reviewer_assignments = self._allocate_units(
+                    candidates,
+                    reviewer_ids,
                     rng_seed,
-                    status,
-                    datetime.utcnow().isoformat(),
-                ),
-            )
-            project_conn.execute(
-                "INSERT OR REPLACE INTO round_configs(round_id, config_json) VALUES (?, ?)",
-                (round_id, canonical_json(config)),
-            )
-
-            label_schema_payload = self._build_label_schema_payload(labelset)
-            label_schema_text = json.dumps(label_schema_payload, indent=2)
-
-            for reviewer in config["reviewers"]:
-                assign_dir = ensure_dir(round_dir / "assignments" / reviewer["id"])
-                assignment_db = assign_dir / "assignment.db"
-                with initialize_assignment_db(assignment_db) as assign_conn:
-                    units = reviewer_assignments[reviewer["id"]]
-                    for display_rank, unit in enumerate(units):
-                        assign_conn.execute(
-                            "INSERT OR REPLACE INTO units(unit_id, display_rank, patient_icn, doc_id, note_count) VALUES (?,?,?,?,?)",
-                            (
-                                unit.unit_id,
-                                display_rank,
-                                unit.patient_icn,
-                                unit.doc_id,
-                                unit.payload.get("note_count"),
-                            ),
-                        )
-                        documents = unit.payload.get("documents", [])
-                        assign_conn.execute(
-                            "DELETE FROM unit_notes WHERE unit_id=?",
-                            (unit.unit_id,),
-                        )
-                        for order_index, doc in enumerate(documents):
-                            doc_id = doc.get("doc_id")
-                            if not doc_id:
-                                continue
-                            metadata = extract_document_metadata(doc)
-                            metadata_json = json.dumps(metadata, sort_keys=True) if metadata else None
-                            assign_conn.execute(
-                                "INSERT OR REPLACE INTO documents(doc_id, hash, text, metadata_json) VALUES (?,?,?,?)",
-                                (
-                                    doc_id,
-                                    doc.get("hash", ""),
-                                    doc.get("text", ""),
-                                    metadata_json,
-                                ),
-                            )
-                            assign_conn.execute(
-                                "INSERT OR REPLACE INTO unit_notes(unit_id, doc_id, order_index) VALUES (?,?,?)",
-                                (unit.unit_id, doc_id, order_index),
-                            )
-                    for label in labelset["labels"]:
-                        for unit in units:
-                            assign_conn.execute(
-                                "INSERT OR IGNORE INTO annotations(unit_id, label_id, na) VALUES (?, ?, 0)",
-                                (unit.unit_id, label["label_id"]),
-                            )
-                (assign_dir / "client.exe").write_text("Annotator client placeholder", encoding="utf-8")
-                (assign_dir / "assignment.lock").write_text("", encoding="utf-8")
-                ensure_dir(assign_dir / "logs")
-                (assign_dir / "label_schema.json").write_text(
-                    label_schema_text,
-                    encoding="utf-8",
+                    config.get("overlap_n", 0),
+                    config.get("total_n"),
+                    config.get("stratification"),
+                    preserve_input_order=bool(csv_override),
                 )
+    
+                if csv_override:
+                    config["preselected_units_csv"] = str(csv_override)
+                config["status"] = status
+    
+                manifest_path = round_dir / "manifest.csv"
+                with manifest_path.open("w", encoding="utf-8", newline="") as fh:
+                    fieldnames = ["unit_id", "patient_icn", "doc_id", "strata_key", "assigned_to", "is_overlap"]
+                    writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for reviewer_id, assignments in reviewer_assignments.items():
+                        for unit in assignments:
+                            writer.writerow(
+                                {
+                                    "unit_id": unit.unit_id,
+                                    "patient_icn": unit.patient_icn,
+                                    "doc_id": unit.doc_id,
+                                    "strata_key": unit.payload["strata_key"],
+                                    "assigned_to": reviewer_id,
+                                    "is_overlap": 1 if unit.payload.get("is_overlap") else 0,
+                                }
+                            )
+    
+                (round_dir / "round_config.json").write_text(canonical_json(config), encoding="utf-8")
+    
                 project_conn.execute(
                     """
-                    INSERT OR REPLACE INTO assignments(assign_id, round_id, reviewer_id, sample_size, overlap_n, created_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO rounds(round_id, pheno_id, round_number, labelset_id, config_hash, rng_seed, status, created_at)
+                    VALUES (?,?,?,?,?,?,?,?)
                     """,
                     (
-                        f"{round_id}_{reviewer['id']}",
                         round_id,
-                        reviewer["id"],
-                        len(reviewer_assignments[reviewer["id"]]),
-                        config.get("overlap_n", 0),
+                        pheno_id,
+                        round_number,
+                        labelset["labelset_id"],
+                        config_hash,
+                        rng_seed,
+                        status,
                         datetime.utcnow().isoformat(),
-                        "open",
                     ),
                 )
-
-            if final_llm_enabled:
-                try:
-                    outputs = self._apply_final_llm_labeling(
-                        pheno_row=pheno,
-                        labelset=labelset,
-                        round_dir=round_dir,
-                        reviewer_assignments=reviewer_assignments,
-                        config=config,
-                        config_base=config_base,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    raise RuntimeError(f"Final LLM labeling failed: {exc}") from exc
-                else:
-                    final_llm_outputs.update(outputs)
-                    config.setdefault("final_llm_outputs", {}).update(outputs)
-                    (round_dir / "round_config.json").write_text(
-                        canonical_json(config),
+                project_conn.execute(
+                    "INSERT OR REPLACE INTO round_configs(round_id, config_json) VALUES (?, ?)",
+                    (round_id, canonical_json(config)),
+                )
+    
+                label_schema_payload = self._build_label_schema_payload(labelset)
+                label_schema_text = json.dumps(label_schema_payload, indent=2)
+    
+                for reviewer in config["reviewers"]:
+                    assign_dir = ensure_dir(round_dir / "assignments" / reviewer["id"])
+                    assignment_db = assign_dir / "assignment.db"
+                    with initialize_assignment_db(assignment_db) as assign_conn:
+                        units = reviewer_assignments[reviewer["id"]]
+                        for display_rank, unit in enumerate(units):
+                            assign_conn.execute(
+                                "INSERT OR REPLACE INTO units(unit_id, display_rank, patient_icn, doc_id, note_count) VALUES (?,?,?,?,?)",
+                                (
+                                    unit.unit_id,
+                                    display_rank,
+                                    unit.patient_icn,
+                                    unit.doc_id,
+                                    unit.payload.get("note_count"),
+                                ),
+                            )
+                            documents = unit.payload.get("documents", [])
+                            assign_conn.execute(
+                                "DELETE FROM unit_notes WHERE unit_id=?",
+                                (unit.unit_id,),
+                            )
+                            for order_index, doc in enumerate(documents):
+                                doc_id = doc.get("doc_id")
+                                if not doc_id:
+                                    continue
+                                metadata = extract_document_metadata(doc)
+                                metadata_json = json.dumps(metadata, sort_keys=True) if metadata else None
+                                assign_conn.execute(
+                                    "INSERT OR REPLACE INTO documents(doc_id, hash, text, metadata_json) VALUES (?,?,?,?)",
+                                    (
+                                        doc_id,
+                                        doc.get("hash", ""),
+                                        doc.get("text", ""),
+                                        metadata_json,
+                                    ),
+                                )
+                                assign_conn.execute(
+                                    "INSERT OR REPLACE INTO unit_notes(unit_id, doc_id, order_index) VALUES (?,?,?)",
+                                    (unit.unit_id, doc_id, order_index),
+                                )
+                        for label in labelset["labels"]:
+                            for unit in units:
+                                assign_conn.execute(
+                                    "INSERT OR IGNORE INTO annotations(unit_id, label_id, na) VALUES (?, ?, 0)",
+                                    (unit.unit_id, label["label_id"]),
+                                )
+                    (assign_dir / "client.exe").write_text("Annotator client placeholder", encoding="utf-8")
+                    (assign_dir / "assignment.lock").write_text("", encoding="utf-8")
+                    ensure_dir(assign_dir / "logs")
+                    (assign_dir / "label_schema.json").write_text(
+                        label_schema_text,
                         encoding="utf-8",
                     )
-
-            assisted_result: Dict[str, Any] = {}
-            assisted_cfg = config.get("assisted_review") if isinstance(config.get("assisted_review"), Mapping) else None
-            if isinstance(assisted_cfg, Mapping) and assisted_cfg.get("enabled"):
-                raw_top = assisted_cfg.get("top_snippets")
-                top_snippets = 0
-                try:
-                    top_snippets = int(raw_top)
-                except (TypeError, ValueError):
-                    top_snippets = 0
-                if top_snippets > 0:
-                    assisted_data = self._generate_assisted_review_snippets(
-                        pheno_row=pheno,
-                        labelset=labelset,
-                        round_dir=round_dir,
-                        reviewer_assignments=reviewer_assignments,
-                        config=config,
-                        config_base=config_base,
-                        top_n=top_snippets,
+                    project_conn.execute(
+                        """
+                        INSERT OR REPLACE INTO assignments(assign_id, round_id, reviewer_id, sample_size, overlap_n, created_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            f"{round_id}_{reviewer['id']}",
+                            round_id,
+                            reviewer["id"],
+                            len(reviewer_assignments[reviewer["id"]]),
+                            config.get("overlap_n", 0),
+                            datetime.utcnow().isoformat(),
+                            "open",
+                        ),
                     )
-                    if assisted_data:
-                        assist_dir = ensure_dir(round_dir / "reports" / "assisted_review")
-                        assist_path = assist_dir / "snippets.json"
-                        assist_path.write_text(
-                            self._json_dumps(assisted_data),
-                            encoding="utf-8",
+    
+                if final_llm_enabled:
+                    try:
+                        outputs = self._apply_final_llm_labeling(
+                            pheno_row=pheno,
+                            labelset=labelset,
+                            round_dir=round_dir,
+                            reviewer_assignments=reviewer_assignments,
+                            config=config,
+                            config_base=config_base,
                         )
-                        updated_cfg = config.setdefault("assisted_review", {})
-                        updated_cfg["enabled"] = True
-                        updated_cfg["top_snippets"] = top_snippets
-                        updated_cfg["generated_at"] = assisted_data.get("generated_at")
-                        updated_cfg["snippets_json"] = str(assist_path)
+                    except Exception as exc:  # noqa: BLE001
+                        raise RuntimeError(f"Final LLM labeling failed: {exc}") from exc
+                    else:
+                        final_llm_outputs.update(outputs)
+                        config.setdefault("final_llm_outputs", {}).update(outputs)
                         (round_dir / "round_config.json").write_text(
                             canonical_json(config),
                             encoding="utf-8",
                         )
-                        project_conn.execute(
-                            "INSERT OR REPLACE INTO round_configs(round_id, config_json) VALUES (?, ?)",
-                            (round_id, canonical_json(config)),
+    
+                assisted_result: Dict[str, Any] = {}
+                assisted_cfg = config.get("assisted_review") if isinstance(config.get("assisted_review"), Mapping) else None
+                if isinstance(assisted_cfg, Mapping) and assisted_cfg.get("enabled"):
+                    raw_top = assisted_cfg.get("top_snippets")
+                    top_snippets = 0
+                    try:
+                        top_snippets = int(raw_top)
+                    except (TypeError, ValueError):
+                        top_snippets = 0
+                    if top_snippets > 0:
+                        assisted_data = self._generate_assisted_review_snippets(
+                            pheno_row=pheno,
+                            labelset=labelset,
+                            round_dir=round_dir,
+                            reviewer_assignments=reviewer_assignments,
+                            config=config,
+                            config_base=config_base,
+                            top_n=top_snippets,
                         )
-                        assisted_result = {"snippets_json": str(assist_path)}
-
-            project_conn.commit()
-            result_payload: Dict[str, Any] = {
-                "round_id": round_id,
-                "round_dir": str(round_dir),
-                "assignment_counts": {rid: len(units) for rid, units in reviewer_assignments.items()},
-            }
-            if final_llm_outputs:
-                result_payload["final_llm_outputs"] = dict(final_llm_outputs)
-            if assisted_result:
-                result_payload.setdefault("assisted_review", {}).update(assisted_result)
-            return result_payload
+                        if assisted_data:
+                            assist_dir = ensure_dir(round_dir / "reports" / "assisted_review")
+                            assist_path = assist_dir / "snippets.json"
+                            assist_path.write_text(
+                                self._json_dumps(assisted_data),
+                                encoding="utf-8",
+                            )
+                            updated_cfg = config.setdefault("assisted_review", {})
+                            updated_cfg["enabled"] = True
+                            updated_cfg["top_snippets"] = top_snippets
+                            updated_cfg["generated_at"] = assisted_data.get("generated_at")
+                            updated_cfg["snippets_json"] = str(assist_path)
+                            (round_dir / "round_config.json").write_text(
+                                canonical_json(config),
+                                encoding="utf-8",
+                            )
+                            project_conn.execute(
+                                "INSERT OR REPLACE INTO round_configs(round_id, config_json) VALUES (?, ?)",
+                                (round_id, canonical_json(config)),
+                            )
+                            assisted_result = {"snippets_json": str(assist_path)}
+    
+                project_conn.commit()
+                result_payload: Dict[str, Any] = {
+                    "round_id": round_id,
+                    "round_dir": str(round_dir),
+                    "assignment_counts": {rid: len(units) for rid, units in reviewer_assignments.items()},
+                }
+                if final_llm_outputs:
+                    result_payload["final_llm_outputs"] = dict(final_llm_outputs)
+                if assisted_result:
+                    result_payload.setdefault("assisted_review", {}).update(assisted_result)
+                return result_payload
+        finally:
+            for key, value in previous_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def _apply_final_llm_labeling(
         self,
@@ -594,6 +612,7 @@ class RoundBuilder:
         config: Mapping[str, Any],
         config_base: Path,
         log_callback: callable | None = None,
+        env_overrides: Mapping[str, str] | None = None,
     ) -> Dict[str, str]:
         """Execute final LLM labeling while forwarding progress logs."""
 
@@ -631,20 +650,37 @@ class RoundBuilder:
                 handler.setLevel(logging.INFO)
                 logger.addHandler(handler)
 
+        overrides = {
+            str(key): str(value)
+            for key, value in (env_overrides or {}).items()
+            if value is not None and str(value)
+        }
+        previous_env: Dict[str, Optional[str]] = {}
+        for key, value in overrides.items():
+            previous_env[key] = os.environ.get(key)
+            os.environ[key] = value
+
         try:
-            return self._apply_final_llm_labeling(
-                pheno_row=pheno_row,
-                labelset=labelset,
-                round_dir=round_dir,
-                reviewer_assignments=reviewer_assignments,
-                config=config,
-                config_base=config_base,
-            )
+            try:
+                return self._apply_final_llm_labeling(
+                    pheno_row=pheno_row,
+                    labelset=labelset,
+                    round_dir=round_dir,
+                    reviewer_assignments=reviewer_assignments,
+                    config=config,
+                    config_base=config_base,
+                )
+            finally:
+                if handler and logger:
+                    logger.removeHandler(handler)
+                    if original_level is not None:
+                        logger.setLevel(original_level)
         finally:
-            if handler and logger:
-                logger.removeHandler(handler)
-                if original_level is not None:
-                    logger.setLevel(original_level)
+            for key, value in previous_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def _collect_round_units_and_notes(
         self, reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import json
 import sqlite3
 import sys
@@ -148,7 +149,7 @@ def seeded_project(tmp_path: Path) -> tuple[RoundBuilder, Path]:
 
 
 def test_generate_round_with_preselected_csv(seeded_project: tuple[RoundBuilder, Path], tmp_path: Path) -> None:
-    builder, project_root = seeded_project
+    builder, _ = seeded_project
     config = {
         "round_number": 2,
         "round_id": "ph_test_r2",
@@ -188,6 +189,49 @@ def test_generate_round_with_preselected_csv(seeded_project: tuple[RoundBuilder,
     assert unit_ids == ["doc_0", "doc_2"]
     stored_config = json.loads((round_dir / "round_config.json").read_text("utf-8"))
     assert stored_config.get("preselected_units_csv") == str(csv_path)
+
+
+def test_generate_round_applies_env_overrides(
+    seeded_project: tuple[RoundBuilder, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder, _ = seeded_project
+    config = {
+        "round_number": 3,
+        "round_id": "ph_test_r3",
+        "labelset_id": "ls_test",
+        "corpus_id": "cor_ph_test",
+        "reviewers": [
+            {"id": "rev_one", "name": "Reviewer One"},
+            {"id": "rev_two", "name": "Reviewer Two"},
+        ],
+        "overlap_n": 0,
+        "rng_seed": 42,
+        "assisted_review": {"enabled": True, "top_snippets": 1},
+    }
+    config_path = tmp_path / "ph_test_r3.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    captured: dict[str, str | None] = {}
+
+    def _fake_assisted(*args, **kwargs):
+        captured["api_key"] = os.getenv("AZURE_OPENAI_API_KEY")
+        return {}
+
+    monkeypatch.setattr(RoundBuilder, "_generate_assisted_review_snippets", _fake_assisted)
+
+    assert os.getenv("AZURE_OPENAI_API_KEY") is None
+
+    builder.generate_round(
+        "ph_test",
+        config_path,
+        created_by="tester",
+        env_overrides={"AZURE_OPENAI_API_KEY": "test-key"},
+    )
+
+    assert captured.get("api_key") == "test-key"
+    assert os.getenv("AZURE_OPENAI_API_KEY") is None
 def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
     project_root = tmp_path / "Project"
     paths = init_project(project_root, "proj", "Project", "tester")
@@ -968,4 +1012,69 @@ def test_run_final_llm_labeling_forwards_logs(
 
     assert outputs == {"final_llm_labels": "dummy"}
     assert any("[FinalLLM]" in message for message in messages)
+
+
+def test_run_final_llm_labeling_applies_env_overrides(
+    seeded_project: tuple[RoundBuilder, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder, project_root = seeded_project
+    round_dir = project_root / "phenotypes" / "ph_test" / "rounds" / "round_env"
+    round_dir.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(project_root / "project.db") as conn:
+        conn.row_factory = sqlite3.Row
+        pheno_row = conn.execute(
+            "SELECT * FROM phenotypes WHERE pheno_id=?",
+            ("ph_test",),
+        ).fetchone()
+        assert pheno_row is not None
+        labelset = fetch_labelset(conn, "ls_test")
+
+    assignments = {
+        "rev_one": [
+            AssignmentUnit(
+                unit_id="doc_0",
+                patient_icn="p0",
+                doc_id="doc_0",
+                payload={
+                    "unit_id": "doc_0",
+                    "patient_icn": "p0",
+                    "doc_id": "doc_0",
+                    "documents": [{"doc_id": "doc_0", "text": "Example text 0"}],
+                    "strata_key": "random_sampling",
+                },
+            )
+        ]
+    }
+
+    captured: dict[str, str | None] = {}
+
+    def _fake_apply(self, **kwargs):  # type: ignore[no-untyped-def]
+        captured["api_key"] = os.getenv("AZURE_OPENAI_API_KEY")
+        captured["api_version"] = os.getenv("AZURE_OPENAI_API_VERSION")
+        return {}
+
+    monkeypatch.setattr(RoundBuilder, "_apply_final_llm_labeling", _fake_apply)
+
+    assert os.getenv("AZURE_OPENAI_API_KEY") is None
+    assert os.getenv("AZURE_OPENAI_API_VERSION") is None
+
+    builder.run_final_llm_labeling(
+        pheno_row=pheno_row,
+        labelset=labelset,
+        round_dir=round_dir,
+        reviewer_assignments=assignments,
+        config={"ai_backend": {}, "final_llm_labeling": True},
+        config_base=round_dir,
+        env_overrides={
+            "AZURE_OPENAI_API_KEY": "env-key",
+            "AZURE_OPENAI_API_VERSION": "2024-05-01",
+        },
+    )
+
+    assert captured["api_key"] == "env-key"
+    assert captured["api_version"] == "2024-05-01"
+    assert os.getenv("AZURE_OPENAI_API_KEY") is None
+    assert os.getenv("AZURE_OPENAI_API_VERSION") is None
 
