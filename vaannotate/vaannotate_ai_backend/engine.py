@@ -1816,6 +1816,7 @@ class LLMAnnotator:
                 hdr_bits = [f"doc_id={s.get('doc_id')}", f"chunk_id={s.get('chunk_id')}"]
                 if md.get("date"):      hdr_bits.append(f"date={md['date']}")
                 if md.get("note_type"): hdr_bits.append(f"type={md['note_type']}")
+                if md.get("document_metadata_json"):  hdr_bits.append(f"metadata={md['document_metadata_json']}")
                 header = "[" + ", ".join(hdr_bits) + "] "
                 text_body = (s.get("text", "") or "")
                 frag = header + text_body
