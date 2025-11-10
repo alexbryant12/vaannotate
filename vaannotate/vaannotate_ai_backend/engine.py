@@ -22,17 +22,14 @@ What’s in this file (high level):
   
   
   To do - 
-  - add "cold start" round 0 branch - simple corpus search based on label exemplars -> k-center (basically just a pure diversity run)
-  - pure inference branch with query builder: default (zero shot, family-tree traversal, label exemplars). Knobs:
+  - Multi-categorical selection support
+  - Local LLM with exllamav2 and LMFE forced JSON schemas
+ - pure inference branch with query builder: default (zero shot, family-tree traversal, label exemplars). Knobs:
       - zero vs. few shot
       - family-tree traversal vs. single prompt
       - label exemplars for RAG vs. hand-written exemplars
       - Prompt stems - use rules as-is from most recent round, or hand-write
       - checkpointing on inference runs + seamless resume
-  
-    Final inference query builder
-    Final performance checks
-    Wire in to app
 """
 
 from __future__ import annotations
