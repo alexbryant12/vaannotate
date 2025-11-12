@@ -39,6 +39,7 @@ if "langchain" not in sys.modules:
 from vaannotate.project import add_phenotype, get_connection, init_project
 from vaannotate.schema import initialize_assignment_db, initialize_corpus_db
 from vaannotate.vaannotate_ai_backend.adapters import export_inputs_from_repo
+from vaannotate.vaannotate_ai_backend.engine import DataRepository, _contexts_for_unit_label
 
 
 def test_export_inputs_uses_storage_path(tmp_path: Path) -> None:
@@ -189,4 +190,67 @@ def test_export_inputs_cold_start_uses_selected_corpus(tmp_path: Path) -> None:
     assert not notes_df.empty
     assert notes_df.loc[0, "doc_id"] == "doc_1"
     assert ann_df.empty
+
+
+def test_contexts_for_unit_label_full_mode() -> None:
+    notes_df = pd.DataFrame(
+        [
+            {"patient_icn": "p1", "doc_id": "doc_full", "text": "Full document context text"},
+        ]
+    )
+    ann_df = pd.DataFrame(
+        {
+            "round_id": pd.Series(dtype="object"),
+            "unit_id": pd.Series(dtype="object"),
+            "doc_id": pd.Series(dtype="object"),
+            "label_id": pd.Series(dtype="object"),
+            "reviewer_id": pd.Series(dtype="object"),
+            "label_value": pd.Series(dtype="object"),
+        }
+    )
+
+    repo = DataRepository(notes_df, ann_df, phenotype_level="single_doc")
+
+    class DummyStore:
+        def __init__(self) -> None:
+            self.chunk_meta = [
+                {"unit_id": "doc_full", "doc_id": "doc_full", "chunk_id": "0", "text": "chunk"}
+            ]
+
+        def get_patient_chunk_indices(self, unit_id: str) -> list[int]:
+            if str(unit_id) == "doc_full":
+                return [0]
+            return []
+
+    class DummyRetriever:
+        def __init__(self) -> None:
+            self.store = DummyStore()
+            self.called = False
+
+        def _extract_meta(self, meta: dict) -> dict:
+            return {"note_type": "demo", "other_meta": "meta"}
+
+        def retrieve_for_patient_label(self, *args: object, **kwargs: object) -> list[dict]:
+            self.called = True
+            return [{"text": "fallback"}]
+
+    retriever = DummyRetriever()
+
+    contexts = _contexts_for_unit_label(
+        retriever,
+        repo,
+        "doc_full",
+        "label1",
+        "",
+        single_doc_context_mode="full",
+        full_doc_char_limit=50,
+    )
+
+    assert len(contexts) == 1
+    ctx = contexts[0]
+    assert ctx["source"] == "full_doc"
+    assert ctx["doc_id"] == "doc_full"
+    assert ctx["text"] == "Full document context text"[:50]
+    assert ctx["metadata"].get("other_meta") == "meta"
+    assert not retriever.called
 
