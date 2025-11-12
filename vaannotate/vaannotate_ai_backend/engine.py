@@ -318,6 +318,7 @@ def iter_with_bar(step: str, iterable, *, total: int | None = None,
     tty = hasattr(_sys.stderr, "isatty") and _sys.stderr.isatty()
     if ascii_only is None: ascii_only = not tty  # default: Unicode in TTY
 
+    wrote_progress = False
     for i, item in enumerate(iterable, 1):
         check_cancelled()
         now = _time.time()
@@ -333,7 +334,8 @@ def iter_with_bar(step: str, iterable, *, total: int | None = None,
             else:
                 spinner = "-\\|/"[int((now - t0) * 8) % 4]
                 msg = f"{step:<14} [{spinner}]  {i} done • {rate:.2f}/s • elapsed {_fmt_hms(now - t0)}"
-            _sys.stderr.write("\r" + msg)
+            _sys.stderr.write("\r\033[K" + msg)
+            wrote_progress = True
             _sys.stderr.flush()
         elif not tty and (i == 1 or now - last >= min_interval_s or (total and i == total)):
             last = now
@@ -354,9 +356,12 @@ def iter_with_bar(step: str, iterable, *, total: int | None = None,
             elapsed = _time.time() - t0
             rate = (total / elapsed) if elapsed > 0 else 0.0
             bar = _bar_str(1.0, width=bar_width, ascii_only=ascii_only)
-            _sys.stderr.write("\r" + f"{step:<14} {bar}  100%  {total}/{total} • {rate:.2f}/s • elapsed {_fmt_hms(elapsed)}" + "\n")
+            _sys.stderr.write("\r\033[K" + f"{step:<14} {bar}  100%  {total}/{total} • {rate:.2f}/s • elapsed {_fmt_hms(elapsed)}" + "\n")
         else:
-            _sys.stderr.write("\n")
+            if wrote_progress:
+                _sys.stderr.write("\r\033[K\n")
+            else:
+                _sys.stderr.write("\n")
         _sys.stderr.flush()
 # ------------------------------------------------------------------------------
 
