@@ -150,6 +150,8 @@ class LLMFirstConfig:
     probe_ce_search_topk_per_unit: int = 15
     probe_ce_rerank_m: int = 3        # aggregate top-3 CE
     probe_ce_unit_agg: str = "max"    # or "mean"
+    single_doc_context: str = "rag"
+    single_doc_full_context_max_chars: int = 12000
     
 
 @dataclass
@@ -496,6 +498,11 @@ class DataRepository:
         self.notes["patient_icn"] = self.notes["patient_icn"].astype(str)
         self.notes["doc_id"] = self.notes["doc_id"].astype(str)
         self.notes["text"] = self.notes["text"].astype(str).map(normalize_text)
+        original_unit_ids = None
+        if "unit_id" in self.notes.columns:
+            original_unit_ids = self.notes["unit_id"].astype(str)
+        self._notes_by_doc_cache: Optional[Dict[str, str]] = None
+        self._unit_doc_lookup: dict[str, str] = {}
 
         if "notetype" not in self.notes.columns:
             self.notes["notetype"] = ""
@@ -504,6 +511,11 @@ class DataRepository:
 
         if self.phenotype_level == "single_doc":
             unit_ids = self.notes["doc_id"]
+            if original_unit_ids is not None:
+                doc_ids = self.notes["doc_id"].astype(str)
+                for raw, doc in zip(original_unit_ids.tolist(), doc_ids.tolist()):
+                    if raw:
+                        self._unit_doc_lookup.setdefault(raw, doc)
         else:
             unit_ids = self.notes["patient_icn"]
         self.notes["unit_id"] = unit_ids.astype(str)
@@ -606,7 +618,28 @@ class DataRepository:
         return None
 
     def notes_by_doc(self) -> Dict[str,str]:
-        return dict(zip(self.notes["doc_id"].tolist(), self.notes["text"].tolist()))
+        if self._notes_by_doc_cache is None:
+            self._notes_by_doc_cache = dict(zip(self.notes["doc_id"].tolist(), self.notes["text"].tolist()))
+        return self._notes_by_doc_cache
+
+    def doc_id_for_unit(self, unit_id: str) -> Optional[str]:
+        if self.phenotype_level != "single_doc":
+            return None
+        unit_str = str(unit_id)
+        if not unit_str:
+            return None
+        notes = self.notes_by_doc()
+        if unit_str in notes:
+            return unit_str
+        doc = self._unit_doc_lookup.get(unit_str)
+        if doc:
+            return doc
+        matches = self.ann[self.ann["unit_id"] == unit_str]
+        if not matches.empty:
+            docs = matches["doc_id"].dropna().astype(str)
+            if not docs.empty:
+                return docs.iloc[0]
+        return None
 
     def label_types(self) -> Dict[str, str]:
         """
@@ -1212,6 +1245,84 @@ class EmbeddingStore:
         return [i for i,m in enumerate(self.chunk_meta) if m.get("unit_id")==uid]
 
 
+_FULL_DOC_CONTEXT_FALLBACK_CHARS = 12000
+
+
+def _contexts_for_unit_label(
+    retriever: "RAGRetriever",
+    repo: DataRepository,
+    unit_id: str,
+    label_id: str,
+    label_rules: str,
+    *,
+    topk_override: int | None = None,
+    min_k_override: int | None = None,
+    mmr_lambda_override: float | None = None,
+    single_doc_context_mode: str = "rag",
+    full_doc_char_limit: int | None = None,
+) -> list[dict]:
+    mode_raw = single_doc_context_mode if isinstance(single_doc_context_mode, str) else "rag"
+    mode = mode_raw.strip().lower() if isinstance(mode_raw, str) else "rag"
+    resolved_unit_id = str(unit_id)
+    if getattr(repo, "phenotype_level", "").strip().lower() == "single_doc":
+        resolver = getattr(repo, "doc_id_for_unit", None)
+        if callable(resolver):
+            resolved = resolver(unit_id)
+            if resolved:
+                resolved_unit_id = str(resolved)
+    if repo.phenotype_level == "single_doc" and mode == "full":
+        doc_id = resolved_unit_id
+        text = repo.notes_by_doc().get(doc_id)
+        if not isinstance(text, str) or not text:
+            return []
+
+        limit = None
+        if full_doc_char_limit is not None:
+            try:
+                limit = int(full_doc_char_limit)
+            except (TypeError, ValueError):
+                limit = None
+        if limit is None or limit <= 0:
+            limit = _FULL_DOC_CONTEXT_FALLBACK_CHARS
+
+        snippet_text = text[:limit]
+
+        metadata: Dict[str, object] = {}
+        try:
+            idxs = retriever.store.get_patient_chunk_indices(doc_id)
+        except Exception:
+            idxs = []
+        if idxs:
+            try:
+                chunk_meta = retriever.store.chunk_meta[idxs[0]]
+                metadata = retriever._extract_meta(chunk_meta) or {}
+            except Exception:
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.setdefault("other_meta", "")
+
+        return [
+            {
+                "doc_id": doc_id,
+                "chunk_id": "__full__",
+                "text": snippet_text,
+                "score": 1.0,
+                "source": "full_doc",
+                "metadata": metadata,
+            }
+        ]
+
+    return retriever.retrieve_for_patient_label(
+        resolved_unit_id,
+        label_id,
+        label_rules,
+        topk_override=topk_override,
+        min_k_override=min_k_override,
+        mmr_lambda_override=mmr_lambda_override,
+    )
+
+
 class DisagreementExpander:
     def __init__(
         self,
@@ -1219,12 +1330,14 @@ class DisagreementExpander:
         repo: DataRepository,
         retriever: RAGRetriever,
         label_config_bundle: LabelConfigBundle | None = None,
+        llmfirst_cfg: LLMFirstConfig | None = None,
     ):
         self.cfg = cfg
         self.repo = repo
         self.retriever = retriever
         self.label_config_bundle = label_config_bundle or EMPTY_BUNDLE
         self._dependency_cache: Dict[str, tuple[dict, dict, list]] = {}
+        self.llmfirst_cfg = llmfirst_cfg
 
     def _dependencies_for(self, labelset_id: Optional[str]) -> tuple[dict, dict, list]:
         key = str(labelset_id or "__current__")
@@ -1298,7 +1411,16 @@ class DisagreementExpander:
         spans = self.repo.get_prior_rationales(unit_id, label_id)
         snips = [sp.get("snippet") for sp in spans if isinstance(sp,dict) and sp.get("snippet")]
         if snips: return snips[: self.cfg.snippets_per_seed]
-        ctx = self.retriever.retrieve_for_patient_label(unit_id, label_id, label_rules, topk_override=self.cfg.snippets_per_seed)
+        ctx = _contexts_for_unit_label(
+            self.retriever,
+            self.repo,
+            unit_id,
+            label_id,
+            label_rules,
+            topk_override=self.cfg.snippets_per_seed,
+            single_doc_context_mode=getattr(self.llmfirst_cfg, "single_doc_context", "rag"),
+            full_doc_char_limit=getattr(self.llmfirst_cfg, "single_doc_full_context_max_chars", None),
+        )
         return [c["text"] for c in ctx if isinstance(c.get("text"), str)]
 
     def expand(self, rules_map: Dict[str,str], seen_pairs: set) -> pd.DataFrame:
@@ -2060,7 +2182,7 @@ class LLMAnnotator:
 class LabelAwarePooler:
     BETA_DEFAULT = 5.0
 
-    def __init__(self, repo: DataRepository, store: EmbeddingStore, models: Models, beta: float = None, kmeans_k: int = 8, persist_dir: str = None, version: str = "v1", use_negative: bool = False):
+    def __init__(self, repo: DataRepository, store: EmbeddingStore, models: Models, beta: float = None, kmeans_k: int = 8, persist_dir: str = None, version: str = "v1", use_negative: bool = False, llmfirst_cfg: LLMFirstConfig | None = None):
         self.repo = repo; self.store = store; self.models = models
         self.beta = float(beta) if beta is not None else self.BETA_DEFAULT
         self.kmeans_k = int(kmeans_k)
@@ -2071,6 +2193,7 @@ class LabelAwarePooler:
         if self.persist_dir:
             os.makedirs(self.persist_dir, exist_ok=True)
         self._cache_vec: Dict[Tuple[str,str], np.ndarray] = {}
+        self.llmfirst_cfg = llmfirst_cfg
 
     def _save_bank(self, label: str, arr: np.ndarray):
         if not self.persist_dir: return
@@ -2192,7 +2315,16 @@ class LabelAwarePooler:
     def pooled_vector(self, unit_id: str, label_id: str, retriever: RAGRetriever, label_rules: str, topk: int=6) -> np.ndarray:
         key = (unit_id, label_id)
         if key in self._cache_vec: return self._cache_vec[key]
-        ctx = retriever.retrieve_for_patient_label(unit_id, label_id, label_rules, topk_override=topk)
+        ctx = _contexts_for_unit_label(
+            retriever,
+            self.repo,
+            unit_id,
+            label_id,
+            label_rules,
+            topk_override=topk,
+            single_doc_context_mode=getattr(self.llmfirst_cfg, "single_doc_context", "rag"),
+            full_doc_char_limit=getattr(self.llmfirst_cfg, "single_doc_full_context_max_chars", None),
+        )
         if not ctx:
             idxs = retriever.store.get_patient_chunk_indices(unit_id)
             if not idxs:
@@ -2722,7 +2854,16 @@ class FamilyLabeler:
         letters = [chr(ord('A') + i) for i in range(len(options))]
         option_lines = [f"{letters[i]}. {options[i]}" for i in range(len(options))]
         system = "You are a careful clinical information extraction assistant."
-        snippets = self.retriever.retrieve_for_patient_label(unit_id, label_id, label_rules, topk_override=self.cfg.topk)
+        snippets = _contexts_for_unit_label(
+            self.retriever,
+            self.repo,
+            unit_id,
+            label_id,
+            label_rules,
+            topk_override=self.cfg.topk,
+            single_doc_context_mode=getattr(self.cfg, "single_doc_context", "rag"),
+            full_doc_char_limit=getattr(self.cfg, "single_doc_full_context_max_chars", None),
+        )
         ctx_lines = []
         for snip in snippets:
             md = snip.get("metadata") or {}
@@ -2832,7 +2973,16 @@ class FamilyLabeler:
                 # record gated-out for transparency but do not include in probe_df to avoid selection noise
                 continue
             # Build a small context
-            ctx = self.retriever.retrieve_for_patient_label(unit_id, lid, rules, topk_override=self.cfg.topk)
+            ctx = _contexts_for_unit_label(
+                self.retriever,
+                self.repo,
+                unit_id,
+                lid,
+                rules,
+                topk_override=self.cfg.topk,
+                single_doc_context_mode=getattr(self.cfg, "single_doc_context", "rag"),
+                full_doc_char_limit=getattr(self.cfg, "single_doc_full_context_max_chars", None),
+            )
             # Decide FC vs JSON
             opts = _options_for_label(lid, ltype, getattr(self.retriever, 'label_configs', {}))
             used_fc = False
@@ -2935,13 +3085,22 @@ class FamilyLabeler:
             
             for uid in iter_with_bar(
                     step = "Enriching probe pool",
-                    iterable = cand_units, 
-                    total = len(cand_units), 
+                    iterable = cand_units,
+                    total = len(cand_units),
                     logger=LOGGER,
                     min_interval_s=_progress_every):
                 if uid in ex:             # redundant but explicit
                     continue
-                ctx = self.retriever.retrieve_for_patient_label(uid, p, rule, topk_override=int(getattr(self.cfg, "probe_ce_search_topk_per_unit", 24) or 24))
+                ctx = _contexts_for_unit_label(
+                    self.retriever,
+                    self.repo,
+                    uid,
+                    p,
+                    rule,
+                    topk_override=int(getattr(self.cfg, "probe_ce_search_topk_per_unit", 24) or 24),
+                    single_doc_context_mode=getattr(self.cfg, "single_doc_context", "rag"),
+                    full_doc_char_limit=getattr(self.cfg, "single_doc_full_context_max_chars", None),
+                )
                 if not ctx:
                     continue
                 unit_chunks.append((uid, ctx))
@@ -3562,7 +3721,17 @@ class ActiveLearningLLMFirst:
             repo=self.repo,
         )
         self.llm = LLMAnnotator(self.cfg.llm, self.cfg.scjitter, cache_dir=self.paths.cache_dir)
-        self.pooler = LabelAwarePooler(self.repo, self.store, self.models, beta=float(os.getenv('POOLER_BETA', 5.0)), kmeans_k=int(os.getenv('POOLER_K', 8)), persist_dir=os.path.join(self.paths.cache_dir, 'prototypes'), version='v1', use_negative=bool(int(os.getenv('POOLER_USE_NEG', '0'))))
+        self.pooler = LabelAwarePooler(
+            self.repo,
+            self.store,
+            self.models,
+            beta=float(os.getenv('POOLER_BETA', 5.0)),
+            kmeans_k=int(os.getenv('POOLER_K', 8)),
+            persist_dir=os.path.join(self.paths.cache_dir, 'prototypes'),
+            version='v1',
+            use_negative=bool(int(os.getenv('POOLER_USE_NEG', '0'))),
+            llmfirst_cfg=self.cfg.llmfirst,
+        )
     def config_for_labelset(self, labelset_id: Optional[str]) -> Dict[str, object]:
         return self.label_config_bundle.config_for_labelset(labelset_id)
 
@@ -3760,6 +3929,7 @@ class ActiveLearningLLMFirst:
             self.repo,
             self.rag,
             label_config_bundle=self.label_config_bundle,
+            llmfirst_cfg=self.cfg.llmfirst,
         )
         expanded = expander.expand(rules_map, seen_pairs)
         if expanded is None or expanded.empty:
