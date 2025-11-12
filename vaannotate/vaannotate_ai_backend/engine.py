@@ -306,7 +306,7 @@ def _bar_str(fraction: float, width: int = 32, ascii_only: bool = False) -> str:
 
 def iter_with_bar(step: str, iterable, *, total: int | None = None,
                   bar_width: int = 32, min_interval_s: float = 0.5,
-                  ascii_only: bool | None = None, logger=LOGGER):
+                  ascii_only: bool | None = None):
     """
     Wrap an iterable and render a live progress bar if stderr is a TTY.
     Falls back to periodic log lines otherwise.
@@ -351,11 +351,11 @@ def iter_with_bar(step: str, iterable, *, total: int | None = None,
             rate = (i / elapsed) if elapsed > 0 else 0.0
             if total:
                 eta = ((total - i) / rate) if rate > 0 else float("inf")
-                logger.info(f"[{step}] {i}/{total} • {rate:.2f}/s • ETA {_fmt_hms(eta)}",
-                            extra={"step": step, "done": i, "total": total, "rate_per_s": rate, "eta_s": eta})
+                msg = f"[{step}] {i}/{total} • {rate:.2f}/s • ETA {_fmt_hms(eta)}"
             else:
-                logger.info(f"[{step}] {i} done • {rate:.2f}/s • elapsed {_fmt_hms(elapsed)}",
-                            extra={"step": step, "done": i, "total": None, "rate_per_s": rate, "elapsed_s": elapsed})
+                msg = f"[{step}] {i} done • {rate:.2f}/s • elapsed {_fmt_hms(elapsed)}"
+            _sys.stderr.write(msg + "\n")
+            _sys.stderr.flush()
         yield item
 
     # finish line
@@ -1046,7 +1046,6 @@ class EmbeddingStore:
             for i in iter_with_bar("Embedding chunks",
                                    range(0, len(texts), bs),
                                    total=(len(texts)+bs-1)//bs,
-                                   logger=LOGGER,
                                    min_interval_s=1.0):
                 batch = texts[i:i+bs]
                 embs  = self.models.embedder.encode(
@@ -1099,7 +1098,6 @@ class EmbeddingStore:
                     step="Chunking docs",
                     iterable=notes_df.itertuples(index=False),
                     total=total_docs,
-                    logger=LOGGER,
                     min_interval_s=float(getattr(getattr(self, "models", None), "progress_min_interval_s", 0.6) or 0.6)):
                 # Chunk the text
                 chunks = splitter.split_text(getattr(row, "text"))
@@ -3068,7 +3066,6 @@ class FamilyLabeler:
                     step = "Enriching probe pool",
                     iterable = cand_units,
                     total = len(cand_units),
-                    logger=LOGGER,
                     min_interval_s=_progress_every):
                 if uid in ex:             # redundant but explicit
                     continue
@@ -3180,7 +3177,6 @@ class FamilyLabeler:
                 step="LLM probe",
                 iterable=sample,
                 total=len(sample),
-                logger=LOGGER,
                 min_interval_s=_progress_every):
             rows.extend(self.label_family_for_unit(uid, label_types, per_label_rules))
 
@@ -3437,7 +3433,6 @@ def build_diversity_bucket(
             step="Diversity: pooling vectors",
             iterable=rem_df.itertuples(index=False),
             total=len(rem_df),
-            logger=LOGGER,
             min_interval_s=_progress_every):
         v = pooler.pooled_vector(r.unit_id, r.label_id, retriever, rules_map.get(r.label_id, ""))
         vecs.append(v)
@@ -4420,7 +4415,6 @@ class ActiveLearningLLMFirst:
                     step="Final family labeling",
                     iterable=unit_ids,
                     total=len(unit_ids),
-                    logger=LOGGER,
                     min_interval_s=_progress_every):
                 fam_rows.extend(
                     fam.label_family_for_unit(uid, types, rules_map,

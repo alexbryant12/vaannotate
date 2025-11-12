@@ -4,6 +4,36 @@ from pathlib import Path
 from typing import List
 
 import sys
+import types
+
+
+def _install_placeholder_module(name: str, *, classes: List[str] | None = None) -> None:
+    if name in sys.modules:
+        return
+
+    module = types.ModuleType(name)
+    module.__path__ = []  # type: ignore[attr-defined]
+
+    def _missing(attr: str | None = None, *_args, **_kwargs):
+        target = f"{name}.{attr}" if attr else name
+        raise ModuleNotFoundError(f"{target} is required to run this module.")
+
+    module.__getattr__ = lambda attr: _missing(attr)  # type: ignore[attr-defined]
+    if classes:
+        for cls in classes:
+            module.__dict__[cls] = type(
+                cls,
+                (),
+                {"__init__": lambda self, *a, _missing=_missing, _cls=cls, **k: _missing(_cls)},
+            )
+    sys.modules[name] = module
+
+
+_install_placeholder_module("numpy")
+_install_placeholder_module("pandas")
+_install_placeholder_module("sentence_transformers", classes=["SentenceTransformer", "CrossEncoder"])
+_install_placeholder_module("langchain_text_splitters", classes=["RecursiveCharacterTextSplitter"])
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -67,6 +97,21 @@ class FakeTTY:
         return True
 
 
+class FakeNonTTY:
+    def __init__(self) -> None:
+        self.writes: List[str] = []
+
+    def write(self, data: str) -> int:
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
 def split_stream_chunks(data: str) -> List[str]:
     chunks: List[str] = []
     buffer = ""
@@ -96,7 +141,6 @@ def test_iter_with_bar_tty_emits_without_escape_sequences(monkeypatch):
             total=3,
             min_interval_s=0.0,
             ascii_only=True,
-            logger=engine.LOGGER,
         )
     )
 
@@ -123,7 +167,6 @@ def test_iter_with_bar_progress_keeps_logs(monkeypatch):
             total=3,
             min_interval_s=0.0,
             ascii_only=True,
-            logger=engine.LOGGER,
         )
     )
 
@@ -134,3 +177,23 @@ def test_iter_with_bar_progress_keeps_logs(monkeypatch):
     assert collector.lines[1] == "Log before 2"
     assert "Embedding" in collector.lines[2]
     assert collector.lines[3] == "Log after"
+
+
+def test_iter_with_bar_non_tty_prints_lines(monkeypatch):
+    fake = FakeNonTTY()
+    monkeypatch.setattr(engine._sys, "stderr", fake)
+
+    list(
+        engine.iter_with_bar(
+            "Batch",
+            range(4),
+            total=4,
+            min_interval_s=0.0,
+            ascii_only=True,
+        )
+    )
+
+    lines = [line.strip() for line in "".join(fake.writes).splitlines() if line.strip()]
+    assert len(lines) >= 4
+    assert lines[0].startswith("[Batch]")
+    assert "4/4" in lines[-1]
