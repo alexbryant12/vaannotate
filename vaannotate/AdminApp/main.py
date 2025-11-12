@@ -2335,7 +2335,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             edit.setText(directory)
 
     def _setup_ui(self) -> None:
-        self.ai_single_doc_context_combo: Optional[QtWidgets.QComboBox] = None
         layout = QtWidgets.QVBoxLayout(self)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -2620,14 +2619,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_final_llm_checkbox = QtWidgets.QCheckBox("Run final LLM labeling")
         self.ai_final_llm_checkbox.setChecked(True)
         ai_config_layout.addRow("Final LLM labeling", self.ai_final_llm_checkbox)
-        if str(self.pheno_row["level"] or "single_doc") == "single_doc":
-            self.ai_single_doc_context_combo = QtWidgets.QComboBox()
-            self.ai_single_doc_context_combo.addItem("RAG snippets", "rag")
-            self.ai_single_doc_context_combo.addItem("Full document", "full")
-            self.ai_single_doc_context_combo.setToolTip(
-                "Choose how the LLM context is built for single-document phenotypes."
-            )
-            ai_config_layout.addRow("Single-doc context", self.ai_single_doc_context_combo)
         pct_hint = QtWidgets.QLabel("Fractions should sum to ≤ 1.0; remaining slots are auto-filled.")
         pct_hint.setWordWrap(True)
         ai_config_layout.addRow(pct_hint)
@@ -3089,20 +3080,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             azure_endpoint = self.ai_azure_endpoint_edit.text().strip()
             if azure_endpoint:
                 backend_cfg["azure_endpoint"] = azure_endpoint
-        if (
-            pheno_level == "single_doc"
-            and isinstance(self.ai_single_doc_context_combo, QtWidgets.QComboBox)
-        ):
-            mode_value = self.ai_single_doc_context_combo.currentData()
-            if not isinstance(mode_value, str) or not mode_value:
-                mode_value = "rag"
-            existing_llmfirst = backend_cfg.get("llmfirst")
-            if isinstance(existing_llmfirst, dict):
-                llmfirst_cfg = existing_llmfirst
-            else:
-                llmfirst_cfg = {}
-                backend_cfg["llmfirst"] = llmfirst_cfg
-            llmfirst_cfg["single_doc_context"] = mode_value
 
         return RoundCreationContext(
             pheno_id=pheno_id,
@@ -3380,17 +3357,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             overrides["select"] = select
         if hasattr(self, "ai_final_llm_checkbox"):
             overrides["final_llm_labeling"] = bool(self.ai_final_llm_checkbox.isChecked())
-        llmfirst_overrides: Dict[str, Any] = {}
-        if (
-            str(self.pheno_row["level"] or "single_doc") == "single_doc"
-            and isinstance(self.ai_single_doc_context_combo, QtWidgets.QComboBox)
-        ):
-            mode_value = self.ai_single_doc_context_combo.currentData()
-            if not isinstance(mode_value, str) or not mode_value:
-                mode_value = "rag"
-            llmfirst_overrides["single_doc_context"] = mode_value
-        if llmfirst_overrides:
-            overrides["llmfirst"] = llmfirst_overrides
         return overrides
 
     def _on_ai_thread_finished(self) -> None:

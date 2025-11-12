@@ -461,7 +461,6 @@ class RoundBuilder:
                 FamilyLabeler,
                 OrchestratorConfig,
                 Paths,
-                _contexts_for_unit_label,
             )
         except ImportError as exc:  # pragma: no cover - runtime guard
             raise RuntimeError("AI backend components are required for assisted chart review") from exc
@@ -502,22 +501,6 @@ class RoundBuilder:
         paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
 
         ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
-        llmfirst_overrides = (
-            ai_backend_config.get("llmfirst")
-            if isinstance(ai_backend_config.get("llmfirst"), Mapping)
-            else {}
-        )
-        mode_override = llmfirst_overrides.get("single_doc_context")
-        if mode_override:
-            setattr(cfg.llmfirst, "single_doc_context", str(mode_override))
-        limit_override = llmfirst_overrides.get("single_doc_full_context_max_chars")
-        if limit_override is not None:
-            try:
-                limit_value = int(limit_override)
-            except (TypeError, ValueError):
-                limit_value = None
-            if limit_value and limit_value > 0:
-                setattr(cfg.llmfirst, "single_doc_full_context_max_chars", limit_value)
         env_overrides: Dict[str, str] = {}
         embed_path = self._resolve_optional_path(ai_backend_config.get("embedding_model_dir"), config_base)
         if embed_path:
@@ -568,15 +551,11 @@ class RoundBuilder:
                 unit_map: Dict[str, list[dict[str, Any]]] = {}
                 for label_id in sorted(current_label_types.keys()):
                     rules_text = current_rules_map.get(label_id, "")
-                    contexts = _contexts_for_unit_label(
-                        orchestrator.rag,
-                        orchestrator.repo,
+                    contexts = orchestrator.rag.retrieve_for_patient_label(
                         unit_id,
                         label_id,
                         rules_text,
                         topk_override=top_n,
-                        single_doc_context_mode=getattr(orchestrator.cfg.llmfirst, "single_doc_context", "rag"),
-                        full_doc_char_limit=getattr(orchestrator.cfg.llmfirst, "single_doc_full_context_max_chars", None),
                     )
                     if not contexts:
                         continue
@@ -841,24 +820,6 @@ class RoundBuilder:
         cfg.final_llm_labeling = True
         cfg.final_llm_labeling_n_consistency = max(1, consistency)
         setattr(cfg.llmfirst, "final_llm_label_consistency", cfg.final_llm_labeling_n_consistency)
-
-        ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
-        llmfirst_overrides = (
-            ai_backend_config.get("llmfirst")
-            if isinstance(ai_backend_config.get("llmfirst"), Mapping)
-            else {}
-        )
-        mode_override = llmfirst_overrides.get("single_doc_context")
-        if mode_override:
-            setattr(cfg.llmfirst, "single_doc_context", str(mode_override))
-        limit_override = llmfirst_overrides.get("single_doc_full_context_max_chars")
-        if limit_override is not None:
-            try:
-                limit_value = int(limit_override)
-            except (TypeError, ValueError):
-                limit_value = None
-            if limit_value and limit_value > 0:
-                setattr(cfg.llmfirst, "single_doc_full_context_max_chars", limit_value)
 
         phenotype_level = str(pheno_row["level"] or "multi_doc")
         label_config_payload = build_label_config(labelset)
