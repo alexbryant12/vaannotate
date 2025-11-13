@@ -1357,8 +1357,12 @@ class AnnotationForm(QtWidgets.QScrollArea):
         self.current_annotations = annotations
         self.current_rationales = rationales
         with self._suspend_widget_signals():
+            for widgets in self.label_widgets.values():
+                self._reset_widgets(widgets)
             for label_id, widgets in self.label_widgets.items():
-                self._apply_annotation(label_id, widgets, annotations.get(label_id, {}))
+                annotation = annotations.get(label_id)
+                if annotation:
+                    self._apply_annotation(label_id, widgets, annotation)
                 self._refresh_highlights(label_id)
         self._update_gating()
         self._update_completion()
