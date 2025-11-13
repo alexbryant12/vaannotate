@@ -10,6 +10,7 @@ import sys
 import types
 from datetime import datetime
 from pathlib import Path
+from typing import Dict
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -17,6 +18,154 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
+if "PySide6" not in sys.modules:
+    qt_module = types.ModuleType("PySide6")
+    qtcore = types.ModuleType("PySide6.QtCore")
+    qtgui = types.ModuleType("PySide6.QtGui")
+    qtwidgets = types.ModuleType("PySide6.QtWidgets")
+
+    class _StubSignal:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def connect(self, *args, **kwargs) -> None:
+            pass
+
+        def emit(self, *args, **kwargs) -> None:
+            pass
+
+    class _StubQObject:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    qtcore.Signal = lambda *args, **kwargs: _StubSignal()
+    qtcore.Slot = lambda *args, **kwargs: (lambda func: func)
+    qtcore.QObject = _StubQObject
+    qtcore.QThread = _StubQObject
+    qtcore.QTimer = _StubQObject
+    qtcore.QEventLoop = type(
+        "QEventLoop",
+        (),
+        {"processEvents": staticmethod(lambda *args, **kwargs: None)},
+    )
+
+    qtcore.QDateTime = type(
+        "QDateTime",
+        (),
+        {
+            "currentDateTimeUtc": staticmethod(
+                lambda: types.SimpleNamespace(toString=lambda *args, **kwargs: "")
+            )
+        },
+    )
+
+    qtcore.Qt = types.SimpleNamespace(
+        AlignmentFlag=type(
+            "AlignmentFlag",
+            (),
+            {
+                "AlignLeft": 0,
+                "AlignRight": 0,
+                "AlignHCenter": 0,
+                "AlignVCenter": 0,
+            },
+        ),
+        Orientation=types.SimpleNamespace(Horizontal=0, Vertical=1),
+        SortOrder=type(
+            "SortOrder", (), {"AscendingOrder": 0, "DescendingOrder": 1}
+        ),
+        ItemDataRole=types.SimpleNamespace(UserRole=0, DisplayRole=0),
+        ItemFlag=types.SimpleNamespace(
+            NoItemFlags=0,
+            ItemIsEnabled=0,
+            ItemIsSelectable=0,
+        ),
+        MatchFlag=type("MatchFlag", (), {"MatchExactly": 0}),
+    )
+
+    class _StubWidget(_StubQObject):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+
+    def _stub_class(name: str) -> type:
+        return type(name, (_StubWidget,), {})
+
+    for cls_name in [
+        "QDialog",
+        "QWidget",
+        "QTreeWidget",
+        "QTreeWidgetItem",
+        "QComboBox",
+        "QLineEdit",
+        "QLabel",
+        "QCheckBox",
+        "QPushButton",
+        "QSpinBox",
+        "QDoubleSpinBox",
+        "QPlainTextEdit",
+        "QDialogButtonBox",
+        "QGroupBox",
+        "QFormLayout",
+        "QHBoxLayout",
+        "QVBoxLayout",
+        "QGridLayout",
+        "QListWidget",
+        "QListWidgetItem",
+        "QStackedWidget",
+        "QProgressBar",
+        "QAction",
+        "QMenu",
+        "QMenuBar",
+        "QToolBar",
+        "QStatusBar",
+        "QMainWindow",
+        "QTabWidget",
+        "QRadioButton",
+        "QTableWidget",
+        "QTableWidgetItem",
+        "QHeaderView",
+    ]:
+        setattr(qtwidgets, cls_name, _stub_class(cls_name))
+
+    qtwidgets.QApplication = type(
+        "QApplication",
+        (),
+        {
+            "__init__": lambda self, *args, **kwargs: None,
+            "exec": lambda self: 0,
+            "instance": staticmethod(lambda: None),
+            "quit": staticmethod(lambda: None),
+        },
+    )
+
+    qtwidgets.QFileDialog = type(
+        "QFileDialog",
+        (),
+        {"getExistingDirectory": staticmethod(lambda *args, **kwargs: "")},
+    )
+
+    qtwidgets.QMessageBox = type(
+        "QMessageBox",
+        (),
+        {
+            "information": staticmethod(lambda *args, **kwargs: None),
+            "warning": staticmethod(lambda *args, **kwargs: None),
+            "critical": staticmethod(lambda *args, **kwargs: None),
+        },
+    )
+
+    qtgui.QCloseEvent = _StubWidget
+
+    qt_module.QtCore = qtcore
+    qt_module.QtGui = qtgui
+    qt_module.QtWidgets = qtwidgets
+
+    sys.modules["PySide6"] = qt_module
+    sys.modules["PySide6.QtCore"] = qtcore
+    sys.modules["PySide6.QtGui"] = qtgui
+    sys.modules["PySide6.QtWidgets"] = qtwidgets
+
+import vaannotate.AdminApp.main as admin_main
 from vaannotate.project import (
     add_labelset,
     add_phenotype,
@@ -30,6 +179,7 @@ from vaannotate.rounds import AssignmentUnit, CandidateUnit, RoundBuilder
 from vaannotate.schema import initialize_corpus_db
 from vaannotate.shared.database import Database
 from vaannotate.shared.sampling import (
+    ReviewerAssignment,
     SamplingFilters,
     allocate_units,
     candidate_documents,
@@ -321,6 +471,145 @@ def test_assisted_snippets_path_is_relative(
 
     result_payload = result.get("assisted_review", {})
     assert result_payload.get("snippets_json") == "reports/assisted_review/snippets.json"
+
+
+def test_build_round_assignment_units_normalizes_payload() -> None:
+    assignments = {
+        "rev_one": ReviewerAssignment(
+            reviewer_id="rev_one",
+            units=[
+                {
+                    "unit_id": "doc_0",
+                    "patient_icn": "p0",
+                    "doc_id": "doc_0",
+                },
+                {
+                    "doc_id": "doc_1",
+                    "patient_icn": "p1",
+                    "strata": "custom",
+                },
+            ],
+        )
+    }
+
+    reviewer_units = admin_main.build_round_assignment_units(assignments)
+
+    assert set(reviewer_units.keys()) == {"rev_one"}
+    units = reviewer_units["rev_one"]
+    assert [unit.unit_id for unit in units] == ["doc_0", "doc_1"]
+    assert units[0].patient_icn == "p0"
+    assert units[0].doc_id == "doc_0"
+    assert units[0].payload.get("strata_key") == "random_sampling"
+    assert units[1].payload.get("strata_key") == "custom"
+
+
+def test_random_assisted_review_generates_snippets(monkeypatch: pytest.MonkeyPatch, seeded_project: tuple[RoundBuilder, Path]) -> None:
+    _, project_root = seeded_project
+
+    class DummyContext:
+        def __init__(self, root: Path) -> None:
+            self.project_root = root
+            self.project_db = Database(root / "project.db")
+            self.registered: Dict[Path, str] = {}
+
+        def require_db(self) -> Database:
+            return self.project_db
+
+        def register_text_file(self, path: Path, content: str) -> None:
+            self.registered[path] = content
+
+    ctx = DummyContext(project_root)
+
+    with ctx.project_db.connect() as conn:
+        conn.row_factory = sqlite3.Row
+        pheno_row = conn.execute(
+            "SELECT * FROM phenotypes WHERE pheno_id=?",
+            ("ph_test",),
+        ).fetchone()
+
+    assignments = {
+        "rev_one": ReviewerAssignment(
+            reviewer_id="rev_one",
+            units=[
+                {
+                    "unit_id": "doc_0",
+                    "patient_icn": "p0",
+                    "doc_id": "doc_0",
+                    "documents": [{"doc_id": "doc_0", "text": "Example"}],
+                }
+            ],
+        )
+    }
+
+    config_payload: Dict[str, object] = {
+        "pheno_id": "ph_test",
+        "labelset_id": "ls_test",
+        "round_id": "round_random",
+        "assisted_review": {"enabled": True, "top_snippets": 1},
+    }
+
+    round_dir = project_root / "phenotypes" / "ph_test" / "rounds" / "round_random"
+    round_dir.mkdir(parents=True, exist_ok=True)
+
+    captured: Dict[str, object] = {}
+
+    class DummyRoundBuilder:
+        def __init__(self, project_root: Path) -> None:
+            captured["project_root"] = project_root
+
+        def _generate_assisted_review_snippets(self, **kwargs: object) -> Dict[str, object]:
+            captured["env_key"] = os.getenv("AZURE_OPENAI_API_KEY")
+            captured["top_n"] = kwargs.get("top_n")
+            captured["config"] = kwargs.get("config")
+            return {
+                "generated_at": "2024-07-01T00:00:00Z",
+                "top_snippets": kwargs.get("top_n", 0),
+                "unit_snippets": {
+                    "doc_0": {
+                        "Flag": [
+                            {
+                                "text": "Example",
+                                "score": 0.5,
+                            }
+                        ]
+                    }
+                },
+            }
+
+        def _json_dumps(self, payload: object) -> str:
+            return json.dumps(payload, sort_keys=True)
+
+    monkeypatch.setattr(admin_main, "RoundBuilder", DummyRoundBuilder)
+
+    dummy_dialog = types.SimpleNamespace(
+        ctx=ctx,
+        pheno_row=pheno_row,
+        random_azure_key_edit=types.SimpleNamespace(text=lambda: "test-azure-key"),
+    )
+
+    result = admin_main.RoundBuilderDialog._generate_random_assisted_review(
+        dummy_dialog,
+        config_payload=config_payload,
+        assignments=assignments,
+        round_dir=round_dir,
+        top_snippets=2,
+    )
+
+    assert captured.get("project_root") == project_root
+    assert captured.get("env_key") == "test-azure-key"
+    assert captured.get("top_n") == 2
+    assert os.getenv("AZURE_OPENAI_API_KEY") is None
+
+    assist_cfg = config_payload.get("assisted_review", {})
+    assert assist_cfg.get("snippets_json") == "reports/assisted_review/snippets.json"
+    assert assist_cfg.get("generated_at") == "2024-07-01T00:00:00Z"
+
+    expected_path = round_dir / "reports" / "assisted_review" / "snippets.json"
+    assert expected_path in ctx.registered
+    stored_payload = json.loads(ctx.registered[expected_path])
+    assert stored_payload.get("unit_snippets")
+
+    assert result == {"snippets_json": "reports/assisted_review/snippets.json"}
 def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
     project_root = tmp_path / "Project"
     paths = init_project(project_root, "proj", "Project", "tester")
@@ -1166,4 +1455,83 @@ def test_run_final_llm_labeling_applies_env_overrides(
     assert captured["api_version"] == "2024-05-01"
     assert os.getenv("AZURE_OPENAI_API_KEY") is None
     assert os.getenv("AZURE_OPENAI_API_VERSION") is None
+
+
+def test_generate_round_auto_submits_llm_reviewer(
+    seeded_project: tuple[RoundBuilder, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder, project_root = seeded_project
+    labels_payload = [
+        {"unit_id": "doc_0", "Flag_llm": "yes", "Score_llm": 1.0},
+        {"unit_id": "doc_1", "Flag_llm": "no", "Score_llm": 2.5},
+        {"unit_id": "doc_2", "Flag_llm": "yes", "Score_llm": None},
+    ]
+
+    def _fake_apply(self, **_kwargs):  # type: ignore[no-untyped-def]
+        round_dir = _kwargs["round_dir"]
+        exports_dir = round_dir / "reports" / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        labels_json = exports_dir / "final_llm_labels.json"
+        labels_json.write_text(json.dumps(labels_payload), encoding="utf-8")
+        return {"final_llm_labels_json": str(labels_json)}
+
+    monkeypatch.setattr(RoundBuilder, "_apply_final_llm_labeling", _fake_apply)
+
+    config = {
+        "round_number": 3,
+        "round_id": "ph_test_r3",
+        "labelset_id": "ls_test",
+        "corpus_id": "cor_ph_test",
+        "reviewers": [
+            {"id": RoundBuilder.LLM_REVIEWER_ID, "name": "LLM"},
+        ],
+        "rng_seed": 5,
+        "total_n": 2,
+        "final_llm_labeling": True,
+    }
+    config_path = tmp_path / "ph_test_r3.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    result = builder.generate_round("ph_test", config_path, created_by="tester")
+
+    round_dir = Path(result["round_dir"])
+    assignment_dir = round_dir / "assignments" / RoundBuilder.LLM_REVIEWER_ID
+    receipt = json.loads((assignment_dir / "submitted.json").read_text("utf-8"))
+    assert receipt["unit_count"] == receipt["completed"]
+    assert receipt["unit_count"] > 0
+
+    with sqlite3.connect(assignment_dir / "assignment.db") as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT unit_id, label_id, value, value_num, na FROM annotations"
+        ).fetchall()
+
+    assert rows
+    observed = {(row["unit_id"], row["label_id"]): row for row in rows}
+    expected_flags = {entry["unit_id"]: entry["Flag_llm"] for entry in labels_payload}
+    expected_scores = {entry["unit_id"]: entry["Score_llm"] for entry in labels_payload}
+
+    for unit_id, expected_flag in expected_flags.items():
+        key = (unit_id, "Flag")
+        if key not in observed:
+            continue
+        assert observed[key]["value"] == expected_flag
+        score_key = (unit_id, "Score")
+        if score_key not in observed:
+            continue
+        expected_score = expected_scores[unit_id]
+        if expected_score is None:
+            assert observed[score_key]["na"] == 1
+        else:
+            assert observed[score_key]["value_num"] == pytest.approx(float(expected_score))
+
+    with sqlite3.connect(project_root / "project.db") as conn:
+        conn.row_factory = sqlite3.Row
+        status_row = conn.execute(
+            "SELECT status FROM assignments WHERE round_id=? AND reviewer_id=?",
+            ("ph_test_r3", RoundBuilder.LLM_REVIEWER_ID),
+        ).fetchone()
+    assert status_row is not None and status_row["status"] == "submitted"
 

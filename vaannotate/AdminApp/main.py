@@ -72,6 +72,47 @@ ASSIGNMENT_MODELS = [
 ]
 
 
+def build_round_assignment_units(
+    assignments: Mapping[str, ReviewerAssignment],
+) -> Dict[str, List[RoundAssignmentUnit]]:
+    """Normalize sampling assignments into round assignment units."""
+
+    reviewer_assignments: Dict[str, List[RoundAssignmentUnit]] = {}
+    for reviewer_id, assignment in assignments.items():
+        units: List[RoundAssignmentUnit] = []
+        for unit in assignment.units:
+            payload = dict(unit)
+            payload.setdefault("documents", payload.get("documents") or [])
+            payload.setdefault(
+                "strata_key",
+                payload.get("strata_key")
+                or payload.get("strata")
+                or "random_sampling",
+            )
+            unit_identifier = (
+                payload.get("unit_id")
+                or payload.get("doc_id")
+                or payload.get("patient_icn")
+            )
+            unit_id = str(unit_identifier or "")
+            if not unit_id:
+                continue
+            doc_id_value = payload.get("doc_id")
+            doc_id = None if doc_id_value is None else str(doc_id_value)
+            patient_icn = str(payload.get("patient_icn") or "")
+            units.append(
+                RoundAssignmentUnit(
+                    unit_id,
+                    patient_icn,
+                    doc_id,
+                    payload,
+                )
+            )
+        if units:
+            reviewer_assignments[reviewer_id] = units
+    return reviewer_assignments
+
+
 @dataclass(frozen=True)
 class AgreementSample:
     unit_id: str
@@ -2241,6 +2282,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_log_dialog: Optional[AIRoundLogDialog] = None
         self.ai_log_output: Optional[QtWidgets.QPlainTextEdit] = None
         self._assisted_review_reminder_shown = False
+        self._llm_prompt_shown = False
         self.ctx.project_changed.connect(self._refresh_labelset_options)
         self.ctx.project_changed.connect(self._refresh_corpus_options)
         self.ctx.project_changed.connect(self._refresh_ai_round_options)
@@ -3694,7 +3736,30 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     "email": str(row["email"] or ""),
                 }
             )
+        llm_id = RoundBuilder.LLM_REVIEWER_ID
+        if not any(str(reviewer.get("id", "")).lower() == llm_id for reviewer in reviewers):
+            reviewers.append({"id": llm_id, "name": "LLM", "email": ""})
         return reviewers
+
+    def _handle_llm_reviewer_added(self) -> None:
+        checkbox = getattr(self, "random_final_llm_checkbox", None)
+        if isinstance(checkbox, QtWidgets.QCheckBox):
+            if not checkbox.isChecked():
+                checkbox.setChecked(True)
+        if not self._llm_prompt_shown:
+            QtWidgets.QMessageBox.information(
+                self,
+                "LLM reviewer",
+                (
+                    "Final LLM labeling is required when the LLM reviewer is included. "
+                    "Provide Azure OpenAI credentials in the Final LLM configuration "
+                    "so the assignment can be completed automatically."
+                ),
+            )
+            self._llm_prompt_shown = True
+        azure_edit = getattr(self, "random_azure_key_edit", None)
+        if isinstance(azure_edit, QtWidgets.QLineEdit):
+            azure_edit.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def _generate_reviewer_id(self, name: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "reviewer"
@@ -3723,6 +3788,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         item.setData(QtCore.Qt.ItemDataRole.UserRole, reviewer)
         self.reviewer_list.addItem(item)
         self._selected_reviewer_ids.add(reviewer_id)
+        if reviewer_id.lower() == RoundBuilder.LLM_REVIEWER_ID:
+            self._handle_llm_reviewer_added()
 
     def _on_add_existing_reviewer(self) -> None:
         data = self.reviewer_combo.currentData()
@@ -3847,6 +3914,20 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         sampling_metadata: Dict[str, object] = {"independent": bool(independent)}
         reviewers = self._prompt_reviewers()
         if not reviewers:
+            return False
+        llm_selected = any(
+            str(reviewer.get("id", "")).lower() == RoundBuilder.LLM_REVIEWER_ID
+            for reviewer in reviewers
+        )
+        if llm_selected and (
+            not hasattr(self, "random_final_llm_checkbox")
+            or not self.random_final_llm_checkbox.isChecked()
+        ):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Final LLM labeling",
+                "Enable final LLM labeling when the LLM reviewer is included.",
+            )
             return False
         labelset_id = self.labelset_combo.currentText().strip() or f"auto_{pheno_id}"
         created_at = QtCore.QDateTime.currentDateTimeUtc().toString(QtCore.Qt.ISODate)
@@ -4144,6 +4225,30 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             populate_assignment_db(assignment_db, reviewer["id"], assignments[reviewer["id"]].units)
             schema_path = assignment_dir / "label_schema.json"
             ctx.register_text_file(schema_path, json.dumps(label_schema, indent=2))
+        assisted_result: Dict[str, object] = {}
+        if assisted_enabled and assisted_top_n > 0:
+            try:
+                assisted_result = self._generate_random_assisted_review(
+                    config_payload=config_payload,
+                    assignments=assignments,
+                    round_dir=round_dir,
+                    top_snippets=assisted_top_n,
+                )
+            except Exception as exc:  # noqa: BLE001
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Assisted chart review",
+                    f"Failed to generate assisted review snippets: {exc}",
+                )
+            else:
+                if assisted_result:
+                    updated_config = json.dumps(config_payload, indent=2)
+                    ctx.register_text_file(round_dir / "round_config.json", updated_config)
+                    with db.transaction() as conn:
+                        conn.execute(
+                            "UPDATE round_configs SET config_json=? WHERE round_id=?",
+                            (updated_config, round_id),
+                        )
         final_llm_outputs: Dict[str, str] = {}
         if hasattr(self, "random_final_llm_checkbox") and self.random_final_llm_checkbox.isChecked():
             try:
@@ -4201,40 +4306,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if not pheno_row:
                 raise RuntimeError(f"Phenotype {pheno_id} not found")
             labelset = fetch_labelset(conn, labelset_id)
+        label_schema_payload = builder._build_label_schema_payload(labelset)
 
-        reviewer_assignments: Dict[str, List[RoundAssignmentUnit]] = {}
-        for reviewer_id, assignment in assignments.items():
-            units: List[RoundAssignmentUnit] = []
-            for unit in assignment.units:
-                payload = dict(unit)
-                payload.setdefault("documents", payload.get("documents") or [])
-                payload.setdefault(
-                    "strata_key",
-                    payload.get("strata_key")
-                    or payload.get("strata")
-                    or "random_sampling",
-                )
-                unit_identifier = (
-                    payload.get("unit_id")
-                    or payload.get("doc_id")
-                    or payload.get("patient_icn")
-                )
-                unit_id = str(unit_identifier or "")
-                if not unit_id:
-                    continue
-                doc_id_value = payload.get("doc_id")
-                doc_id = None if doc_id_value is None else str(doc_id_value)
-                patient_icn = str(payload.get("patient_icn") or "")
-                units.append(
-                    RoundAssignmentUnit(
-                        unit_id,
-                        patient_icn,
-                        doc_id,
-                        payload,
-                    )
-                )
-            if units:
-                reviewer_assignments[reviewer_id] = units
+        reviewer_assignments = build_round_assignment_units(assignments)
         if not reviewer_assignments:
             raise RuntimeError("No assignments available for final LLM labeling")
 
@@ -4261,7 +4335,17 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 config_base=round_dir,
                 log_callback=self._append_ai_log,
                 env_overrides=env_overrides,
+                auto_submit_llm=False,
             )
+            if outputs:
+                self._apply_llm_reviewer_submission_with_context(
+                    builder=builder,
+                    config_payload=config_payload,
+                    round_dir=round_dir,
+                    reviewer_assignments=reviewer_assignments,
+                    label_schema=label_schema_payload,
+                    final_llm_outputs=outputs,
+                )
         except Exception as exc:  # noqa: BLE001
             self._append_ai_log(f"Final LLM labeling failed: {exc}")
             raise
@@ -4273,6 +4357,188 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return outputs
         finally:
             self._mark_ai_log_complete()
+
+    def _generate_random_assisted_review(
+        self,
+        *,
+        config_payload: Dict[str, object],
+        assignments: Mapping[str, ReviewerAssignment],
+        round_dir: Path,
+        top_snippets: int,
+    ) -> Dict[str, object]:
+        if top_snippets <= 0:
+            return {}
+        project_root = getattr(self.ctx, "project_root", None)
+        if not project_root:
+            raise RuntimeError("Project root is not available")
+        reviewer_assignments = build_round_assignment_units(assignments)
+        if not reviewer_assignments:
+            return {}
+        builder = RoundBuilder(project_root)
+        db = self.ctx.require_db()
+        pheno_id = str(config_payload.get("pheno_id") or self.pheno_row["pheno_id"])
+        labelset_id = str(config_payload.get("labelset_id") or "")
+        if not labelset_id:
+            raise RuntimeError("Label set ID is required for assisted review")
+        with db.connect() as conn:
+            conn.row_factory = sqlite3.Row
+            pheno_row = conn.execute(
+                "SELECT * FROM phenotypes WHERE pheno_id=?",
+                (pheno_id,),
+            ).fetchone()
+            if not pheno_row:
+                raise RuntimeError(f"Phenotype {pheno_id} not found")
+            labelset = fetch_labelset(conn, labelset_id)
+        config_copy = dict(config_payload)
+        assist_cfg = config_copy.setdefault("assisted_review", {})
+        assist_cfg["enabled"] = True
+        assist_cfg["top_snippets"] = int(top_snippets)
+
+        azure_key: str = ""
+        azure_widget = getattr(self, "random_azure_key_edit", None)
+        if hasattr(azure_widget, "text"):
+            try:
+                azure_key = str(azure_widget.text()).strip()
+            except Exception:  # noqa: BLE001
+                azure_key = ""
+
+        previous_env: Dict[str, Optional[str]] = {}
+        if azure_key:
+            previous_env["AZURE_OPENAI_API_KEY"] = os.environ.get("AZURE_OPENAI_API_KEY")
+            os.environ["AZURE_OPENAI_API_KEY"] = azure_key
+
+        try:
+            assisted_data = builder._generate_assisted_review_snippets(
+                pheno_row=pheno_row,
+                labelset=labelset,
+                round_dir=round_dir,
+                reviewer_assignments=reviewer_assignments,
+                config=config_copy,
+                config_base=round_dir,
+                top_n=int(top_snippets),
+            )
+        finally:
+            for key, value in previous_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        if not assisted_data:
+            return {}
+
+        assist_dir = ensure_dir(round_dir / "reports" / "assisted_review")
+        assist_path = assist_dir / "snippets.json"
+        serialized = builder._json_dumps(assisted_data)
+        self.ctx.register_text_file(assist_path, serialized)
+
+        try:
+            relative_path = assist_path.relative_to(round_dir)
+        except ValueError:
+            try:
+                relative_path = assist_path.resolve().relative_to(round_dir.resolve())
+            except ValueError:
+                relative_path = assist_path
+
+        assist_cfg = config_payload.setdefault("assisted_review", {})
+        assist_cfg["enabled"] = True
+        assist_cfg["top_snippets"] = int(top_snippets)
+        assist_cfg["generated_at"] = assisted_data.get("generated_at")
+        assist_cfg["snippets_json"] = str(relative_path)
+
+        return {"snippets_json": str(relative_path)}
+
+    def _apply_llm_reviewer_submission_with_context(
+        self,
+        *,
+        builder: RoundBuilder,
+        config_payload: Mapping[str, object],
+        round_dir: Path,
+        reviewer_assignments: Mapping[str, Sequence[RoundAssignmentUnit]],
+        label_schema: Mapping[str, Any],
+        final_llm_outputs: Mapping[str, str],
+    ) -> None:
+        llm_ids = builder._llm_reviewer_ids(config_payload)
+        if not llm_ids:
+            return
+        predictions = builder._extract_llm_predictions(final_llm_outputs, round_dir)
+        if not predictions:
+            raise RuntimeError("Final LLM labeling outputs are missing LLM predictions")
+        labels_obj = label_schema.get("labels") if isinstance(label_schema, Mapping) else None
+        if not isinstance(labels_obj, Sequence):
+            raise RuntimeError("Label schema is required to populate LLM assignments")
+        label_lookup = {
+            str(label.get("label_id")): label
+            for label in labels_obj
+            if isinstance(label, Mapping) and label.get("label_id")
+        }
+        if not label_lookup:
+            raise RuntimeError("Label schema did not include label identifiers")
+        db = self.ctx.require_db()
+        round_id = str(config_payload.get("round_id") or "")
+        timestamp = datetime.utcnow().isoformat()
+        for reviewer_id in llm_ids:
+            assignments = reviewer_assignments.get(reviewer_id)
+            if not assignments:
+                continue
+            unit_ids = [
+                str(unit.unit_id)
+                for unit in assignments
+                if getattr(unit, "unit_id", None)
+            ]
+            if not unit_ids:
+                continue
+            assignment_dir = round_dir / "assignments" / reviewer_id
+            assignment_db = self.ctx.get_assignment_db(assignment_dir / "assignment.db")
+            if assignment_db is None:
+                raise RuntimeError(f"Assignment database not found for reviewer {reviewer_id}")
+            annotation_records: list[models.Annotation] = []
+            for unit_id in unit_ids:
+                label_values = predictions.get(unit_id, {})
+                for label_id, label_info in label_lookup.items():
+                    raw_value = label_values.get(label_id)
+                    value, value_num, value_date, na_flag = builder._normalize_annotation_value(
+                        label_info,
+                        raw_value,
+                    )
+                    annotation_records.append(
+                        models.Annotation(
+                            unit_id=unit_id,
+                            label_id=label_id,
+                            value=value,
+                            value_num=value_num,
+                            value_date=value_date,
+                            na=na_flag,
+                            notes=None,
+                        )
+                    )
+            with assignment_db.transaction() as conn:
+                conn.executemany(
+                    "DELETE FROM annotations WHERE unit_id=?",
+                    [(unit_id,) for unit_id in unit_ids],
+                )
+                if annotation_records:
+                    models.Annotation.insert_many(conn, annotation_records)
+                for unit_id in unit_ids:
+                    conn.execute(
+                        "UPDATE units SET complete=1, completed_at=? WHERE unit_id=?",
+                        (timestamp, unit_id),
+                    )
+            receipt = {
+                "unit_count": len(unit_ids),
+                "completed": len(unit_ids),
+                "submitted_at": timestamp,
+            }
+            self.ctx.register_text_file(
+                assignment_dir / "submitted.json",
+                json.dumps(receipt, indent=2),
+            )
+            if round_id:
+                with db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE assignments SET status='submitted' WHERE round_id=? AND reviewer_id=?",
+                        (round_id, reviewer_id),
+                    )
 
 
 class ProjectTreeWidget(QtWidgets.QTreeWidget):
