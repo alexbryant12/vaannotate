@@ -2711,29 +2711,29 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._refresh_ai_round_options()
         self._update_ai_batch_size_label()
         if hasattr(self, "ai_embedding_path_edit"):
-            self.ai_embedding_path_edit.setText(os.getenv("MED_EMBED_MODEL_NAME", ""))
+            self.ai_embedding_path_edit.setText(os.getenv("MED_EMBED_MODEL_NAME", "E:/medembed_small"))
         if hasattr(self, "ai_reranker_path_edit"):
-            self.ai_reranker_path_edit.setText(os.getenv("RERANKER_MODEL_NAME", ""))
+            self.ai_reranker_path_edit.setText(os.getenv("RERANKER_MODEL_NAME", "E:/ms_marco_MiniLM_L6_v2"))
         if hasattr(self, "ai_azure_key_edit"):
             self.ai_azure_key_edit.setText(os.getenv("AZURE_OPENAI_API_KEY", ""))
         if hasattr(self, "ai_azure_version_edit"):
             self.ai_azure_version_edit.setText(
-                os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+                os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-28")
             )
         if hasattr(self, "ai_azure_endpoint_edit"):
-            self.ai_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", ""))
+            self.ai_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", "https://spd-prod-openai-va-apim.azure-api.us/api"))
         if hasattr(self, "random_embedding_path_edit"):
-            self.random_embedding_path_edit.setText(os.getenv("MED_EMBED_MODEL_NAME", ""))
+            self.random_embedding_path_edit.setText(os.getenv("MED_EMBED_MODEL_NAME", "E:/medembed_small"))
         if hasattr(self, "random_reranker_path_edit"):
-            self.random_reranker_path_edit.setText(os.getenv("RERANKER_MODEL_NAME", ""))
+            self.random_reranker_path_edit.setText(os.getenv("RERANKER_MODEL_NAME", "E:/ms_marco_MiniLM_L6_v2"))
         if hasattr(self, "random_azure_key_edit"):
             self.random_azure_key_edit.setText(os.getenv("AZURE_OPENAI_API_KEY", ""))
         if hasattr(self, "random_azure_version_edit"):
             self.random_azure_version_edit.setText(
-                os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+                os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-28")
             )
         if hasattr(self, "random_azure_endpoint_edit"):
-            self.random_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", ""))
+            self.random_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", "https://spd-prod-openai-va-apim.azure-api.us/api"))
         if hasattr(self, "random_final_llm_checkbox"):
             self._on_random_final_llm_toggled(self.random_final_llm_checkbox.isChecked())
         if hasattr(self, "assisted_review_checkbox"):
