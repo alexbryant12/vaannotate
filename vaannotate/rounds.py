@@ -58,9 +58,218 @@ class AssignmentUnit:
 
 
 class RoundBuilder:
+    LLM_REVIEWER_ID = "llm"
+
     def __init__(self, project_root: Path):
         self.project_root = project_root
         self.project_db = project_root / "project.db"
+
+    @staticmethod
+    def _llm_reviewer_ids(config: Mapping[str, Any]) -> list[str]:
+        reviewers = config.get("reviewers")
+        if not isinstance(reviewers, Sequence):
+            return []
+        llm_ids: list[str] = []
+        for reviewer in reviewers:
+            if not isinstance(reviewer, Mapping):
+                continue
+            raw_id = reviewer.get("id") or reviewer.get("reviewer_id")
+            if raw_id is None:
+                continue
+            reviewer_id = str(raw_id)
+            if reviewer_id and reviewer_id.lower() == RoundBuilder.LLM_REVIEWER_ID:
+                llm_ids.append(reviewer_id)
+        return llm_ids
+
+    def _extract_llm_predictions(
+        self,
+        final_llm_outputs: Mapping[str, str],
+        base_dir: Path,
+    ) -> dict[str, dict[str, object]]:
+        labels_path_value = final_llm_outputs.get("final_llm_labels_json")
+        if not labels_path_value:
+            return {}
+        try:
+            labels_path = Path(str(labels_path_value))
+        except Exception:  # noqa: BLE001
+            return {}
+        if not labels_path.is_absolute():
+            labels_path = (base_dir / labels_path).resolve()
+        if not labels_path.exists():
+            return {}
+        try:
+            payload = json.loads(labels_path.read_text("utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+        if not isinstance(payload, list):
+            return {}
+        predictions: dict[str, dict[str, object]] = {}
+        for row in payload:
+            if not isinstance(row, Mapping):
+                continue
+            unit_value = row.get("unit_id")
+            if unit_value is None:
+                continue
+            unit_id = str(unit_value)
+            if not unit_id:
+                continue
+            unit_map = predictions.setdefault(unit_id, {})
+            for key, value in row.items():
+                if not isinstance(key, str) or not key.endswith("_llm"):
+                    continue
+                label_id = key[: -len("_llm")]
+                if not label_id:
+                    continue
+                unit_map[label_id] = value
+        return predictions
+
+    @staticmethod
+    def _normalize_annotation_value(
+        label_info: Mapping[str, Any],
+        raw_value: object,
+    ) -> tuple[Optional[str], Optional[float], Optional[str], int]:
+        label_type = str(label_info.get("type") or "").lower()
+        na_allowed = bool(label_info.get("na_allowed"))
+        if raw_value is None:
+            return (None, None, None, 1 if na_allowed else 0)
+        if label_type in {"integer", "float"}:
+            text = str(raw_value).strip()
+            if not text:
+                return (None, None, None, 1 if na_allowed else 0)
+            try:
+                numeric = float(text)
+            except ValueError:
+                numeric = None
+            return (text, numeric, None, 0)
+        if label_type == "date":
+            text = str(raw_value).strip()
+            if not text:
+                return (None, None, None, 1 if na_allowed else 0)
+            return (None, None, text, 0)
+        if label_type == "categorical_multi":
+            entries: list[str]
+            if isinstance(raw_value, (list, tuple, set)):
+                entries = [
+                    str(item).strip()
+                    for item in raw_value
+                    if item not in (None, "")
+                ]
+            else:
+                text = str(raw_value)
+                entries = [part.strip() for part in text.split(",") if part.strip()]
+            if not entries:
+                return (None, None, None, 1 if na_allowed else 0)
+            joined = ",".join(entries)
+            return (joined, None, None, 0)
+        text_value = str(raw_value).strip()
+        if not text_value:
+            if na_allowed:
+                return (None, None, None, 1)
+            return ("", None, None, 0)
+        return (text_value, None, None, 0)
+
+    def _auto_submit_llm_assignments(
+        self,
+        *,
+        round_id: str,
+        round_dir: Path,
+        reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]],
+        label_schema: Mapping[str, Any] | None,
+        config: Mapping[str, Any],
+        final_llm_outputs: Mapping[str, str],
+        project_conn: sqlite3.Connection | None = None,
+    ) -> None:
+        llm_ids = self._llm_reviewer_ids(config)
+        if not llm_ids:
+            return
+        predictions = self._extract_llm_predictions(final_llm_outputs, round_dir)
+        if not predictions:
+            raise RuntimeError("Final LLM labeling outputs are missing LLM predictions")
+        labels = []
+        if isinstance(label_schema, Mapping):
+            raw_labels = label_schema.get("labels")
+            if isinstance(raw_labels, Sequence):
+                labels = [label for label in raw_labels if isinstance(label, Mapping)]
+        if not labels:
+            raise RuntimeError("Label schema is required to populate LLM assignments")
+        label_lookup = {str(label.get("label_id")): label for label in labels if label.get("label_id") is not None}
+        if not label_lookup:
+            raise RuntimeError("Label schema did not contain label identifiers")
+        timestamp = datetime.utcnow().isoformat()
+        for reviewer_id in llm_ids:
+            assignments = reviewer_assignments.get(reviewer_id)
+            if not assignments:
+                continue
+            unit_ids = [
+                str(unit.unit_id)
+                for unit in assignments
+                if getattr(unit, "unit_id", None)
+            ]
+            if not unit_ids:
+                continue
+            assign_dir = round_dir / "assignments" / reviewer_id
+            db_path = assign_dir / "assignment.db"
+            if not db_path.exists():
+                raise RuntimeError(f"Assignment database not found for reviewer {reviewer_id}")
+            annotation_rows: list[tuple[str, str, Optional[str], Optional[float], Optional[str], int, Optional[str]]] = []
+            for unit_id in unit_ids:
+                label_values = predictions.get(unit_id, {})
+                for label_id, label_info in label_lookup.items():
+                    raw_value = label_values.get(label_id)
+                    value, value_num, value_date, na_flag = self._normalize_annotation_value(label_info, raw_value)
+                    annotation_rows.append(
+                        (
+                            unit_id,
+                            label_id,
+                            value,
+                            value_num,
+                            value_date,
+                            na_flag,
+                            None,
+                        )
+                    )
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("PRAGMA foreign_keys=ON;")
+                conn.executemany(
+                    "DELETE FROM annotations WHERE unit_id=?",
+                    [(unit_id,) for unit_id in unit_ids],
+                )
+                if annotation_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO annotations(unit_id, label_id, value, value_num, value_date, na, notes)
+                        VALUES (?,?,?,?,?,?,?)
+                        """,
+                        annotation_rows,
+                    )
+                conn.executemany(
+                    "UPDATE units SET complete=1, completed_at=? WHERE unit_id=?",
+                    [(timestamp, unit_id) for unit_id in unit_ids],
+                )
+                conn.commit()
+            receipt = {
+                "unit_count": len(unit_ids),
+                "completed": len(unit_ids),
+                "submitted_at": timestamp,
+            }
+            receipt_path = assign_dir / "submitted.json"
+            receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+        round_key = str(round_id or "")
+        if not round_key:
+            return
+        updater: sqlite3.Connection | None = project_conn
+        if updater is None:
+            updater = self._connect_project()
+        try:
+            for reviewer_id in llm_ids:
+                updater.execute(
+                    "UPDATE assignments SET status='submitted' WHERE round_id=? AND reviewer_id=?",
+                    (round_key, reviewer_id),
+                )
+        finally:
+            if project_conn is None and updater is not None:
+                updater.commit()
+                updater.close()
 
     def _connect_project(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.project_db)
@@ -319,6 +528,20 @@ class RoundBuilder:
                             canonical_json(config),
                             encoding="utf-8",
                         )
+                        try:
+                            self._auto_submit_llm_assignments(
+                                round_id=round_id,
+                                round_dir=round_dir,
+                                reviewer_assignments=reviewer_assignments,
+                                label_schema=label_schema_payload,
+                                config=config,
+                                final_llm_outputs=outputs,
+                                project_conn=project_conn,
+                            )
+                        except Exception as autop_exc:  # noqa: BLE001
+                            raise RuntimeError(
+                                f"Failed to populate LLM reviewer assignment: {autop_exc}"
+                            ) from autop_exc
     
                 assisted_result: Dict[str, Any] = {}
                 assisted_cfg = config.get("assisted_review") if isinstance(config.get("assisted_review"), Mapping) else None
@@ -657,6 +880,7 @@ class RoundBuilder:
         config_base: Path,
         log_callback: callable | None = None,
         env_overrides: Mapping[str, str] | None = None,
+        auto_submit_llm: bool = True,
     ) -> Dict[str, str]:
         """Execute final LLM labeling while forwarding progress logs."""
 
@@ -706,7 +930,7 @@ class RoundBuilder:
 
         try:
             try:
-                return self._apply_final_llm_labeling(
+                outputs = self._apply_final_llm_labeling(
                     pheno_row=pheno_row,
                     labelset=labelset,
                     round_dir=round_dir,
@@ -715,6 +939,22 @@ class RoundBuilder:
                     config_base=config_base,
                     include_reasoning=self._final_llm_include_reasoning(config),
                 )
+                if auto_submit_llm and outputs:
+                    try:
+                        label_schema = self._build_label_schema_payload(labelset)
+                        self._auto_submit_llm_assignments(
+                            round_id=str(config.get("round_id") or ""),
+                            round_dir=round_dir,
+                            reviewer_assignments=reviewer_assignments,
+                            label_schema=label_schema,
+                            config=config,
+                            final_llm_outputs=outputs,
+                        )
+                    except Exception as autop_exc:  # noqa: BLE001
+                        raise RuntimeError(
+                            f"Failed to populate LLM reviewer assignment: {autop_exc}"
+                        ) from autop_exc
+                return outputs
             finally:
                 if handler and logger:
                     logger.removeHandler(handler)
