@@ -93,6 +93,8 @@ class RoundBuilder:
         else:
             final_llm_enabled = bool(final_llm_flag)
         config["final_llm_labeling"] = final_llm_enabled
+        include_reasoning = self._final_llm_include_reasoning(config)
+        config["final_llm_include_reasoning"] = include_reasoning
         final_llm_outputs: Dict[str, str] = {}
         overrides = {
             str(key): str(value)
@@ -306,6 +308,7 @@ class RoundBuilder:
                             reviewer_assignments=reviewer_assignments,
                             config=config,
                             config_base=config_base,
+                            include_reasoning=include_reasoning,
                         )
                     except Exception as exc:  # noqa: BLE001
                         raise RuntimeError(f"Final LLM labeling failed: {exc}") from exc
@@ -395,6 +398,7 @@ class RoundBuilder:
         reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]],
         config: Mapping[str, Any],
         config_base: Path,
+        include_reasoning: bool,
     ) -> Dict[str, str]:
         try:
             import pandas as pd
@@ -433,7 +437,16 @@ class RoundBuilder:
                 round_dir=round_dir,
                 reviewer_assignments=reviewer_assignments,
                 config=config,
+                include_reasoning=include_reasoning,
             )
+
+        if not include_reasoning:
+            if labels_df is not None:
+                drop_cols = [col for col in labels_df.columns if str(col).endswith("_llm_reason")]
+                if drop_cols:
+                    labels_df = labels_df.drop(columns=drop_cols)
+            if probe_df is not None and "llm_reasoning" in probe_df.columns:
+                probe_df = probe_df.drop(columns=["llm_reasoning"])
 
         exports_dir = ensure_dir(Path(round_dir) / "reports" / "exports")
         return self._write_final_llm_outputs(labels_df=labels_df, probe_df=probe_df, exports_dir=exports_dir)
@@ -700,6 +713,7 @@ class RoundBuilder:
                     reviewer_assignments=reviewer_assignments,
                     config=config,
                     config_base=config_base,
+                    include_reasoning=self._final_llm_include_reasoning(config),
                 )
             finally:
                 if handler and logger:
@@ -764,6 +778,37 @@ class RoundBuilder:
             candidate = (base_dir / candidate).resolve()
         return candidate
 
+    @staticmethod
+    def _coerce_optional_bool(value: object) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "t", "yes", "y", "on"}:
+                return True
+            if text in {"0", "false", "f", "no", "n", "off"}:
+                return False
+        return None
+
+    def _final_llm_include_reasoning(self, config: Mapping[str, Any]) -> bool:
+        candidates: list[object] = [config.get("final_llm_include_reasoning")]
+        llm_cfg = config.get("llm_labeling")
+        if isinstance(llm_cfg, Mapping):
+            candidates.append(llm_cfg.get("include_reasoning"))
+            candidates.append(llm_cfg.get("final_llm_include_reasoning"))
+        ai_backend_cfg = config.get("ai_backend")
+        if isinstance(ai_backend_cfg, Mapping):
+            candidates.append(ai_backend_cfg.get("final_llm_include_reasoning"))
+        for candidate in candidates:
+            parsed = self._coerce_optional_bool(candidate)
+            if parsed is not None:
+                return parsed
+        return True
+
     def _run_final_llm_labeling_inference(
         self,
         *,
@@ -772,6 +817,7 @@ class RoundBuilder:
         round_dir: Path,
         reviewer_assignments: Mapping[str, Sequence[AssignmentUnit]],
         config: Mapping[str, Any],
+        include_reasoning: bool,
     ) -> tuple["pd.DataFrame", "pd.DataFrame"]:
         try:
             import pandas as pd
@@ -912,7 +958,7 @@ class RoundBuilder:
                 fam_df.rename(columns={"consistency": "llm_consistency"}, inplace=True)
             if "prediction" in fam_df.columns:
                 fam_df.rename(columns={"prediction": "llm_prediction"}, inplace=True)
-            if "llm_runs" in fam_df.columns:
+            if include_reasoning and "llm_runs" in fam_df.columns:
                 fam_df["llm_reasoning"] = fam_df["llm_runs"].map(
                     lambda runs: (runs[0].get("raw", {}).get("reasoning") if isinstance(runs, list) and runs else None)
                 )
@@ -931,7 +977,7 @@ class RoundBuilder:
             pivot.pivot_table(index="unit_id", columns="col", values="llm_prediction", aggfunc="first")
             .reset_index()
         )
-        if "llm_reasoning" in fam_df.columns:
+        if include_reasoning and "llm_reasoning" in fam_df.columns:
             reasoning = fam_df[["unit_id", "label_id", "llm_reasoning"]].copy()
             reasoning["colr"] = reasoning["label_id"].astype(str) + "_llm_reason"
             fam_reason = (
