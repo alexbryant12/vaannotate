@@ -136,7 +136,7 @@ class LLMFirstConfig:
     n_probe_units: int = 10
     topk: int = 6
     json_trace_policy: str = 'fallback'
-    progress_min_interval_s: float = 1.0
+    progress_min_interval_s: float = 10.0
     exemplar_K: int = 10
     exemplar_generate: bool = True
     exemplar_temperature: float = 0.9
@@ -305,7 +305,7 @@ def _bar_str(fraction: float, width: int = 32, ascii_only: bool = False) -> str:
     return "[" + full * filled + empty * (width - filled) + "]"
 
 def iter_with_bar(step: str, iterable, *, total: int | None = None,
-                  bar_width: int = 32, min_interval_s: float = 0.5,
+                  bar_width: int = 32, min_interval_s: float = 10,
                   ascii_only: bool | None = None):
     """
     Wrap an iterable and render a live progress bar if stderr is a TTY.
@@ -1118,7 +1118,7 @@ class EmbeddingStore:
             for i in iter_with_bar("Embedding chunks",
                                    range(0, len(texts), bs),
                                    total=(len(texts)+bs-1)//bs,
-                                   min_interval_s=1.0):
+                                   min_interval_s=10):
                 batch = texts[i:i+bs]
                 embs  = self.models.embedder.encode(
                     batch, batch_size=bs, show_progress_bar=False,
