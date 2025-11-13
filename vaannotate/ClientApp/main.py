@@ -324,6 +324,25 @@ class AssignmentContext(QtCore.QObject):
         self.assisted_review_enabled: bool = False
         self.assisted_review_top_n: int = 0
         self._assisted_review_snippets: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
+        self.final_llm_enabled: bool = False
+        self._final_llm_reasoning: bool = True
+        self._final_llm_labels: Dict[str, Dict[str, Dict[str, object]]] = {}
+
+    @staticmethod
+    def _parse_bool(value: object, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "t", "yes", "y", "on"}:
+                return True
+            if text in {"0", "false", "f", "no", "n", "off"}:
+                return False
+        return default
 
     def open_assignment(self, directory: Path) -> None:
         directory = directory.resolve()
@@ -352,6 +371,9 @@ class AssignmentContext(QtCore.QObject):
         self.assisted_review_enabled = False
         self.assisted_review_top_n = 0
         self._assisted_review_snippets = {}
+        self.final_llm_enabled = False
+        self._final_llm_reasoning = True
+        self._final_llm_labels = {}
         round_dir: Optional[Path] = None
         try:
             round_dir = directory.parent.parent
@@ -423,6 +445,51 @@ class AssignmentContext(QtCore.QObject):
                                     self.assisted_review_top_n = int(payload_top)
                                 except (TypeError, ValueError):
                                     pass
+                final_enabled = False
+                if isinstance(round_config, Mapping):
+                    final_enabled = self._parse_bool(round_config.get("final_llm_labeling"), False)
+                    outputs_cfg = round_config.get("final_llm_outputs")
+                    include_reasoning_value = round_config.get("final_llm_include_reasoning")
+                    if isinstance(outputs_cfg, Mapping):
+                        if not final_enabled:
+                            final_enabled = True
+                        if include_reasoning_value is None:
+                            include_reasoning_value = outputs_cfg.get("final_llm_include_reasoning")
+                        self._final_llm_reasoning = self._parse_bool(include_reasoning_value, True)
+                        by_unit_value = outputs_cfg.get("final_llm_labels_by_unit")
+                        if by_unit_value:
+                            try:
+                                candidate = Path(str(by_unit_value))
+                            except Exception:  # noqa: BLE001
+                                candidate = None
+                            if candidate is not None and not candidate.is_absolute():
+                                candidate = (round_dir / candidate).resolve()
+                            if candidate is not None and candidate.exists():
+                                try:
+                                    payload = json.loads(candidate.read_text(encoding="utf-8"))
+                                except Exception:  # noqa: BLE001
+                                    payload = {}
+                                if isinstance(payload, Mapping):
+                                    normalized_llm: Dict[str, Dict[str, Dict[str, object]]] = {}
+                                    for unit_key, entries in payload.items():
+                                        if not isinstance(entries, list):
+                                            continue
+                                        label_entries: Dict[str, Dict[str, object]] = {}
+                                        for entry in entries:
+                                            if not isinstance(entry, Mapping):
+                                                continue
+                                            label_key = str(entry.get("label_id") or "").strip()
+                                            if not label_key:
+                                                continue
+                                            cleaned = {str(k): entry[k] for k in entry}
+                                            label_entries[label_key] = cleaned
+                                        if label_entries:
+                                            normalized_llm[str(unit_key)] = label_entries
+                                    if normalized_llm:
+                                        self._final_llm_labels = normalized_llm
+                else:
+                    final_enabled = False
+                self.final_llm_enabled = final_enabled or bool(self._final_llm_labels)
         with self.assignment_db.connect() as conn:
             ensure_schema(
                 conn,
@@ -695,6 +762,19 @@ class AssignmentContext(QtCore.QObject):
         unit_map = self._assisted_review_snippets.get(str(unit_id), {})
         entries = unit_map.get(str(label_id), [])
         return [dict(entry) for entry in entries]
+
+    def has_final_llm_labels(self) -> bool:
+        return bool(self.final_llm_enabled)
+
+    def final_llm_reasoning_enabled(self) -> bool:
+        return bool(self._final_llm_reasoning)
+
+    def get_final_llm_label(self, unit_id: str, label_id: str) -> Dict[str, object]:
+        unit_map = self._final_llm_labels.get(str(unit_id), {})
+        entry = unit_map.get(str(label_id))
+        if not isinstance(entry, Mapping):
+            return {}
+        return {str(key): entry[key] for key in entry}
 
     def load_annotations(self, unit_id: str) -> Dict[str, Dict[str, object]]:
         self._annotation_baseline.setdefault(unit_id, {})
@@ -1264,6 +1344,7 @@ class AnnotationForm(QtWidgets.QScrollArea):
             row_widget.setProperty("label_id", label.label_id)
             self.layout.addWidget(row_widget)
             self._update_snippet_button(label.label_id)
+            self._update_llm_button(label.label_id)
         self.layout.addStretch()
 
     def load_unit(
@@ -1310,6 +1391,13 @@ class AnnotationForm(QtWidgets.QScrollArea):
         snippet_btn.setEnabled(False)
         header_layout.addWidget(snippet_btn)
         state["snippet_btn"] = snippet_btn
+        llm_btn = QtWidgets.QPushButton("View LLM label")
+        llm_btn.setAutoDefault(False)
+        llm_btn.clicked.connect(lambda _checked, lid=label.label_id: self._show_llm_label(lid))
+        llm_btn.setVisible(self.ctx.has_final_llm_labels())
+        llm_btn.setEnabled(False)
+        header_layout.addWidget(llm_btn)
+        state["llm_btn"] = llm_btn
         if label.na_allowed:
             na_box = QtWidgets.QCheckBox("N/A")
             na_box.stateChanged.connect(
@@ -1485,6 +1573,7 @@ class AnnotationForm(QtWidgets.QScrollArea):
         highlight_list.blockSignals(False)
         self._on_highlight_selection_changed(label_id)
         self._update_snippet_button(label_id)
+        self._update_llm_button(label_id)
 
     def _update_snippet_button(self, label_id: str) -> None:
         widgets = self.label_widgets.get(label_id)
@@ -1500,6 +1589,21 @@ class AnnotationForm(QtWidgets.QScrollArea):
             has_data = bool(snippets)
         button.setVisible(visible)
         button.setEnabled(has_data)
+
+    def _update_llm_button(self, label_id: str) -> None:
+        widgets = self.label_widgets.get(label_id)
+        if not widgets:
+            return
+        button = widgets.get("llm_btn")
+        if not isinstance(button, QtWidgets.QPushButton):
+            return
+        visible = self.ctx.has_final_llm_labels()
+        has_value = False
+        if visible and self.current_unit_id:
+            entry = self.ctx.get_final_llm_label(self.current_unit_id, label_id)
+            has_value = bool(entry)
+        button.setVisible(visible)
+        button.setEnabled(has_value)
 
     def _show_assisted_snippets(self, label_id: str) -> None:
         if not self.ctx.has_assisted_review():
@@ -1587,6 +1691,78 @@ class AnnotationForm(QtWidgets.QScrollArea):
         buttons.rejected.connect(dialog.reject)
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
+        dialog.exec()
+
+    def _show_llm_label(self, label_id: str) -> None:
+        if not self.ctx.has_final_llm_labels():
+            QtWidgets.QMessageBox.information(
+                self,
+                "LLM label",
+                "Final LLM labels are not available for this assignment.",
+            )
+            return
+        if not self.current_unit_id:
+            QtWidgets.QMessageBox.information(
+                self,
+                "LLM label",
+                "Select a unit before viewing the LLM label.",
+            )
+            return
+        entry = self.ctx.get_final_llm_label(self.current_unit_id, label_id)
+        if not entry:
+            QtWidgets.QMessageBox.information(
+                self,
+                "LLM label",
+                "No LLM label is available for this unit and label.",
+            )
+            return
+        widgets = self.label_widgets.get(label_id) or {}
+        definition = widgets.get("definition")
+        label_name = label_id
+        if isinstance(definition, LabelDefinition) and definition.name:
+            label_name = definition.name
+        prediction_value = entry.get("llm_prediction") or entry.get("prediction")
+        prediction_text = str(prediction_value) if prediction_value is not None else "(none)"
+        reasoning_text = None
+        if self.ctx.final_llm_reasoning_enabled():
+            raw_reasoning = entry.get("llm_reasoning")
+            if raw_reasoning is not None:
+                reasoning_text = str(raw_reasoning)
+        consistency_value = entry.get("llm_consistency") or entry.get("consistency")
+        if consistency_value is not None:
+            try:
+                consistency_float = float(consistency_value)
+                consistency_display = f"{consistency_float:.3f}"
+            except (TypeError, ValueError):
+                consistency_display = str(consistency_value)
+        else:
+            consistency_display = None
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"LLM label • {label_name}")
+        dialog.resize(460, 260)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        summary = QtWidgets.QLabel(f"Prediction: {prediction_text}")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        if consistency_display:
+            consistency_label = QtWidgets.QLabel(
+                f"Self-consistency agreement: {consistency_display}"
+            )
+            consistency_label.setWordWrap(True)
+            layout.addWidget(consistency_label)
+        if reasoning_text:
+            reasoning_label = QtWidgets.QLabel("Reasoning:")
+            layout.addWidget(reasoning_label)
+            reasoning_box = QtWidgets.QPlainTextEdit()
+            reasoning_box.setPlainText(reasoning_text)
+            reasoning_box.setReadOnly(True)
+            reasoning_box.setMinimumHeight(140)
+            layout.addWidget(reasoning_box)
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        button_box.rejected.connect(dialog.reject)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
         dialog.exec()
 
     def _selected_highlight(self, label_id: str) -> Optional[Dict[str, object]]:

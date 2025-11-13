@@ -942,7 +942,51 @@ class EmbeddingStore:
 
         # Nothing else to do; chunk_meta is now enriched in-memory and will be
         # persisted on the next cache save.
-    
+
+    def _remap_unit_ids(self, notes_df: "pd.DataFrame") -> None:
+        """Align cached chunk unit IDs with the unit granularity of the notes."""
+        if not isinstance(notes_df, pd.DataFrame) or notes_df.empty or not self.chunk_meta:
+            return
+        if "doc_id" not in notes_df.columns or "unit_id" not in notes_df.columns:
+            return
+
+        doc_to_unit: Dict[str, str] = {}
+        for row in notes_df.itertuples(index=False):
+            doc_val = getattr(row, "doc_id", None)
+            unit_val = getattr(row, "unit_id", None)
+            if doc_val is None or unit_val is None:
+                continue
+            doc_str = str(doc_val)
+            unit_str = str(unit_val)
+            if not doc_str or unit_str.lower() in {"", "nan", "none"}:
+                continue
+            doc_to_unit[doc_str] = unit_str
+
+        if not doc_to_unit:
+            return
+
+        changed = False
+        for meta in self.chunk_meta:
+            doc_val = meta.get("doc_id")
+            if doc_val is None:
+                continue
+            doc_str = str(doc_val)
+            target_unit = doc_to_unit.get(doc_str)
+            if not target_unit:
+                continue
+            current_unit = str(meta.get("unit_id", ""))
+            if current_unit != target_unit:
+                meta["unit_id"] = target_unit
+                changed = True
+
+        if not changed:
+            return
+
+        unit_to_idxs = defaultdict(list)
+        for idx, meta in enumerate(self.chunk_meta):
+            unit_to_idxs[str(meta.get("unit_id", ""))].append(idx)
+        self.unit_to_chunk_idxs = dict(unit_to_idxs)
+
     def _embedder_id(self) -> str:
         try:
             return getattr(self.models.embedder, "name_or_path", "") or str(self.models.embedder)
@@ -1157,6 +1201,7 @@ class EmbeddingStore:
         # 3) Bind to store
         self.X = np.load(paths["emb"], mmap_mode="r") if isinstance(X, np.memmap) or isinstance(X, np.ndarray) else X
         self.chunk_meta = meta
+        self._remap_unit_ids(notes_df)
         self._backfill_chunk_metadata(notes_df)
         unit_to_idxs = defaultdict(list)
         for i, m in enumerate(self.chunk_meta):
@@ -2070,14 +2115,42 @@ class LLMAnnotator:
                 temperature_this_vote = self.cfg.temperature
     
             # ----- build prompt for this vote -----
-            task = (
-                f"Label: '{label_id}' (type: {label_type}). "
-                "Use the evidence snippets from this patient's notes. "
-                "If insufficient evidence, reply with 'unknown'.\n\n"
-                f"Guidelines:\n{label_rules}\n\n"
-                "Evidence snippets:\n" + ctx_text + "\n\n"
-                "RESPONSE JSON keys: prediction, reasoning"
-            )
+            opts = _options_for_label(label_id, label_type, self.label_config)
+            lt_norm = (label_type or "").strip().lower()
+            categorical_types = {
+                "binary",
+                "boolean",
+                "categorical",
+                "categorical_single",
+                "ordinal",
+            }
+            use_options = bool(opts) and lt_norm in categorical_types
+            option_values = [str(opt) for opt in (opts or [])]
+
+            segments: list[str] = [
+                f"Label: '{label_id}' (type: {label_type}). Use the evidence snippets from this patient's notes.",
+            ]
+            if use_options:
+                segments.append("Choose the single best option from the list below based on the evidence.")
+            else:
+                segments.append("If insufficient evidence, reply with 'unknown'.")
+            segments.append("")
+            guideline_text = label_rules if label_rules else "(no additional guidelines)"
+            segments.append(f"Guidelines:\n{guideline_text}")
+            if use_options:
+                segments.append("")
+                segments.append("Options:")
+                segments.extend(f"- {opt}" for opt in option_values)
+                segments.append("")
+                segments.append(
+                    f"Set prediction to exactly one of: {', '.join(option_values)}. Do not invent new options."
+                )
+            segments.append("")
+            segments.append("Evidence snippets:")
+            segments.append(ctx_text)
+            segments.append("")
+            segments.append("RESPONSE JSON keys: prediction, reasoning")
+            task = "\n".join(segments)
             messages = [{"role": "system", "content": system},
                         {"role": "user",   "content": task}]
     
