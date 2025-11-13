@@ -800,7 +800,6 @@ class DataRepository:
                 "round_id": round_value,
                 "labelset_id": labelset_value,
             })
-        print(rows)
         return _pd.DataFrame(rows)
 
     def hard_disagree(self, label_types: dict, *, date_days: int = 14, num_abs: float = 1.0, num_rel: float = 0.20) -> pd.DataFrame:
@@ -1484,6 +1483,7 @@ class DisagreementExpander:
 
     def expand(self, rules_map: Dict[str,str], seen_pairs: set) -> pd.DataFrame:
         seeds = self.high_entropy_seeds()
+        print('disagreement seeds: ', seeds)
         rows = []
         for lid, grp in seeds.groupby("label_id"):
             labelset_value = ""
