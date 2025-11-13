@@ -1922,6 +1922,11 @@ class LLMAnnotator:
         self.scCfg = scCfg
         self.cache_dir = os.path.join(cache_dir,"llm_cache"); os.makedirs(self.cache_dir, exist_ok=True)
         self.client = None
+        # The label configuration is injected by the orchestrator once it has been
+        # materialised.  Default to an empty mapping so that downstream calls that
+        # access ``self.label_config`` degrade gracefully when no configuration has
+        # been supplied (e.g. during unit tests or CLI usage without overrides).
+        self.label_config: dict[str, object] = {}
         self._init_client()
 
     def _init_client(self):
@@ -3805,6 +3810,9 @@ class ActiveLearningLLMFirst:
             repo=self.repo,
         )
         self.llm = LLMAnnotator(self.cfg.llm, self.cfg.scjitter, cache_dir=self.paths.cache_dir)
+        # Ensure the annotator has access to the materialised label configuration
+        # so that option lookups during JSON prompting succeed.
+        self.llm.label_config = self.label_config
         self.pooler = LabelAwarePooler(
             self.repo,
             self.store,
