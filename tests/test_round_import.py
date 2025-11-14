@@ -1535,3 +1535,42 @@ def test_generate_round_auto_submits_llm_reviewer(
         ).fetchone()
     assert status_row is not None and status_row["status"] == "submitted"
 
+
+def test_generate_round_auto_submit_llm_missing_predictions(
+    seeded_project: tuple[RoundBuilder, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder, _ = seeded_project
+    labels_payload = [
+        {"unit_id": "doc_0", "Flag_llm": "yes", "Score_llm": 1.0},
+    ]
+
+    def _fake_apply(self, **_kwargs):  # type: ignore[no-untyped-def]
+        round_dir = _kwargs["round_dir"]
+        exports_dir = round_dir / "reports" / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        labels_json = exports_dir / "final_llm_labels.json"
+        labels_json.write_text(json.dumps(labels_payload), encoding="utf-8")
+        return {"final_llm_labels_json": str(labels_json)}
+
+    monkeypatch.setattr(RoundBuilder, "_apply_final_llm_labeling", _fake_apply)
+
+    config = {
+        "round_number": 3,
+        "round_id": "ph_test_r3",
+        "labelset_id": "ls_test",
+        "corpus_id": "cor_ph_test",
+        "reviewers": [
+            {"id": RoundBuilder.LLM_REVIEWER_ID, "name": "LLM"},
+        ],
+        "rng_seed": 5,
+        "total_n": 2,
+        "final_llm_labeling": True,
+    }
+    config_path = tmp_path / "ph_test_r3.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="missing predictions"):
+        builder.generate_round("ph_test", config_path, created_by="tester")
+
