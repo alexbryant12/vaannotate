@@ -45,6 +45,7 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
+from .llm_backends import JSONCallResult, ForcedChoiceResult, build_llm_backend
 
 try:
     import faiss  # faiss-cpu
@@ -77,10 +78,6 @@ except Exception:
     except Exception:
         raise ImportError("Please install langchain-text-splitters or langchain to use RecursiveCharacterTextSplitter.")
 
-try:
-    from openai import AzureOpenAI
-except Exception:
-    AzureOpenAI = None
 # ------------------------------
 # Config
 # ------------------------------
@@ -109,9 +106,20 @@ class RAGConfig:
     mmr_multiplier: int = 3
     neighbor_hops: int = 1
         
+def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    val = os.getenv(name)
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
 @dataclass
 class LLMConfig:
     model_name: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    backend: str = os.getenv("LLM_BACKEND", "azure")
     temperature: float = 0.2
     n_consistency: int = 3
     logprobs: bool = True
@@ -122,6 +130,15 @@ class LLMConfig:
     retry_backoff: float = 2.0
     max_context_chars: int = 1200000
     rpm_limit: Optional[int] = 30
+    # Azure OpenAI specific knobs
+    azure_api_key: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
+    azure_api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+    azure_endpoint: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
+    # Local ExLlamaV2 specific knobs
+    local_model_dir: Optional[str] = os.getenv("LOCAL_LLM_MODEL_DIR")
+    local_gpu_split: Optional[str] = os.getenv("LOCAL_LLM_GPU_SPLIT")
+    local_max_seq_len: Optional[int] = _env_int("LOCAL_LLM_MAX_SEQ_LEN")
+    local_max_new_tokens: Optional[int] = _env_int("LOCAL_LLM_MAX_NEW_TOKENS")
     
 @dataclass
 class SelectionConfig:
@@ -1921,22 +1938,13 @@ class LLMAnnotator:
         self.cfg = cfg
         self.scCfg = scCfg
         self.cache_dir = os.path.join(cache_dir,"llm_cache"); os.makedirs(self.cache_dir, exist_ok=True)
-        self.client = None
+        self.backend = None
         # The label configuration is injected by the orchestrator once it has been
         # materialised.  Default to an empty mapping so that downstream calls that
         # access ``self.label_config`` degrade gracefully when no configuration has
         # been supplied (e.g. during unit tests or CLI usage without overrides).
         self.label_config: dict[str, object] = {}
-        self._init_client()
-
-    def _init_client(self):
-        if AzureOpenAI is None: raise ImportError("Please install openai>=1.0 for Azure")
-        self.client = AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION","2024-06-01"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            timeout=self.cfg.timeout
-        )
+        self.backend = build_llm_backend(self.cfg)
 
     def _save(self, key: str, data: dict):
         # Record final aggregate per-call object in memory; the single file is written at the end of run()
@@ -2084,7 +2092,6 @@ class LLMAnnotator:
 
         # --- run n_consistency votes (each vote = fresh jitter if enabled) ---
         preds, runs = [], []
-        time_last_call = time.time()
     
         # Prebuild immutable "system" header (we add a tiny meta line per vote to avoid LLM-side cache collisions)
         system_base = ("You are a meticulous clinical annotator for EHR data. "
@@ -2163,42 +2170,31 @@ class LLMAnnotator:
             attempt = 0
             while attempt <= self.cfg.retry_max:
                 try:
-                    kwargs = dict(
-                        model=self.cfg.model_name,
-                        temperature=temperature_this_vote,
-                        response_format={"type": "json_object"},
-                        logprobs=self.cfg.logprobs,
-                        n=1,
+                    result = self.backend.json_call(
                         messages=messages,
+                        temperature=temperature_this_vote,
+                        logprobs=self.cfg.logprobs,
+                        top_logprobs=int(self.cfg.top_logprobs) if self.cfg.logprobs and int(self.cfg.top_logprobs) > 0 else None,
+                        response_format={"type": "json_object"},
                     )
-                    if self.cfg.logprobs and int(self.cfg.top_logprobs) > 0:
-                        kwargs["top_logprobs"] = int(self.cfg.top_logprobs)
-    
-                    # simple RPM limiter (your original approach)
-                    if self.cfg.rpm_limit is not None:
-                        min_spacing = float(60 / self.cfg.rpm_limit)
-                        since = time.time() - time_last_call
-                        if since < min_spacing:
-                            time.sleep(min_spacing - since)
-    
-                    t0 = time.time()
-                    resp = self.client.chat.completions.create(**kwargs)
-                    time_last_call = time.time()
-                    dt = time.time() - t0
-                    content = resp.choices[0].message.content
-                    data = json.loads(content)
+                    content = result.content
+                    data = result.data
     
                     pred = data.get(self.cfg.prediction_field, data.get("prediction"))
     
                     preds.append(str(pred) if pred is not None else None)
 
-                    runs.append({
+                    run_entry = {
                         "prediction": pred,
                         "raw": data,
                         "jitter": ({"k": k, "drop": drop_p, "shuffle": shuffle_context, "temperature": temperature_this_vote}
                                    if jitter_params else None),
-                    })
-                    
+                    }
+                    if result.logprobs is not None:
+                        run_entry["logprobs"] = result.logprobs
+                    run_entry["response_latency_s"] = result.latency_s
+                    runs.append(run_entry)
+
                     try:
                         # Capture the exact prompt + minimal context identifiers used this vote
                         LLM_RECORDER.record("json_vote", {
@@ -2212,7 +2208,7 @@ class LLMAnnotator:
                                 "n_consistency": int(n_consistency),
                             },
                             "snippets": [{"doc_id": c.get("doc_id"), "chunk_id": c.get("chunk_id")} for c in (cand if jitter_params else snippets)],
-                            "output": {"prediction": pred, "raw": data},
+                            "output": {"prediction": pred, "raw": data, "content": content},
                         })
                     except Exception:
                         LLM_RECORDER.record("json_vote_error", {})
@@ -2810,35 +2806,18 @@ class FamilyLabeler:
                 }}
                 """.strip()
     
-        # ----- Azure OpenAI JSON-mode call -----
+        # ----- Backend JSON call -----
         temp = float(getattr(self.cfg, "exemplar_temperature", 0.7) or 0.7)
-        kwargs = dict(
-            model=self.llm.cfg.model_name,
-            temperature=temp,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
-    
-        # Optional RPM limiter (matches your pattern elsewhere)
+
         try:
-            if getattr(self.llm.cfg, "rpm_limit", None):
-                _since = getattr(self.llm, "_last_call", 0.0)
-                _min_spacing = float(60.0 / float(self.llm.cfg.rpm_limit))
-                now = _time.time()
-                if now - _since < _min_spacing:
-                    _time.sleep(_min_spacing - (now - _since))
-        except Exception:
-            pass
-    
-        try:
-            resp = self.llm.client.chat.completions.create(**kwargs)
-            setattr(self.llm, "_last_call", _time.time())
-            ch = resp.choices[0]
-            content = (
-                getattr(getattr(ch, "message", None), "content", None)
-                or getattr(ch, "content", None)
-                or ""
+            result = self.llm.backend.json_call(
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=temp,
+                logprobs=False,
+                top_logprobs=None,
+                response_format={"type": "json_object"},
             )
+            content = result.content
             # Capture the exact prompt + minimal context identifiers used this vote
             LLM_RECORDER.record("label_exemplar", {
                 "label_id": label_id,
@@ -2975,56 +2954,17 @@ class FamilyLabeler:
             "Return ONLY the option letter.\n\n" +
             "Context:\n" + ctx
         )
-        kwargs = dict(
-            model=self.llm.cfg.model_name,
-            temperature=0.0,
-            logprobs=True,
-            top_logprobs=5,
-            max_tokens=1,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        result = self.llm.backend.forced_choice(
+            system=system,
+            user=user,
+            options=options,
+            letters=letters,
+            top_logprobs=int(self.llm.cfg.top_logprobs) if int(self.llm.cfg.top_logprobs) > 0 else 5,
         )
-        # RPM limiter
-        if self.llm.cfg.rpm_limit:
-            import time as _time
-            _since = getattr(self.llm, "_last_call", 0.0)
-            _min_spacing = float(60.0 / self.llm.cfg.rpm_limit)
-            now = _time.time()
-            if now - _since < _min_spacing:
-                _time.sleep(_min_spacing - (now - _since))
-        t0 = time.time()
-        resp = self.llm.client.chat.completions.create(**kwargs)
-        dt = time.time() - t0
-        setattr(self.llm, "_last_call", time.time())
-        ch = resp.choices[0]
-        lp = getattr(ch, "logprobs", None)
-        items = getattr(lp, "content", None) or []
-        letter_logps = {L: -1e9 for L in letters}
-        for it in items:
-            tops = getattr(it, "top_logprobs", None) or (it.get("top_logprobs") if isinstance(it, dict) else None)
-            if not tops:
-                continue
-            for cand in tops:
-                tok = getattr(cand, "token", None) or (cand.get("token") if isinstance(cand, dict) else None)
-                val = getattr(cand, "logprob", None) or (cand.get("logprob") if isinstance(cand, dict) else None)
-                if tok is None or val is None: 
-                    continue
-                t = str(tok).strip().strip('"').strip("'")
-                if t and not t[0].isalnum():
-                    t = t[1:]
-                t = t[:1].upper() if t else ""
-                if t in letter_logps:
-                    letter_logps[t] = max(letter_logps[t], float(val))
-        # convert to probs
-        logits = np.array([letter_logps[L] for L in letters], dtype="float64")
-        # stabilize
-        m = logits.max()
-        probs = np.exp(logits - m); probs = probs / probs.sum() if probs.sum() > 0 else np.ones_like(probs)/len(probs)
-        # entropy
-        ent = float(-(probs * np.log(probs + 1e-12)).sum())
-        # map back to option labels
-        opt_probs = {options[i]: float(probs[i]) for i in range(len(options))}
-        pred = options[int(np.argmax(probs))]
-        
+        opt_probs = dict(result.option_probs)
+        ent = float(result.entropy)
+        pred = result.prediction
+
         try:
             LLM_RECORDER.record("forced_choice", {
                 "unit_id": unit_id,
@@ -3032,7 +2972,12 @@ class FamilyLabeler:
                 "label_type": label_type,
                 "prompt": {"system": system, "user": user},
                 "snippets": ctx,
-                "fc_output": {"fc_probs": opt_probs, "fc_entropy": ent, "prediction": pred},
+                "fc_output": {
+                    "fc_probs": opt_probs,
+                    "fc_entropy": ent,
+                    "prediction": pred,
+                    "latency_s": result.latency_s,
+                },
             })
         except Exception:
             pass
