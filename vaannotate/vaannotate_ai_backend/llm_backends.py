@@ -490,6 +490,8 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                 "tokens": token_ids,
                 "logprobs": token_logprobs,
             }
+        print(text)
+        print(logprob_payload)
         return JSONCallResult(
             data=data,
             content=text,
@@ -564,6 +566,9 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         option_probs = {options[i]: float(probs[i]) for i in range(len(options))}
         prediction = options[max(range(len(probs)), key=lambda idx: probs[idx])]
         avg_latency = latency_total / max(1, len(option_logps))
+        print("fc call:")
+        print(prediction)
+        print(option_logps)
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
