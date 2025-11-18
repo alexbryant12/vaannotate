@@ -28,6 +28,7 @@ import json
 import math
 import os
 import time
+from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
@@ -58,6 +59,44 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - handled when backend initialises
     JsonSchemaParser = None  # type: ignore
     ExLlamaV2TokenEnforcerFilter = None  # type: ignore
+
+
+def _to_serializable(value: Any) -> Any:
+    """Convert SDK response objects into plain Python structures."""
+
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, MappingABC):
+        return {str(k): _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, SequenceABC) and not isinstance(value, (str, bytes, bytearray)):
+        return [_to_serializable(v) for v in value]
+
+    for attr in ("model_dump", "to_dict"):
+        method = getattr(value, attr, None)
+        if callable(method):  # pragma: no branch - best effort serialisation
+            try:
+                return _to_serializable(method())
+            except Exception:  # noqa: BLE001 - fallback to next strategy
+                pass
+
+    json_method = getattr(value, "model_dump_json", None)
+    if callable(json_method):
+        try:
+            return json.loads(json_method())
+        except Exception:  # noqa: BLE001 - fallback to repr
+            pass
+
+    if hasattr(value, "__dict__"):
+        try:
+            return {
+                str(k): _to_serializable(v)
+                for k, v in value.__dict__.items()
+                if not k.startswith("_")
+            }
+        except Exception:  # noqa: BLE001 - fallback to repr
+            pass
+
+    return str(value)
 
 
 @dataclass
@@ -188,6 +227,8 @@ class AzureOpenAIBackend(LLMBackend):
         content = content or ""
         data = json.loads(content)
         logprob_info = getattr(choice, "logprobs", None)
+        if logprob_info is not None:
+            logprob_info = _to_serializable(logprob_info)
         return JSONCallResult(
             data=data,
             content=content,
@@ -490,8 +531,6 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                 "tokens": token_ids,
                 "logprobs": token_logprobs,
             }
-        print(text)
-        print(logprob_payload)
         return JSONCallResult(
             data=data,
             content=text,
@@ -515,36 +554,48 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                 {"role": "user", "content": user},
             ]
         )
-        option_logps: Dict[str, float] = {}
+
+        import torch
+        import torch.nn.functional as F  # type: ignore
+
+        letter_logps: Dict[str, float] = {letter: -1e9 for letter in letters}
         latency_total = 0.0
+        completed = 0
+
+        class _Processor:
+            """Logits processor that records the logprob of a single target token."""
+
+            def __init__(self, target_id: int):
+                self._target = int(target_id)
+                self.last_logprob: float = float("-1e9")
+
+            def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+                if logits.dim() == 3:
+                    scores = logits[:, -1, :]
+                else:
+                    scores = logits
+                log_probs = F.log_softmax(scores, dim=-1)
+                lp = log_probs[..., self._target]
+                self.last_logprob = float(lp.reshape(-1)[0].item())
+                mask = torch.full_like(logits, float("-inf"))
+                mask[..., self._target] = logits[..., self._target]
+                return mask
 
         def _processor_for_letter(letter_text: str):
-            import torch
-
             encoded = self.tokenizer.encode(letter_text)
             token_ids = encoded.tolist() if hasattr(encoded, "tolist") else list(encoded)
             if not token_ids:
                 return None
-
-            class _Processor:
-                def __init__(self, target: int):
-                    self._target = target
-
-                def __call__(self, logits):
-                    mask = torch.full_like(logits, float("-inf"))
-                    mask[..., self._target] = logits[..., self._target]
-                    return mask
-
             return _Processor(int(token_ids[0]))
 
         for letter, option in zip(letters, options):
             processor = _processor_for_letter(letter)
             if processor is None:
-                option_logps[option] = -1e9
+                letter_logps[letter] = -1e9
                 continue
             self._respect_rpm_limit()
             t0 = time.time()
-            _, _, token_logprobs = self._generate(
+            self._generate(
                 prompt,
                 max_new_tokens=1,
                 temperature=0.0,
@@ -553,8 +604,9 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             latency = time.time() - t0
             latency_total += latency
             self._post_call()
-            option_logps[option] = float(token_logprobs[0]) if token_logprobs else -1e9
-        logits = list(option_logps.values())
+            letter_logps[letter] = float(getattr(processor, "last_logprob", -1e9))
+            completed += 1
+        logits = [letter_logps[letter] for letter in letters]
         m = max(logits)
         probs = [math.exp(v - m) for v in logits]
         denom = sum(probs)
@@ -564,11 +616,9 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             probs = [p / denom for p in probs]
         entropy = -sum(p * math.log(max(p, 1e-12)) for p in probs)
         option_probs = {options[i]: float(probs[i]) for i in range(len(options))}
+        option_logps = {options[i]: float(letter_logps[letters[i]]) for i in range(len(options))}
         prediction = options[max(range(len(probs)), key=lambda idx: probs[idx])]
-        avg_latency = latency_total / max(1, len(option_logps))
-        print("fc call:")
-        print(prediction)
-        print(option_logps)
+        avg_latency = latency_total / max(1, completed)
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
