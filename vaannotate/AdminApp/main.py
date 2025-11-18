@@ -2659,11 +2659,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         random_llm_layout.addRow("Local model dir", random_local_model_widget)
         random_local_model_label = random_llm_layout.labelForField(random_local_model_widget)
 
-        self.random_local_gpu_split_edit = QtWidgets.QLineEdit()
-        self.random_local_gpu_split_edit.setPlaceholderText("Optional GPU split string")
-        random_llm_layout.addRow("GPU split", self.random_local_gpu_split_edit)
-        random_local_gpu_split_label = random_llm_layout.labelForField(self.random_local_gpu_split_edit)
-
         self.random_local_max_seq_spin = QtWidgets.QSpinBox()
         self.random_local_max_seq_spin.setRange(0, 262144)
         self.random_local_max_seq_spin.setSpecialValueText("Model default")
@@ -2719,8 +2714,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             for w in (
                 random_local_model_label,
                 random_local_model_widget,
-                self.random_local_gpu_split_edit,
-                random_local_gpu_split_label,
                 self.random_local_max_seq_spin,
                 random_local_max_seq_label,
                 self.random_local_max_new_tokens_spin,
@@ -2780,10 +2773,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         ai_local_model_layout.setStretch(1, 0)
         ai_config_layout.addRow("Local model dir", ai_local_model_widget)
         ai_local_model_label = ai_config_layout.labelForField(ai_local_model_widget)
-        self.ai_local_gpu_split_edit = QtWidgets.QLineEdit()
-        self.ai_local_gpu_split_edit.setPlaceholderText("Optional GPU split string")
-        ai_config_layout.addRow("GPU split", self.ai_local_gpu_split_edit)
-        ai_local_gpu_split_label = ai_config_layout.labelForField(self.ai_local_gpu_split_edit)
         self.ai_local_max_seq_spin = QtWidgets.QSpinBox()
         self.ai_local_max_seq_spin.setRange(0, 262144)
         self.ai_local_max_seq_spin.setSpecialValueText("Model default")
@@ -2835,8 +2824,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             for w in (
                 ai_local_model_label,
                 ai_local_model_widget,
-                self.ai_local_gpu_split_edit,
-                ai_local_gpu_split_label,
                 self.ai_local_max_seq_spin,
                 ai_local_max_seq_label,
                 self.ai_local_max_new_tokens_spin,
@@ -2945,8 +2932,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.ai_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", "https://spd-prod-openai-va-apim.azure-api.us/api"))
         if hasattr(self, "ai_local_model_path_edit"):
             self.ai_local_model_path_edit.setText(os.getenv("LOCAL_LLM_MODEL_DIR", ""))
-        if hasattr(self, "ai_local_gpu_split_edit"):
-            self.ai_local_gpu_split_edit.setText(os.getenv("LOCAL_LLM_GPU_SPLIT", ""))
         if hasattr(self, "ai_local_max_seq_spin"):
             try:
                 max_seq_env = int(os.getenv("LOCAL_LLM_MAX_SEQ_LEN", "0") or 0)
@@ -2979,8 +2964,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.random_azure_endpoint_edit.setText(os.getenv("AZURE_OPENAI_ENDPOINT", "https://spd-prod-openai-va-apim.azure-api.us/api"))
         if hasattr(self, "random_local_model_path_edit"):
             self.random_local_model_path_edit.setText(os.getenv("LOCAL_LLM_MODEL_DIR", ""))
-        if hasattr(self, "random_local_gpu_split_edit"):
-            self.random_local_gpu_split_edit.setText(os.getenv("LOCAL_LLM_GPU_SPLIT", ""))
         if hasattr(self, "random_local_max_seq_spin"):
             try:
                 random_max_seq_env = int(os.getenv("LOCAL_LLM_MAX_SEQ_LEN", "0") or 0)
@@ -3399,10 +3382,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 model_dir = self.ai_local_model_path_edit.text().strip()
                 if model_dir:
                     backend_cfg["local_model_dir"] = model_dir
-            if hasattr(self, "ai_local_gpu_split_edit"):
-                split = self.ai_local_gpu_split_edit.text().strip()
-                if split:
-                    backend_cfg["local_gpu_split"] = split
             if hasattr(self, "ai_local_max_seq_spin"):
                 max_seq = int(self.ai_local_max_seq_spin.value())
                 if max_seq > 0:
@@ -3618,11 +3597,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     )
                     return None
                 env["LOCAL_LLM_MODEL_DIR"] = str(model_dir)
-            gpu_split = ""
-            if hasattr(self, "ai_local_gpu_split_edit"):
-                gpu_split = self.ai_local_gpu_split_edit.text().strip()
-            if gpu_split:
-                env["LOCAL_LLM_GPU_SPLIT"] = gpu_split
             if hasattr(self, "ai_local_max_seq_spin"):
                 max_seq = int(self.ai_local_max_seq_spin.value())
                 if max_seq > 0:
@@ -3728,13 +3702,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     )
                     return None
                 env["LOCAL_LLM_MODEL_DIR"] = str(model_dir)
-            gpu_split = (
-                self.random_local_gpu_split_edit.text().strip()
-                if hasattr(self, "random_local_gpu_split_edit")
-                else ""
-            )
-            if gpu_split:
-                env["LOCAL_LLM_GPU_SPLIT"] = gpu_split
             if hasattr(self, "random_local_max_seq_spin"):
                 max_seq = int(self.random_local_max_seq_spin.value())
                 if max_seq > 0:
@@ -3801,10 +3768,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 model_dir = self.ai_local_model_path_edit.text().strip()
                 if model_dir:
                     llm_overrides["local_model_dir"] = model_dir
-            if hasattr(self, "ai_local_gpu_split_edit"):
-                split = self.ai_local_gpu_split_edit.text().strip()
-                if split:
-                    llm_overrides["local_gpu_split"] = split
             if hasattr(self, "ai_local_max_seq_spin"):
                 max_seq = int(self.ai_local_max_seq_spin.value())
                 if max_seq > 0:
@@ -4553,13 +4516,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     )
                     if model_dir:
                         backend_cfg["local_model_dir"] = model_dir
-                    gpu_split = (
-                        self.random_local_gpu_split_edit.text().strip()
-                        if hasattr(self, "random_local_gpu_split_edit")
-                        else ""
-                    )
-                    if gpu_split:
-                        backend_cfg["local_gpu_split"] = gpu_split
                     if hasattr(self, "random_local_max_seq_spin"):
                         max_seq = int(self.random_local_max_seq_spin.value())
                         if max_seq > 0:

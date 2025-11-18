@@ -290,8 +290,6 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         config.model_dir = str(model_dir)
         if cfg.local_max_seq_len:
             config.max_seq_len = int(cfg.local_max_seq_len)
-        if cfg.local_gpu_split:
-            config.set_auto_map(cfg.local_gpu_split)
         if hasattr(config, "no_flash_attn"):
             setattr(config, "no_flash_attn", True)
         elif hasattr(config, "use_flash_attn"):
@@ -304,6 +302,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         self.tokenizer = ExLlamaV2Tokenizer(config)
         max_seq = int(getattr(cfg, "local_max_seq_len", 0) or config.max_seq_len)
         self.cache = ExLlamaV2Cache(self.model, max_seq_len=max_seq, lazy=True)
+        self.model.load_autosplit(self.cache, progress=True)
         if ExLlamaV2DynamicGenerator is None:
             raise ImportError(
                 "ExLlamaV2DynamicGenerator is unavailable even though exllamav2 was imported."
