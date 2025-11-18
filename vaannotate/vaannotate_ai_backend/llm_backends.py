@@ -558,9 +558,28 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         import torch
         import torch.nn.functional as F  # type: ignore
 
-        letter_logps: Dict[str, float] = {letter: -1e9 for letter in letters}
+        option_logps: Dict[str, float] = {}
         latency_total = 0.0
         completed = 0
+
+        class _Processor:
+            """Logits processor that records the logprob of a single target token."""
+
+            def __init__(self, target_id: int):
+                self._target = int(target_id)
+                self.last_logprob: float = float("-1e9")
+
+            def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+                if logits.dim() == 3:
+                    scores = logits[:, -1, :]
+                else:
+                    scores = logits
+                log_probs = F.log_softmax(scores, dim=-1)
+                lp = log_probs[..., self._target]
+                self.last_logprob = float(lp.reshape(-1)[0].item())
+                mask = torch.full_like(logits, float("-inf"))
+                mask[..., self._target] = logits[..., self._target]
+                return mask
 
         class _Processor:
             """Logits processor that records the logprob of a single target token."""
@@ -604,9 +623,8 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             latency = time.time() - t0
             latency_total += latency
             self._post_call()
-            letter_logps[letter] = float(getattr(processor, "last_logprob", -1e9))
-            completed += 1
-        logits = [letter_logps[letter] for letter in letters]
+            option_logps[option] = float(getattr(processor, "last_logprob", -1e9))
+        logits = list(option_logps.values())
         m = max(logits)
         probs = [math.exp(v - m) for v in logits]
         denom = sum(probs)
@@ -618,7 +636,10 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         option_probs = {options[i]: float(probs[i]) for i in range(len(options))}
         option_logps = {options[i]: float(letter_logps[letters[i]]) for i in range(len(options))}
         prediction = options[max(range(len(probs)), key=lambda idx: probs[idx])]
-        avg_latency = latency_total / max(1, completed)
+        avg_latency = latency_total / max(1, len(option_logps))
+        print("FC probe")
+        print(option_probs)
+        print(prediction)
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
