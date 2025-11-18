@@ -40,32 +40,24 @@ except Exception:  # pragma: no cover - handled when backend is constructed
     AzureOpenAI = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
-    from exllamav2 import ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Config
-    from exllamav2.tokenizer import ExLlamaV2Tokenizer
-    from exllamav2.generator import (
-        ExLlamaV2Generator,
-        ExLlamaV2StreamingGenerator,
-        SequenceGeneratorSettings,
-    )
+    from exllamav2 import ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Config, ExLlamaV2Tokenizer
+    from exllamav2.generator import ExLlamaV2DynamicGenerator, ExLlamaV2Sampler
+    from exllamav2.generator.filters import ExLlamaV2PrefixFilter
 except Exception:  # pragma: no cover - handled during backend construction
     ExLlamaV2 = None  # type: ignore
     ExLlamaV2Cache = None  # type: ignore
     ExLlamaV2Config = None  # type: ignore
     ExLlamaV2Tokenizer = None  # type: ignore
-    ExLlamaV2Generator = None  # type: ignore
-    ExLlamaV2StreamingGenerator = None  # type: ignore
-    SequenceGeneratorSettings = None  # type: ignore
+    ExLlamaV2DynamicGenerator = None  # type: ignore
+    ExLlamaV2Sampler = None  # type: ignore
+    ExLlamaV2PrefixFilter = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
     from lmformatenforcer import JsonSchemaParser
-    from lmformatenforcer.integrations.exllamav2 import (
-        ExLlamaV2LogitsProcessor,
-        ExLlamaV2TokenizerProxy,
-    )
+    from lmformatenforcer.integrations.exllamav2 import ExLlamaV2TokenEnforcerFilter
 except Exception:  # pragma: no cover - handled when backend initialises
     JsonSchemaParser = None  # type: ignore
-    ExLlamaV2LogitsProcessor = None  # type: ignore
-    ExLlamaV2TokenizerProxy = None  # type: ignore
+    ExLlamaV2TokenEnforcerFilter = None  # type: ignore
 
 
 @dataclass
@@ -281,9 +273,13 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             raise ImportError(
                 "ExLlamaV2 backend requested but exllamav2 is not installed."
             )
-        if JsonSchemaParser is None or ExLlamaV2LogitsProcessor is None:
+        if JsonSchemaParser is None or ExLlamaV2TokenEnforcerFilter is None:
             raise ImportError(
                 "ExLlamaV2 backend requires lm-format-enforcer with the exllamav2 integration."
+            )
+        if ExLlamaV2PrefixFilter is None:
+            raise ImportError(
+                "ExLlamaV2 backend requires the prefix filter from exllamav2.generator.filters."
             )
         super().__init__(cfg)
         model_dir = cfg.local_model_dir or os.getenv("LOCAL_LLM_MODEL_DIR")
@@ -308,10 +304,31 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         self.tokenizer = ExLlamaV2Tokenizer(config)
         max_seq = int(getattr(cfg, "local_max_seq_len", 0) or config.max_seq_len)
         self.cache = ExLlamaV2Cache(self.model, max_seq_len=max_seq, lazy=True)
-        self.generator = ExLlamaV2Generator(self.model, self.tokenizer, self.cache)
+        if ExLlamaV2DynamicGenerator is None:
+            raise ImportError(
+                "ExLlamaV2DynamicGenerator is unavailable even though exllamav2 was imported."
+            )
+        try:
+            # Prefer keyword arguments to match current releases.
+            self.generator = ExLlamaV2DynamicGenerator(
+                model=self.model,
+                cache=self.cache,
+                tokenizer=self.tokenizer,
+                paged=False,
+            )
+        except TypeError:  # pragma: no cover - signature drift across releases
+            try:
+                self.generator = ExLlamaV2DynamicGenerator(self.model, self.cache, self.tokenizer)
+            except TypeError:
+                self.generator = ExLlamaV2DynamicGenerator(self.model, self.tokenizer, self.cache)
 
-        # LMFE integration keeps strict JSON outputs
-        self._tokenizer_proxy = ExLlamaV2TokenizerProxy(self.tokenizer)
+        warmup = getattr(self.generator, "warmup", None)
+        if callable(warmup):  # pragma: no cover - optional optimisation
+            warmup()
+
+        self._json_stop_conditions: Sequence[int] = tuple(
+            getattr(cfg, "local_json_stop_tokens", None) or (128001, 128009, 78191)
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -335,14 +352,16 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         parts.append("<|start_header_id|>assistant<|end_header_id|>\n")
         return "".join(parts)
 
-    def _build_json_logits_processor(self, response_format: Optional[Mapping[str, Any]]):
+    def _build_json_filters(self, response_format: Optional[Mapping[str, Any]]):
         schema: Mapping[str, Any]
         if response_format and response_format.get("type") == "json_schema":
             schema = response_format.get("json_schema", {}) or {"type": "object"}
         else:
             schema = {"type": "object"}
         parser = JsonSchemaParser(schema)
-        return ExLlamaV2LogitsProcessor(parser, self._tokenizer_proxy)
+        lmfe_filter = ExLlamaV2TokenEnforcerFilter(parser, self.tokenizer)
+        prefix_filter = ExLlamaV2PrefixFilter(self.model, self.tokenizer, "{")
+        return [lmfe_filter, prefix_filter]
 
     def _generate(
         self,
@@ -350,35 +369,91 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         *,
         max_new_tokens: int,
         temperature: float,
+        filters: Optional[Sequence[Any]] = None,
+        stop_conditions: Optional[Sequence[int]] = None,
         logits_processors: Optional[Sequence[Any]] = None,
     ) -> tuple[str, List[int], List[float]]:
-        settings = SequenceGeneratorSettings()
+        if ExLlamaV2Sampler is None:
+            raise ImportError(
+                "ExLlamaV2Sampler is unavailable even though exllamav2 was imported."
+            )
+        settings = ExLlamaV2Sampler.Settings()
         settings.temperature = max(0.0, float(temperature))
         settings.top_p = 1.0
         settings.top_k = 0
         settings.token_repetition_penalty = 1.0
         settings.max_new_tokens = int(max_new_tokens)
+        if filters:
+            settings.filters = list(filters)
+            settings.filter_prefer_eos = True
 
-        stream_gen = ExLlamaV2StreamingGenerator(self.generator)
+        kwargs: Dict[str, Any] = {
+            "prompt": prompt,
+            "max_new_tokens": int(max_new_tokens),
+            "gen_settings": settings,
+            "add_bos": False,
+            "add_eos": False,
+            "completion_only": True,
+            "encode_special_tokens": True,
+        }
+        if stop_conditions:
+            kwargs["stop_conditions"] = list(stop_conditions)
+
+        generator = self.generator
+        clear_logits = getattr(generator, "clear_logits_processors", None)
+        remove_logits = getattr(generator, "remove_logits_processor", None)
+        add_logits = getattr(generator, "add_logits_processor", None)
+
+        if logits_processors and callable(clear_logits):  # pragma: no cover - optional API
+            clear_logits()
+
+        added_processors: List[Any] = []
         if logits_processors:
+            if not callable(add_logits):  # pragma: no cover - defensive
+                raise RuntimeError(
+                    "ExLlamaV2DynamicGenerator does not support logits processors"
+                )
             for processor in logits_processors:
-                stream_gen.add_logits_processor(processor)
-        stream_gen.begin_stream(prompt)
-        collected_tokens: List[int] = []
-        collected_logprobs: List[float] = []
-        output_chunks: List[str] = []
-        while True:
-            token, text = stream_gen.stream_next(settings)
-            if token is None:
-                break
-            collected_tokens.append(int(token))
-            collected_logprobs.append(float(stream_gen.last_token_logprob()))
-            if text:
-                output_chunks.append(text)
-            if len(collected_tokens) >= max_new_tokens:
-                break
-        stream_gen.end_stream()
-        return "".join(output_chunks), collected_tokens, collected_logprobs
+                add_logits(processor)
+                added_processors.append(processor)
+
+        try:
+            result = generator.generate(**kwargs)
+        finally:  # pragma: no cover - cleanup path
+            if logits_processors and callable(remove_logits):
+                for processor in added_processors:
+                    remove_logits(processor)
+            elif logits_processors and callable(clear_logits):
+                clear_logits()
+
+        text: str
+        token_ids: List[int]
+        token_logprobs: List[float]
+
+        if isinstance(result, tuple):
+            # Older versions may return (text, token_ids, logprobs)
+            if len(result) == 3:
+                text = str(result[0])
+                token_ids = list(result[1] or [])
+                token_logprobs = list(result[2] or [])
+            else:  # pragma: no cover - defensive
+                text = str(result[0])
+                token_ids = list(result[1] or []) if len(result) > 1 else []
+                token_logprobs = list(result[2] or []) if len(result) > 2 else []
+        elif isinstance(result, dict):
+            text = str(result.get("text") or result.get("output") or "")
+            token_ids = list(result.get("token_ids") or result.get("tokens") or [])
+            token_logprobs = list(
+                result.get("token_logprobs") or result.get("logprobs") or []
+            )
+        else:
+            text = str(getattr(result, "text", result))
+            token_ids = list(getattr(result, "token_ids", getattr(result, "tokens", [])))
+            token_logprobs = list(
+                getattr(result, "token_logprobs", getattr(result, "logprobs", []))
+            )
+
+        return text, [int(t) for t in token_ids], [float(lp) for lp in token_logprobs]
 
     # ------------------------------------------------------------------
     # Backend API implementation
@@ -395,13 +470,14 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         prompt = self._format_messages(messages)
         max_new = int(self.cfg.local_max_new_tokens or 1024)
         self._respect_rpm_limit()
-        logits_processor = self._build_json_logits_processor(response_format)
+        filters = self._build_json_filters(response_format)
         t0 = time.time()
         text, token_ids, token_logprobs = self._generate(
             prompt,
             max_new_tokens=max_new,
             temperature=temperature,
-            logits_processors=[logits_processor],
+            filters=filters,
+            stop_conditions=self._json_stop_conditions,
         )
         latency = time.time() - t0
         self._post_call()
