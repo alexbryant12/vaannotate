@@ -762,18 +762,48 @@ class RoundBuilder:
             if limit_value and limit_value > 0:
                 setattr(cfg.llmfirst, "single_doc_full_context_max_chars", limit_value)
         env_overrides: Dict[str, str] = {}
+        backend_choice = str(ai_backend_config.get("backend") or "").strip().lower()
+        backend_env_value: str | None = None
+        if backend_choice == "azure":
+            backend_env_value = "azure"
+        elif backend_choice in {"exllamav2", "exllama", "local"}:
+            backend_env_value = "exllamav2" if backend_choice == "local" else backend_choice
+            local_model_path = self._resolve_optional_path(
+                ai_backend_config.get("local_model_dir"), config_base
+            )
+            if local_model_path:
+                env_overrides["LOCAL_LLM_MODEL_DIR"] = str(local_model_path)
+            local_max_seq = ai_backend_config.get("local_max_seq_len")
+            if local_max_seq is not None:
+                try:
+                    local_max_seq_value = int(local_max_seq)
+                except (TypeError, ValueError):
+                    local_max_seq_value = None
+                if local_max_seq_value and local_max_seq_value > 0:
+                    env_overrides["LOCAL_LLM_MAX_SEQ_LEN"] = str(local_max_seq_value)
+            local_max_new = ai_backend_config.get("local_max_new_tokens")
+            if local_max_new is not None:
+                try:
+                    local_max_new_value = int(local_max_new)
+                except (TypeError, ValueError):
+                    local_max_new_value = None
+                if local_max_new_value and local_max_new_value > 0:
+                    env_overrides["LOCAL_LLM_MAX_NEW_TOKENS"] = str(local_max_new_value)
+        if backend_env_value:
+            env_overrides["LLM_BACKEND"] = backend_env_value
         embed_path = self._resolve_optional_path(ai_backend_config.get("embedding_model_dir"), config_base)
         if embed_path:
             env_overrides["MED_EMBED_MODEL_NAME"] = str(embed_path)
         rerank_path = self._resolve_optional_path(ai_backend_config.get("reranker_model_dir"), config_base)
         if rerank_path:
             env_overrides["RERANKER_MODEL_NAME"] = str(rerank_path)
-        azure_version = ai_backend_config.get("azure_api_version")
-        if azure_version:
-            env_overrides["AZURE_OPENAI_API_VERSION"] = str(azure_version)
-        azure_endpoint = ai_backend_config.get("azure_endpoint")
-        if azure_endpoint:
-            env_overrides["AZURE_OPENAI_ENDPOINT"] = str(azure_endpoint)
+        if backend_env_value == "azure":
+            azure_version = ai_backend_config.get("azure_api_version")
+            if azure_version:
+                env_overrides["AZURE_OPENAI_API_VERSION"] = str(azure_version)
+            azure_endpoint = ai_backend_config.get("azure_endpoint")
+            if azure_endpoint:
+                env_overrides["AZURE_OPENAI_ENDPOINT"] = str(azure_endpoint)
 
         previous_env: Dict[str, Optional[str]] = {}
         for key, value in env_overrides.items():
