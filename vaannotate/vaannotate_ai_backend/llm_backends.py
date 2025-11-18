@@ -515,26 +515,37 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                 {"role": "user", "content": user},
             ]
         )
+
+        import torch
+        import torch.nn.functional as F  # type: ignore
+
         option_logps: Dict[str, float] = {}
         latency_total = 0.0
 
-        def _processor_for_letter(letter_text: str):
-            import torch
+        class _Processor:
+            """Logits processor that records the logprob of a single target token."""
 
+            def __init__(self, target_id: int):
+                self._target = int(target_id)
+                self.last_logprob: float = float("-1e9")
+
+            def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+                if logits.dim() == 3:
+                    scores = logits[:, -1, :]
+                else:
+                    scores = logits
+                log_probs = F.log_softmax(scores, dim=-1)
+                lp = log_probs[..., self._target]
+                self.last_logprob = float(lp.reshape(-1)[0].item())
+                mask = torch.full_like(logits, float("-inf"))
+                mask[..., self._target] = logits[..., self._target]
+                return mask
+
+        def _processor_for_letter(letter_text: str):
             encoded = self.tokenizer.encode(letter_text)
             token_ids = encoded.tolist() if hasattr(encoded, "tolist") else list(encoded)
             if not token_ids:
                 return None
-
-            class _Processor:
-                def __init__(self, target: int):
-                    self._target = target
-
-                def __call__(self, logits):
-                    mask = torch.full_like(logits, float("-inf"))
-                    mask[..., self._target] = logits[..., self._target]
-                    return mask
-
             return _Processor(int(token_ids[0]))
 
         for letter, option in zip(letters, options):
@@ -544,7 +555,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                 continue
             self._respect_rpm_limit()
             t0 = time.time()
-            _, _, token_logprobs = self._generate(
+            self._generate(
                 prompt,
                 max_new_tokens=1,
                 temperature=0.0,
@@ -553,7 +564,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             latency = time.time() - t0
             latency_total += latency
             self._post_call()
-            option_logps[option] = float(token_logprobs[0]) if token_logprobs else -1e9
+            option_logps[option] = float(getattr(processor, "last_logprob", -1e9))
         logits = list(option_logps.values())
         m = max(logits)
         probs = [math.exp(v - m) for v in logits]
@@ -566,9 +577,6 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         option_probs = {options[i]: float(probs[i]) for i in range(len(options))}
         prediction = options[max(range(len(probs)), key=lambda idx: probs[idx])]
         avg_latency = latency_total / max(1, len(option_logps))
-        print("fc call:")
-        print(prediction)
-        print(option_logps)
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
