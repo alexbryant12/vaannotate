@@ -516,38 +516,55 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             ]
         )
 
+        import torch
+        import torch.nn.functional as F  # type: ignore
+
         option_logps: Dict[str, float] = {}
         latency_total = 0.0
 
-        def _prefix_length(letter_text: str) -> int:
+        class _Processor:
+            """Logits processor that records the logprob of a single target token."""
+
+            def __init__(self, target_id: int):
+                self._target = int(target_id)
+                self.last_logprob: float = float("-1e9")
+
+            def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+                if logits.dim() == 3:
+                    scores = logits[:, -1, :]
+                else:
+                    scores = logits
+                log_probs = F.log_softmax(scores, dim=-1)
+                lp = log_probs[..., self._target]
+                self.last_logprob = float(lp.reshape(-1)[0].item())
+                mask = torch.full_like(logits, float("-inf"))
+                mask[..., self._target] = logits[..., self._target]
+                return mask
+
+        def _processor_for_letter(letter_text: str):
             encoded = self.tokenizer.encode(letter_text)
             token_ids = encoded.tolist() if hasattr(encoded, "tolist") else list(encoded)
             if not token_ids:
-                return 1
-            bos = getattr(self.tokenizer, "bos_token_id", None)
-            if bos is not None and token_ids and token_ids[0] == int(bos):
-                token_ids = token_ids[1:]
-            return max(1, len(token_ids))
+                return None
+            return _Processor(int(token_ids[0]))
 
         for letter, option in zip(letters, options):
-            prefix_len = _prefix_length(letter)
-            prefix_filter = ExLlamaV2PrefixFilter(self.model, self.tokenizer, letter)
+            processor = _processor_for_letter(letter)
+            if processor is None:
+                option_logps[option] = -1e9
+                continue
             self._respect_rpm_limit()
             t0 = time.time()
-            _, _, token_logprobs = self._generate(
+            self._generate(
                 prompt,
-                max_new_tokens=prefix_len,
+                max_new_tokens=1,
                 temperature=0.0,
-                filters=[prefix_filter],
+                logits_processors=[processor],
             )
             latency = time.time() - t0
             latency_total += latency
             self._post_call()
-            if token_logprobs:
-                lp = float(sum(token_logprobs[:prefix_len]))
-            else:
-                lp = float(-1e9)
-            option_logps[option] = lp
+            option_logps[option] = float(getattr(processor, "last_logprob", -1e9))
         logits = list(option_logps.values())
         m = max(logits)
         probs = [math.exp(v - m) for v in logits]
@@ -560,6 +577,9 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         option_probs = {options[i]: float(probs[i]) for i in range(len(options))}
         prediction = options[max(range(len(probs)), key=lambda idx: probs[idx])]
         avg_latency = latency_total / max(1, len(option_logps))
+        print("FC probe")
+        print(option_probs)
+        print(prediction)
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
