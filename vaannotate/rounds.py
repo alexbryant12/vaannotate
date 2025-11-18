@@ -1134,6 +1134,7 @@ class RoundBuilder:
         cfg.final_llm_labeling = True
         cfg.final_llm_labeling_n_consistency = max(1, consistency)
         setattr(cfg.llmfirst, "final_llm_label_consistency", cfg.final_llm_labeling_n_consistency)
+        setattr(cfg.llm, "include_reasoning", bool(include_reasoning))
 
         ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         llmfirst_overrides = (

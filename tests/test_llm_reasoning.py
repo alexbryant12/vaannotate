@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import json
+
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from vaannotate.vaannotate_ai_backend import engine
+from vaannotate.vaannotate_ai_backend.llm_backends import JSONCallResult
+
+
+def test_llm_annotator_omits_reasoning_when_disabled(monkeypatch, tmp_path):
+    calls: dict[str, object] = {}
+
+    class DummyBackend:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def json_call(self, messages, **kwargs):  # noqa: D401
+            calls["messages"] = list(messages)
+            payload = {"prediction": "yes", "reasoning": "explanation"}
+            return JSONCallResult(
+                data=payload,
+                content=json.dumps(payload),
+                raw_response=None,
+                latency_s=0.01,
+                logprobs=None,
+            )
+
+    monkeypatch.setattr(engine, "build_llm_backend", lambda cfg: DummyBackend(cfg))
+
+    llm_cfg = engine.LLMConfig()
+    llm_cfg.include_reasoning = False
+    annotator = engine.LLMAnnotator(llm_cfg, engine.SCJitterConfig(), cache_dir=str(tmp_path))
+
+    result = annotator.annotate(
+        unit_id="unit-1",
+        label_id="Flag",
+        label_type="categorical",
+        label_rules="",
+        snippets=[{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}],
+        n_consistency=1,
+        jitter_params=False,
+    )
+
+    user_message = next(msg["content"] for msg in calls["messages"] if msg["role"] == "user")
+    assert "prediction" in user_message
+    assert "reasoning" not in user_message
+
+    run = result["runs"][0]
+    assert "reasoning" not in run["raw"]
