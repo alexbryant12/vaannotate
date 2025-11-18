@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, List, Dict, Tuple, Optional, Any
+from typing import Callable, List, Dict, Tuple, Optional, Any, Mapping
 import numpy as np
 import logging
 import pandas as pd
@@ -130,6 +130,7 @@ class LLMConfig:
     retry_backoff: float = 2.0
     max_context_chars: int = 1200000
     rpm_limit: Optional[int] = 30
+    include_reasoning: bool = True
     # Azure OpenAI specific knobs
     azure_api_key: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
     azure_api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
@@ -2056,17 +2057,26 @@ class LLMAnnotator:
                 pairs += 1
         return float(sim_sum / max(1, pairs))
 
-    def annotate(self, unit_id: str, label_id: str, label_type: str, label_rules: str, snippets: List[dict], n_consistency: int=1, 
-                 jitter_params: bool=False) -> dict:
+    def annotate(
+        self,
+        unit_id: str,
+        label_id: str,
+        label_type: str,
+        label_rules: str,
+        snippets: List[dict],
+        n_consistency: int = 1,
+        jitter_params: bool = False,
+    ) -> dict:
         import json, time
-        
+
         rag_topk_range     = self.scCfg.rag_topk_range
         rag_dropout_p      = self.scCfg.rag_dropout_p
         temp_range         = self.scCfg.temperature_range
         shuffle_context    = self.scCfg.shuffle_context
-    
+
         # Jitter RNG
         rng = random.Random()
+        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
     
         # --- helper: build context text from a candidate chunk list with char budget ---
         def _build_context_text(_snips: List[dict]) -> str:
@@ -2160,7 +2170,8 @@ class LLMAnnotator:
             segments.append("Evidence snippets:")
             segments.append(ctx_text)
             segments.append("")
-            segments.append("RESPONSE JSON keys: prediction, reasoning")
+            response_keys = "prediction, reasoning" if include_reasoning else "prediction"
+            segments.append(f"RESPONSE JSON keys: {response_keys}")
             task = "\n".join(segments)
             messages = [{"role": "system", "content": system},
                         {"role": "user",   "content": task}]
@@ -2177,15 +2188,22 @@ class LLMAnnotator:
                         response_format={"type": "json_object"},
                     )
                     content = result.content
-                    data = result.data
-    
-                    pred = data.get(self.cfg.prediction_field, data.get("prediction"))
-    
+                    data_map: dict[str, Any]
+                    raw_data = result.data
+                    if isinstance(raw_data, Mapping):
+                        data_map = dict(raw_data.items())
+                    else:
+                        data_map = {"prediction": raw_data}
+                    if not include_reasoning:
+                        data_map.pop("reasoning", None)
+
+                    pred = data_map.get(self.cfg.prediction_field, data_map.get("prediction"))
+
                     preds.append(str(pred) if pred is not None else None)
 
                     run_entry = {
                         "prediction": pred,
-                        "raw": data,
+                        "raw": data_map,
                         "jitter": ({"k": k, "drop": drop_p, "shuffle": shuffle_context, "temperature": temperature_this_vote}
                                    if jitter_params else None),
                     }
@@ -2207,7 +2225,7 @@ class LLMAnnotator:
                                 "n_consistency": int(n_consistency),
                             },
                             "snippets": [{"doc_id": c.get("doc_id"), "chunk_id": c.get("chunk_id")} for c in (cand if jitter_params else snippets)],
-                            "output": {"prediction": pred, "raw": data, "content": content},
+                            "output": {"prediction": pred, "raw": data_map, "content": content},
                         })
                     except Exception:
                         LLM_RECORDER.record("json_vote_error", {})
