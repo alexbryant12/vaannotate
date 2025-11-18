@@ -136,7 +136,6 @@ class LLMConfig:
     azure_endpoint: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
     # Local ExLlamaV2 specific knobs
     local_model_dir: Optional[str] = os.getenv("LOCAL_LLM_MODEL_DIR")
-    local_gpu_split: Optional[str] = os.getenv("LOCAL_LLM_GPU_SPLIT")
     local_max_seq_len: Optional[int] = _env_int("LOCAL_LLM_MAX_SEQ_LEN")
     local_max_new_tokens: Optional[int] = _env_int("LOCAL_LLM_MAX_NEW_TOKENS")
     
