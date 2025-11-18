@@ -610,6 +610,131 @@ def test_random_assisted_review_generates_snippets(monkeypatch: pytest.MonkeyPat
     assert stored_payload.get("unit_snippets")
 
     assert result == {"snippets_json": "reports/assisted_review/snippets.json"}
+
+
+def test_assisted_review_respects_local_backend_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from vaannotate.vaannotate_ai_backend import engine as backend_engine
+
+    project_root = tmp_path / "Project"
+    project_root.mkdir()
+    builder = RoundBuilder(project_root)
+    round_dir = tmp_path / "round"
+    round_dir.mkdir()
+    local_model_dir = tmp_path / "LocalLLM"
+    local_model_dir.mkdir()
+
+    env_snapshot: Dict[str, object] = {}
+
+    class DummyOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:
+            env_snapshot["LLM_BACKEND"] = os.getenv("LLM_BACKEND")
+            env_snapshot["LOCAL_LLM_MODEL_DIR"] = os.getenv("LOCAL_LLM_MODEL_DIR")
+            env_snapshot["LOCAL_LLM_MAX_SEQ_LEN"] = os.getenv("LOCAL_LLM_MAX_SEQ_LEN")
+            env_snapshot["LOCAL_LLM_MAX_NEW_TOKENS"] = os.getenv("LOCAL_LLM_MAX_NEW_TOKENS")
+            self.repo = types.SimpleNamespace(notes=None)
+            self.store = types.SimpleNamespace(build_chunk_index=lambda *args, **kwargs: None)
+            llmfirst = types.SimpleNamespace(
+                single_doc_context="rag",
+                single_doc_full_context_max_chars=None,
+            )
+            self.cfg = types.SimpleNamespace(
+                rag=types.SimpleNamespace(),
+                index=types.SimpleNamespace(),
+                scjitter=types.SimpleNamespace(),
+                llmfirst=llmfirst,
+            )
+            self.llm = object()
+            self.rag = object()
+            self.label_config = kwargs.get("label_config", {})
+
+        def _label_maps(self):  # noqa: D401
+            return {}, {}, {"Flag": "rule"}, {"Flag": {"type": "categorical_single"}}
+
+    class DummyFamilyLabeler:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def ensure_label_exemplars(self, *args, **kwargs) -> None:
+            return None
+
+    def dummy_contexts(*args, **kwargs):
+        return [
+            {
+                "doc_id": "doc_local",
+                "chunk_id": 1,
+                "score": 0.9,
+                "source": "test",
+                "text": "Example context",
+                "metadata": {"note": "example"},
+            }
+        ]
+
+    monkeypatch.setattr(backend_engine, "ActiveLearningLLMFirst", DummyOrchestrator)
+    monkeypatch.setattr(backend_engine, "FamilyLabeler", DummyFamilyLabeler)
+    monkeypatch.setattr(backend_engine, "_contexts_for_unit_label", dummy_contexts)
+
+    assignments = {
+        "rev_one": [
+            AssignmentUnit(
+                unit_id="unit_local",
+                patient_icn="p1",
+                doc_id="doc_local",
+                payload={
+                    "documents": [
+                        {
+                            "doc_id": "doc_local",
+                            "patient_icn": "p1",
+                            "text": "Source note",
+                        }
+                    ]
+                },
+            )
+        ]
+    }
+
+    labelset = {
+        "labelset_id": "ls_local",
+        "labels": [
+            {
+                "label_id": "Flag",
+                "name": "Flag",
+                "type": "categorical_single",
+                "required": False,
+                "options": [{"value": "yes", "display": "Yes"}],
+            }
+        ],
+    }
+
+    config = {
+        "assisted_review": {"enabled": True, "top_snippets": 1},
+        "ai_backend": {
+            "backend": "exllamav2",
+            "local_model_dir": str(local_model_dir),
+            "local_max_seq_len": 4096,
+            "local_max_new_tokens": 256,
+        },
+    }
+
+    pheno_row = {"level": "single_doc"}
+
+    result = builder._generate_assisted_review_snippets(
+        pheno_row=pheno_row,
+        labelset=labelset,
+        round_dir=round_dir,
+        reviewer_assignments=assignments,
+        config=config,
+        config_base=round_dir,
+        top_n=1,
+    )
+
+    unit_map = result.get("unit_snippets", {}).get("unit_local", {})
+    assert unit_map.get("Flag")
+    assert env_snapshot.get("LLM_BACKEND") == "exllamav2"
+    assert env_snapshot.get("LOCAL_LLM_MODEL_DIR") == str(local_model_dir)
+    assert env_snapshot.get("LOCAL_LLM_MAX_SEQ_LEN") == "4096"
+    assert env_snapshot.get("LOCAL_LLM_MAX_NEW_TOKENS") == "256"
+    assert os.getenv("LOCAL_LLM_MODEL_DIR") is None
+    assert os.getenv("LLM_BACKEND") is None
 def test_multi_doc_round_uses_patient_display_unit(tmp_path: Path) -> None:
     project_root = tmp_path / "Project"
     paths = init_project(project_root, "proj", "Project", "tester")
