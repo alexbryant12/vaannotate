@@ -577,6 +577,9 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         option_probs = {options[i]: float(probs[i]) for i in range(len(options))}
         prediction = options[max(range(len(probs)), key=lambda idx: probs[idx])]
         avg_latency = latency_total / max(1, len(option_logps))
+        print("FC probe")
+        print(option_probs)
+        print(prediction)
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
