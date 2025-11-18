@@ -130,7 +130,7 @@ class LLMConfig:
     retry_backoff: float = 2.0
     max_context_chars: int = 1200000
     rpm_limit: Optional[int] = 30
-    include_reasoning: bool = True
+    include_reasoning: bool = False
     # Azure OpenAI specific knobs
     azure_api_key: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
     azure_api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
