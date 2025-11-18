@@ -40,15 +40,21 @@ except Exception:  # pragma: no cover - handled when backend is constructed
     AzureOpenAI = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
-    from exllamav2 import ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Config, ExLlamaV2Tokenizer
-    from exllamav2.generator import ExLlamaV2DynamicGenerator, ExLlamaV2Sampler
+    from exllamav2 import ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Config
+    from exllamav2.tokenizer import ExLlamaV2Tokenizer
+    from exllamav2.generator import (
+        ExLlamaV2Generator,
+        ExLlamaV2StreamingGenerator,
+        SequenceGeneratorSettings,
+    )
 except Exception:  # pragma: no cover - handled during backend construction
     ExLlamaV2 = None  # type: ignore
     ExLlamaV2Cache = None  # type: ignore
     ExLlamaV2Config = None  # type: ignore
     ExLlamaV2Tokenizer = None  # type: ignore
-    ExLlamaV2DynamicGenerator = None  # type: ignore
-    ExLlamaV2Sampler = None  # type: ignore
+    ExLlamaV2Generator = None  # type: ignore
+    ExLlamaV2StreamingGenerator = None  # type: ignore
+    SequenceGeneratorSettings = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
     from lmformatenforcer import JsonSchemaParser
@@ -302,16 +308,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         self.tokenizer = ExLlamaV2Tokenizer(config)
         max_seq = int(getattr(cfg, "local_max_seq_len", 0) or config.max_seq_len)
         self.cache = ExLlamaV2Cache(self.model, max_seq_len=max_seq, lazy=True)
-        if ExLlamaV2DynamicGenerator is None:
-            raise ImportError(
-                "ExLlamaV2DynamicGenerator is unavailable even though exllamav2 was imported."
-            )
-        try:
-            # Some versions expect (model, cache, tokenizer) while older releases used
-            # (model, tokenizer, cache); try both for maximum compatibility.
-            self.generator = ExLlamaV2DynamicGenerator(self.model, self.cache, self.tokenizer)
-        except TypeError:  # pragma: no cover - defensive for signature drift
-            self.generator = ExLlamaV2DynamicGenerator(self.model, self.tokenizer, self.cache)
+        self.generator = ExLlamaV2Generator(self.model, self.tokenizer, self.cache)
 
         # LMFE integration keeps strict JSON outputs
         self._tokenizer_proxy = ExLlamaV2TokenizerProxy(self.tokenizer)
@@ -355,72 +352,33 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         temperature: float,
         logits_processors: Optional[Sequence[Any]] = None,
     ) -> tuple[str, List[int], List[float]]:
-        if ExLlamaV2Sampler is None:
-            raise ImportError(
-                "ExLlamaV2Sampler is unavailable even though exllamav2 was imported."
-            )
-        settings = ExLlamaV2Sampler.Settings()
+        settings = SequenceGeneratorSettings()
         settings.temperature = max(0.0, float(temperature))
         settings.top_p = 1.0
         settings.top_k = 0
         settings.token_repetition_penalty = 1.0
         settings.max_new_tokens = int(max_new_tokens)
 
-        generator = self.generator
-        clear_logits = getattr(generator, "clear_logits_processors", None)
-        remove_logits = getattr(generator, "remove_logits_processor", None)
-        add_logits = getattr(generator, "add_logits_processor", None)
-
-        if callable(clear_logits):  # pragma: no cover - optional API
-            clear_logits()
-
-        added_processors: List[Any] = []
+        stream_gen = ExLlamaV2StreamingGenerator(self.generator)
         if logits_processors:
-            if not callable(add_logits):  # pragma: no cover - defensive
-                raise RuntimeError(
-                    "ExLlamaV2DynamicGenerator does not support logits processors"
-                )
             for processor in logits_processors:
-                add_logits(processor)
-                added_processors.append(processor)
-
-        try:
-            result = generator.generate_simple(prompt, settings)
-        finally:  # pragma: no cover - cleanup path
-            if callable(remove_logits):
-                for processor in added_processors:
-                    remove_logits(processor)
-            elif callable(clear_logits):
-                clear_logits()
-
-        text: str
-        token_ids: List[int]
-        token_logprobs: List[float]
-
-        if isinstance(result, tuple):
-            # Older versions may return (text, token_ids, logprobs)
-            if len(result) == 3:
-                text = str(result[0])
-                token_ids = list(result[1] or [])
-                token_logprobs = list(result[2] or [])
-            else:  # pragma: no cover - defensive
-                text = str(result[0])
-                token_ids = list(result[1] or []) if len(result) > 1 else []
-                token_logprobs = list(result[2] or []) if len(result) > 2 else []
-        elif isinstance(result, dict):
-            text = str(result.get("text") or result.get("output") or "")
-            token_ids = list(result.get("token_ids") or result.get("tokens") or [])
-            token_logprobs = list(
-                result.get("token_logprobs") or result.get("logprobs") or []
-            )
-        else:
-            text = str(getattr(result, "text", result))
-            token_ids = list(getattr(result, "token_ids", getattr(result, "tokens", [])))
-            token_logprobs = list(
-                getattr(result, "token_logprobs", getattr(result, "logprobs", []))
-            )
-
-        return text, [int(t) for t in token_ids], [float(lp) for lp in token_logprobs]
+                stream_gen.add_logits_processor(processor)
+        stream_gen.begin_stream(prompt)
+        collected_tokens: List[int] = []
+        collected_logprobs: List[float] = []
+        output_chunks: List[str] = []
+        while True:
+            token, text = stream_gen.stream_next(settings)
+            if token is None:
+                break
+            collected_tokens.append(int(token))
+            collected_logprobs.append(float(stream_gen.last_token_logprob()))
+            if text:
+                output_chunks.append(text)
+            if len(collected_tokens) >= max_new_tokens:
+                break
+        stream_gen.end_stream()
+        return "".join(output_chunks), collected_tokens, collected_logprobs
 
     # ------------------------------------------------------------------
     # Backend API implementation
