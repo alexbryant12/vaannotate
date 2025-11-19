@@ -13,7 +13,7 @@ import sys
 import uuid
 import tempfile
 from collections.abc import Mapping as ABCMapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type, Tuple
@@ -47,7 +47,12 @@ from vaannotate.project import (
 )
 from vaannotate.utils import copy_sqlite_database, ensure_dir
 from vaannotate.rounds import AssignmentUnit as RoundAssignmentUnit, RoundBuilder
-from vaannotate.vaannotate_ai_backend import CancelledError, BackendResult, run_ai_backend_and_collect
+from vaannotate.vaannotate_ai_backend import (
+    CancelledError,
+    BackendResult,
+    engine,
+    run_ai_backend_and_collect,
+)
 
 PROJECT_MODELS = [
     models.Project,
@@ -218,6 +223,276 @@ class AIRoundLogDialog(QtWidgets.QDialog):
         if self._cancel_button:
             self._cancel_button.setEnabled(False)
 
+
+def _deep_update_dict(target: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
+    """Recursively merge updates into target and return the target dict."""
+
+    for key, value in updates.items():
+        if isinstance(value, Mapping):
+            current = target.get(key)
+            if not isinstance(current, Mapping):
+                current = {}
+            target[key] = _deep_update_dict(dict(current), value)
+        else:
+            target[key] = copy.deepcopy(value)
+    return target
+
+
+AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
+    "index": {
+        "type": "FAISS index type: flat (brute force), hnsw (graph), or ivf (quantized inverted lists).",
+        "nlist": "Number of clusters/lists for IVF indexes.",
+        "nprobe": "How many IVF lists to search at query time (higher = better recall).",
+        "hnsw_M": "HNSW graph degree (edges per node).",
+        "hnsw_efSearch": "HNSW search breadth; larger trades memory for recall.",
+        "persist": "Persist built FAISS indexes to disk for reuse.",
+    },
+    "rag": {
+        "chunk_size": "Maximum characters per text chunk before embedding.",
+        "chunk_overlap": "Overlap between consecutive chunks to preserve context.",
+        "normalize_embeddings": "L2-normalize embeddings before indexing/searching.",
+        "per_label_topk": "Top-k chunks to keep per label during retrieval.",
+        "use_mmr": "Use maximal marginal relevance to diversify retrieved chunks.",
+        "mmr_lambda": "MMR trade-off between relevance (1.0) and diversity (0.0).",
+        "mmr_candidates": "Candidate pool size for MMR selection.",
+        "use_keywords": "Blend keyword search results into retrieval.",
+        "keyword_topk": "How many keyword hits to include when enabled.",
+        "min_context_chunks": "Minimum chunks of context to pass to the LLM.",
+        "mmr_multiplier": "Scale the number of chunks considered for MMR diversification.",
+        "neighbor_hops": "How many hops to explore around selected chunks for neighbors.",
+    },
+    "llm": {
+        "model_name": "LLM deployment/model identifier.",
+        "backend": "LLM backend to use: azure or exllamav2 (local).",
+        "temperature": "Sampling temperature for LLM calls.",
+        "n_consistency": "Self-consistency samples for JSON calls.",
+        "logprobs": "Request log-probabilities from the LLM when available.",
+        "top_logprobs": "Top-N token log-probs to request.",
+        "prediction_field": "JSON field containing the model prediction.",
+        "timeout": "Per-request timeout (seconds).",
+        "retry_max": "Maximum LLM retry attempts.",
+        "retry_backoff": "Exponential backoff base (seconds) between retries.",
+        "max_context_chars": "Guardrail on total characters passed to the LLM.",
+        "rpm_limit": "Requests-per-minute throttle; leave 0 to disable.",
+        "include_reasoning": "Ask the LLM to return reasoning/rationale text.",
+        "azure_api_version": "Azure OpenAI API version to target.",
+        "azure_endpoint": "Custom Azure OpenAI endpoint URL.",
+        "local_model_dir": "Path to the local ExLlamaV2 model directory.",
+        "local_max_seq_len": "Override maximum sequence length for local models (0=default).",
+        "local_max_new_tokens": "Override maximum new tokens for local generation (0=default).",
+    },
+    "select": {
+        "batch_size": "Number of candidate units to select for the next round.",
+        "pct_disagreement": "Fraction pulled from reviewer disagreement bucket.",
+        "pct_uncertain": "Fraction pulled from LLM-uncertain bucket.",
+        "pct_easy_qc": "Fraction pulled from LLM-certain/easy QC bucket.",
+        "pct_diversity": "Fraction pulled from diversity bucket.",
+    },
+    "llmfirst": {
+        "n_probe_units": "How many units to probe when estimating uncertainty.",
+        "topk": "Top-K relevant chunks to feed into LLM-first probes.",
+        "json_trace_policy": "Fallback policy for JSON traces (e.g., 'fallback').",
+        "progress_min_interval_s": "Minimum seconds between progress updates.",
+        "exemplar_K": "Number of exemplar documents to retrieve per label.",
+        "exemplar_generate": "Generate synthetic exemplars when none exist.",
+        "exemplar_temperature": "Sampling temperature for exemplar generation.",
+        "fc_enable": "Enable forced-choice micro-probe scoring.",
+        "enrich": "Enrich probes with additional context/details.",
+        "probe_enrichment_mix": "Blend between enriched vs. uniform probe selection (0-1).",
+        "probe_enrichment_equalize": "Equalize enrichment per parent label instead of proportional.",
+        "probe_ce_unit_sample": "How many units to sample for cross-encoder scoring.",
+        "probe_ce_search_topk_per_unit": "Top-K search hits per unit for CE reranking.",
+        "probe_ce_rerank_m": "Aggregate top-M cross-encoder scores per unit.",
+        "probe_ce_unit_agg": "Aggregation mode for CE scores (max/mean).",
+        "single_doc_context": "Context strategy for single-document phenotypes (rag/full).",
+        "single_doc_full_context_max_chars": "Max characters when using full-document context.",
+    },
+    "disagree": {
+        "round_policy": "How to weight prior rounds when measuring disagreement (last/all/decay).",
+        "decay_half_life": "Half-life (rounds) when round_policy=decay.",
+        "high_entropy_threshold": "Entropy threshold for treating disagreements as high entropy.",
+        "seeds_per_label": "Seed examples per label for disagreement expansion.",
+        "snippets_per_seed": "Relevant snippets to collect per seed case.",
+        "similar_chunks_per_seed": "Neighbor chunks to pull per seed during expansion.",
+        "expanded_per_label": "Expanded cases to include per label.",
+        "date_disagree_days": "Days apart to treat date labels as conflicting.",
+        "numeric_disagree_abs": "Absolute numeric delta that counts as disagreement.",
+        "numeric_disagree_rel": "Relative numeric delta that counts as disagreement (0-1).",
+    },
+    "diversity": {
+        "rag_k": "Chunks to retrieve per label for diversity sampling.",
+        "min_rel_quantile": "Minimum relevance quantile to consider for diversity sampling.",
+        "mmr_lambda": "Diversity MMR weighting (1=relevance, 0=diversity).",
+        "sample_cap": "Maximum candidates to sample from diversity bucket.",
+        "adaptive_relax": "Relax diversity thresholds when few candidates are found.",
+        "use_proto": "Use prototype-based representations when building diversity candidates.",
+    },
+    "scjitter": {
+        "enable": "Apply stochastic jittering when sampling easy/uncertain buckets.",
+        "rag_topk_range": "Range of RAG top-k values to sample from (min,max).",
+        "rag_dropout_p": "Probability of dropping a retrieved chunk.",
+        "temperature_range": "Range of LLM temperatures sampled for jittering.",
+        "shuffle_context": "Shuffle retrieved context before prompting the LLM.",
+    },
+    "orchestrator": {
+        "final_llm_labeling": "Run a final LLM labeling pass after selection.",
+        "final_llm_labeling_n_consistency": "Self-consistency passes for final labeling (≥1).",
+    },
+}
+
+
+class AIAdvancedConfigDialog(QtWidgets.QDialog):
+    """Dialog that surfaces all engine.py configuration options."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget], config: Mapping[str, Any]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AI backend advanced settings")
+        self.resize(760, 820)
+        self._config: Dict[str, Any] = dict(config)
+        self.result_config: Dict[str, Any] = {}
+        layout = QtWidgets.QVBoxLayout(self)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QtWidgets.QWidget()
+        container_layout = QtWidgets.QVBoxLayout(container)
+        container_layout.setContentsMargins(6, 6, 6, 6)
+
+        self._section_widgets: Dict[str, Dict[str, QtWidgets.QWidget]] = {}
+
+        sections: list[tuple[str, str]] = [
+            ("Indexing", "index"),
+            ("Retrieval (RAG)", "rag"),
+            ("LLM", "llm"),
+            ("Selection buckets", "select"),
+            ("LLM-first probing", "llmfirst"),
+            ("Disagreement", "disagree"),
+            ("Diversity", "diversity"),
+            ("Self-consistency jitter", "scjitter"),
+        ]
+
+        for title, key in sections:
+            section_values = self._config.get(key, {}) if isinstance(self._config.get(key), Mapping) else {}
+            group = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QFormLayout(group)
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+            widgets: Dict[str, QtWidgets.QWidget] = {}
+            for field_name, value in section_values.items():
+                widget = self._build_field_widget(key, field_name, value)
+                widgets[field_name] = widget
+                label_text = field_name.replace("_", " ").capitalize()
+                form.addRow(label_text, widget)
+            self._section_widgets[key] = widgets
+            container_layout.addWidget(group)
+
+        orch_group = QtWidgets.QGroupBox("Orchestrator")
+        orch_form = QtWidgets.QFormLayout(orch_group)
+        orch_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self._orch_widgets: Dict[str, QtWidgets.QWidget] = {}
+        for field_name in ("final_llm_labeling", "final_llm_labeling_n_consistency"):
+            value = self._config.get(field_name)
+            widget = self._build_field_widget("orchestrator", field_name, value)
+            self._orch_widgets[field_name] = widget
+            label_text = field_name.replace("_", " ").capitalize()
+            orch_form.addRow(label_text, widget)
+        container_layout.addWidget(orch_group)
+
+        container_layout.addStretch()
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self._on_accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _build_field_widget(self, section: str, name: str, value: Any) -> QtWidgets.QWidget:
+        tooltip = AI_CONFIG_TOOLTIPS.get(section, {}).get(name, "")
+        widget: QtWidgets.QWidget
+        if name == "type" and section == "index":
+            combo = QtWidgets.QComboBox()
+            for label, data in (("Flat", "flat"), ("HNSW", "hnsw"), ("IVF", "ivf")):
+                combo.addItem(label, data)
+            idx = combo.findData(str(value))
+            combo.setCurrentIndex(max(0, idx))
+            widget = combo
+        elif name == "backend" and section == "llm":
+            combo = QtWidgets.QComboBox()
+            combo.addItem("Azure OpenAI", "azure")
+            combo.addItem("Local ExLlamaV2", "exllamav2")
+            idx = combo.findData(str(value))
+            combo.setCurrentIndex(max(0, idx))
+            widget = combo
+        elif isinstance(value, (tuple, list)) and len(value) == 2:
+            edit = QtWidgets.QLineEdit()
+            edit.setText(", ".join(str(v) for v in value))
+            edit.setPlaceholderText("min,max")
+            edit.setProperty("value_type", "tuple")
+            edit.setProperty(
+                "tuple_cast",
+                float if any(isinstance(v, float) for v in value) else int,
+            )
+            edit.setProperty("tuple_factory", tuple if isinstance(value, tuple) else list)
+            widget = edit
+        elif isinstance(value, bool):
+            checkbox = QtWidgets.QCheckBox()
+            checkbox.setChecked(bool(value))
+            widget = checkbox
+        elif isinstance(value, float):
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-1_000_000.0, 1_000_000.0)
+            spin.setDecimals(4)
+            spin.setSingleStep(0.05)
+            spin.setValue(float(value))
+            widget = spin
+        elif isinstance(value, int):
+            spin = QtWidgets.QSpinBox()
+            spin.setRange(-1_000_000_000, 1_000_000_000)
+            spin.setValue(int(value))
+            widget = spin
+        else:
+            edit = QtWidgets.QLineEdit()
+            edit.setText("" if value is None else str(value))
+            widget = edit
+        if tooltip:
+            widget.setToolTip(tooltip)
+        return widget
+
+    def _collect_section_values(self, widgets: Mapping[str, QtWidgets.QWidget]) -> Dict[str, Any]:
+        values: Dict[str, Any] = {}
+        for key, widget in widgets.items():
+            if isinstance(widget, QtWidgets.QCheckBox):
+                values[key] = bool(widget.isChecked())
+            elif isinstance(widget, QtWidgets.QComboBox):
+                data = widget.currentData()
+                values[key] = data if data is not None else widget.currentText()
+            elif isinstance(widget, QtWidgets.QDoubleSpinBox):
+                values[key] = float(widget.value())
+            elif isinstance(widget, QtWidgets.QSpinBox):
+                values[key] = int(widget.value())
+            elif isinstance(widget, QtWidgets.QLineEdit):
+                if widget.property("value_type") == "tuple":
+                    text = widget.text().strip()
+                    parts = [p.strip() for p in text.split(",") if p.strip()]
+                    cast = widget.property("tuple_cast") or str
+                    factory = widget.property("tuple_factory") or tuple
+                    try:
+                        values[key] = factory(cast(p) for p in parts)
+                    except Exception:  # noqa: BLE001
+                        values[key] = text
+                else:
+                    values[key] = widget.text().strip()
+        return values
+
+    def _on_accept(self) -> None:
+        result: Dict[str, Any] = {}
+        for section, widgets in self._section_widgets.items():
+            result[section] = self._collect_section_values(widgets)
+        result.update(self._collect_section_values(self._orch_widgets))
+        self.result_config = result
+        self.accept()
 
 class AIRoundWorker(QtCore.QObject):
     finished = QtCore.Signal(object, object)
@@ -524,6 +799,10 @@ class AIRoundWorker(QtCore.QObject):
             payload["ai_backend"]["final_llm_family_probe_json"] = str(final_probe_json)
         if "final_llm_labeling" in self.cfg_overrides:
             payload["final_llm_labeling"] = bool(self.cfg_overrides.get("final_llm_labeling"))
+        if "final_llm_include_reasoning" in self.cfg_overrides:
+            payload["final_llm_include_reasoning"] = bool(
+                self.cfg_overrides.get("final_llm_include_reasoning")
+            )
         handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
         with handle:
             json.dump(payload, handle, indent=2)
@@ -2281,6 +2560,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_progress_block_number: Optional[int] = None
         self._ai_log_dialog: Optional[AIRoundLogDialog] = None
         self.ai_log_output: Optional[QtWidgets.QPlainTextEdit] = None
+        self._ai_engine_overrides: Dict[str, Any] = {}
         self._assisted_review_reminder_shown = False
         self._llm_prompt_shown = False
         self.ctx.project_changed.connect(self._refresh_labelset_options)
@@ -2313,9 +2593,159 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         value = self.total_n_spin.value() if hasattr(self, "total_n_spin") else 0
         self.ai_batch_size_label.setText(f"{value} (matches Total N)")
 
+    def _build_ai_config_snapshot(self) -> Dict[str, Any]:
+        try:
+            base_cfg: Dict[str, Any] = asdict(engine.OrchestratorConfig())
+        except Exception:  # noqa: BLE001
+            base_cfg = {}
+        _deep_update_dict(base_cfg, self._ai_engine_overrides or {})
+        select_cfg = base_cfg.get("select", {}) if isinstance(base_cfg.get("select"), Mapping) else {}
+        if hasattr(self, "total_n_spin"):
+            select_cfg["batch_size"] = int(self.total_n_spin.value())
+        if hasattr(self, "ai_disagreement_pct"):
+            select_cfg["pct_disagreement"] = float(self.ai_disagreement_pct.value())
+        if hasattr(self, "ai_uncertain_pct"):
+            select_cfg["pct_uncertain"] = float(self.ai_uncertain_pct.value())
+        if hasattr(self, "ai_easy_pct"):
+            select_cfg["pct_easy_qc"] = float(self.ai_easy_pct.value())
+        if hasattr(self, "ai_diversity_pct"):
+            select_cfg["pct_diversity"] = float(self.ai_diversity_pct.value())
+        base_cfg["select"] = select_cfg
+        llm_cfg = base_cfg.get("llm", {}) if isinstance(base_cfg.get("llm"), Mapping) else {}
+        backend_choice = self._current_ai_backend()
+        if backend_choice:
+            llm_cfg["backend"] = backend_choice
+        include_checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
+        if isinstance(include_checkbox, QtWidgets.QCheckBox):
+            llm_cfg["include_reasoning"] = bool(include_checkbox.isChecked())
+        if backend_choice == "azure":
+            if hasattr(self, "ai_azure_key_edit"):
+                azure_key = self.ai_azure_key_edit.text().strip()
+                if azure_key:
+                    llm_cfg["azure_api_key"] = azure_key
+            if hasattr(self, "ai_azure_version_edit"):
+                version = self.ai_azure_version_edit.text().strip()
+                if version:
+                    llm_cfg["azure_api_version"] = version
+            if hasattr(self, "ai_azure_endpoint_edit"):
+                endpoint = self.ai_azure_endpoint_edit.text().strip()
+                if endpoint:
+                    llm_cfg["azure_endpoint"] = endpoint
+        elif backend_choice:
+            if hasattr(self, "ai_local_model_path_edit"):
+                model_dir = self.ai_local_model_path_edit.text().strip()
+                if model_dir:
+                    llm_cfg["local_model_dir"] = model_dir
+            if hasattr(self, "ai_local_max_seq_spin"):
+                llm_cfg["local_max_seq_len"] = int(self.ai_local_max_seq_spin.value())
+            if hasattr(self, "ai_local_max_new_tokens_spin"):
+                llm_cfg["local_max_new_tokens"] = int(self.ai_local_max_new_tokens_spin.value())
+        base_cfg["llm"] = llm_cfg
+        if hasattr(self, "ai_final_llm_checkbox"):
+            base_cfg["final_llm_labeling"] = bool(self.ai_final_llm_checkbox.isChecked())
+        if "final_llm_labeling_n_consistency" not in base_cfg:
+            try:
+                base_cfg["final_llm_labeling_n_consistency"] = int(
+                    engine.OrchestratorConfig().final_llm_labeling_n_consistency
+                )
+            except Exception:  # noqa: BLE001
+                base_cfg["final_llm_labeling_n_consistency"] = 1
+        if (
+            str(self.pheno_row["level"] or "single_doc") == "single_doc"
+            and isinstance(getattr(self, "ai_single_doc_context_combo", None), QtWidgets.QComboBox)
+        ):
+            llmfirst_cfg = base_cfg.get("llmfirst", {}) if isinstance(base_cfg.get("llmfirst"), Mapping) else {}
+            mode_value = self.ai_single_doc_context_combo.currentData()
+            if not isinstance(mode_value, str) or not mode_value:
+                mode_value = "rag"
+            llmfirst_cfg["single_doc_context"] = mode_value
+            base_cfg["llmfirst"] = llmfirst_cfg
+        return base_cfg
+
+    def _apply_ai_config_to_controls(self, config: Mapping[str, Any]) -> None:
+        select_cfg = config.get("select", {}) if isinstance(config.get("select"), Mapping) else {}
+        batch_size = select_cfg.get("batch_size")
+        if hasattr(self, "total_n_spin") and isinstance(batch_size, (int, float)):
+            try:
+                self.total_n_spin.setValue(int(batch_size))
+            except Exception:  # noqa: BLE001
+                pass
+        for attr_name, key in (
+            ("ai_disagreement_pct", "pct_disagreement"),
+            ("ai_uncertain_pct", "pct_uncertain"),
+            ("ai_easy_pct", "pct_easy_qc"),
+            ("ai_diversity_pct", "pct_diversity"),
+        ):
+            widget = getattr(self, attr_name, None)
+            value = select_cfg.get(key)
+            if isinstance(widget, QtWidgets.QDoubleSpinBox) and isinstance(value, (int, float)):
+                widget.setValue(float(value))
+        llm_cfg = config.get("llm", {}) if isinstance(config.get("llm"), Mapping) else {}
+        backend_choice = llm_cfg.get("backend")
+        if backend_choice and hasattr(self, "ai_backend_combo"):
+            idx = self.ai_backend_combo.findData(str(backend_choice))
+            if idx >= 0:
+                self.ai_backend_combo.setCurrentIndex(idx)
+                self._update_ai_backend_fields()
+        include_reasoning = llm_cfg.get("include_reasoning")
+        checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
+        if isinstance(checkbox, QtWidgets.QCheckBox) and isinstance(include_reasoning, bool):
+            checkbox.setChecked(include_reasoning)
+        if backend_choice == "azure":
+            if hasattr(self, "ai_azure_key_edit") and llm_cfg.get("azure_api_key"):
+                self.ai_azure_key_edit.setText(str(llm_cfg.get("azure_api_key")))
+            if hasattr(self, "ai_azure_version_edit") and llm_cfg.get("azure_api_version"):
+                self.ai_azure_version_edit.setText(str(llm_cfg.get("azure_api_version")))
+            if hasattr(self, "ai_azure_endpoint_edit") and llm_cfg.get("azure_endpoint"):
+                self.ai_azure_endpoint_edit.setText(str(llm_cfg.get("azure_endpoint")))
+        elif backend_choice:
+            if hasattr(self, "ai_local_model_path_edit") and llm_cfg.get("local_model_dir"):
+                self.ai_local_model_path_edit.setText(str(llm_cfg.get("local_model_dir")))
+            if hasattr(self, "ai_local_max_seq_spin") and llm_cfg.get("local_max_seq_len") is not None:
+                try:
+                    self.ai_local_max_seq_spin.setValue(int(llm_cfg.get("local_max_seq_len")))
+                except Exception:  # noqa: BLE001
+                    pass
+            if hasattr(self, "ai_local_max_new_tokens_spin") and llm_cfg.get("local_max_new_tokens") is not None:
+                try:
+                    self.ai_local_max_new_tokens_spin.setValue(int(llm_cfg.get("local_max_new_tokens")))
+                except Exception:  # noqa: BLE001
+                    pass
+        if hasattr(self, "ai_final_llm_checkbox") and "final_llm_labeling" in config:
+            try:
+                self.ai_final_llm_checkbox.setChecked(bool(config.get("final_llm_labeling")))
+            except Exception:  # noqa: BLE001
+                pass
+        if (
+            str(self.pheno_row["level"] or "single_doc") == "single_doc"
+            and isinstance(getattr(self, "ai_single_doc_context_combo", None), QtWidgets.QComboBox)
+        ):
+            value = None
+            llmfirst_cfg = config.get("llmfirst", {}) if isinstance(config.get("llmfirst"), Mapping) else {}
+            if llmfirst_cfg:
+                value = llmfirst_cfg.get("single_doc_context")
+            if value:
+                idx = self.ai_single_doc_context_combo.findData(str(value))
+                if idx >= 0:
+                    self.ai_single_doc_context_combo.setCurrentIndex(idx)
+
+    def _open_ai_advanced_settings(self) -> None:
+        config = self._build_ai_config_snapshot()
+        dialog = AIAdvancedConfigDialog(self, config)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self._ai_engine_overrides = dialog.result_config or {}
+        self._apply_ai_config_to_controls(self._ai_engine_overrides)
+
+
     def _on_random_final_llm_toggled(self, checked: bool) -> None:
         if hasattr(self, "random_final_llm_group"):
             self.random_final_llm_group.setEnabled(bool(checked))
+
+    def _on_ai_final_llm_toggled(self, checked: bool) -> None:
+        checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
+        if isinstance(checkbox, QtWidgets.QCheckBox):
+            checkbox.setEnabled(bool(checked))
 
     def _on_assisted_review_toggled(self, checked: bool) -> None:
         if hasattr(self, "assisted_review_spin"):
@@ -2862,7 +3292,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         ai_config_layout.addRow("Diversity pct", self.ai_diversity_pct)
         self.ai_final_llm_checkbox = QtWidgets.QCheckBox("Run final LLM labeling")
         self.ai_final_llm_checkbox.setChecked(True)
+        self.ai_final_llm_checkbox.toggled.connect(self._on_ai_final_llm_toggled)
         ai_config_layout.addRow("Final LLM labeling", self.ai_final_llm_checkbox)
+
+        self.ai_include_reasoning_checkbox = QtWidgets.QCheckBox("Include reasoning")
+        self.ai_include_reasoning_checkbox.setChecked(False)
+        ai_config_layout.addRow("Include reasoning", self.ai_include_reasoning_checkbox)
         if str(self.pheno_row["level"] or "single_doc") == "single_doc":
             self.ai_single_doc_context_combo = QtWidgets.QComboBox()
             self.ai_single_doc_context_combo.addItem("RAG snippets", "rag")
@@ -2871,6 +3306,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 "Choose how the LLM context is built for single-document phenotypes."
             )
             ai_config_layout.addRow("Single-doc context", self.ai_single_doc_context_combo)
+        self.ai_advanced_settings_btn = QtWidgets.QPushButton("Advanced settings…")
+        self.ai_advanced_settings_btn.setToolTip(
+            "Open the full AI engine configuration (indexing, RAG, LLM, buckets, and more)."
+        )
+        self.ai_advanced_settings_btn.clicked.connect(self._open_ai_advanced_settings)
+        ai_config_layout.addRow("Advanced", self.ai_advanced_settings_btn)
         pct_hint = QtWidgets.QLabel("Fractions should sum to ≤ 1.0; remaining slots are auto-filled.")
         pct_hint.setWordWrap(True)
         ai_config_layout.addRow(pct_hint)
@@ -2982,6 +3423,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.random_local_max_new_tokens_spin.setValue(random_max_new_env)
         if hasattr(self, "random_final_llm_checkbox"):
             self._on_random_final_llm_toggled(self.random_final_llm_checkbox.isChecked())
+        if hasattr(self, "ai_final_llm_checkbox"):
+            self._on_ai_final_llm_toggled(self.ai_final_llm_checkbox.isChecked())
         if hasattr(self, "assisted_review_checkbox"):
             self._on_assisted_review_toggled(self.assisted_review_checkbox.isChecked())
         self.total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
@@ -3409,6 +3852,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 backend_cfg["llmfirst"] = llmfirst_cfg
             llmfirst_cfg["single_doc_context"] = mode_value
 
+        backend_cfg["config_overrides"] = copy.deepcopy(self._collect_ai_overrides())
+
         return RoundCreationContext(
             pheno_id=pheno_id,
             pheno_level=pheno_level,
@@ -3738,10 +4183,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         )
 
     def _collect_ai_overrides(self) -> Dict[str, Any]:
-        overrides: Dict[str, Any] = {}
+        overrides: Dict[str, Any] = copy.deepcopy(self._ai_engine_overrides) if self._ai_engine_overrides else {}
         if not self._using_ai_backend():
             return overrides
-        select: Dict[str, Any] = {}
+        select: Dict[str, Any] = overrides.get("select", {}) if isinstance(overrides.get("select"), Mapping) else {}
         if hasattr(self, "total_n_spin"):
             select["batch_size"] = int(self.total_n_spin.value())
         if hasattr(self, "ai_disagreement_pct"):
@@ -3756,6 +4201,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             overrides["select"] = select
         if hasattr(self, "ai_final_llm_checkbox"):
             overrides["final_llm_labeling"] = bool(self.ai_final_llm_checkbox.isChecked())
+        if "final_llm_labeling_n_consistency" not in overrides:
+            try:
+                overrides["final_llm_labeling_n_consistency"] = int(
+                    engine.OrchestratorConfig().final_llm_labeling_n_consistency
+                )
+            except Exception:  # noqa: BLE001
+                overrides["final_llm_labeling_n_consistency"] = 1
+        include_reasoning_value: Optional[bool] = None
+        include_checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
+        if isinstance(include_checkbox, QtWidgets.QCheckBox):
+            include_reasoning_value = bool(include_checkbox.isChecked())
+            overrides["final_llm_include_reasoning"] = include_reasoning_value
         llmfirst_overrides: Dict[str, Any] = {}
         if (
             str(self.pheno_row["level"] or "single_doc") == "single_doc"
@@ -3771,6 +4228,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         backend_choice = self._current_ai_backend()
         if backend_choice:
             llm_overrides["backend"] = backend_choice
+        if include_reasoning_value is not None:
+            llm_overrides["include_reasoning"] = include_reasoning_value
         if backend_choice == "azure":
             if hasattr(self, "ai_azure_version_edit"):
                 version = self.ai_azure_version_edit.text().strip()
