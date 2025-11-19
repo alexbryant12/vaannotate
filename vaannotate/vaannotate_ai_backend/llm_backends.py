@@ -690,6 +690,9 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         latency = time.time() - t0
         self._post_call()
 
+        print('FC call:')
+        print(option_probs)
+        print(prediction)
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
