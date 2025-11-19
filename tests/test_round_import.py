@@ -581,10 +581,46 @@ def test_random_assisted_review_generates_snippets(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(admin_main, "RoundBuilder", DummyRoundBuilder)
 
+    embed_dir = project_root / "embed"
+    embed_dir.mkdir()
+    rerank_dir = project_root / "rerank"
+    rerank_dir.mkdir()
+    local_model_dir = project_root / "llm"
+    local_model_dir.mkdir()
+
+    class DummyLineEdit:
+        def __init__(self, value: str = "") -> None:
+            self._value = value
+
+        def text(self) -> str:  # noqa: D401
+            return self._value
+
+    class DummySpinBox:
+        def __init__(self, value: int = 0) -> None:
+            self._value = value
+
+        def value(self) -> int:  # noqa: D401
+            return self._value
+
+    class DummyCombo:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def currentData(self) -> str:  # noqa: D401
+            return self._value
+
     dummy_dialog = types.SimpleNamespace(
         ctx=ctx,
         pheno_row=pheno_row,
-        random_azure_key_edit=types.SimpleNamespace(text=lambda: "test-azure-key"),
+        random_backend_combo=DummyCombo("azure"),
+        random_embedding_path_edit=DummyLineEdit(str(embed_dir)),
+        random_reranker_path_edit=DummyLineEdit(str(rerank_dir)),
+        random_azure_key_edit=DummyLineEdit("test-azure-key"),
+        random_azure_version_edit=DummyLineEdit("2024-06-01"),
+        random_azure_endpoint_edit=DummyLineEdit("https://example.azure.com"),
+        random_local_model_path_edit=DummyLineEdit(str(local_model_dir)),
+        random_local_max_seq_spin=DummySpinBox(0),
+        random_local_max_new_tokens_spin=DummySpinBox(0),
     )
 
     result = admin_main.RoundBuilderDialog._generate_random_assisted_review(
