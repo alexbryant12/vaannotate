@@ -2189,7 +2189,19 @@ class LLMAnnotator:
             task = "\n".join(segments)
             messages = [{"role": "system", "content": system},
                         {"role": "user",   "content": task}]
-    
+
+            response_schema = {
+                "type": "object",
+                "properties": {
+                    "prediction": {"type": ["string", "number", "boolean", "null"]},
+                },
+                "required": ["prediction"],
+                "additionalProperties": False,
+            }
+            if include_reasoning:
+                response_schema["properties"]["reasoning"] = {"type": ["string", "null"]}
+                response_schema["required"].append("reasoning")
+
             # ----- per-vote LLM call -----
             attempt = 0
             while attempt <= self.cfg.retry_max:
@@ -2199,7 +2211,10 @@ class LLMAnnotator:
                         temperature=temperature_this_vote,
                         logprobs=self.cfg.logprobs,
                         top_logprobs=int(self.cfg.top_logprobs) if self.cfg.logprobs and int(self.cfg.top_logprobs) > 0 else None,
-                        response_format={"type": "json_object"},
+                        response_format={
+                            "type": "json_object",
+                            "json_schema": response_schema,
+                        },
                     )
                     content = result.content
                     data_map: dict[str, Any]
@@ -2840,13 +2855,49 @@ class FamilyLabeler:
         # ----- Backend JSON call -----
         temp = float(getattr(self.cfg, "exemplar_temperature", 0.7) or 0.7)
 
+        if has_opts:
+            snippets_schema: Mapping[str, Any] = {
+                "type": "object",
+                "properties": {
+                    "snippets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "option": {"type": "string"},
+                                "text": {"type": "string"},
+                            },
+                            "required": ["option", "text"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["snippets"],
+                "additionalProperties": False,
+            }
+        else:
+            snippets_schema = {
+                "type": "object",
+                "properties": {
+                    "snippets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    }
+                },
+                "required": ["snippets"],
+                "additionalProperties": False,
+            }
+
         try:
             result = self.llm.backend.json_call(
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 temperature=temp,
                 logprobs=False,
                 top_logprobs=None,
-                response_format={"type": "json_object"},
+                response_format={
+                    "type": "json_object",
+                    "json_schema": snippets_schema,
+                },
             )
             content = result.content
             # Capture the exact prompt + minimal context identifiers used this vote

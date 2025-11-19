@@ -394,7 +394,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
 
     def _build_json_filters(self, response_format: Optional[Mapping[str, Any]]):
         schema: Mapping[str, Any]
-        if response_format and response_format.get("type") == "json_schema":
+        if response_format and response_format.get("json_schema"):
             schema = response_format.get("json_schema", {}) or {"type": "object"}
         else:
             schema = {"type": "object"}
