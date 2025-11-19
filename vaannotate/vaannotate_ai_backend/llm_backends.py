@@ -424,7 +424,9 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         settings.token_repetition_penalty = 1.0
         settings.max_new_tokens = int(max_new_tokens)
         if filters:
-            settings.filters = list(filters)
+            print('filters applied:')
+            print(filters)
+            settings.filters = filters
             settings.filter_prefer_eos = True
 
         kwargs: Dict[str, Any] = {
