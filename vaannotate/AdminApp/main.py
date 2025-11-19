@@ -2697,6 +2697,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         random_rerank_row.setStretch(1, 0)
         random_llm_layout.addRow("Re-ranker model", random_rerank_row)
 
+        self.random_include_reasoning_checkbox = QtWidgets.QCheckBox("Include reasoning")
+        self.random_include_reasoning_checkbox.setChecked(False)
+        random_llm_layout.addRow("Include reasoning", self.random_include_reasoning_checkbox)
+
         self._random_azure_widgets = [
             w
             for w in (
@@ -3615,9 +3619,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return None
         return env
 
-    def _collect_random_final_llm_environment(self) -> Optional[Dict[str, str]]:
-        if not hasattr(self, "random_final_llm_checkbox") or not self.random_final_llm_checkbox.isChecked():
-            return {}
+    def _collect_random_llm_environment(
+        self,
+        *,
+        context_label: str,
+        require_checkbox: bool,
+    ) -> Optional[Dict[str, str]]:
+        if require_checkbox:
+            checkbox = getattr(self, "random_final_llm_checkbox", None)
+            if not isinstance(checkbox, QtWidgets.QCheckBox) or not checkbox.isChecked():
+                return {}
         env: Dict[str, str] = {}
         missing: List[str] = []
         embed_path = (
@@ -3649,12 +3660,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if not rerank_dir.exists() or not rerank_dir.is_dir():
                 QtWidgets.QMessageBox.warning(
                     self,
-                    "Final LLM labeling",
+                    context_label,
                     "The selected re-ranker model directory does not exist or is not a directory.",
                 )
                 return None
             env["RERANKER_MODEL_NAME"] = str(rerank_dir)
-        backend_choice = self._current_random_backend()
+        backend_choice = RoundBuilderDialog._current_random_backend(self)
         if backend_choice == "azure":
             azure_key = (
                 self.random_azure_key_edit.text().strip()
@@ -3697,7 +3708,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 if not model_dir.exists() or not model_dir.is_dir():
                     QtWidgets.QMessageBox.warning(
                         self,
-                        "Final LLM labeling",
+                        context_label,
                         "The selected local LLM model directory does not exist or is not a directory.",
                     )
                     return None
@@ -3714,11 +3725,17 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if missing:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Final LLM labeling",
-                f"Provide the {' and '.join(missing)} before running final LLM labeling.",
+                context_label,
+                f"Provide the {' and '.join(missing)} before continuing.",
             )
             return None
         return env
+
+    def _collect_random_final_llm_environment(self) -> Optional[Dict[str, str]]:
+        return self._collect_random_llm_environment(
+            context_label="Final LLM labeling",
+            require_checkbox=True,
+        )
 
     def _collect_ai_overrides(self) -> Dict[str, Any]:
         overrides: Dict[str, Any] = {}
@@ -4476,6 +4493,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 final_llm_enabled = bool(self.random_final_llm_checkbox.isChecked())
                 config_payload["final_llm_labeling"] = final_llm_enabled
             if final_llm_enabled or assisted_enabled:
+                include_reasoning = False
+                if isinstance(getattr(self, "random_include_reasoning_checkbox", None), QtWidgets.QCheckBox):
+                    include_reasoning = bool(self.random_include_reasoning_checkbox.isChecked())
+                config_payload["final_llm_include_reasoning"] = include_reasoning
                 backend_choice = self._current_random_backend()
                 if backend_choice:
                     backend_cfg["backend"] = backend_choice
@@ -4759,18 +4780,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         assist_cfg["enabled"] = True
         assist_cfg["top_snippets"] = int(top_snippets)
 
-        azure_key: str = ""
-        azure_widget = getattr(self, "random_azure_key_edit", None)
-        if hasattr(azure_widget, "text"):
-            try:
-                azure_key = str(azure_widget.text()).strip()
-            except Exception:  # noqa: BLE001
-                azure_key = ""
+        env_overrides = RoundBuilderDialog._collect_random_llm_environment(
+            self,
+            context_label="Assisted chart review",
+            require_checkbox=False,
+        )
+        if env_overrides is None:
+            raise RuntimeError("Assisted chart review configuration is incomplete")
 
         previous_env: Dict[str, Optional[str]] = {}
-        if azure_key:
-            previous_env["AZURE_OPENAI_API_KEY"] = os.environ.get("AZURE_OPENAI_API_KEY")
-            os.environ["AZURE_OPENAI_API_KEY"] = azure_key
+        for key, value in env_overrides.items():
+            previous_env[key] = os.environ.get(key)
+            os.environ[key] = value
 
         try:
             assisted_data = builder._generate_assisted_review_snippets(

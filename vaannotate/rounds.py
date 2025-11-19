@@ -763,6 +763,14 @@ class RoundBuilder:
                 setattr(cfg.llmfirst, "single_doc_full_context_max_chars", limit_value)
         env_overrides: Dict[str, str] = {}
         backend_choice = str(ai_backend_config.get("backend") or "").strip().lower()
+        if not backend_choice:
+            if self._resolve_optional_path(ai_backend_config.get("local_model_dir"), config_base):
+                backend_choice = "exllamav2"
+            elif any(
+                str(ai_backend_config.get(key) or "").strip()
+                for key in ("azure_endpoint", "azure_api_version")
+            ):
+                backend_choice = "azure"
         backend_env_value: str | None = None
         if backend_choice == "azure":
             backend_env_value = "azure"
