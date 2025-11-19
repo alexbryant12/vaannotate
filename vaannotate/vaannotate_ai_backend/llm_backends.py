@@ -551,8 +551,8 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         """
         Forced-choice micro-probe for local ExLlamaV2.
 
-        Workaround for upstream ExLlamaV2 not exposing logits processors on the
-        dynamic generator:
+        Workaround for upstream ExLlamaV2 not exposing logits processors or
+        returning token_logprobs:
 
         - Build the full chat prompt using the Llama 3.x template.
         - Encode it with the ExLlamaV2 tokenizer.
@@ -560,6 +560,10 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         - Convert to log-softmax and read off the logprob for each answer letter.
         """
 
+        import torch
+        import torch.nn.functional as F  # type: ignore
+
+        # ---- Build prompt via existing chat template -----------------------
         prompt = self._format_messages(
             [
                 {"role": "system", "content": system},
@@ -567,30 +571,23 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             ]
         )
 
-        import torch
-        import torch.nn.functional as F  # type: ignore
-
         self._respect_rpm_limit()
         t0 = time.time()
 
         # ---- Encode prompt -------------------------------------------------
-        # Match the generator's behaviour: encode special tokens, no extra BOS.
         tokens = self.tokenizer.encode(
             prompt,
             add_bos=False,
             encode_special_tokens=True,
         )
-        # tokenizer.encode usually returns shape [1, seq_len]; be defensive.
         if hasattr(tokens, "dim") and tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
 
-        # ---- Run a single forward pass to get next-token logits -----------
-        # Pattern adapted from common ExLlamaV2 wrappers:
-        #   cache.current_seq_len = 0
-        #   model.forward(prompt[:, :-1], cache, preprocess_only=True)
-        #   logits = model.forward(prompt[:, -1:], cache)
+        # ---- Forward pass to get next-token logits ------------------------
         self.cache.current_seq_len = 0
+
         with torch.inference_mode():
+            # Prime KV cache with all but the last token
             if tokens.size(1) > 1:
                 _ = self.model.forward(
                     tokens[:, :-1],
@@ -598,27 +595,48 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                     input_mask=None,
                     preprocess_only=True,
                 )
+
             logits = self.model.forward(
-                tokens[:, -1:],
+                tokens[:, -1:],  # last token
                 self.cache,
                 input_mask=None,
             ).float()
 
-        # logits: [batch, seq, vocab] or [batch, vocab]; we only care about the
-        # *last* position of the single prompt in the batch.
+        # logits: [1, 1, vocab] or [1, vocab]
         if logits.dim() == 3:
-            scores = logits[:, -1, :]  # [1, vocab]
+            scores = logits[0, -1, :]
         else:
-            scores = logits  # [1, vocab] or [vocab]
+            scores = logits[0, :]
+
         log_probs = F.log_softmax(scores, dim=-1).reshape(-1)  # [vocab]
 
-        # ---- Map letters -> token logprobs ---------------------------------
-        # We mimic the Azure path: letter 'A' corresponds to whichever token(s)
-        # decode to something whose first alnum char is 'A'. Here we approximate
-        # by trying tokenisation of "A" and " A" and taking the best logprob.
-        letter_logps: Dict[str, float] = {letter: float("-1e9") for letter in letters}
+        # ---- Helpers to map letters -> token IDs --------------------------
+        def _flatten_ids(enc) -> list[int]:
+            """
+            Robustly flatten encode output to a 1D list of ints.
+
+            Handles:
+            - torch tensors (1D or 2D)
+            - list-of-lists ([[...]])
+            """
+            if hasattr(enc, "dim"):  # torch tensor
+                if enc.dim() > 1:
+                    enc = enc.view(-1)
+                return [int(x) for x in enc.tolist()]
+
+            ids = enc
+            # Peel off nesting like [[1, 2, 3]] -> [1, 2, 3]
+            while isinstance(ids, (list, tuple)) and ids and isinstance(
+                ids[0], (list, tuple)
+            ):
+                ids = ids[0]
+            return [int(x) for x in ids]
 
         def _best_letter_logprob(letter_text: str) -> float:
+            """
+            Best-effort log p(letter) by trying both 'A' and ' A' style encodings
+            and taking the logprob of the *last* token.
+            """
             best = float("-1e9")
             for variant in (letter_text, " " + letter_text):
                 enc = self.tokenizer.encode(
@@ -626,21 +644,21 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                     add_bos=False,
                     encode_special_tokens=False,
                 )
-                ids = enc.tolist() if hasattr(enc, "tolist") else list(enc)
+                ids = _flatten_ids(enc)
                 if not ids:
                     continue
-                # Use the last token in case the variant split into multiple tokens.
-                tok_id = int(ids[-1])
+                tok_id = ids[-1]
                 if 0 <= tok_id < log_probs.shape[0]:
                     lp = float(log_probs[tok_id].item())
                     if lp > best:
                         best = lp
             return best
 
+        # ---- Letter logprobs and aggregate by option ----------------------
+        letter_logps: Dict[str, float] = {}
         for letter in letters:
             letter_logps[letter] = _best_letter_logprob(letter)
 
-        # ---- Aggregate by option ------------------------------------------
         option_logps: Dict[str, float] = {}
         for opt, letter in zip(options, letters):
             option_logps[opt] = letter_logps.get(letter, float("-1e9"))
@@ -658,7 +676,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                 raw_response=option_logps,
             )
 
-        # Softmax-normalise into probabilities and compute entropy.
+        # ---- Softmax-normalise + entropy + prediction ---------------------
         m = max(logits_list)
         probs = [math.exp(v - m) for v in logits_list]
         denom = sum(probs) or 1.0
@@ -671,6 +689,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
 
         latency = time.time() - t0
         self._post_call()
+
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
@@ -679,6 +698,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             latency_s=float(latency),
             raw_response=option_logps,
         )
+
       
 def build_llm_backend(cfg: LLMConfig) -> LLMBackend:
     """Factory helper that instantiates the requested backend."""
