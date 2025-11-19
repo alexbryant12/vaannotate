@@ -546,8 +546,20 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         *,
         options: Sequence[str],
         letters: Sequence[str],
-        top_logprobs: int = 5,
+        top_logprobs: int = 5,  # kept for interface symmetry; unused here
     ) -> ForcedChoiceResult:
+        """
+        Forced-choice micro-probe for local ExLlamaV2.
+
+        Workaround for upstream ExLlamaV2 not exposing logits processors on the
+        dynamic generator:
+
+        - Build the full chat prompt using the Llama 3.x template.
+        - Encode it with the ExLlamaV2 tokenizer.
+        - Run ExLlamaV2.forward manually to get logits for the *next* token.
+        - Convert to log-softmax and read off the logprob for each answer letter.
+        """
+
         prompt = self._format_messages(
             [
                 {"role": "system", "content": system},
@@ -558,98 +570,116 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         import torch
         import torch.nn.functional as F  # type: ignore
 
-        option_logps: Dict[str, float] = {}
-        latency_total = 0.0
-        completed = 0
+        self._respect_rpm_limit()
+        t0 = time.time()
 
-        class _Processor:
-            """Logits processor that records the logprob of a single target token."""
+        # ---- Encode prompt -------------------------------------------------
+        # Match the generator's behaviour: encode special tokens, no extra BOS.
+        tokens = self.tokenizer.encode(
+            prompt,
+            add_bos=False,
+            encode_special_tokens=True,
+        )
+        # tokenizer.encode usually returns shape [1, seq_len]; be defensive.
+        if hasattr(tokens, "dim") and tokens.dim() == 1:
+            tokens = tokens.unsqueeze(0)
 
-            def __init__(self, target_id: int):
-                self._target = int(target_id)
-                self.last_logprob: float = float("-1e9")
+        # ---- Run a single forward pass to get next-token logits -----------
+        # Pattern adapted from common ExLlamaV2 wrappers:
+        #   cache.current_seq_len = 0
+        #   model.forward(prompt[:, :-1], cache, preprocess_only=True)
+        #   logits = model.forward(prompt[:, -1:], cache)
+        self.cache.current_seq_len = 0
+        with torch.inference_mode():
+            if tokens.size(1) > 1:
+                _ = self.model.forward(
+                    tokens[:, :-1],
+                    self.cache,
+                    input_mask=None,
+                    preprocess_only=True,
+                )
+            logits = self.model.forward(
+                tokens[:, -1:],
+                self.cache,
+                input_mask=None,
+            ).float()
 
-            def __call__(self, logits: torch.Tensor) -> torch.Tensor:
-                if logits.dim() == 3:
-                    scores = logits[:, -1, :]
-                else:
-                    scores = logits
-                log_probs = F.log_softmax(scores, dim=-1)
-                lp = log_probs[..., self._target]
-                self.last_logprob = float(lp.reshape(-1)[0].item())
-                mask = torch.full_like(logits, float("-inf"))
-                mask[..., self._target] = logits[..., self._target]
-                return mask
-
-        class _Processor:
-            """Logits processor that records the logprob of a single target token."""
-
-            def __init__(self, target_id: int):
-                self._target = int(target_id)
-                self.last_logprob: float = float("-1e9")
-
-            def __call__(self, logits: torch.Tensor) -> torch.Tensor:
-                if logits.dim() == 3:
-                    scores = logits[:, -1, :]
-                else:
-                    scores = logits
-                log_probs = F.log_softmax(scores, dim=-1)
-                lp = log_probs[..., self._target]
-                self.last_logprob = float(lp.reshape(-1)[0].item())
-                mask = torch.full_like(logits, float("-inf"))
-                mask[..., self._target] = logits[..., self._target]
-                return mask
-
-        def _processor_for_letter(letter_text: str):
-            encoded = self.tokenizer.encode(letter_text)
-            token_ids = encoded.tolist() if hasattr(encoded, "tolist") else list(encoded)
-            if not token_ids:
-                return None
-            return _Processor(int(token_ids[0]))
-
-        for letter, option in zip(letters, options):
-            processor = _processor_for_letter(letter)
-            if processor is None:
-                letter_logps[letter] = -1e9
-                continue
-            self._respect_rpm_limit()
-            t0 = time.time()
-            self._generate(
-                prompt,
-                max_new_tokens=1,
-                temperature=0.0,
-                logits_processors=[processor],
-            )
-            latency = time.time() - t0
-            latency_total += latency
-            self._post_call()
-            option_logps[option] = float(getattr(processor, "last_logprob", -1e9))
-        logits = list(option_logps.values())
-        m = max(logits)
-        probs = [math.exp(v - m) for v in logits]
-        denom = sum(probs)
-        if denom <= 0:
-            probs = [1.0 / len(probs) for _ in probs]
+        # logits: [batch, seq, vocab] or [batch, vocab]; we only care about the
+        # *last* position of the single prompt in the batch.
+        if logits.dim() == 3:
+            scores = logits[:, -1, :]  # [1, vocab]
         else:
-            probs = [p / denom for p in probs]
+            scores = logits  # [1, vocab] or [vocab]
+        log_probs = F.log_softmax(scores, dim=-1).reshape(-1)  # [vocab]
+
+        # ---- Map letters -> token logprobs ---------------------------------
+        # We mimic the Azure path: letter 'A' corresponds to whichever token(s)
+        # decode to something whose first alnum char is 'A'. Here we approximate
+        # by trying tokenisation of "A" and " A" and taking the best logprob.
+        letter_logps: Dict[str, float] = {letter: float("-1e9") for letter in letters}
+
+        def _best_letter_logprob(letter_text: str) -> float:
+            best = float("-1e9")
+            for variant in (letter_text, " " + letter_text):
+                enc = self.tokenizer.encode(
+                    variant,
+                    add_bos=False,
+                    encode_special_tokens=False,
+                )
+                ids = enc.tolist() if hasattr(enc, "tolist") else list(enc)
+                if not ids:
+                    continue
+                # Use the last token in case the variant split into multiple tokens.
+                tok_id = int(ids[-1])
+                if 0 <= tok_id < log_probs.shape[0]:
+                    lp = float(log_probs[tok_id].item())
+                    if lp > best:
+                        best = lp
+            return best
+
+        for letter in letters:
+            letter_logps[letter] = _best_letter_logprob(letter)
+
+        # ---- Aggregate by option ------------------------------------------
+        option_logps: Dict[str, float] = {}
+        for opt, letter in zip(options, letters):
+            option_logps[opt] = letter_logps.get(letter, float("-1e9"))
+
+        logits_list = list(option_logps.values())
+        if not logits_list:
+            latency = time.time() - t0
+            self._post_call()
+            return ForcedChoiceResult(
+                option_probs={},
+                option_logprobs=option_logps,
+                prediction="",
+                entropy=0.0,
+                latency_s=float(latency),
+                raw_response=option_logps,
+            )
+
+        # Softmax-normalise into probabilities and compute entropy.
+        m = max(logits_list)
+        probs = [math.exp(v - m) for v in logits_list]
+        denom = sum(probs) or 1.0
+        probs = [p / denom for p in probs]
+
         entropy = -sum(p * math.log(max(p, 1e-12)) for p in probs)
-        option_probs = {options[i]: float(probs[i]) for i in range(len(options))}
-        option_logps = {options[i]: float(letter_logps[letters[i]]) for i in range(len(options))}
-        prediction = options[max(range(len(probs)), key=lambda idx: probs[idx])]
-        avg_latency = latency_total / max(1, len(option_logps))
-        print("FC probe")
-        print(option_probs)
-        print(prediction)
+        option_probs = {opt: float(p) for opt, p in zip(options, probs)}
+        pred_idx = max(range(len(probs)), key=lambda i: probs[i])
+        prediction = options[pred_idx]
+
+        latency = time.time() - t0
+        self._post_call()
         return ForcedChoiceResult(
             option_probs=option_probs,
             option_logprobs=option_logps,
             prediction=prediction,
             entropy=float(entropy),
-            latency_s=float(avg_latency),
+            latency_s=float(latency),
             raw_response=option_logps,
         )
-
-
+      
 def build_llm_backend(cfg: LLMConfig) -> LLMBackend:
     """Factory helper that instantiates the requested backend."""
 
