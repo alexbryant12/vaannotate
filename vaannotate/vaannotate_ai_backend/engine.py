@@ -118,8 +118,10 @@ def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
 
 @dataclass
 class LLMConfig:
-    model_name: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-    backend: str = os.getenv("LLM_BACKEND", "azure")
+    model_name: str = field(
+        default_factory=lambda: os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    )
+    backend: str = field(default_factory=lambda: os.getenv("LLM_BACKEND", "azure"))
     temperature: float = 0.2
     n_consistency: int = 3
     logprobs: bool = True
@@ -132,13 +134,25 @@ class LLMConfig:
     rpm_limit: Optional[int] = 30
     include_reasoning: bool = False
     # Azure OpenAI specific knobs
-    azure_api_key: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
-    azure_api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
-    azure_endpoint: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
+    azure_api_key: Optional[str] = field(
+        default_factory=lambda: os.getenv("AZURE_OPENAI_API_KEY")
+    )
+    azure_api_version: str = field(
+        default_factory=lambda: os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+    )
+    azure_endpoint: Optional[str] = field(
+        default_factory=lambda: os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
     # Local ExLlamaV2 specific knobs
-    local_model_dir: Optional[str] = os.getenv("LOCAL_LLM_MODEL_DIR")
-    local_max_seq_len: Optional[int] = _env_int("LOCAL_LLM_MAX_SEQ_LEN")
-    local_max_new_tokens: Optional[int] = _env_int("LOCAL_LLM_MAX_NEW_TOKENS")
+    local_model_dir: Optional[str] = field(
+        default_factory=lambda: os.getenv("LOCAL_LLM_MODEL_DIR")
+    )
+    local_max_seq_len: Optional[int] = field(
+        default_factory=lambda: _env_int("LOCAL_LLM_MAX_SEQ_LEN")
+    )
+    local_max_new_tokens: Optional[int] = field(
+        default_factory=lambda: _env_int("LOCAL_LLM_MAX_NEW_TOKENS")
+    )
     
 @dataclass
 class SelectionConfig:
