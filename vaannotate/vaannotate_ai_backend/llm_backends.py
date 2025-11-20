@@ -4,8 +4,7 @@ This module provides a light abstraction around the two inference backends we
 currently support:
 
 * Azure OpenAI Chat Completions (the historical default)
-* Local ExLlamaV2 inference with LM Format Enforcer (LMFE) for strict JSON
-  schema control
+* Local ExLlamaV2 inference with tolerant JSON parsing
 
 Backends expose only the operations required by the active-learning engine:
 
@@ -27,6 +26,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
 from dataclasses import dataclass
@@ -43,7 +43,6 @@ except Exception:  # pragma: no cover - handled when backend is constructed
 try:  # pragma: no cover - optional dependency
     from exllamav2 import ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Config, ExLlamaV2Tokenizer
     from exllamav2.generator import ExLlamaV2DynamicGenerator, ExLlamaV2Sampler
-    from exllamav2.generator.filters import ExLlamaV2PrefixFilter
 except Exception:  # pragma: no cover - handled during backend construction
     ExLlamaV2 = None  # type: ignore
     ExLlamaV2Cache = None  # type: ignore
@@ -51,15 +50,6 @@ except Exception:  # pragma: no cover - handled during backend construction
     ExLlamaV2Tokenizer = None  # type: ignore
     ExLlamaV2DynamicGenerator = None  # type: ignore
     ExLlamaV2Sampler = None  # type: ignore
-    ExLlamaV2PrefixFilter = None  # type: ignore
-
-try:  # pragma: no cover - optional dependency
-    from lmformatenforcer import JsonSchemaParser
-    from lmformatenforcer.integrations.exllamav2 import ExLlamaV2TokenEnforcerFilter
-except Exception:  # pragma: no cover - handled when backend initialises
-    JsonSchemaParser = None  # type: ignore
-    ExLlamaV2TokenEnforcerFilter = None  # type: ignore
-
 
 def _to_serializable(value: Any) -> Any:
     """Convert SDK response objects into plain Python structures."""
@@ -307,20 +297,12 @@ class AzureOpenAIBackend(LLMBackend):
 
 
 class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optional deps
-    """Backend that runs inference locally via ExLlamaV2 with LMFE."""
+    """Backend that runs inference locally via ExLlamaV2."""
 
     def __init__(self, cfg: LLMConfig):
         if ExLlamaV2 is None or ExLlamaV2Config is None or ExLlamaV2Tokenizer is None:
             raise ImportError(
                 "ExLlamaV2 backend requested but exllamav2 is not installed."
-            )
-        if JsonSchemaParser is None or ExLlamaV2TokenEnforcerFilter is None:
-            raise ImportError(
-                "ExLlamaV2 backend requires lm-format-enforcer with the exllamav2 integration."
-            )
-        if ExLlamaV2PrefixFilter is None:
-            raise ImportError(
-                "ExLlamaV2 backend requires the prefix filter from exllamav2.generator.filters."
             )
         super().__init__(cfg)
         model_dir = cfg.local_model_dir or os.getenv("LOCAL_LLM_MODEL_DIR")
@@ -392,16 +374,90 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         parts.append("<|start_header_id|>assistant<|end_header_id|>\n")
         return "".join(parts)
 
-    def _build_json_filters(self, response_format: Optional[Mapping[str, Any]]):
-        schema: Mapping[str, Any]
-        if response_format and response_format.get("json_schema"):
-            schema = response_format.get("json_schema", {}) or {"type": "object"}
-        else:
-            schema = {"type": "object"}
-        parser = JsonSchemaParser(schema)
-        lmfe_filter = ExLlamaV2TokenEnforcerFilter(parser, self.tokenizer)
-        prefix_filter = ExLlamaV2PrefixFilter(self.model, self.tokenizer, "{")
-        return [lmfe_filter, prefix_filter]
+    def _tolerant_json_loads(self, text: str) -> Mapping[str, Any]:
+        """
+        Best-effort JSON parsing for locally generated completions.
+
+        The ExLlamaV2 generator is not guaranteed to emit perfectly formatted
+        JSON. This helper tries multiple repair strategies before falling back
+        to regex-based extraction of key fields like ``prediction`` and
+        ``reasoning``.
+        """
+
+        def _strip_code_fences(payload: str) -> str:
+            stripped = payload.strip()
+            stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+            stripped = re.sub(r"\s*```$", "", stripped)
+            return stripped.strip()
+
+        def _balance_pairs(payload: str, open_char: str, close_char: str) -> str:
+            opens = payload.count(open_char)
+            closes = payload.count(close_char)
+            if opens > closes:
+                payload = payload + (close_char * (opens - closes))
+            return payload
+
+        cleaned = _strip_code_fences(text)
+        candidates: List[str] = []
+        if cleaned:
+            candidates.append(cleaned)
+
+        brace_start = cleaned.find("{")
+        brace_end = cleaned.rfind("}")
+        if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+            candidates.append(cleaned[brace_start : brace_end + 1])
+
+        balanced_candidates: List[str] = []
+        for cand in candidates:
+            balanced_candidates.append(cand)
+            balanced = _balance_pairs(cand, "{", "}")
+            if balanced != cand:
+                balanced_candidates.append(balanced)
+
+        decoder = json.JSONDecoder()
+        for cand in balanced_candidates:
+            try:
+                obj, _ = decoder.raw_decode(cand)
+                return obj
+            except Exception:
+                continue
+
+        salvage: Dict[str, Any] = {}
+
+        def _capture_scalar(key: str) -> None:
+            pattern = re.compile(
+                rf"\b{re.escape(key)}\b\s*[:=]\s*(?:'([^']*)'|\"([^\"]*)\"|([^,}}\n]+))",
+                re.IGNORECASE | re.DOTALL,
+            )
+            match = pattern.search(cleaned)
+            if match:
+                for group in match.groups():
+                    if group is not None:
+                        salvage[key] = group.strip()
+                        break
+
+        for key in ("prediction", "reasoning"):
+            _capture_scalar(key)
+
+        snippet_match = re.search(
+            r"\b(snippets)\b\s*[:=]\s*(\[[\s\S]*?)(\]|$)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if snippet_match:
+            snippets_text = snippet_match.group(2)
+            snippets_balanced = _balance_pairs(snippets_text, "[", "]")
+            try:
+                salvage["snippets"] = json.loads(snippets_balanced)
+            except Exception:
+                # best-effort: split by line/item delimiters
+                rough_items = re.split(r"\s*[,\n]\s*", snippets_balanced.strip("[] \n\t"))
+                salvage["snippets"] = [item for item in (s.strip() for s in rough_items) if item]
+
+        if salvage:
+            return salvage
+
+        raise ValueError(f"Local backend produced invalid JSON: {text}")
 
     def _generate(
         self,
@@ -512,21 +568,40 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         prompt = self._format_messages(messages)
         max_new = int(self.cfg.local_max_new_tokens or 1024)
         self._respect_rpm_limit()
-        filters = self._build_json_filters(response_format)
-        t0 = time.time()
-        text, token_ids, token_logprobs = self._generate(
-            prompt,
-            max_new_tokens=max_new,
-            temperature=temperature,
-            filters=filters,
-            stop_conditions=self._json_stop_conditions,
-        )
-        latency = time.time() - t0
-        self._post_call()
-        try:
-            data = json.loads(text)
-        except Exception as exc:  # pragma: no cover - defensive parsing
-            raise ValueError(f"Local backend produced invalid JSON: {exc}\n{text}") from exc
+        attempts = 0
+        last_error: Exception | None = None
+        text = ""
+        token_ids: List[int] = []
+        token_logprobs: List[float] = []
+        data: Mapping[str, Any] | None = None
+        latency = 0.0
+        while attempts < 2:
+            t0 = time.time()
+            text, token_ids, token_logprobs = self._generate(
+                prompt,
+                max_new_tokens=max_new,
+                temperature=temperature,
+                stop_conditions=self._json_stop_conditions,
+            )
+            latency = time.time() - t0
+            self._post_call()
+            try:
+                data = self._tolerant_json_loads(text)
+                break
+            except Exception as exc:
+                last_error = exc
+                attempts += 1
+                if attempts >= 2:
+                    raise
+                continue
+        else:  # pragma: no cover - defensive
+            latency = time.time() - t0
+            self._post_call()
+            if last_error:
+                raise last_error
+
+        assert data is not None  # for type checkers; parsed JSON required
+
         logprob_payload = None
         if logprobs:
             logprob_payload = {
