@@ -102,6 +102,7 @@ class RAGConfig:
     mmr_candidates: int = 200
     use_keywords: bool = False
     keyword_topk: int = 20
+    keywords: List[str] = field(default_factory=list)
     min_context_chunks: int = 3
     mmr_multiplier: int = 3
     neighbor_hops: int = 1
@@ -939,6 +940,7 @@ class EmbeddingStore:
         self.chunk_meta: List[dict] = []
         self.X = None
         self.unit_to_chunk_idxs: Dict[str,List[int]] = {}
+        self.bm25_indices: Dict[str, dict] = {}
 
     def _backfill_chunk_metadata(self, notes_df: "pd.DataFrame") -> None:
         """Ensure cached chunk metadata includes key fields such as notetype."""
@@ -1078,6 +1080,11 @@ class EmbeddingStore:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, p)
+
+    def _update_manifest(self, chunk_dir: str, **fields: object) -> None:
+        man = self._load_manifest(chunk_dir) or {}
+        man.update(fields)
+        self._save_manifest(chunk_dir, man)
     
     def _paths_for_cache(self, chunk_dir: str, index_cfg) -> dict:
         idx_name = f"faiss_{getattr(index_cfg, 'type', 'flat')}.index"
@@ -1085,6 +1092,7 @@ class EmbeddingStore:
             "meta": os.path.join(chunk_dir, "chunk_meta.json"),
             "emb": os.path.join(chunk_dir, "chunk_embeddings.npy"),
             "faiss": os.path.join(chunk_dir, idx_name),
+            "bm25": os.path.join(chunk_dir, "bm25_indices.json"),
         }
     
     def _try_load_cached_chunks(self, chunk_dir: str) -> tuple[list[dict] | None, np.ndarray | None, dict | None]:
@@ -1107,6 +1115,101 @@ class EmbeddingStore:
             return (meta, X, man)
         except Exception:
             return (None, None, None)
+
+    def _bm25_index_path(self, chunk_dir: str) -> str:
+        return os.path.join(chunk_dir, "bm25_indices.json")
+
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        if not text:
+            return []
+        return re.findall(r"\b\w+\b", str(text).lower())
+
+    def _build_bm25_indices(self) -> Dict[str, dict]:
+        unit_docs: Dict[str, list] = defaultdict(list)
+        unit_metas: Dict[str, list] = defaultdict(list)
+        for meta in self.chunk_meta:
+            toks = self._tokenize_for_bm25(meta.get("text", ""))
+            if not toks:
+                continue
+            uid = str(meta.get("unit_id", ""))
+            unit_docs[uid].append(toks)
+            unit_metas[uid].append(meta)
+
+        indices: Dict[str, dict] = {}
+        for uid, docs in unit_docs.items():
+            if not docs:
+                continue
+            N = len(docs)
+            df = Counter()
+            for toks in docs:
+                df.update(set(toks))
+            idf = {tok: math.log((N - freq + 0.5) / (freq + 0.5) + 1.0) for tok, freq in df.items()}
+            avgdl = sum(len(toks) for toks in docs) / float(N)
+            indices[uid] = {
+                "docs": docs,
+                "metas": unit_metas.get(uid, []),
+                "idf": idf,
+                "avgdl": avgdl,
+            }
+        return indices
+
+    def _load_bm25_indices(self, chunk_dir: str) -> dict | None:
+        p = self._bm25_index_path(chunk_dir)
+        if not os.path.exists(p):
+            return None
+        try:
+            data = json.load(open(p, "r", encoding="utf-8"))
+            indices = data.get("units") or data.get("indices") or {}
+            if not isinstance(indices, dict):
+                return None
+            expected_n = data.get("n_chunks")
+            if expected_n is not None and expected_n != len(self.chunk_meta):
+                return None
+            return indices
+        except Exception:
+            return None
+
+    def _save_bm25_indices(self, chunk_dir: str, indices: dict) -> None:
+        payload = {
+            "version": "v1",
+            "n_chunks": len(self.chunk_meta),
+            "units": indices,
+        }
+        p = self._bm25_index_path(chunk_dir)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, p)
+        self._update_manifest(chunk_dir, bm25_version="v1")
+
+    def bm25_index_for_unit(self, unit_id: str) -> dict | None:
+        uid = str(unit_id)
+        cached = self.bm25_indices.get(uid)
+        if cached is not None:
+            return cached
+
+        if hasattr(self, "_chunk_cache_dir_path"):
+            loaded = self._load_bm25_indices(self._chunk_cache_dir_path)
+            if isinstance(loaded, dict):
+                self.bm25_indices = loaded
+                hit = loaded.get(uid)
+                if hit is not None:
+                    return hit
+
+        if not self.chunk_meta:
+            return None
+
+        rebuilt = self._build_bm25_indices()
+        if not rebuilt:
+            return None
+
+        self.bm25_indices = rebuilt
+        if hasattr(self, "_chunk_cache_dir_path"):
+            try:
+                self._save_bm25_indices(self._chunk_cache_dir_path, rebuilt)
+            except Exception:
+                pass
+        return self.bm25_indices.get(uid)
     
     def _save_cached_chunks(self, chunk_dir: str, meta: list[dict], X: np.ndarray, rag_cfg):
         paths = self._paths_for_cache(chunk_dir, type("Cfg", (), {"type": "flat"}))
@@ -1237,6 +1340,16 @@ class EmbeddingStore:
         for i, m in enumerate(self.chunk_meta):
             unit_to_idxs[m["unit_id"]].append(i)
         self.unit_to_chunk_idxs = dict(unit_to_idxs)
+
+        bm25_loaded = self._load_bm25_indices(chunk_dir)
+        if bm25_loaded is None:
+            bm25_loaded = self._build_bm25_indices()
+            if bm25_loaded:
+                try:
+                    self._save_bm25_indices(chunk_dir, bm25_loaded)
+                except Exception:
+                    pass
+        self.bm25_indices = bm25_loaded or {}
     
         # 4) FAISS index: try load; else build and persist
         if faiss is None:
@@ -1307,6 +1420,15 @@ class EmbeddingStore:
                 for i, m in enumerate(self.chunk_meta):
                     unit_to_idxs[str(m["unit_id"])].append(i)
                 self.unit_to_chunk_idxs = dict(unit_to_idxs)
+                bm25_loaded = self._load_bm25_indices(self._chunk_cache_dir_path)
+                if bm25_loaded is None:
+                    bm25_loaded = self._build_bm25_indices()
+                    if bm25_loaded:
+                        try:
+                            self._save_bm25_indices(self._chunk_cache_dir_path, bm25_loaded)
+                        except Exception:
+                            pass
+                self.bm25_indices = bm25_loaded or {}
             else:
                 raise RuntimeError("FAISS index not built; call build_chunk_index() first.")
     
@@ -1560,6 +1682,7 @@ class RAGRetriever:
         self._notes_by_doc = notes_by_doc or {}
         self._repo = repo
         self._rr_cache = LRUCache(maxsize=self._RR_CACHE_MAX)
+        self._bm25_cache: Dict[str, dict] = {}
         self._label_query_texts = {}   # (label_id, rules_hash, K) -> List[str]
         self._label_query_embs  = {}   # (label_id, rules_hash, K) -> np.ndarray[K,d]
 
@@ -1633,21 +1756,125 @@ class RAGRetriever:
             base += "Guidelines: " + re.sub(r"\s+"," ",label_rules.strip()) + " "
         return base.strip()
 
-    def _keyword_hits_for_patient(self, unit_id: str, keywords: List[str]) -> List[dict]:
-        if not keywords: return []
-        idxs = self.store.get_patient_chunk_indices(unit_id)
-        if not idxs: return []
-        pats = [re.compile(rf"\b{re.escape(k)}\b", re.I) for k in keywords if isinstance(k,str) and k.strip()]
-        out = []
+    def _tokenize(self, text: str) -> List[str]:
+        if not text:
+            return []
+        return re.findall(r"\b\w+\b", str(text).lower())
+
+    def _bm25_index_for_patient(self, unit_id: str) -> Optional[dict]:
+        uid = str(unit_id)
+        cached = self._bm25_cache.get(uid)
+        if cached is not None:
+            return cached
+        if hasattr(self.store, "bm25_index_for_unit"):
+            idx = self.store.bm25_index_for_unit(uid)
+            if idx is not None:
+                self._bm25_cache[uid] = idx
+                return idx
+        idxs = self.store.get_patient_chunk_indices(uid)
+        if not idxs:
+            return None
+        docs, metas = [], []
         for ix in idxs:
-            txt = self.store.chunk_meta[ix]["text"]
-            score = sum(len(p.findall(txt)) for p in pats)
-            if score > 0:
-                m = self.store.chunk_meta[ix]
-                out.append({"doc_id": m["doc_id"], "chunk_id": m["chunk_id"], 'metadata': self._extract_meta(m),
-                            "text": txt, "score": float(score), "source": "keyword"})
-        out.sort(key=lambda d: d["score"], reverse=True)
-        return out[: self.cfg.keyword_topk]
+            meta = self.store.chunk_meta[ix]
+            tokens = self._tokenize(meta.get("text", ""))
+            if not tokens:
+                continue
+            docs.append(tokens)
+            metas.append(meta)
+        if not docs:
+            return None
+        N = len(docs)
+        df = Counter()
+        for toks in docs:
+            df.update(set(toks))
+        idf = {tok: math.log((N - freq + 0.5) / (freq + 0.5) + 1.0) for tok, freq in df.items()}
+        avgdl = sum(len(toks) for toks in docs) / float(N)
+        index = {"docs": docs, "metas": metas, "idf": idf, "avgdl": avgdl}
+        self._bm25_cache[uid] = index
+        if hasattr(self.store, "bm25_indices"):
+            try:
+                self.store.bm25_indices = dict(getattr(self.store, "bm25_indices", {}))
+                self.store.bm25_indices[uid] = index
+                if hasattr(self.store, "_chunk_cache_dir_path"):
+                    self.store._save_bm25_indices(self.store._chunk_cache_dir_path, self.store.bm25_indices)
+            except Exception:
+                pass
+        return index
+
+    def _bm25_hits_for_patient(self, unit_id: str, keywords: List[str]) -> List[dict]:
+        if not keywords:
+            return []
+        index = self._bm25_index_for_patient(unit_id)
+        if not index:
+            return []
+        query_tokens = []
+        for kw in keywords:
+            if isinstance(kw, str):
+                query_tokens.extend(self._tokenize(kw))
+        if not query_tokens:
+            return []
+        docs = index["docs"]
+        idf = index["idf"]
+        avgdl = index["avgdl"] or 1.0
+        metas = index["metas"]
+        k1, b = 1.5, 0.75
+        scores: List[tuple[float, dict]] = []
+        for toks, meta in zip(docs, metas):
+            tf = Counter(toks)
+            dl = len(toks)
+            score = 0.0
+            for term in query_tokens:
+                if term not in tf or term not in idf:
+                    continue
+                freq = tf[term]
+                denom = freq + k1 * (1 - b + b * dl / avgdl)
+                score += idf[term] * (freq * (k1 + 1)) / (denom + 1e-12)
+            if score <= 0:
+                continue
+            scores.append((score, meta))
+        scores.sort(key=lambda pair: pair[0], reverse=True)
+        out = []
+        for score, meta in scores[: self.cfg.keyword_topk]:
+            out.append({
+                "doc_id": meta.get("doc_id"),
+                "chunk_id": meta.get("chunk_id"),
+                "metadata": self._extract_meta(meta),
+                "text": meta.get("text", ""),
+                "score": float(score),
+                "source": "bm25",
+            })
+        return out
+
+    def _reciprocal_rank_fusion(self, runs: List[List[dict]], constant: int = 60) -> List[dict]:
+        fused: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for run in runs:
+            if not run:
+                continue
+            for rank, item in enumerate(run):
+                doc_id = str(item.get("doc_id"))
+                try:
+                    chunk_id = int(item.get("chunk_id", -1))
+                except Exception:
+                    continue
+                if chunk_id < 0:
+                    continue
+                key = (doc_id, chunk_id)
+                entry = fused.setdefault(key, {"score": 0.0, "item": item})
+                entry["score"] += 1.0 / (constant + rank + 1)
+                if entry["item"] is not item:
+                    merged = dict(entry["item"])
+                    for k, v in item.items():
+                        if k not in merged or merged[k] in (None, ""):
+                            merged[k] = v
+                    entry["item"] = merged
+        fused_items = []
+        for data in fused.values():
+            merged_item = dict(data.get("item", {}))
+            merged_item["score"] = float(data.get("score", 0.0))
+            fused_items.append(merged_item)
+        fused_items.sort(key=lambda d: d.get("score", 0.0), reverse=True)
+        return fused_items
 
     def _mmr_select(self, q_emb: np.ndarray, cand_idxs: List[int], k: int, lam: float) -> List[int]:
         if k<=0 or not cand_idxs: return []
@@ -1817,14 +2044,35 @@ class RAGRetriever:
             query = self._build_query(label_id, label_rules)
             q_emb = self.store._embed([query])[0]
             items = _patient_local_rank(str(unit_id), q_emb, need=mmr_select_k * 2)
-            
+
         #  + (optional) keywords
+        bm25_hits: List[dict] = []
         if use_kw:
             lblcfg = self.label_configs.get(label_id, {}) if isinstance(self.label_configs, dict) else {}
-            kw = lblcfg.get("keywords", [])
-            items += self._keyword_hits_for_patient(str(unit_id), kw)
+            cfg_keywords = getattr(cfg_rag, "keywords", [])
+            keywords: list[str] = []
+            if isinstance(cfg_keywords, (list, tuple)):
+                keywords.extend(str(k) for k in cfg_keywords if isinstance(k, str) and k.strip())
+            lbl_keywords = lblcfg.get("keywords", []) if isinstance(lblcfg, Mapping) else []
+            if isinstance(lbl_keywords, (list, tuple)):
+                keywords.extend(str(k) for k in lbl_keywords if isinstance(k, str) and k.strip())
+            if keywords:
+                # de-duplicate while preserving order
+                seen_kw = set()
+                uniq_keywords = []
+                for kw in keywords:
+                    if kw in seen_kw:
+                        continue
+                    seen_kw.add(kw)
+                    uniq_keywords.append(kw)
+                bm25_hits = self._bm25_hits_for_patient(str(unit_id), uniq_keywords)
+        if bm25_hits:
+            if items:
+                items = self._reciprocal_rank_fusion([items, bm25_hits])
+            else:
+                items = bm25_hits
 
-       # Dedup
+        # Dedup
         pool = _dedup_only(items)
     
         # Neighbor padding for short pools
@@ -2183,24 +2431,34 @@ class LLMAnnotator:
             segments.append("")
             segments.append("Evidence snippets:")
             segments.append(ctx_text)
+            if include_reasoning:
+                segments.append("Think step-by-step citing specific evidence, and keep the reasoning concise.")
             segments.append("")
-            response_keys = "prediction, reasoning" if include_reasoning else "prediction"
+            response_keys = "reasoning, prediction" if include_reasoning else "prediction"
             segments.append(f"RESPONSE JSON keys: {response_keys}")
             task = "\n".join(segments)
             messages = [{"role": "system", "content": system},
                         {"role": "user",   "content": task}]
 
-            response_schema = {
-                "type": "object",
-                "properties": {
-                    "prediction": {"type": ["string", "number", "boolean", "null"]},
-                },
-                "required": ["prediction"],
-                "additionalProperties": False,
-            }
             if include_reasoning:
-                response_schema["properties"]["reasoning"] = {"type": ["string", "null"]}
-                response_schema["required"].append("reasoning")
+                response_schema = {
+                    "type": "object",
+                    "properties": {
+                        "reasoning": {"type": ["string", "null"]},
+                        "prediction": {"type": ["string", "number", "boolean", "null"]},
+                    },
+                    "required": ["reasoning", "prediction"],
+                    "additionalProperties": False,
+                }
+            else:
+                response_schema = {
+                    "type": "object",
+                    "properties": {
+                        "prediction": {"type": ["string", "number", "boolean", "null"]},
+                    },
+                    "required": ["prediction"],
+                    "additionalProperties": False,
+                }
 
             # ----- per-vote LLM call -----
             attempt = 0
