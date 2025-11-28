@@ -38,6 +38,12 @@ from vaannotate.shared.sampling import (
 )
 from vaannotate.shared.statistics import cohens_kappa, fleiss_kappa, percent_agreement
 from vaannotate.shared.theme import apply_dark_palette
+from vaannotate.AdminApp.prompt_builder import (
+    PromptBuilderConfig,
+    PromptExperimentConfig,
+    PromptExperimentSweep,
+    PromptInferenceJob,
+)
 from vaannotate.corpus import TABULAR_EXTENSIONS, import_tabular_corpus
 from vaannotate.project import (
     build_label_config,
@@ -2331,6 +2337,372 @@ class PhenotypeLabelSetsDialog(QtWidgets.QDialog):
                     child_item = self._build_tree_item(child)
                     item.addChild(child_item)
         return item
+
+
+class PromptInferenceWorker(QtCore.QObject):
+    """Background runner for prompt experiment sweeps."""
+
+    log_message = QtCore.Signal(str)
+    finished = QtCore.Signal(list)
+    errored = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        job: PromptInferenceJob,
+        variants: list[PromptExperimentConfig],
+        user: str,
+    ) -> None:
+        super().__init__()
+        self.job = job
+        self.variants = variants
+        self.user = user
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _log(self, message: str) -> None:
+        self.log_message.emit(message)
+
+    def _cancelled_cb(self) -> bool:
+        return self._cancelled
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            results = self.job.run(
+                self.variants,
+                user=self.user,
+                log_callback=self._log,
+                cancel_callback=self._cancelled_cb,
+            )
+            self.finished.emit(results)
+        except Exception as exc:  # noqa: BLE001
+            self.errored.emit(str(exc))
+
+
+class PromptInferenceDialog(QtWidgets.QDialog):
+    """UI for building prompt sweeps and running inference jobs."""
+
+    def __init__(
+        self,
+        ctx: ProjectContext,
+        pheno: Dict[str, object],
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.ctx = ctx
+        self.pheno = dict(pheno)
+        self.pheno_id = str(self.pheno.get("pheno_id") or "")
+        self.pheno_name = str(self.pheno.get("name") or self.pheno_id)
+        self.pheno_level = str(self.pheno.get("level") or "single_doc")
+        self._worker_thread: Optional[QtCore.QThread] = None
+        self._worker: Optional[PromptInferenceWorker] = None
+        self.setWindowTitle(f"Inference • {self.pheno_name}")
+        self.resize(900, 720)
+        self._build_ui()
+        self._load_options()
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        description = QtWidgets.QLabel(
+            "Configure prompt experiments using adjudicated rounds, then run and review results."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        form = QtWidgets.QFormLayout()
+
+        self.labelset_combo = QtWidgets.QComboBox()
+        form.addRow("Label set", self.labelset_combo)
+
+        self.rounds_list = QtWidgets.QListWidget()
+        self.rounds_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.MultiSelection
+        )
+        form.addRow("Adjudicated rounds", self.rounds_list)
+
+        self.corpus_combo = QtWidgets.QComboBox()
+        form.addRow("Gold standard corpus", self.corpus_combo)
+
+        self.backend_combo = QtWidgets.QComboBox()
+        self.backend_combo.addItems(["default", "openai", "local"])
+        form.addRow("Backend", self.backend_combo)
+
+        self.system_prompt = QtWidgets.QPlainTextEdit()
+        self.system_prompt.setPlaceholderText("Optional system prompt override")
+        form.addRow("System prompt", self.system_prompt)
+
+        self.rule_overrides = QtWidgets.QPlainTextEdit()
+        self.rule_overrides.setPlaceholderText("Optional JSON mapping of label_id → rule text")
+        form.addRow("Rule overrides", self.rule_overrides)
+
+        self.few_shot_examples = QtWidgets.QPlainTextEdit()
+        self.few_shot_examples.setPlaceholderText(
+            "Optional JSON object containing few-shot examples keyed by label_id"
+        )
+        form.addRow("Few-shot examples", self.few_shot_examples)
+
+        layout.addLayout(form)
+
+        sweep_group = QtWidgets.QGroupBox("Sweep options")
+        sweep_layout = QtWidgets.QGridLayout(sweep_group)
+
+        self.enable_zero_shot = QtWidgets.QCheckBox("Include zero-shot")
+        self.enable_zero_shot.setChecked(True)
+        self.enable_few_shot = QtWidgets.QCheckBox("Include few-shot")
+        self.enable_few_shot.setChecked(True)
+        self.include_family_tree = QtWidgets.QCheckBox("Family-tree mode")
+        self.include_family_tree.setChecked(True)
+        self.include_single_shot = QtWidgets.QCheckBox("Single-shot mode")
+        self.include_single_shot.setChecked(True)
+        sweep_layout.addWidget(self.enable_zero_shot, 0, 0)
+        sweep_layout.addWidget(self.enable_few_shot, 0, 1)
+        sweep_layout.addWidget(self.include_family_tree, 1, 0)
+        sweep_layout.addWidget(self.include_single_shot, 1, 1)
+
+        self.mmr_values = QtWidgets.QLineEdit("0.7")
+        self.chunk_sizes = QtWidgets.QLineEdit("1500")
+        self.num_chunks = QtWidgets.QLineEdit("6")
+        sweep_layout.addWidget(QtWidgets.QLabel("MMR λ (comma-separated)"), 2, 0)
+        sweep_layout.addWidget(self.mmr_values, 2, 1)
+        sweep_layout.addWidget(QtWidgets.QLabel("Chunk sizes"), 3, 0)
+        sweep_layout.addWidget(self.chunk_sizes, 3, 1)
+        sweep_layout.addWidget(QtWidgets.QLabel("Chunks per label"), 4, 0)
+        sweep_layout.addWidget(self.num_chunks, 4, 1)
+
+        layout.addWidget(sweep_group)
+
+        self.checkpoint_label = QtWidgets.QLabel()
+        layout.addWidget(self.checkpoint_label)
+
+        self.results_table = QtWidgets.QTableWidget(0, 3)
+        self.results_table.setHorizontalHeaderLabels(["Variant", "Agreement", "Metrics"])
+        self.results_table.horizontalHeader().setSectionResizeMode(
+            2, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.results_table)
+
+        self.log_output = QtWidgets.QPlainTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setPlaceholderText("Logs, checkpoints, and backend output will appear here.")
+        layout.addWidget(self.log_output)
+
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Close
+        )
+        self.run_button = self.button_box.addButton(
+            "Run experiments", QtWidgets.QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.cancel_button = self.button_box.addButton(
+            "Cancel run", QtWidgets.QDialogButtonBox.ButtonRole.RejectRole
+        )
+        self.cancel_button.setEnabled(False)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        self.run_button.clicked.connect(self._start_run)
+        self.cancel_button.clicked.connect(self._cancel_run)
+
+    def _load_options(self) -> None:
+        self.labelset_combo.clear()
+        for entry in self.ctx.list_label_sets_for_pheno(self.pheno_id):
+            labelset = entry.get("labelset") or {}
+            labelset_id = str(labelset.get("labelset_id") or "")
+            display = labelset_id
+            if entry.get("assigned_to_pheno"):
+                display = f"{display} (assigned)"
+            self.labelset_combo.addItem(display, labelset_id)
+        self.rounds_list.clear()
+        for round_row in self.ctx.list_rounds(self.pheno_id):
+            round_number = int(round_row.get("round_number") or 0)
+            status = str(round_row.get("status") or "")
+            label = f"Round {round_number} — {status}"
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, round_number)
+            if status.lower() in {"finalized", "adjudicating", "closed"}:
+                item.setSelected(True)
+            self.rounds_list.addItem(item)
+        self.corpus_combo.clear()
+        self.corpus_combo.addItem("<None>", "")
+        for corpus in self.ctx.list_corpora():
+            corpus_id = str(corpus.get("corpus_id") or "")
+            name = str(corpus.get("name") or corpus_id)
+            self.corpus_combo.addItem(f"{name} ({corpus_id})", corpus_id)
+        checkpoint_path = (
+            self.ctx.require_project()
+            / "prompt_runs"
+            / f"{self.pheno_id}_prompt_checkpoint.json"
+        )
+        self.checkpoint_label.setText(f"Checkpoint: {checkpoint_path}")
+
+    @staticmethod
+    def _parse_float_list(value: str, default: Sequence[float]) -> list[float]:
+        parts = [v.strip() for v in value.split(",") if v.strip()]
+        if not parts:
+            return list(default)
+        parsed: list[float] = []
+        for part in parts:
+            try:
+                parsed.append(float(part))
+            except ValueError:
+                continue
+        return parsed or list(default)
+
+    @staticmethod
+    def _parse_int_list(value: str, default: Sequence[int]) -> list[int]:
+        parts = [v.strip() for v in value.split(",") if v.strip()]
+        if not parts:
+            return list(default)
+        parsed: list[int] = []
+        for part in parts:
+            try:
+                parsed.append(int(part))
+            except ValueError:
+                continue
+        return parsed or list(default)
+
+    def _selected_rounds(self) -> list[int]:
+        return [
+            int(item.data(QtCore.Qt.ItemDataRole.UserRole) or 0)
+            for item in self.rounds_list.selectedItems()
+        ]
+
+    def _start_run(self) -> None:
+        labelset_id = str(self.labelset_combo.currentData() or "")
+        if not labelset_id:
+            QtWidgets.QMessageBox.warning(self, "Inference", "Select a label set first.")
+            return
+        rounds = self._selected_rounds()
+        if not rounds:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Inference",
+                "Choose at least one adjudicated round to evaluate against.",
+            )
+            return
+        base_config = PromptBuilderConfig(
+            labelset_id=labelset_id,
+            system_prompt=self.system_prompt.toPlainText(),
+            use_few_shot=False,
+            few_shot_examples=self._load_json_field(self.few_shot_examples),
+            label_rule_overrides=self._load_json_field(self.rule_overrides),
+            backend=str(self.backend_combo.currentText()),
+        )
+        sweep = PromptExperimentSweep(base=base_config)
+        sweep.zero_shot = self.enable_zero_shot.isChecked()
+        sweep.few_shot = self.enable_few_shot.isChecked()
+        sweep.mmr_lambdas = self._parse_float_list(self.mmr_values.text(), sweep.mmr_lambdas)
+        sweep.chunk_sizes = self._parse_int_list(self.chunk_sizes.text(), sweep.chunk_sizes)
+        sweep.num_chunks = self._parse_int_list(self.num_chunks.text(), sweep.num_chunks)
+        variants = sweep.variants()
+        if not self.include_family_tree.isChecked():
+            variants = [v for v in variants if v.config.inference_mode != "family_tree"]
+        if not self.include_single_shot.isChecked():
+            variants = [v for v in variants if v.config.inference_mode != "single_shot"]
+        if not variants:
+            QtWidgets.QMessageBox.warning(self, "Inference", "No experiment variants to run.")
+            return
+
+        corpus_id = str(self.corpus_combo.currentData() or "") or None
+        corpus_path = None
+        if corpus_id:
+            try:
+                corpus_path = self.ctx.resolve_corpus_path(corpus_id)
+            except Exception as exc:  # noqa: BLE001
+                QtWidgets.QMessageBox.critical(self, "Inference", f"Corpus error: {exc}")
+                return
+
+        job = PromptInferenceJob(
+            project_root=self.ctx.require_project(),
+            pheno_id=self.pheno_id,
+            labelset_id=labelset_id,
+            phenotype_level=self.pheno_level,
+            adjudicated_rounds=rounds,
+            corpus_id=corpus_id,
+            corpus_path=corpus_path,
+        )
+
+        self.log_output.appendPlainText(
+            f"Starting {len(variants)} variant(s). Checkpoint → {job.checkpoint_path}"
+        )
+        self._set_running(True)
+        self._worker_thread = QtCore.QThread(self)
+        self._worker = PromptInferenceWorker(job, variants, user="admin")
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.log_message.connect(self._on_log)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.errored.connect(self._on_error)
+        self._worker_thread.start()
+
+    def _load_json_field(self, widget: QtWidgets.QPlainTextEdit) -> Dict[str, object]:
+        raw = widget.toPlainText().strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            QtWidgets.QMessageBox.warning(self, "Inference", "Invalid JSON; ignoring field.")
+        return {}
+
+    def _set_running(self, running: bool) -> None:
+        self.run_button.setEnabled(not running)
+        self.cancel_button.setEnabled(running)
+        self.button_box.button(QtWidgets.QDialogButtonBox.StandardButton.Close).setEnabled(
+            not running
+        )
+
+    def _cancel_run(self) -> None:
+        if self._worker:
+            self._worker.cancel()
+            self._on_log("Cancellation requested…")
+
+    @QtCore.Slot(str)
+    def _on_log(self, message: str) -> None:
+        timestamp = datetime.utcnow().strftime("%H:%M:%S")
+        self.log_output.appendPlainText(f"[{timestamp}] {message}")
+
+    @QtCore.Slot(list)
+    def _on_finished(self, results: list) -> None:  # type: ignore[override]
+        self._populate_results(results)
+        self._teardown_worker()
+        self._set_running(False)
+        QtWidgets.QMessageBox.information(self, "Inference", "Experiments completed.")
+
+    @QtCore.Slot(str)
+    def _on_error(self, message: str) -> None:
+        self._on_log(f"Error: {message}")
+        self._teardown_worker()
+        self._set_running(False)
+        QtWidgets.QMessageBox.critical(self, "Inference", message)
+
+    def _teardown_worker(self) -> None:
+        if self._worker_thread:
+            self._worker_thread.quit()
+            self._worker_thread.wait(2000)
+        self._worker_thread = None
+        self._worker = None
+
+    def _populate_results(self, results: list) -> None:
+        self.results_table.setRowCount(0)
+        for idx, result in enumerate(results):
+            self.results_table.insertRow(idx)
+            name_item = QtWidgets.QTableWidgetItem(str(result.name))
+            agreement = result.agreement
+            agreement_item = QtWidgets.QTableWidgetItem(
+                "" if agreement is None else f"{float(agreement):.3f}"
+            )
+            metrics_json = json.dumps(result.metrics, indent=2, sort_keys=True)
+            metrics_item = QtWidgets.QTableWidgetItem(metrics_json)
+            self.results_table.setItem(idx, 0, name_item)
+            self.results_table.setItem(idx, 1, agreement_item)
+            self.results_table.setItem(idx, 2, metrics_item)
+        self.results_table.resizeColumnsToContents()
+
 
     def _add_label(self) -> None:
         existing_ids = {label["label_id"] for label in self.labels}
@@ -5545,6 +5917,8 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             view_labelsets_action.triggered.connect(lambda: self._view_labelsets(item))
             action = menu.addAction("Add round…")
             action.triggered.connect(lambda: self._add_round(item))
+            inference_action = menu.addAction("Inference…")
+            inference_action.triggered.connect(lambda: self._open_inference(item))
             delete_action = menu.addAction("Delete phenotype…")
             delete_action.triggered.connect(lambda: self._delete_phenotype(item))
         elif node_type == "round":
@@ -5635,6 +6009,14 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
         if not pheno_id:
             return
         dialog = PhenotypeLabelSetsDialog(self.ctx, pheno_data, self)
+        dialog.exec()
+
+    def _open_inference(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
+        pheno = data.get("pheno")
+        if not isinstance(pheno, dict):
+            return
+        dialog = PromptInferenceDialog(self.ctx, pheno, self)
         dialog.exec()
 
     def _add_round(self, item: QtWidgets.QTreeWidgetItem) -> None:
