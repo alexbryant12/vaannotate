@@ -258,6 +258,7 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
         "use_keywords": "Blend keyword search results into retrieval.",
         "keyword_topk": "How many keyword hits to include when enabled.",
         "keywords": "Comma-separated keywords to seed lexical retrieval across all labels.",
+        "label_keywords": "Optional JSON mapping of label_id → keywords (list or comma-separated string) for BM25 search.",
         "min_context_chunks": "Minimum chunks of context to pass to the LLM.",
         "mmr_multiplier": "Scale the number of chunks considered for MMR diversification.",
         "neighbor_hops": "How many hops to explore around selected chunks for neighbors.",
@@ -276,6 +277,7 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
         "max_context_chars": "Guardrail on total characters passed to the LLM.",
         "rpm_limit": "Requests-per-minute throttle; leave 0 to disable.",
         "include_reasoning": "Ask the LLM to return reasoning/rationale text.",
+        "few_shot_examples": "Optional JSON mapping of label_id → examples, each with 'context' and JSON 'answer'.",
         "azure_api_version": "Azure OpenAI API version to target.",
         "azure_endpoint": "Custom Azure OpenAI endpoint URL.",
         "local_model_dir": "Path to the local ExLlamaV2 model directory.",
@@ -437,6 +439,19 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
             )
             edit.setProperty("tuple_factory", tuple if isinstance(value, tuple) else list)
             widget = edit
+        elif name in {"few_shot_examples", "label_keywords"}:
+            edit = QtWidgets.QPlainTextEdit()
+            try:
+                edit.setPlainText(json.dumps(value, indent=2, ensure_ascii=False))
+            except Exception:  # noqa: BLE001
+                edit.setPlainText("" if value is None else str(value))
+            edit.setPlaceholderText(
+                "JSON mapping of label_id to [{\"context\": \"...\", \"answer\": \"{\\\"prediction\\\": ...}\"}]"
+                if name == "few_shot_examples"
+                else "JSON mapping of label_id to keyword lists (or comma-separated strings)."
+            )
+            edit.setProperty("value_type", "json_object")
+            widget = edit
         elif isinstance(value, list):
             edit = QtWidgets.QLineEdit()
             edit.setText(", ".join(str(v) for v in value))
@@ -479,6 +494,18 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
                 values[key] = float(widget.value())
             elif isinstance(widget, QtWidgets.QSpinBox):
                 values[key] = int(widget.value())
+            elif isinstance(widget, QtWidgets.QPlainTextEdit):
+                text = widget.toPlainText().strip()
+                if widget.property("value_type") == "json_object":
+                    if not text:
+                        values[key] = {}
+                    else:
+                        try:
+                            values[key] = json.loads(text)
+                        except Exception:  # noqa: BLE001
+                            values[key] = text
+                else:
+                    values[key] = text
             elif isinstance(widget, QtWidgets.QLineEdit):
                 if widget.property("value_type") == "tuple":
                     text = widget.text().strip()

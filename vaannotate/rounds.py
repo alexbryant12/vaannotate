@@ -742,7 +742,16 @@ class RoundBuilder:
         cfg.final_llm_labeling = False
         phenotype_level = str(pheno_row["level"] or "multi_doc")
         label_config_payload = build_label_config(labelset)
+        label_keywords = self._extract_label_keywords(config)
+        if label_keywords:
+            label_config_payload = self._apply_label_keywords(label_config_payload, label_keywords)
         paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
+        few_shot_examples = self._extract_few_shot_examples(config)
+        if few_shot_examples:
+            try:
+                setattr(cfg.llm, "few_shot_examples", few_shot_examples)
+            except Exception:  # noqa: BLE001
+                pass
 
         ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         llmfirst_overrides = (
@@ -1094,6 +1103,93 @@ class RoundBuilder:
                 return parsed
         return True
 
+    @staticmethod
+    def _extract_few_shot_examples(config: Mapping[str, Any]) -> Dict[str, list[dict[str, str]]]:
+        ai_backend_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        llm_cfg = ai_backend_cfg.get("llm") if isinstance(ai_backend_cfg, Mapping) and isinstance(ai_backend_cfg.get("llm"), Mapping) else {}
+        top_llm_cfg = config.get("llm") if isinstance(config.get("llm"), Mapping) else {}
+
+        candidates: list[object] = []
+        if isinstance(ai_backend_cfg, Mapping):
+            candidates.append(ai_backend_cfg.get("few_shot_examples"))
+        if isinstance(llm_cfg, Mapping):
+            candidates.append(llm_cfg.get("few_shot_examples"))
+        if isinstance(top_llm_cfg, Mapping):
+            candidates.append(top_llm_cfg.get("few_shot_examples"))
+
+        few_shot_raw: Mapping[str, object] | None = None
+        for candidate in candidates:
+            if isinstance(candidate, Mapping):
+                few_shot_raw = candidate
+                break
+
+        if not few_shot_raw:
+            return {}
+
+        cleaned: Dict[str, list[dict[str, str]]] = {}
+        for label_id, examples in few_shot_raw.items():
+            if not isinstance(examples, Sequence):
+                continue
+            parsed_examples: list[dict[str, str]] = []
+            for entry in examples:
+                if not isinstance(entry, Mapping):
+                    continue
+                example: dict[str, str] = {}
+                if entry.get("context") is not None:
+                    example["context"] = str(entry.get("context"))
+                if entry.get("answer") is not None:
+                    example["answer"] = str(entry.get("answer"))
+                if example:
+                    parsed_examples.append(example)
+            if parsed_examples:
+                cleaned[str(label_id)] = parsed_examples
+        return cleaned
+
+    @staticmethod
+    def _extract_label_keywords(config: Mapping[str, Any]) -> Dict[str, list[str]]:
+        ai_backend_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        rag_cfg = ai_backend_cfg.get("rag") if isinstance(ai_backend_cfg, Mapping) and isinstance(ai_backend_cfg.get("rag"), Mapping) else {}
+        top_rag_cfg = config.get("rag") if isinstance(config.get("rag"), Mapping) else {}
+        raw_candidates: list[object] = []
+        if isinstance(rag_cfg, Mapping):
+            raw_candidates.append(rag_cfg.get("label_keywords"))
+        if isinstance(top_rag_cfg, Mapping):
+            raw_candidates.append(top_rag_cfg.get("label_keywords"))
+
+        raw: Mapping[str, object] | None = None
+        for candidate in raw_candidates:
+            if isinstance(candidate, Mapping):
+                raw = candidate
+                break
+
+        if not raw:
+            return {}
+
+        parsed: Dict[str, list[str]] = {}
+        for label_id, keywords in raw.items():
+            values: list[str] = []
+            if isinstance(keywords, str):
+                values.extend([kw.strip() for kw in re.split(r"[,\n]", keywords) if kw.strip()])
+            elif isinstance(keywords, Sequence):
+                values.extend([str(kw).strip() for kw in keywords if isinstance(kw, str) and kw.strip()])
+            if values:
+                parsed[str(label_id)] = values
+        return parsed
+
+    @staticmethod
+    def _apply_label_keywords(
+        label_config: Mapping[str, object], label_keywords: Mapping[str, Sequence[str]]
+    ) -> Dict[str, object]:
+        merged = {key: copy.deepcopy(value) for key, value in label_config.items()}
+        for label_id, keywords in label_keywords.items():
+            if not keywords:
+                continue
+            entry = merged.get(label_id)
+            entry_payload = copy.deepcopy(entry) if isinstance(entry, Mapping) else {}
+            entry_payload["keywords"] = list(keywords)
+            merged[label_id] = entry_payload
+        return merged
+
     def _run_final_llm_labeling_inference(
         self,
         *,
@@ -1173,6 +1269,12 @@ class RoundBuilder:
         cfg.final_llm_labeling_n_consistency = max(1, consistency)
         setattr(cfg.llmfirst, "final_llm_label_consistency", cfg.final_llm_labeling_n_consistency)
         setattr(cfg.llm, "include_reasoning", bool(include_reasoning))
+        few_shot_examples = self._extract_few_shot_examples(config)
+        if few_shot_examples:
+            try:
+                setattr(cfg.llm, "few_shot_examples", few_shot_examples)
+            except Exception:  # noqa: BLE001
+                pass
 
         ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         llmfirst_overrides = (
@@ -1194,6 +1296,9 @@ class RoundBuilder:
 
         phenotype_level = str(pheno_row["level"] or "multi_doc")
         label_config_payload = build_label_config(labelset)
+        label_keywords = self._extract_label_keywords(config)
+        if label_keywords:
+            label_config_payload = self._apply_label_keywords(label_config_payload, label_keywords)
         paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
         orchestrator = ActiveLearningLLMFirst(
             paths=paths,

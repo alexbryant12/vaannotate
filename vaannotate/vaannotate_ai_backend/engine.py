@@ -103,6 +103,7 @@ class RAGConfig:
     use_keywords: bool = False
     keyword_topk: int = 20
     keywords: List[str] = field(default_factory=list)
+    label_keywords: dict[str, list[str]] = field(default_factory=dict)
     min_context_chunks: int = 3
     mmr_multiplier: int = 3
     neighbor_hops: int = 1
@@ -127,6 +128,7 @@ class LLMConfig:
     n_consistency: int = 3
     logprobs: bool = True
     top_logprobs: int = 5
+    few_shot_examples: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     prediction_field: str = "prediction"
     timeout: float = 60.0
     retry_max: int = 3
@@ -2053,6 +2055,11 @@ class RAGRetriever:
             keywords: list[str] = []
             if isinstance(cfg_keywords, (list, tuple)):
                 keywords.extend(str(k) for k in cfg_keywords if isinstance(k, str) and k.strip())
+            per_label_kw_cfg = getattr(cfg_rag, "label_keywords", {})
+            if isinstance(per_label_kw_cfg, Mapping):
+                label_kw = per_label_kw_cfg.get(label_id) or per_label_kw_cfg.get(str(label_id))
+                if isinstance(label_kw, (list, tuple)):
+                    keywords.extend(str(k) for k in label_kw if isinstance(k, str) and k.strip())
             lbl_keywords = lblcfg.get("keywords", []) if isinstance(lblcfg, Mapping) else []
             if isinstance(lbl_keywords, (list, tuple)):
                 keywords.extend(str(k) for k in lbl_keywords if isinstance(k, str) and k.strip())
@@ -2319,6 +2326,26 @@ class LLMAnnotator:
                 pairs += 1
         return float(sim_sum / max(1, pairs))
 
+    def _few_shot_messages(self, label_id: str) -> list[dict[str, str]]:
+        examples_cfg = getattr(self.cfg, "few_shot_examples", {}) or {}
+        if not isinstance(examples_cfg, Mapping):
+            return []
+        label_key = str(label_id)
+        label_examples = examples_cfg.get(label_key) or examples_cfg.get(label_key.lower())
+        if not isinstance(label_examples, (list, tuple)):
+            return []
+        messages: list[dict[str, str]] = []
+        for entry in label_examples:
+            if not isinstance(entry, Mapping):
+                continue
+            answer = entry.get("answer")
+            context = entry.get("context")
+            if context is not None:
+                messages.append({"role": "user", "content": str(context)})
+            if answer is not None:
+                messages.append({"role": "assistant", "content": str(answer)})
+        return messages
+
     def annotate(
         self,
         unit_id: str,
@@ -2437,8 +2464,12 @@ class LLMAnnotator:
             response_keys = "reasoning, prediction" if include_reasoning else "prediction"
             segments.append(f"RESPONSE JSON keys: {response_keys}")
             task = "\n".join(segments)
-            messages = [{"role": "system", "content": system},
-                        {"role": "user",   "content": task}]
+            few_shot_messages = self._few_shot_messages(label_id)
+            messages = [
+                {"role": "system", "content": system},
+                *few_shot_messages,
+                {"role": "user", "content": task},
+            ]
 
             if include_reasoning:
                 response_schema = {
