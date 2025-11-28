@@ -89,6 +89,23 @@ def _to_serializable(value: Any) -> Any:
     return str(value)
 
 
+def _reasoning_first(obj: Mapping[str, Any] | Any) -> Mapping[str, Any] | Any:
+    """Return a shallow copy with the reasoning key (if present) first."""
+
+    if not isinstance(obj, MappingABC):
+        return obj
+
+    if "reasoning" not in obj:
+        return obj
+
+    ordered: Dict[str, Any] = {"reasoning": obj.get("reasoning")}
+    for key, value in obj.items():
+        if key == "reasoning":
+            continue
+        ordered[key] = value
+    return ordered
+
+
 @dataclass
 class JSONCallResult:
     """Structured result returned by :meth:`LLMBackend.json_call`."""
@@ -215,7 +232,7 @@ class AzureOpenAIBackend(LLMBackend):
         if content is None:
             content = getattr(choice, "content", "")
         content = content or ""
-        data = json.loads(content)
+        data = _reasoning_first(json.loads(content))
         logprob_info = getattr(choice, "logprobs", None)
         if logprob_info is not None:
             logprob_info = _to_serializable(logprob_info)
@@ -436,7 +453,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
                         salvage[key] = group.strip()
                         break
 
-        for key in ("prediction", "reasoning"):
+        for key in ("reasoning", "prediction"):
             _capture_scalar(key)
 
         snippet_match = re.search(
@@ -586,7 +603,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             latency = time.time() - t0
             self._post_call()
             try:
-                data = self._tolerant_json_loads(text)
+                data = _reasoning_first(self._tolerant_json_loads(text))
                 break
             except Exception as exc:
                 last_error = exc

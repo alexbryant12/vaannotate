@@ -257,6 +257,7 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
         "mmr_candidates": "Candidate pool size for MMR selection.",
         "use_keywords": "Blend keyword search results into retrieval.",
         "keyword_topk": "How many keyword hits to include when enabled.",
+        "keywords": "Comma-separated keywords to seed lexical retrieval across all labels.",
         "min_context_chunks": "Minimum chunks of context to pass to the LLM.",
         "mmr_multiplier": "Scale the number of chunks considered for MMR diversification.",
         "neighbor_hops": "How many hops to explore around selected chunks for neighbors.",
@@ -436,6 +437,12 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
             )
             edit.setProperty("tuple_factory", tuple if isinstance(value, tuple) else list)
             widget = edit
+        elif isinstance(value, list):
+            edit = QtWidgets.QLineEdit()
+            edit.setText(", ".join(str(v) for v in value))
+            edit.setPlaceholderText("comma-separated values")
+            edit.setProperty("value_type", "list")
+            widget = edit
         elif isinstance(value, bool):
             checkbox = QtWidgets.QCheckBox()
             checkbox.setChecked(bool(value))
@@ -482,6 +489,10 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
                         values[key] = factory(cast(p) for p in parts)
                     except Exception:  # noqa: BLE001
                         values[key] = text
+                elif widget.property("value_type") == "list":
+                    text = widget.text().strip()
+                    parts = [p.strip() for p in re.split(r"[,\n]", text) if p.strip()]
+                    values[key] = parts
                 else:
                     values[key] = widget.text().strip()
         return values
