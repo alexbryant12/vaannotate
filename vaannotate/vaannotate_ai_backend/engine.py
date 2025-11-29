@@ -2035,8 +2035,22 @@ class RAGRetriever:
         if lam is not None: lam = max(0.0, min(1.0, lam))
 
         # ---- label-aware query + embedding ----
-        K = int(getattr(self.cfg, "exemplar_K", 6) or 6)
-        Q = self._get_label_query_embs(label_id, label_rules, K=K)
+        try:
+            label_types = repo.label_types()
+        except Exception:
+            label_types = {}
+        base_k = getattr(self.cfg, "exemplar_K", None)
+        K_use = int(base_k if base_k is not None else 6)
+        if K_use <= 0:
+            K_use = 6
+        opts = _options_for_label(
+            label_id,
+            label_types.get(str(label_id), "categorical"),
+            getattr(self, "label_configs", {}),
+        ) or []
+        if opts:
+            K_use = max(K_use, len(opts))
+        Q = self._get_label_query_embs(label_id, label_rules, K=K_use)
         mmr_select_k = final_k * mmr_mult
 
         rule_query = self._build_query(label_id, label_rules)
@@ -3866,10 +3880,20 @@ def build_diversity_bucket(
         if proto is None:
             Q = None
             try:
-                K = int(getattr(getattr(retriever, "cfg", None), "exemplar_K", 6) or 6)
+                base_k = getattr(getattr(retriever, "cfg", None), "exemplar_K", None)
+                K_use = int(base_k if base_k is not None else 6)
+                if K_use <= 0:
+                    K_use = 6
+                opts = _options_for_label(
+                    lid,
+                    label_types.get(str(lid), "categorical"),
+                    getattr(retriever, "label_configs", {}),
+                ) or []
+                if opts:
+                    K_use = max(K_use, len(opts))
                 getQ = getattr(retriever, "_get_label_query_embs", None)
                 if callable(getQ):
-                    Q = getQ(lid, rules_map.get(lid, ""), K)
+                    Q = getQ(lid, rules_map.get(lid, ""), K_use)
             except Exception:
                 Q = None
             if Q is not None and getattr(Q, "ndim", 1) == 2 and Q.shape[0] > 0:
