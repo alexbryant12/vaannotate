@@ -33,7 +33,7 @@ What’s in this file (high level):
 """
 
 from __future__ import annotations
-import os, re, json, math, time, random, hashlib
+import os, re, json, math, time, random, hashlib, unicodedata
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 from contextlib import contextmanager
@@ -935,6 +935,10 @@ class Models:
         self.device = device; self.emb_batch = emb_batch; self.rerank_batch = rerank_batch
 
 class EmbeddingStore:
+    BM25_STOPWORDS = {
+        "the", "and", "of", "to", "in", "for", "on", "at", "a", "an", "is", "it", "with",
+    }
+
     def __init__(self, models: Models, cache_dir: str, normalize: bool = True):
         self.models = models; self.cache_dir = cache_dir; os.makedirs(cache_dir, exist_ok=True)
         self.normalize = normalize
@@ -943,6 +947,8 @@ class EmbeddingStore:
         self.X = None
         self.unit_to_chunk_idxs: Dict[str,List[int]] = {}
         self.bm25_indices: Dict[str, dict] = {}
+        self.bm25_idf_global: Dict[str, float] = {}
+        self.bm25_N_global: int = 0
 
     def _backfill_chunk_metadata(self, notes_df: "pd.DataFrame") -> None:
         """Ensure cached chunk metadata includes key fields such as notetype."""
@@ -1124,11 +1130,14 @@ class EmbeddingStore:
     def _tokenize_for_bm25(self, text: str) -> List[str]:
         if not text:
             return []
-        return re.findall(r"\b\w+\b", str(text).lower())
+        normalized = unicodedata.normalize("NFKC", str(text))
+        tokens = re.findall(r"[a-z0-9_+\-/]+", normalized.lower())
+        return [tok for tok in tokens if tok and tok not in self.BM25_STOPWORDS]
 
     def _build_bm25_indices(self) -> Dict[str, dict]:
         unit_docs: Dict[str, list] = defaultdict(list)
         unit_metas: Dict[str, list] = defaultdict(list)
+        global_df: Counter = Counter()
         for meta in self.chunk_meta:
             toks = self._tokenize_for_bm25(meta.get("text", ""))
             if not toks:
@@ -1136,24 +1145,25 @@ class EmbeddingStore:
             uid = str(meta.get("unit_id", ""))
             unit_docs[uid].append(toks)
             unit_metas[uid].append(meta)
+            global_df.update(set(toks))
 
-        indices: Dict[str, dict] = {}
+        all_docs = sum(len(docs) for docs in unit_docs.values())
+        eps = 1e-12
+        idf_global = {tok: math.log((all_docs - freq + 0.5) / (freq + 0.5 + eps)) for tok, freq in global_df.items()}
+        self.bm25_idf_global = idf_global
+        self.bm25_N_global = all_docs
+
+        bm25_units: Dict[str, dict] = {}
         for uid, docs in unit_docs.items():
             if not docs:
                 continue
-            N = len(docs)
-            df = Counter()
-            for toks in docs:
-                df.update(set(toks))
-            idf = {tok: math.log((N - freq + 0.5) / (freq + 0.5) + 1.0) for tok, freq in df.items()}
-            avgdl = sum(len(toks) for toks in docs) / float(N)
-            indices[uid] = {
+            avgdl = sum(len(toks) for toks in docs) / float(len(docs))
+            bm25_units[uid] = {
                 "docs": docs,
                 "metas": unit_metas.get(uid, []),
-                "idf": idf,
                 "avgdl": avgdl,
             }
-        return indices
+        return bm25_units
 
     def _load_bm25_indices(self, chunk_dir: str) -> dict | None:
         p = self._bm25_index_path(chunk_dir)
@@ -1161,13 +1171,18 @@ class EmbeddingStore:
             return None
         try:
             data = json.load(open(p, "r", encoding="utf-8"))
-            indices = data.get("units") or data.get("indices") or {}
-            if not isinstance(indices, dict):
+            units = data.get("units") or data.get("indices") or {}
+            if not isinstance(units, dict):
                 return None
             expected_n = data.get("n_chunks")
             if expected_n is not None and expected_n != len(self.chunk_meta):
                 return None
-            return indices
+            idf_global = data.get("idf_global") or {}
+            n_global = int(data.get("N_global") or 0)
+            self.bm25_idf_global = idf_global if isinstance(idf_global, dict) else {}
+            self.bm25_N_global = n_global
+            self.bm25_indices = units
+            return units
         except Exception:
             return None
 
@@ -1176,6 +1191,8 @@ class EmbeddingStore:
             "version": "v1",
             "n_chunks": len(self.chunk_meta),
             "units": indices,
+            "idf_global": getattr(self, "bm25_idf_global", {}),
+            "N_global": getattr(self, "bm25_N_global", 0),
         }
         p = self._bm25_index_path(chunk_dir)
         tmp = p + ".tmp"
@@ -1193,7 +1210,6 @@ class EmbeddingStore:
         if hasattr(self, "_chunk_cache_dir_path"):
             loaded = self._load_bm25_indices(self._chunk_cache_dir_path)
             if isinstance(loaded, dict):
-                self.bm25_indices = loaded
                 hit = loaded.get(uid)
                 if hit is not None:
                     return hit
@@ -1783,20 +1799,15 @@ class RAGRetriever:
         docs, metas = [], []
         for ix in idxs:
             meta = self.store.chunk_meta[ix]
-            tokens = self._tokenize(meta.get("text", ""))
+            tokens = self._tokenize_for_bm25(meta.get("text", ""))
             if not tokens:
                 continue
             docs.append(tokens)
             metas.append(meta)
         if not docs:
             return None
-        N = len(docs)
-        df = Counter()
-        for toks in docs:
-            df.update(set(toks))
-        idf = {tok: math.log((N - freq + 0.5) / (freq + 0.5) + 1.0) for tok, freq in df.items()}
-        avgdl = sum(len(toks) for toks in docs) / float(N)
-        index = {"docs": docs, "metas": metas, "idf": idf, "avgdl": avgdl}
+        avgdl = sum(len(toks) for toks in docs) / float(len(docs))
+        index = {"docs": docs, "metas": metas, "avgdl": avgdl}
         self._bm25_cache[uid] = index
         if hasattr(self.store, "bm25_indices"):
             try:
@@ -1811,17 +1822,25 @@ class RAGRetriever:
     def _bm25_hits_for_patient(self, unit_id: str, keywords: List[str]) -> List[dict]:
         if not keywords:
             return []
+        if hasattr(self.store, "bm25_idf_global") and not getattr(self.store, "bm25_idf_global", {}):
+            try:
+                if hasattr(self.store, "_build_bm25_indices"):
+                    rebuilt = self.store._build_bm25_indices()
+                    if rebuilt:
+                        self.store.bm25_indices = rebuilt
+            except Exception:
+                pass
         index = self._bm25_index_for_patient(unit_id)
         if not index:
             return []
         query_tokens = []
         for kw in keywords:
             if isinstance(kw, str):
-                query_tokens.extend(self._tokenize(kw))
+                query_tokens.extend(self._tokenize_for_bm25(kw))
         if not query_tokens:
             return []
         docs = index["docs"]
-        idf = index["idf"]
+        idf_global = getattr(self.store, "bm25_idf_global", {}) or {}
         avgdl = index["avgdl"] or 1.0
         metas = index["metas"]
         k1, b = 1.5, 0.75
@@ -1831,11 +1850,11 @@ class RAGRetriever:
             dl = len(toks)
             score = 0.0
             for term in query_tokens:
-                if term not in tf or term not in idf:
+                if term not in tf or term not in idf_global:
                     continue
                 freq = tf[term]
                 denom = freq + k1 * (1 - b + b * dl / avgdl)
-                score += idf[term] * (freq * (k1 + 1)) / (denom + 1e-12)
+                score += idf_global[term] * (freq * (k1 + 1)) / (denom + 1e-12)
             if score <= 0:
                 continue
             scores.append((score, meta))
