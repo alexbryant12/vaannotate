@@ -171,7 +171,7 @@ class LLMFirstConfig:
     topk: int = 6
     json_trace_policy: str = 'fallback'
     progress_min_interval_s: float = 10.0
-    exemplar_K: int = 10
+    exemplar_K: int = 1
     exemplar_generate: bool = True
     exemplar_temperature: float = 0.9
     # forced-choice micro-probe
@@ -1694,10 +1694,14 @@ class RAGRetriever:
         if self._label_query_texts[key]:
             E = self.store._embed(self._label_query_texts[key])   # (K, d)
             self._label_query_embs[key] = E
-    
+
     def _get_label_query_embs(self, label_id: str, rules: str, K: int):
         key = (str(label_id), _stable_rules_hash(label_id, rules, K, getattr(self.models.embedder, "name_or_path", "")), int(K))
         return self._label_query_embs.get(key)
+
+    def _get_label_query_texts(self, label_id: str, rules: str, K: int):
+        key = (str(label_id), _stable_rules_hash(label_id, rules, K, getattr(self.models.embedder, "name_or_path", "")), int(K))
+        return self._label_query_texts.get(key)
     
     def _extract_meta(self, m:dict) -> dict:
         """
@@ -2034,18 +2038,32 @@ class RAGRetriever:
         K = int(getattr(self.cfg, "exemplar_K", 6) or 6)
         Q = self._get_label_query_embs(label_id, label_rules, K=K)
         mmr_select_k = final_k * mmr_mult
-        
+
+        rule_query = self._build_query(label_id, label_rules)
+        rule_emb = self.store._embed([rule_query])[0]
+        mmr_query_embs: list[np.ndarray] = [rule_emb]
+        semantic_runs: list[list[dict]] = []
+
+        rule_hits = _patient_local_rank(str(unit_id), rule_emb, need=mmr_select_k * 2)
+        for it in rule_hits:
+            it["source"] = "patient_rule"
+        semantic_runs.append(rule_hits)
+
         if Q is not None and getattr(Q, "ndim", 1) == 2 and Q.shape[0] > 0:
-            # multi-vector preselect by max-sim across exemplars
-            items = _patient_local_rank_multi(str(unit_id), Q, need=mmr_select_k * 2)
-            # centroid for MMR
-            q_emb = Q.mean(axis=0)
-            query = f"[exemplar centroid for {label_id}]"
+            for i in range(Q.shape[0]):
+                ex_hits = _patient_local_rank(str(unit_id), Q[i], need=mmr_select_k * 2)
+                for it in ex_hits:
+                    it["source"] = "patient_exemplar"
+                semantic_runs.append(ex_hits)
+                mmr_query_embs.append(Q[i])
+
+        if len(semantic_runs) == 1:
+            items = semantic_runs[0]
         else:
-            # fallback to rules-string query
-            query = self._build_query(label_id, label_rules)
-            q_emb = self.store._embed([query])[0]
-            items = _patient_local_rank(str(unit_id), q_emb, need=mmr_select_k * 2)
+            items = self._reciprocal_rank_fusion(semantic_runs)
+
+        q_emb = np.mean(np.vstack(mmr_query_embs), axis=0) if mmr_query_embs else rule_emb
+        query = rule_query
 
         #  + (optional) keywords
         bm25_hits: List[dict] = []
@@ -3042,8 +3060,18 @@ class FamilyLabeler:
         
     
     def ensure_label_exemplars(self, rules_map: dict[str, str], K: int = 6):
+        try:
+            label_types = self.repo.label_types()
+        except Exception:
+            label_types = {}
         for lid, rules in (rules_map or {}).items():
-            K_use = int(getattr(self.cfg, "exemplar_K", K) or K)
+            base_k = getattr(self.cfg, "exemplar_K", None)
+            K_use = int(base_k if base_k is not None else K)
+            if K_use <= 0:
+                K_use = K
+            opts = _options_for_label(lid, label_types.get(str(lid), "categorical"), self.label_config) or []
+            if opts:
+                K_use = max(K_use, len(opts))
             # skip if already cached
             if self.retriever._get_label_query_embs(lid, rules, K_use) is not None:
                 continue
