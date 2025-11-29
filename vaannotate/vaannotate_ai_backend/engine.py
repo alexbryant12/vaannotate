@@ -1803,6 +1803,14 @@ class RAGRetriever:
             return []
         return re.findall(r"\b\w+\b", str(text).lower())
 
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        if hasattr(self.store, "_tokenize_for_bm25"):
+            try:
+                return self.store._tokenize_for_bm25(text)
+            except Exception:
+                pass
+        return self._tokenize(text)
+
     def _bm25_index_for_patient(self, unit_id: str) -> Optional[dict]:
         uid = str(unit_id)
         cached = self._bm25_cache.get(uid)
