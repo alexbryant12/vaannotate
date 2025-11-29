@@ -33,7 +33,7 @@ What’s in this file (high level):
 """
 
 from __future__ import annotations
-import os, re, json, math, time, random, hashlib
+import os, re, json, math, time, random, hashlib, unicodedata
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 from contextlib import contextmanager
@@ -943,6 +943,8 @@ class EmbeddingStore:
         self.X = None
         self.unit_to_chunk_idxs: Dict[str,List[int]] = {}
         self.bm25_indices: Dict[str, dict] = {}
+        self.idf_global: Dict[str, float] = {}
+        self.N_global: int = 0
 
     def _backfill_chunk_metadata(self, notes_df: "pd.DataFrame") -> None:
         """Ensure cached chunk metadata includes key fields such as notetype."""
@@ -1124,36 +1126,57 @@ class EmbeddingStore:
     def _tokenize_for_bm25(self, text: str) -> List[str]:
         if not text:
             return []
-        return re.findall(r"\b\w+\b", str(text).lower())
+        stopwords = {
+            "the",
+            "and",
+            "of",
+            "to",
+            "in",
+            "for",
+            "on",
+            "with",
+            "a",
+            "an",
+        }
+        normalized = unicodedata.normalize("NFKC", str(text)).lower()
+        tokens = re.findall(r"[a-z0-9_+\-/]+", normalized)
+        return [tok for tok in tokens if tok and tok not in stopwords]
 
     def _build_bm25_indices(self) -> Dict[str, dict]:
-        unit_docs: Dict[str, list] = defaultdict(list)
-        unit_metas: Dict[str, list] = defaultdict(list)
+        chunk_tokens: list[tuple[dict, List[str]]] = []
+        global_df: Counter[str] = Counter()
         for meta in self.chunk_meta:
             toks = self._tokenize_for_bm25(meta.get("text", ""))
             if not toks:
                 continue
+            chunk_tokens.append((meta, toks))
+            global_df.update(set(toks))
+
+        N_global = len(chunk_tokens)
+        eps = 1e-12
+        idf_global = {tok: math.log((N_global - freq + 0.5) / (freq + 0.5 + eps)) for tok, freq in global_df.items()}
+
+        unit_docs: Dict[str, list] = defaultdict(list)
+        unit_metas: Dict[str, list] = defaultdict(list)
+        for meta, toks in chunk_tokens:
             uid = str(meta.get("unit_id", ""))
             unit_docs[uid].append(toks)
             unit_metas[uid].append(meta)
 
-        indices: Dict[str, dict] = {}
+        bm25_units: Dict[str, dict] = {}
         for uid, docs in unit_docs.items():
             if not docs:
                 continue
-            N = len(docs)
-            df = Counter()
-            for toks in docs:
-                df.update(set(toks))
-            idf = {tok: math.log((N - freq + 0.5) / (freq + 0.5) + 1.0) for tok, freq in df.items()}
-            avgdl = sum(len(toks) for toks in docs) / float(N)
-            indices[uid] = {
+            avgdl = sum(len(toks) for toks in docs) / float(len(docs))
+            bm25_units[uid] = {
                 "docs": docs,
                 "metas": unit_metas.get(uid, []),
-                "idf": idf,
                 "avgdl": avgdl,
             }
-        return indices
+
+        self.idf_global = idf_global
+        self.N_global = N_global
+        return {"units": bm25_units, "idf_global": idf_global, "N_global": N_global}
 
     def _load_bm25_indices(self, chunk_dir: str) -> dict | None:
         p = self._bm25_index_path(chunk_dir)
@@ -1161,21 +1184,28 @@ class EmbeddingStore:
             return None
         try:
             data = json.load(open(p, "r", encoding="utf-8"))
-            indices = data.get("units") or data.get("indices") or {}
-            if not isinstance(indices, dict):
+            units = data.get("units") or data.get("indices") or {}
+            if not isinstance(units, dict):
                 return None
             expected_n = data.get("n_chunks")
             if expected_n is not None and expected_n != len(self.chunk_meta):
                 return None
-            return indices
+            idf_global = data.get("idf_global") or {}
+            N_global = data.get("N_global") or expected_n or 0
+            self.idf_global = idf_global
+            self.N_global = int(N_global)
+            return {"units": units, "idf_global": idf_global, "N_global": N_global}
         except Exception:
             return None
 
     def _save_bm25_indices(self, chunk_dir: str, indices: dict) -> None:
+        units = indices.get("units") if isinstance(indices, dict) else indices
         payload = {
             "version": "v1",
             "n_chunks": len(self.chunk_meta),
-            "units": indices,
+            "units": units,
+            "idf_global": indices.get("idf_global", getattr(self, "idf_global", {})) if isinstance(indices, dict) else getattr(self, "idf_global", {}),
+            "N_global": indices.get("N_global", getattr(self, "N_global", 0)) if isinstance(indices, dict) else getattr(self, "N_global", 0),
         }
         p = self._bm25_index_path(chunk_dir)
         tmp = p + ".tmp"
@@ -1186,15 +1216,18 @@ class EmbeddingStore:
 
     def bm25_index_for_unit(self, unit_id: str) -> dict | None:
         uid = str(unit_id)
-        cached = self.bm25_indices.get(uid)
-        if cached is not None:
-            return cached
+        bm25_units = self.bm25_indices.get("units") if isinstance(self.bm25_indices, dict) and "units" in self.bm25_indices else self.bm25_indices
+        if isinstance(bm25_units, dict):
+            cached = bm25_units.get(uid)
+            if cached is not None:
+                return cached
 
         if hasattr(self, "_chunk_cache_dir_path"):
             loaded = self._load_bm25_indices(self._chunk_cache_dir_path)
             if isinstance(loaded, dict):
                 self.bm25_indices = loaded
-                hit = loaded.get(uid)
+                bm25_units = loaded.get("units") if "units" in loaded else loaded
+                hit = bm25_units.get(uid) if isinstance(bm25_units, dict) else None
                 if hit is not None:
                     return hit
 
@@ -1206,12 +1239,15 @@ class EmbeddingStore:
             return None
 
         self.bm25_indices = rebuilt
+        self.idf_global = rebuilt.get("idf_global", getattr(self, "idf_global", {}))
+        self.N_global = int(rebuilt.get("N_global", getattr(self, "N_global", 0)))
         if hasattr(self, "_chunk_cache_dir_path"):
             try:
                 self._save_bm25_indices(self._chunk_cache_dir_path, rebuilt)
             except Exception:
                 pass
-        return self.bm25_indices.get(uid)
+        bm25_units = rebuilt.get("units") if "units" in rebuilt else rebuilt
+        return bm25_units.get(uid) if isinstance(bm25_units, dict) else None
     
     def _save_cached_chunks(self, chunk_dir: str, meta: list[dict], X: np.ndarray, rag_cfg):
         paths = self._paths_for_cache(chunk_dir, type("Cfg", (), {"type": "flat"}))
@@ -1783,25 +1819,32 @@ class RAGRetriever:
         docs, metas = [], []
         for ix in idxs:
             meta = self.store.chunk_meta[ix]
-            tokens = self._tokenize(meta.get("text", ""))
+            tokens = self._tokenize_for_bm25(meta.get("text", ""))
             if not tokens:
                 continue
             docs.append(tokens)
             metas.append(meta)
         if not docs:
             return None
-        N = len(docs)
-        df = Counter()
-        for toks in docs:
-            df.update(set(toks))
-        idf = {tok: math.log((N - freq + 0.5) / (freq + 0.5) + 1.0) for tok, freq in df.items()}
-        avgdl = sum(len(toks) for toks in docs) / float(N)
-        index = {"docs": docs, "metas": metas, "idf": idf, "avgdl": avgdl}
+        avgdl = sum(len(toks) for toks in docs) / float(len(docs))
+        index = {"docs": docs, "metas": metas, "avgdl": avgdl}
         self._bm25_cache[uid] = index
         if hasattr(self.store, "bm25_indices"):
             try:
-                self.store.bm25_indices = dict(getattr(self.store, "bm25_indices", {}))
-                self.store.bm25_indices[uid] = index
+                existing_indices = getattr(self.store, "bm25_indices", {})
+                if not isinstance(existing_indices, dict):
+                    existing_indices = {}
+                units = existing_indices.get("units") if "units" in existing_indices else existing_indices
+                if not isinstance(units, dict):
+                    units = {}
+                units = dict(units)
+                units[uid] = index
+                if "units" in existing_indices or not existing_indices:
+                    existing_indices = dict(existing_indices)
+                    existing_indices["units"] = units
+                else:
+                    existing_indices = units
+                self.store.bm25_indices = existing_indices
                 if hasattr(self.store, "_chunk_cache_dir_path"):
                     self.store._save_bm25_indices(self.store._chunk_cache_dir_path, self.store.bm25_indices)
             except Exception:
@@ -1817,11 +1860,26 @@ class RAGRetriever:
         query_tokens = []
         for kw in keywords:
             if isinstance(kw, str):
-                query_tokens.extend(self._tokenize(kw))
+                query_tokens.extend(self._tokenize_for_bm25(kw))
         if not query_tokens:
             return []
         docs = index["docs"]
-        idf = index["idf"]
+        idf = getattr(self.store, "idf_global", {}) or {}
+        if not idf and isinstance(getattr(self.store, "bm25_indices", None), dict):
+            indices_dict = getattr(self.store, "bm25_indices", {})
+            idf = indices_dict.get("idf_global", {}) if isinstance(indices_dict, dict) else {}
+        if not idf and hasattr(self.store, "_build_bm25_indices"):
+            built = self.store._build_bm25_indices()
+            if isinstance(built, dict):
+                self.store.bm25_indices = built
+                idf = built.get("idf_global", {})
+                if hasattr(self.store, "_chunk_cache_dir_path"):
+                    try:
+                        self.store._save_bm25_indices(self.store._chunk_cache_dir_path, built)
+                    except Exception:
+                        pass
+        if not idf:
+            return []
         avgdl = index["avgdl"] or 1.0
         metas = index["metas"]
         k1, b = 1.5, 0.75
