@@ -1154,7 +1154,13 @@ class EmbeddingStore:
 
         N_global = len(chunk_tokens)
         eps = 1e-12
-        idf_global = {tok: math.log((N_global - freq + 0.5) / (freq + 0.5 + eps)) for tok, freq in global_df.items()}
+        # Keep common but clinically important terms (e.g., "pain", "blood") from
+        # being downweighted into negative scores by adding a +1 offset, which was
+        # used in the previous implementation.
+        idf_global = {
+            tok: math.log((N_global - freq + 0.5) / (freq + 0.5 + eps)) + 1.0
+            for tok, freq in global_df.items()
+        }
 
         unit_docs: Dict[str, list] = defaultdict(list)
         unit_metas: Dict[str, list] = defaultdict(list)
