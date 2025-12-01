@@ -395,6 +395,114 @@ class LabelKeywordsEditor(QtWidgets.QWidget):
         return mapping
 
 
+class _FewShotTable(QtWidgets.QWidget):
+    """Simple table for entering context/answer pairs."""
+
+    def __init__(self, existing: Sequence[Mapping[str, object]] | None = None) -> None:
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._table = QtWidgets.QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Context", "Answer (JSON or text)"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        layout.addWidget(self._table)
+
+        buttons = QtWidgets.QHBoxLayout()
+        add_btn = QtWidgets.QPushButton("Add example")
+        add_btn.clicked.connect(self._on_add)
+        remove_btn = QtWidgets.QPushButton("Remove selected")
+        remove_btn.clicked.connect(self._on_remove)
+        buttons.addWidget(add_btn)
+        buttons.addWidget(remove_btn)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+        if isinstance(existing, Sequence):
+            for entry in existing:
+                if not isinstance(entry, Mapping):
+                    continue
+                context = entry.get("context")
+                answer = entry.get("answer")
+                self._add_row(context if context is not None else "", answer if answer is not None else "")
+
+    def _add_row(self, context: str = "", answer: str = "") -> None:
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+        self._table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(context)))
+        self._table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(answer)))
+        if not context and not answer:
+            self._table.editItem(self._table.item(row, 0))
+
+    def _on_add(self) -> None:
+        self._add_row()
+
+    def _on_remove(self) -> None:
+        row = self._table.currentRow()
+        if row >= 0:
+            self._table.removeRow(row)
+
+    def to_examples(self) -> list[dict[str, str]]:
+        examples: list[dict[str, str]] = []
+        for row in range(self._table.rowCount()):
+            context_item = self._table.item(row, 0)
+            answer_item = self._table.item(row, 1)
+            context = context_item.text().strip() if context_item else ""
+            answer = answer_item.text().strip() if answer_item else ""
+            if not context and not answer:
+                continue
+            example: dict[str, str] = {}
+            if context:
+                example["context"] = context
+            if answer:
+                example["answer"] = answer
+            if example:
+                examples.append(example)
+        return examples
+
+
+class LabelFewShotExamplesEditor(QtWidgets.QWidget):
+    """Friendly editor for per-label few-shot examples."""
+
+    def __init__(self, labels: Sequence[Mapping[str, object]], existing: Mapping[str, object]) -> None:
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        info = QtWidgets.QLabel(
+            "Enter context/response examples for each label. Add one or more rows "
+            "per label; leave blank to skip."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        self._tables: Dict[str, _FewShotTable] = {}
+        for label in labels:
+            label_id = str(label.get("label_id") or "")
+            if not label_id:
+                continue
+            display_name = str(label.get("name") or label_id)
+            examples = existing.get(label_id) if isinstance(existing, Mapping) else None
+            group = QtWidgets.QGroupBox(f"{display_name} ({label_id})")
+            group_layout = QtWidgets.QVBoxLayout(group)
+            table = _FewShotTable(examples if isinstance(examples, Sequence) else None)
+            group_layout.addWidget(table)
+            layout.addWidget(group)
+            self._tables[label_id] = table
+        layout.addStretch()
+
+    def to_mapping(self) -> Dict[str, list[dict[str, str]]]:
+        mapping: Dict[str, list[dict[str, str]]] = {}
+        for label_id, table in self._tables.items():
+            examples = table.to_examples()
+            if examples:
+                mapping[label_id] = examples
+        return mapping
+
+
 class AIAdvancedConfigDialog(QtWidgets.QDialog):
     """Dialog that surfaces all engine.py configuration options."""
 
@@ -410,9 +518,9 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
         self._config: Dict[str, Any] = dict(config)
         self.result_config: Dict[str, Any] = {}
         labels_obj = label_schema.get("labels") if isinstance(label_schema, Mapping) else None
-        self._label_keywords_labels: list[Mapping[str, object]] = []
+        self._label_schema_labels: list[Mapping[str, object]] = []
         if isinstance(labels_obj, Sequence):
-            self._label_keywords_labels = [label for label in labels_obj if isinstance(label, Mapping)]
+            self._label_schema_labels = [label for label in labels_obj if isinstance(label, Mapping)]
         layout = QtWidgets.QVBoxLayout(self)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -499,6 +607,9 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
             )
             edit.setProperty("tuple_factory", tuple if isinstance(value, tuple) else list)
             widget = edit
+        elif name == "few_shot_examples" and self._label_schema_labels:
+            existing = value if isinstance(value, Mapping) else {}
+            widget = LabelFewShotExamplesEditor(self._label_schema_labels, existing)
         elif name == "few_shot_examples":
             edit = QtWidgets.QPlainTextEdit()
             try:
@@ -510,9 +621,9 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
             )
             edit.setProperty("value_type", "json_object")
             widget = edit
-        elif name == "label_keywords" and self._label_keywords_labels:
+        elif name == "label_keywords" and self._label_schema_labels:
             existing = value if isinstance(value, Mapping) else {}
-            widget = LabelKeywordsEditor(self._label_keywords_labels, existing)
+            widget = LabelKeywordsEditor(self._label_schema_labels, existing)
         elif name == "label_keywords":
             edit = QtWidgets.QPlainTextEdit()
             try:
@@ -578,7 +689,7 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
                             values[key] = text
                 else:
                     values[key] = text
-            elif isinstance(widget, LabelKeywordsEditor):
+            elif isinstance(widget, (LabelKeywordsEditor, LabelFewShotExamplesEditor)):
                 values[key] = widget.to_mapping()
             elif isinstance(widget, QtWidgets.QLineEdit):
                 if widget.property("value_type") == "tuple":
