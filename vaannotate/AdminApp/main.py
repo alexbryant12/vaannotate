@@ -1254,13 +1254,14 @@ class ProjectContext(QtCore.QObject):
             ).fetchone()
         return row
 
-    def list_rounds(self, pheno_id: str) -> List[sqlite3.Row]:
+    def list_rounds(self, pheno_id: str) -> List[Dict[str, object]]:
         db = self.require_db()
         with db.connect() as conn:
-            return conn.execute(
+            rows = conn.execute(
                 "SELECT * FROM rounds WHERE pheno_id=? ORDER BY round_number",
                 (pheno_id,),
             ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_label_sets(self) -> List[sqlite3.Row]:
         db = self.require_db()
