@@ -315,6 +315,7 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
         "probe_ce_unit_agg": "Aggregation mode for CE scores (max/mean).",
         "single_doc_context": "Context strategy for single-document phenotypes (rag/full).",
         "single_doc_full_context_max_chars": "Max characters when using full-document context.",
+        "context_order": "Order context snippets by relevance or chronologically across RAG calls.",
     },
     "disagree": {
         "round_policy": "How to weight prior rounds when measuring disagreement (last/all/decay).",
@@ -2532,11 +2533,13 @@ class PromptInferenceWorker(QtCore.QObject):
         job: PromptInferenceJob,
         variants: list[PromptExperimentConfig],
         user: str,
+        env_overrides: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
         self.job = job
         self.variants = variants
         self.user = user
+        self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items() if str(v)}
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -2551,12 +2554,23 @@ class PromptInferenceWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            results = self.job.run(
-                self.variants,
-                user=self.user,
-                log_callback=self._log,
-                cancel_callback=self._cancelled_cb,
-            )
+            original_env: Dict[str, Optional[str]] = {}
+            try:
+                for key, value in self.env_overrides.items():
+                    original_env[key] = os.environ.get(key)
+                    os.environ[key] = value
+                results = self.job.run(
+                    self.variants,
+                    user=self.user,
+                    log_callback=self._log,
+                    cancel_callback=self._cancelled_cb,
+                )
+            finally:
+                for key, prior in original_env.items():
+                    if prior is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = prior
             self.finished.emit(results)
         except Exception as exc:  # noqa: BLE001
             self.errored.emit(str(exc))
@@ -2608,8 +2622,42 @@ class PromptInferenceDialog(QtWidgets.QDialog):
         form.addRow("Gold standard corpus", self.corpus_combo)
 
         self.backend_combo = QtWidgets.QComboBox()
-        self.backend_combo.addItems(["default", "openai", "local"])
+        self.backend_combo.addItem("Azure OpenAI", "azure")
+        self.backend_combo.addItem("Local (ExLlamaV2)", "exllamav2")
+        self.backend_combo.setCurrentIndex(0)
+        self.backend_combo.currentIndexChanged.connect(self._update_backend_fields)
         form.addRow("Backend", self.backend_combo)
+        self.embedding_path_edit = QtWidgets.QLineEdit()
+        self.embedding_path_edit.setPlaceholderText("Path to embedding model directory")
+        form.addRow("Embedding model", self.embedding_path_edit)
+        self.reranker_path_edit = QtWidgets.QLineEdit()
+        self.reranker_path_edit.setPlaceholderText("Path to re-ranker model directory")
+        form.addRow("Re-ranker model", self.reranker_path_edit)
+        self.azure_key_edit = QtWidgets.QLineEdit()
+        self.azure_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.azure_key_edit.setPlaceholderText("Enter Azure OpenAI API key")
+        form.addRow("Azure API key", self.azure_key_edit)
+        self.azure_version_edit = QtWidgets.QLineEdit()
+        self.azure_version_edit.setPlaceholderText("Enter Azure API version (e.g., 2025-04-28)")
+        form.addRow("Azure API version", self.azure_version_edit)
+        self.azure_endpoint_edit = QtWidgets.QLineEdit()
+        self.azure_endpoint_edit.setPlaceholderText("Enter Azure OpenAI endpoint URL")
+        form.addRow("Azure endpoint", self.azure_endpoint_edit)
+        self.local_model_path_edit = QtWidgets.QLineEdit()
+        self.local_model_path_edit.setPlaceholderText("Path to local model directory")
+        form.addRow("Local model dir", self.local_model_path_edit)
+        self.local_max_seq_spin = QtWidgets.QSpinBox()
+        self.local_max_seq_spin.setRange(0, 4096 * 8)
+        self.local_max_seq_spin.setSpecialValueText("Default")
+        form.addRow("Local max seq len", self.local_max_seq_spin)
+        self.local_max_new_tokens_spin = QtWidgets.QSpinBox()
+        self.local_max_new_tokens_spin.setRange(0, 4096 * 8)
+        self.local_max_new_tokens_spin.setSpecialValueText("Default")
+        form.addRow("Local max new tokens", self.local_max_new_tokens_spin)
+        self.context_order_combo = QtWidgets.QComboBox()
+        self.context_order_combo.addItem("Relevance ranking", "relevance")
+        self.context_order_combo.addItem("Chronological", "chronological")
+        form.addRow("Context order", self.context_order_combo)
 
         self.system_prompt = QtWidgets.QPlainTextEdit()
         self.system_prompt.setPlaceholderText("Optional system prompt override")
@@ -2624,6 +2672,18 @@ class PromptInferenceDialog(QtWidgets.QDialog):
             "Optional JSON object containing few-shot examples keyed by label_id"
         )
         form.addRow("Few-shot examples", self.few_shot_examples)
+
+        self._azure_widgets = [
+            self.azure_key_edit,
+            self.azure_version_edit,
+            self.azure_endpoint_edit,
+        ]
+        self._local_widgets = [
+            self.local_model_path_edit,
+            self.local_max_seq_spin,
+            self.local_max_new_tokens_spin,
+        ]
+        self._update_backend_fields()
 
         layout.addLayout(form)
 
@@ -2717,6 +2777,27 @@ class PromptInferenceDialog(QtWidgets.QDialog):
             / f"{self.pheno_id}_prompt_checkpoint.json"
         )
         self.checkpoint_label.setText(f"Checkpoint: {checkpoint_path}")
+        self.embedding_path_edit.setText(os.getenv("MED_EMBED_MODEL_NAME", ""))
+        self.reranker_path_edit.setText(os.getenv("RERANKER_MODEL_NAME", ""))
+        self.azure_key_edit.setText(os.getenv("AZURE_OPENAI_API_KEY", ""))
+        self.azure_version_edit.setText(os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-28"))
+        self.azure_endpoint_edit.setText(
+            os.getenv("AZURE_OPENAI_ENDPOINT", "https://spd-prod-openai-va-apim.azure-api.us/api")
+        )
+        self.local_model_path_edit.setText(os.getenv("LOCAL_LLM_MODEL_DIR", ""))
+        try:
+            self.local_max_seq_spin.setValue(int(os.getenv("LOCAL_LLM_MAX_SEQ_LEN", "0") or 0))
+        except ValueError:
+            self.local_max_seq_spin.setValue(0)
+        try:
+            self.local_max_new_tokens_spin.setValue(int(os.getenv("LOCAL_LLM_MAX_NEW_TOKENS", "0") or 0))
+        except ValueError:
+            self.local_max_new_tokens_spin.setValue(0)
+        backend_env = (os.getenv("LLM_BACKEND") or "azure").lower()
+        backend_key = "azure" if backend_env in {"azure", "openai"} else "exllamav2"
+        idx = self.backend_combo.findData(backend_key)
+        self.backend_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._update_backend_fields()
 
     @staticmethod
     def _parse_float_list(value: str, default: Sequence[float]) -> list[float]:
@@ -2744,16 +2825,107 @@ class PromptInferenceDialog(QtWidgets.QDialog):
                 continue
         return parsed or list(default)
 
+    def _update_backend_fields(self) -> None:
+        backend = str(self.backend_combo.currentData() or "")
+        show_azure = backend == "azure"
+        show_local = backend != "azure"
+        for widget in getattr(self, "_azure_widgets", []):
+            if isinstance(widget, QtWidgets.QWidget):
+                widget.setVisible(show_azure)
+        for widget in getattr(self, "_local_widgets", []):
+            if isinstance(widget, QtWidgets.QWidget):
+                widget.setVisible(show_local)
+
     def _selected_rounds(self) -> list[int]:
         return [
             int(item.data(QtCore.Qt.ItemDataRole.UserRole) or 0)
             for item in self.rounds_list.selectedItems()
         ]
 
+    def _collect_backend_environment(self) -> Optional[Dict[str, str]]:
+        env: Dict[str, str] = {}
+        missing: list[str] = []
+        embed_path = self.embedding_path_edit.text().strip()
+        rerank_path = self.reranker_path_edit.text().strip()
+        if not embed_path:
+            missing.append("embedding model directory")
+        else:
+            embed_dir = Path(embed_path).expanduser()
+            if not embed_dir.exists() or not embed_dir.is_dir():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Inference",
+                    "The selected embedding model directory does not exist or is not a directory.",
+                )
+                return None
+            env["MED_EMBED_MODEL_NAME"] = str(embed_dir)
+        if not rerank_path:
+            missing.append("re-ranker model directory")
+        else:
+            rerank_dir = Path(rerank_path).expanduser()
+            if not rerank_dir.exists() or not rerank_dir.is_dir():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Inference",
+                    "The selected re-ranker model directory does not exist or is not a directory.",
+                )
+                return None
+            env["RERANKER_MODEL_NAME"] = str(rerank_dir)
+        backend_choice = str(self.backend_combo.currentData() or "")
+        if backend_choice == "azure":
+            azure_key = self.azure_key_edit.text().strip()
+            azure_version = self.azure_version_edit.text().strip()
+            azure_endpoint = self.azure_endpoint_edit.text().strip()
+            if not azure_key:
+                missing.append("Azure API key")
+            else:
+                env["AZURE_OPENAI_API_KEY"] = azure_key
+            if not azure_version:
+                missing.append("Azure API version")
+            else:
+                env["AZURE_OPENAI_API_VERSION"] = azure_version
+            if not azure_endpoint:
+                missing.append("Azure endpoint")
+            else:
+                env["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
+            env["LLM_BACKEND"] = "azure"
+        else:
+            model_dir = self.local_model_path_edit.text().strip()
+            if not model_dir:
+                missing.append("local model directory")
+            else:
+                local_dir = Path(model_dir).expanduser()
+                if not local_dir.exists() or not local_dir.is_dir():
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Inference",
+                        "The selected local model directory does not exist or is not a directory.",
+                    )
+                    return None
+                env["LOCAL_LLM_MODEL_DIR"] = str(local_dir)
+            max_seq = int(self.local_max_seq_spin.value())
+            max_new = int(self.local_max_new_tokens_spin.value())
+            if max_seq > 0:
+                env["LOCAL_LLM_MAX_SEQ_LEN"] = str(max_seq)
+            if max_new > 0:
+                env["LOCAL_LLM_MAX_NEW_TOKENS"] = str(max_new)
+            env["LLM_BACKEND"] = "exllamav2"
+        if missing:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Inference",
+                f"Provide the {' and '.join(missing)} before running inference.",
+            )
+            return None
+        return env
+
     def _start_run(self) -> None:
         labelset_id = str(self.labelset_combo.currentData() or "")
         if not labelset_id:
             QtWidgets.QMessageBox.warning(self, "Inference", "Select a label set first.")
+            return
+        env_overrides = self._collect_backend_environment()
+        if env_overrides is None:
             return
         rounds = self._selected_rounds()
         if not rounds:
@@ -2769,7 +2941,16 @@ class PromptInferenceDialog(QtWidgets.QDialog):
             use_few_shot=False,
             few_shot_examples=self._load_json_field(self.few_shot_examples),
             label_rule_overrides=self._load_json_field(self.rule_overrides),
-            backend=str(self.backend_combo.currentText()),
+            backend=str(self.backend_combo.currentData() or "azure"),
+            azure_api_key=self.azure_key_edit.text().strip(),
+            azure_api_version=self.azure_version_edit.text().strip(),
+            azure_endpoint=self.azure_endpoint_edit.text().strip(),
+            local_model_dir=self.local_model_path_edit.text().strip(),
+            local_max_seq_len=int(self.local_max_seq_spin.value()),
+            local_max_new_tokens=int(self.local_max_new_tokens_spin.value()),
+            embedding_model_dir=self.embedding_path_edit.text().strip(),
+            reranker_model_dir=self.reranker_path_edit.text().strip(),
+            context_order=str(self.context_order_combo.currentData() or "relevance"),
         )
         sweep = PromptExperimentSweep(base=base_config)
         sweep.zero_shot = self.enable_zero_shot.isChecked()
@@ -2810,7 +2991,7 @@ class PromptInferenceDialog(QtWidgets.QDialog):
         )
         self._set_running(True)
         self._worker_thread = QtCore.QThread(self)
-        self._worker = PromptInferenceWorker(job, variants, user="admin")
+        self._worker = PromptInferenceWorker(job, variants, user="admin", env_overrides=env_overrides)
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
         self._worker.log_message.connect(self._on_log)
@@ -3902,6 +4083,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_include_reasoning_checkbox = QtWidgets.QCheckBox("Include reasoning")
         self.ai_include_reasoning_checkbox.setChecked(False)
         ai_config_layout.addRow("Include reasoning", self.ai_include_reasoning_checkbox)
+        self.ai_context_order_combo = QtWidgets.QComboBox()
+        self.ai_context_order_combo.addItem("Relevance ranking", "relevance")
+        self.ai_context_order_combo.addItem("Chronological", "chronological")
+        self.ai_context_order_combo.setToolTip(
+            "Choose whether to preserve chronological order or use relevance ranking when building context snippets."
+        )
+        ai_config_layout.addRow("Context order", self.ai_context_order_combo)
         if str(self.pheno_row["level"] or "single_doc") == "single_doc":
             self.ai_single_doc_context_combo = QtWidgets.QComboBox()
             self.ai_single_doc_context_combo.addItem("RAG snippets", "rag")
@@ -4826,6 +5014,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if not isinstance(mode_value, str) or not mode_value:
                 mode_value = "rag"
             llmfirst_overrides["single_doc_context"] = mode_value
+        if isinstance(getattr(self, "ai_context_order_combo", None), QtWidgets.QComboBox):
+            order_value = self.ai_context_order_combo.currentData()
+            if isinstance(order_value, str) and order_value:
+                llmfirst_overrides["context_order"] = order_value
         if llmfirst_overrides:
             overrides["llmfirst"] = llmfirst_overrides
         llm_overrides: Dict[str, Any] = {}

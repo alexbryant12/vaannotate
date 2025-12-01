@@ -187,6 +187,7 @@ class LLMFirstConfig:
     probe_ce_unit_agg: str = "max"    # or "mean"
     single_doc_context: str = "rag"
     single_doc_full_context_max_chars: int = 12000
+    context_order: str = "relevance"  # relevance | chronological
     
 
 @dataclass
@@ -2509,10 +2510,26 @@ class LLMAnnotator:
     ) -> dict:
         import json, time
 
-        rag_topk_range     = self.scCfg.rag_topk_range
-        rag_dropout_p      = self.scCfg.rag_dropout_p
-        temp_range         = self.scCfg.temperature_range
-        shuffle_context    = self.scCfg.shuffle_context
+        rag_topk_range = self.scCfg.rag_topk_range
+        rag_dropout_p = self.scCfg.rag_dropout_p
+        temp_range = self.scCfg.temperature_range
+        shuffle_context = self.scCfg.shuffle_context
+        context_order = getattr(self.cfg, "context_order", "relevance") or "relevance"
+
+        def _ordered_snippets(items: List[dict]) -> List[dict]:
+            if str(context_order).lower() != "chronological":
+                return list(items)
+            sortable: list[tuple[str, int, dict]] = []
+            for idx, snip in enumerate(items):
+                meta = snip.get("metadata") if isinstance(snip, Mapping) else {}
+                date_val = ""
+                if isinstance(meta, Mapping):
+                    date_val = str(meta.get("date") or "")
+                sortable.append((date_val, idx, snip))
+            sortable.sort(key=lambda t: (t[0], t[1]))
+            return [entry[2] for entry in sortable]
+
+        snippets = _ordered_snippets(snippets)
 
         # Jitter RNG
         rng = random.Random()
