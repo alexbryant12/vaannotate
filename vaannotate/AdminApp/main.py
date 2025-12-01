@@ -1545,25 +1545,26 @@ class ProjectContext(QtCore.QObject):
         root = self.require_project()
         return (root / relative).resolve()
 
-    def list_corpora(self) -> List[sqlite3.Row]:
+    def list_corpora(self) -> List[Dict[str, object]]:
         project_id = self.current_project_id()
         if not project_id:
             return []
         db = self.require_db()
         with db.connect() as conn:
-            return conn.execute(
+            rows = conn.execute(
                 "SELECT * FROM project_corpora WHERE project_id=? ORDER BY name",
                 (project_id,),
             ).fetchall()
+        return [dict(row) for row in rows]
 
-    def get_corpus(self, corpus_id: str) -> Optional[sqlite3.Row]:
+    def get_corpus(self, corpus_id: str) -> Optional[Dict[str, object]]:
         db = self.require_db()
         with db.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM project_corpora WHERE corpus_id=?",
                 (corpus_id,),
             ).fetchone()
-        return row
+        return dict(row) if row else None
 
     def resolve_corpus_path(self, corpus_id: str) -> Path:
         row = self.get_corpus(corpus_id)
