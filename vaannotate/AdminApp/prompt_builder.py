@@ -30,6 +30,15 @@ class PromptBuilderConfig:
     label_rule_overrides: Dict[str, str] = field(default_factory=dict)
     inference_mode: str = "family_tree"  # "family_tree" | "single_shot"
     backend: str = "default"  # "default" | "openai" | "local"
+    azure_api_key: str = ""
+    azure_api_version: str = ""
+    azure_endpoint: str = ""
+    local_model_dir: str = ""
+    local_max_seq_len: int = 0
+    local_max_new_tokens: int = 0
+    embedding_model_dir: str = ""
+    reranker_model_dir: str = ""
+    context_order: str = "relevance"
     rag_chunk_size: int = 1500
     rag_num_chunks: int = 6
     rag_mmr_lambda: float = 0.7
@@ -54,8 +63,24 @@ class PromptBuilderConfig:
         """Translate UI settings into ``cfg_overrides`` for the backend."""
 
         llm_cfg: Dict[str, object] = {"backend": self.backend}
+        if self.azure_api_key:
+            llm_cfg["azure_api_key"] = self.azure_api_key
+        if self.azure_api_version:
+            llm_cfg["azure_api_version"] = self.azure_api_version
+        if self.azure_endpoint:
+            llm_cfg["azure_endpoint"] = self.azure_endpoint
+        if self.local_model_dir:
+            llm_cfg["local_model_dir"] = self.local_model_dir
+        if self.local_max_seq_len:
+            llm_cfg["local_max_seq_len"] = self.local_max_seq_len
+        if self.local_max_new_tokens:
+            llm_cfg["local_max_new_tokens"] = self.local_max_new_tokens
         if self.use_few_shot and self.few_shot_examples:
             llm_cfg["few_shot_examples"] = self.few_shot_examples
+        if self.embedding_model_dir:
+            llm_cfg["embedding_model_dir"] = self.embedding_model_dir
+        if self.reranker_model_dir:
+            llm_cfg["reranker_model_dir"] = self.reranker_model_dir
 
         rag_cfg: Dict[str, object] = {
             "chunk_size": self.rag_chunk_size,
@@ -69,10 +94,15 @@ class PromptBuilderConfig:
             "system_prompt": self.system_prompt,
         }
 
+        llmfirst_cfg: Dict[str, object] = {}
+        if self.context_order:
+            llmfirst_cfg["context_order"] = self.context_order
+
         return {
             "llm": llm_cfg,
             "rag": rag_cfg,
             "prompt_builder": prompt_cfg,
+            "llmfirst": llmfirst_cfg,
         }
 
 
@@ -133,6 +163,15 @@ class PromptExperimentSweep:
                                 label_rule_overrides=self.base.label_rule_overrides,
                                 inference_mode=mode,
                                 backend=self.base.backend,
+                                azure_api_key=self.base.azure_api_key,
+                                azure_api_version=self.base.azure_api_version,
+                                azure_endpoint=self.base.azure_endpoint,
+                                local_model_dir=self.base.local_model_dir,
+                                local_max_seq_len=self.base.local_max_seq_len,
+                                local_max_new_tokens=self.base.local_max_new_tokens,
+                                embedding_model_dir=self.base.embedding_model_dir,
+                                reranker_model_dir=self.base.reranker_model_dir,
+                                context_order=self.base.context_order,
                                 rag_chunk_size=chunk_size,
                                 rag_num_chunks=num_chunks,
                                 rag_mmr_lambda=lam,
