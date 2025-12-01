@@ -229,10 +229,33 @@ class AzureOpenAIBackend(LLMBackend):
         choice = resp.choices[0]
         message = getattr(choice, "message", None)
         content = getattr(message, "content", None) if message else None
-        if content is None:
-            content = getattr(choice, "content", "")
-        content = content or ""
-        data = _reasoning_first(json.loads(content))
+        parsed = getattr(message, "parsed", None) if message else None
+
+        # Azure JSON mode may populate `message.parsed` instead of `content`
+        if parsed is not None:
+            data_candidate = parsed
+            if not content:
+                try:
+                    content = json.dumps(parsed)
+                except Exception:
+                    content = str(parsed)
+        else:
+            if content is None:
+                content = getattr(choice, "content", "")
+            content = content or ""
+            data_candidate = content
+            if content:
+                try:
+                    data_candidate = json.loads(content)
+                except Exception as exc:
+                    if response_format:
+                        snippet = content[:2000]
+                        raise ValueError(f"Failed to parse JSON response: {snippet}") from exc
+
+        if response_format and not isinstance(data_candidate, MappingABC):
+            raise ValueError(f"Expected JSON object but received: {str(data_candidate)[:2000]}")
+
+        data = _reasoning_first(data_candidate)
         logprob_info = getattr(choice, "logprobs", None)
         if logprob_info is not None:
             logprob_info = _to_serializable(logprob_info)

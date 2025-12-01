@@ -33,6 +33,7 @@ What’s in this file (high level):
 """
 
 from __future__ import annotations
+import gzip
 import os, re, json, math, time, random, hashlib, unicodedata
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
@@ -1093,10 +1094,10 @@ class EmbeddingStore:
     def _paths_for_cache(self, chunk_dir: str, index_cfg) -> dict:
         idx_name = f"faiss_{getattr(index_cfg, 'type', 'flat')}.index"
         return {
-            "meta": os.path.join(chunk_dir, "chunk_meta.json"),
+            "meta": os.path.join(chunk_dir, "chunk_meta.json.gz"),
             "emb": os.path.join(chunk_dir, "chunk_embeddings.npy"),
             "faiss": os.path.join(chunk_dir, idx_name),
-            "bm25": os.path.join(chunk_dir, "bm25_indices.json"),
+            "bm25": self._bm25_index_path(chunk_dir),
         }
     
     def _try_load_cached_chunks(self, chunk_dir: str) -> tuple[list[dict] | None, np.ndarray | None, dict | None]:
@@ -1106,10 +1107,22 @@ class EmbeddingStore:
         paths = self._paths_for_cache(chunk_dir, type("Cfg", (), {"type": "flat"}))
         meta_p, emb_p = paths["meta"], paths["emb"]
         man = self._load_manifest(chunk_dir)
-        if not (os.path.exists(meta_p) and os.path.exists(emb_p) and man):
+        if not ((os.path.exists(meta_p) or os.path.exists(meta_p.replace(".gz", ""))) and os.path.exists(emb_p) and man):
             return (None, None, None)
         try:
-            meta = json.load(open(meta_p, "r", encoding="utf-8"))
+            meta = None
+            for mp in (meta_p, meta_p.replace(".gz", "")):
+                if not os.path.exists(mp):
+                    continue
+                try:
+                    opener = gzip.open if mp.endswith(".gz") else open
+                    meta = json.load(opener(mp, "rt", encoding="utf-8"))
+                    break
+                except Exception:
+                    continue
+            if meta is None:
+                return (None, None, None)
+
             X = np.load(emb_p, mmap_mode="r")  # memmap
             # sanity: manifest rows/dims
             n = int(man.get("n_chunks", -1))
@@ -1121,7 +1134,7 @@ class EmbeddingStore:
             return (None, None, None)
 
     def _bm25_index_path(self, chunk_dir: str) -> str:
-        return os.path.join(chunk_dir, "bm25_indices.json")
+        return os.path.join(chunk_dir, "bm25_indices.json.gz")
 
     def _tokenize_for_bm25(self, text: str) -> List[str]:
         if not text:
@@ -1185,29 +1198,34 @@ class EmbeddingStore:
         return {"units": bm25_units, "idf_global": idf_global, "N_global": N_global}
 
     def _load_bm25_indices(self, chunk_dir: str) -> dict | None:
-        p = self._bm25_index_path(chunk_dir)
-        if not os.path.exists(p):
-            return None
-        try:
-            data = json.load(open(p, "r", encoding="utf-8"))
-            units = data.get("units") or data.get("indices") or {}
-            if not isinstance(units, dict):
-                return None
-            expected_n = data.get("n_chunks")
-            if expected_n is not None and expected_n != len(self.chunk_meta):
-                return None
-            idf_global = data.get("idf_global") or {}
-            N_global = data.get("N_global") or expected_n or 0
-            self.idf_global = idf_global
-            self.N_global = int(N_global)
-            return {"units": units, "idf_global": idf_global, "N_global": N_global}
-        except Exception:
-            return None
+        primary = self._bm25_index_path(chunk_dir)
+        legacy = os.path.join(chunk_dir, "bm25_indices.json")
+        for path in (primary, legacy):
+            if not os.path.exists(path):
+                continue
+            try:
+                opener = gzip.open if path.endswith(".gz") else open
+                with opener(path, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+                units = data.get("units") or data.get("indices") or {}
+                if not isinstance(units, dict):
+                    continue
+                expected_n = data.get("n_chunks")
+                if expected_n is not None and expected_n != len(self.chunk_meta):
+                    continue
+                idf_global = data.get("idf_global") or {}
+                N_global = data.get("N_global") or expected_n or 0
+                self.idf_global = idf_global
+                self.N_global = int(N_global)
+                return {"units": units, "idf_global": idf_global, "N_global": N_global}
+            except Exception:
+                continue
+        return None
 
     def _save_bm25_indices(self, chunk_dir: str, indices: dict) -> None:
         units = indices.get("units") if isinstance(indices, dict) else indices
         payload = {
-            "version": "v1",
+            "version": "v2",
             "n_chunks": len(self.chunk_meta),
             "units": units,
             "idf_global": indices.get("idf_global", getattr(self, "idf_global", {})) if isinstance(indices, dict) else getattr(self, "idf_global", {}),
@@ -1215,10 +1233,10 @@ class EmbeddingStore:
         }
         p = self._bm25_index_path(chunk_dir)
         tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, p)
-        self._update_manifest(chunk_dir, bm25_version="v1")
+        self._update_manifest(chunk_dir, bm25_version="v2")
 
     def bm25_index_for_unit(self, unit_id: str) -> dict | None:
         uid = str(unit_id)
@@ -1260,11 +1278,14 @@ class EmbeddingStore:
         meta_p, emb_p = paths["meta"], paths["emb"]
         # Save meta
         tmp = meta_p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as f:
             json.dump(meta, f, ensure_ascii=False)
         os.replace(tmp, meta_p)
         # Save embeddings (np.save is atomic-ish via temp file on most FS; to be safe, write to tmp then replace)
-        np.save(emb_p, X)
+        X_to_save = X.astype(np.float16)
+        emb_tmp = emb_p + ".tmp"
+        np.save(emb_tmp, X_to_save)
+        os.replace(emb_tmp, emb_p)
         # Manifest
         self._save_manifest(chunk_dir, {
             "n_chunks": int(X.shape[0]),
@@ -1273,7 +1294,9 @@ class EmbeddingStore:
             "chunk_overlap": int(rag_cfg.chunk_overlap),
             "normalize": bool(self.normalize),
             "embedder": self._embedder_id(),
-            "version": "v1",
+            "emb_dtype": str(X_to_save.dtype),
+            "meta_compressed": True,
+            "version": "v2",
         })
     
     def _try_load_faiss_index(self, faiss_path: str, expected_n: int) -> "faiss.Index" | None:
@@ -1376,7 +1399,13 @@ class EmbeddingStore:
             meta = chunk_meta
     
         # 3) Bind to store
-        self.X = np.load(paths["emb"], mmap_mode="r") if isinstance(X, np.memmap) or isinstance(X, np.ndarray) else X
+        if isinstance(X, np.ndarray):
+            self.X = X.astype(np.float32) if X.dtype != np.float32 else X
+        elif isinstance(X, np.memmap):
+            self.X = np.asarray(X, dtype=np.float32)
+        else:
+            loaded = np.load(paths["emb"], mmap_mode="r")
+            self.X = loaded.astype(np.float32) if loaded.dtype != np.float32 else loaded
         self.chunk_meta = meta
         self._remap_unit_ids(notes_df)
         self._backfill_chunk_metadata(notes_df)
@@ -1449,8 +1478,19 @@ class EmbeddingStore:
             if hasattr(self, "_chunk_cache_dir_path"):
                 paths = self._paths_for_cache(self._chunk_cache_dir_path, index_cfg)
                 # load X + meta
-                self.X = np.load(paths["emb"], mmap_mode="r")
-                self.chunk_meta = json.load(open(paths["meta"], "r", encoding="utf-8"))
+                emb = np.load(paths["emb"], mmap_mode="r")
+                self.X = emb.astype(np.float32) if emb.dtype != np.float32 else emb
+                meta = None
+                for mp in (paths["meta"], paths["meta"].replace(".gz", "")):
+                    if not os.path.exists(mp):
+                        continue
+                    try:
+                        opener = gzip.open if mp.endswith(".gz") else open
+                        meta = json.load(opener(mp, "rt", encoding="utf-8"))
+                        break
+                    except Exception:
+                        continue
+                self.chunk_meta = meta or []
                 # load or build index
                 idx = self._try_load_faiss_index(paths["faiss"], expected_n=int(self.X.shape[0]))
                 if idx is None:
@@ -1494,9 +1534,16 @@ class EmbeddingStore:
         if self.unit_to_chunk_idxs:
             return self.unit_to_chunk_idxs.get(uid, [])
         if not self.chunk_meta:
-            Mp = os.path.join(self.cache_dir,"chunk_meta.json")
-            if os.path.exists(Mp):
-                self.chunk_meta = json.load(open(Mp,"r",encoding="utf-8"))
+            Mp = os.path.join(self.cache_dir, "chunk_meta.json.gz")
+            for mp in (Mp, Mp.replace(".gz", "")):
+                if not os.path.exists(mp):
+                    continue
+                try:
+                    opener = gzip.open if mp.endswith(".gz") else open
+                    self.chunk_meta = json.load(opener(mp, "rt", encoding="utf-8"))
+                    break
+                except Exception:
+                    continue
         return [i for i,m in enumerate(self.chunk_meta) if m.get("unit_id")==uid]
 
 
@@ -3162,8 +3209,31 @@ class FamilyLabeler:
             if self.retriever._get_label_query_embs(lid, rules, K_use) is not None:
                 continue
             t = self._generate_label_exemplars(lid, rules, K_use)
+            if not t:
+                t = self._fallback_label_exemplars(lid, rules, K_use, opts)
             if t:
                 self.retriever.set_label_exemplars(lid, rules, K_use, t)
+
+    def _fallback_label_exemplars(self, label_id: str, rules: str, K: int, options: list[str] | None) -> list[str]:
+        """Graceful fallback if exemplar generation fails (e.g., Azure JSON mode issues).
+
+        We synthesize minimal exemplars using the label rules so downstream RAG still
+        has deterministic label-aware queries instead of aborting with
+        "label_exemplar_error". These are intentionally simple and will be embedded
+        just like LLM-generated snippets.
+        """
+        K = max(1, int(K))
+        base = self.retriever._build_query(label_id, rules)
+        texts: list[str] = []
+        opts = options or []
+        if opts:
+            for o in opts:
+                texts.append(f"{base} Example of option '{o}'.")
+        if not texts:
+            texts.append(base)
+        while len(texts) < K:
+            texts.append(base)
+        return texts[:K]
 
     def _generate_label_exemplars(
         self,
