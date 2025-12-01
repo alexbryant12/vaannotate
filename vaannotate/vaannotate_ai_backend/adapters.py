@@ -634,6 +634,35 @@ def export_inputs_from_repo(
             pass
     return notes_df, ann_df
 
+
+def _scope_corpus_to_annotations(
+    notes_df: pd.DataFrame,
+    ann_df: pd.DataFrame,
+    log: Callable[[str], None],
+) -> pd.DataFrame:
+    """Limit the corpus to the documents referenced by prior annotations."""
+
+    if ann_df.empty or "doc_id" not in ann_df.columns or "doc_id" not in notes_df.columns:
+        return notes_df
+
+    ann_doc_ids = ann_df["doc_id"].dropna().astype(str)
+    if ann_doc_ids.empty:
+        return notes_df
+
+    scoped_notes = notes_df.copy()
+    scoped_notes["doc_id"] = scoped_notes["doc_id"].astype(str)
+    mask = scoped_notes["doc_id"].isin(set(ann_doc_ids))
+    if mask.all():
+        return scoped_notes
+
+    filtered = scoped_notes.loc[mask].copy()
+    removed = len(scoped_notes) - len(filtered)
+    log(
+        "Scoping corpus to documents referenced by prior rounds: "
+        f"kept {len(filtered)}, dropped {removed}"
+    )
+    return filtered
+
 def run_ai_backend_and_collect(
     project_root: Path,
     pheno_id: str,
@@ -650,6 +679,7 @@ def run_ai_backend_and_collect(
     corpus_record: Optional[Mapping[str, Any] | sqlite3.Row | Dict[str, Any]] = None,
     corpus_id: Optional[str] = None,
     corpus_path: Optional[str] = None,
+    scope_corpus_to_annotations: bool = False,
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
@@ -677,6 +707,8 @@ def run_ai_backend_and_collect(
         corpus_id=corpus_id,
         corpus_path=normalized_corpus_path,
     )
+    if scope_corpus_to_annotations:
+        notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
     ai_dir = Path(round_dir) / "imports" / "ai"
     ai_dir.mkdir(parents=True, exist_ok=True)
     log(f"Exported {len(notes_df)} corpus rows and {len(ann_df)} prior annotations")

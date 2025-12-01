@@ -335,6 +335,7 @@ class PromptInferenceJob:
                     cancel_callback=cancel_callback,
                     corpus_id=self.corpus_id,
                     corpus_path=str(self.corpus_path) if self.corpus_path else None,
+                    scope_corpus_to_annotations=True,
                 )
                 result = PromptExperimentResult(
                     name=variant.name,
