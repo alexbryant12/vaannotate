@@ -1524,6 +1524,8 @@ class RoundBuilder:
                     "range": {"min": entry.get("min"), "max": entry.get("max")},
                     "gating_expr": entry.get("gating_expr"),
                     "options": options,
+                    "keywords": entry.get("keywords", []),
+                    "few_shot_examples": entry.get("few_shot_examples", []),
                 }
             )
 
