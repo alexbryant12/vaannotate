@@ -85,6 +85,12 @@ def _load_label_config_bundle(
     round_labelsets: Dict[str, str] = {}
     current_config: Optional[Dict[str, Any]] = overrides.copy() if overrides else None
     current_labelset_id = labelset_id
+    if current_config is not None and not current_labelset_id:
+        meta = current_config.get("_meta") if isinstance(current_config, Mapping) else None
+        if isinstance(meta, Mapping):
+            inferred = meta.get("labelset_id") or meta.get("labelset_name")
+            if inferred:
+                current_labelset_id = str(inferred)
 
     if not project_db.exists():
         return LabelConfigBundle(
