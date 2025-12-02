@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 import re
 import sqlite3
 from datetime import datetime
@@ -121,7 +122,7 @@ def add_labelset(
     created_by: str,
     notes: str | None,
     labels: Iterable[dict],
-    ) -> None:
+) -> None:
     created_at = datetime.utcnow().isoformat()
     conn.execute(
         """
@@ -141,11 +142,25 @@ def add_labelset(
                 f"Duplicate label_id '{label_id}' detected in label set '{labelset_id}'"
             )
         seen_label_ids.add(label_id)
+        keywords_json: str | None = None
+        keywords_raw = label.get("keywords")
+        if isinstance(keywords_raw, (list, dict)):
+            try:
+                keywords_json = json.dumps(keywords_raw)
+            except TypeError:
+                keywords_json = None
+        few_shot_json: str | None = None
+        few_shot_raw = label.get("few_shot_examples")
+        if isinstance(few_shot_raw, list):
+            try:
+                few_shot_json = json.dumps(few_shot_raw)
+            except TypeError:
+                few_shot_json = None
         conn.execute(
             """
             INSERT OR REPLACE INTO labels(
-                label_id,labelset_id,name,type,required,order_index,rules,gating_expr,na_allowed,unit,min,max
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                label_id,labelset_id,name,type,required,order_index,rules,gating_expr,na_allowed,unit,min,max,keywords_json,few_shot_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 label_id,
@@ -160,6 +175,8 @@ def add_labelset(
                 label.get("unit"),
                 label.get("min"),
                 label.get("max"),
+                keywords_json,
+                few_shot_json,
             ),
         )
         for o_idx, option in enumerate(label.get("options", [])):
@@ -207,6 +224,37 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
         options_map.setdefault(row["label_id"], []).append(row)
     label_dicts = []
     for label in labels:
+        keywords: list[str] = []
+        raw_keywords = label["keywords_json"]
+        if isinstance(raw_keywords, str):
+            try:
+                parsed_keywords = json.loads(raw_keywords)
+                if isinstance(parsed_keywords, list):
+                    keywords = [str(item).strip() for item in parsed_keywords if str(item).strip()]
+                elif isinstance(parsed_keywords, dict):
+                    keywords = [str(item).strip() for item in parsed_keywords.values() if str(item).strip()]
+            except Exception:  # noqa: BLE001
+                keywords = []
+
+        few_shot_examples: list[dict[str, object]] = []
+        raw_examples = label["few_shot_json"]
+        if isinstance(raw_examples, str):
+            try:
+                parsed_examples = json.loads(raw_examples)
+                if isinstance(parsed_examples, list):
+                    for entry in parsed_examples:
+                        if not isinstance(entry, Mapping):
+                            continue
+                        example_payload: dict[str, object] = {}
+                        if entry.get("context") is not None:
+                            example_payload["context"] = entry.get("context")
+                        if entry.get("answer") is not None:
+                            example_payload["answer"] = entry.get("answer")
+                        if example_payload:
+                            few_shot_examples.append(example_payload)
+            except Exception:  # noqa: BLE001
+                few_shot_examples = []
+
         label_dicts.append(
             {
                 "label_id": label["label_id"],
@@ -220,6 +268,8 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
                 "unit": label["unit"],
                 "min": label["min"],
                 "max": label["max"],
+                "keywords": keywords,
+                "few_shot_examples": few_shot_examples,
                 "options": [dict(opt) for opt in options_map.get(label["label_id"], [])],
             }
         )
@@ -362,6 +412,8 @@ def build_label_config(labelset: dict) -> Dict[str, object]:
             "range": {"min": label.get("min"), "max": label.get("max")},
             "options": options,
             "option_details": option_details,
+            "keywords": label.get("keywords", []),
+            "few_shot_examples": label.get("few_shot_examples", []),
         }
         gating_parents = [
             str(rel.get("label_id"))

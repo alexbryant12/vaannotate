@@ -746,7 +746,7 @@ class RoundBuilder:
         if label_keywords:
             label_config_payload = self._apply_label_keywords(label_config_payload, label_keywords)
         paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
-        few_shot_examples = self._extract_few_shot_examples(config)
+        few_shot_examples = self._extract_few_shot_examples(config, labelset)
         if few_shot_examples:
             try:
                 setattr(cfg.llm, "few_shot_examples", few_shot_examples)
@@ -1105,7 +1105,9 @@ class RoundBuilder:
         return True
 
     @staticmethod
-    def _extract_few_shot_examples(config: Mapping[str, Any]) -> Dict[str, list[dict[str, str]]]:
+    def _extract_few_shot_examples(
+        config: Mapping[str, Any], labelset: Mapping[str, Any] | None = None
+    ) -> Dict[str, list[dict[str, str]]]:
         ai_backend_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         llm_cfg = ai_backend_cfg.get("llm") if isinstance(ai_backend_cfg, Mapping) and isinstance(ai_backend_cfg.get("llm"), Mapping) else {}
         top_llm_cfg = config.get("llm") if isinstance(config.get("llm"), Mapping) else {}
@@ -1124,26 +1126,50 @@ class RoundBuilder:
                 few_shot_raw = candidate
                 break
 
-        if not few_shot_raw:
-            return {}
-
         cleaned: Dict[str, list[dict[str, str]]] = {}
-        for label_id, examples in few_shot_raw.items():
-            if not isinstance(examples, Sequence):
-                continue
-            parsed_examples: list[dict[str, str]] = []
-            for entry in examples:
-                if not isinstance(entry, Mapping):
+        if few_shot_raw:
+            for label_id, examples in few_shot_raw.items():
+                if not isinstance(examples, Sequence):
                     continue
-                example: dict[str, str] = {}
-                if entry.get("context") is not None:
-                    example["context"] = str(entry.get("context"))
-                if entry.get("answer") is not None:
-                    example["answer"] = str(entry.get("answer"))
-                if example:
-                    parsed_examples.append(example)
-            if parsed_examples:
-                cleaned[str(label_id)] = parsed_examples
+                parsed_examples: list[dict[str, str]] = []
+                for entry in examples:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    example: dict[str, str] = {}
+                    if entry.get("context") is not None:
+                        example["context"] = str(entry.get("context"))
+                    if entry.get("answer") is not None:
+                        example["answer"] = str(entry.get("answer"))
+                    if example:
+                        parsed_examples.append(example)
+                if parsed_examples:
+                    cleaned[str(label_id)] = parsed_examples
+
+        if labelset:
+            labels = labelset.get("labels") if isinstance(labelset, Mapping) else None
+            if isinstance(labels, Sequence):
+                for label in labels:
+                    if not isinstance(label, Mapping):
+                        continue
+                    label_id = str(label.get("label_id") or "")
+                    if not label_id:
+                        continue
+                    raw_examples = label.get("few_shot_examples")
+                    if not isinstance(raw_examples, Sequence):
+                        continue
+                    parsed_examples: list[dict[str, str]] = []
+                    for entry in raw_examples:
+                        if not isinstance(entry, Mapping):
+                            continue
+                        example: dict[str, str] = {}
+                        if entry.get("context") is not None:
+                            example["context"] = str(entry.get("context"))
+                        if entry.get("answer") is not None:
+                            example["answer"] = str(entry.get("answer"))
+                        if example:
+                            parsed_examples.append(example)
+                    if parsed_examples and label_id not in cleaned:
+                        cleaned[label_id] = parsed_examples
         return cleaned
 
     @staticmethod
@@ -1270,7 +1296,7 @@ class RoundBuilder:
         cfg.final_llm_labeling_n_consistency = max(1, consistency)
         setattr(cfg.llmfirst, "final_llm_label_consistency", cfg.final_llm_labeling_n_consistency)
         setattr(cfg.llm, "include_reasoning", bool(include_reasoning))
-        few_shot_examples = self._extract_few_shot_examples(config)
+        few_shot_examples = self._extract_few_shot_examples(config, labelset)
         if few_shot_examples:
             try:
                 setattr(cfg.llm, "few_shot_examples", few_shot_examples)
