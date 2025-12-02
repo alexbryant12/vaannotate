@@ -1096,10 +1096,26 @@ class EmbeddingStore:
         idx_name = f"faiss_{getattr(index_cfg, 'type', 'flat')}.index"
         return {
             "meta": os.path.join(chunk_dir, "chunk_meta.json.gz"),
-            "emb": os.path.join(chunk_dir, "chunk_embeddings.npy"),
+            "emb": os.path.join(chunk_dir, "chunk_embeddings.npz"),
+            "emb_legacy": os.path.join(chunk_dir, "chunk_embeddings.npy"),
             "faiss": os.path.join(chunk_dir, idx_name),
             "bm25": self._bm25_index_path(chunk_dir),
         }
+
+    def _load_cached_embeddings(self, emb_path: str, legacy_path: str | None = None):
+        candidates = [p for p in (emb_path, legacy_path) if p]
+        for p in candidates:
+            if not os.path.exists(p):
+                continue
+            if p.endswith(".npz"):
+                with np.load(p) as data:
+                    if "embeddings" in data:
+                        return data["embeddings"]
+                    if "arr_0" in data:
+                        return data["arr_0"]
+                continue
+            return np.load(p, mmap_mode="r")
+        raise FileNotFoundError("No cached embeddings found")
     
     def _try_load_cached_chunks(self, chunk_dir: str) -> tuple[list[dict] | None, np.ndarray | None, dict | None]:
         """
@@ -1107,8 +1123,10 @@ class EmbeddingStore:
         """
         paths = self._paths_for_cache(chunk_dir, type("Cfg", (), {"type": "flat"}))
         meta_p, emb_p = paths["meta"], paths["emb"]
+        emb_legacy = paths.get("emb_legacy")
         man = self._load_manifest(chunk_dir)
-        if not ((os.path.exists(meta_p) or os.path.exists(meta_p.replace(".gz", ""))) and os.path.exists(emb_p) and man):
+        emb_exists = any(os.path.exists(p) for p in (emb_p, emb_legacy) if p)
+        if not ((os.path.exists(meta_p) or os.path.exists(meta_p.replace(".gz", ""))) and emb_exists and man):
             return (None, None, None)
         try:
             meta = None
@@ -1124,7 +1142,7 @@ class EmbeddingStore:
             if meta is None:
                 return (None, None, None)
 
-            X = np.load(emb_p, mmap_mode="r")  # memmap
+            X = self._load_cached_embeddings(emb_p, emb_legacy)
             # sanity: manifest rows/dims
             n = int(man.get("n_chunks", -1))
             d = int(man.get("dim", -1))
@@ -1277,6 +1295,7 @@ class EmbeddingStore:
     def _save_cached_chunks(self, chunk_dir: str, meta: list[dict], X: np.ndarray, rag_cfg):
         paths = self._paths_for_cache(chunk_dir, type("Cfg", (), {"type": "flat"}))
         meta_p, emb_p = paths["meta"], paths["emb"]
+        emb_legacy = paths.get("emb_legacy")
         # Save meta
         tmp = meta_p + ".tmp"
         with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as f:
@@ -1285,8 +1304,13 @@ class EmbeddingStore:
         # Save embeddings (np.save is atomic-ish via temp file on most FS; to be safe, write to tmp then replace)
         X_to_save = X.astype(np.float16)
         emb_tmp = emb_p + ".tmp"
-        np.save(emb_tmp, X_to_save)
+        np.savez_compressed(emb_tmp, embeddings=X_to_save)
         os.replace(emb_tmp, emb_p)
+        if emb_legacy and os.path.exists(emb_legacy):
+            try:
+                os.remove(emb_legacy)
+            except Exception:
+                pass
         # Manifest
         self._save_manifest(chunk_dir, {
             "n_chunks": int(X.shape[0]),
@@ -1297,6 +1321,7 @@ class EmbeddingStore:
             "embedder": self._embedder_id(),
             "emb_dtype": str(X_to_save.dtype),
             "meta_compressed": True,
+            "emb_compressed": True,
             "version": "v2",
         })
     
@@ -1311,6 +1336,44 @@ class EmbeddingStore:
             return None
         except Exception:
             return None
+
+    def _build_faiss_index(self, X: np.ndarray, index_cfg) -> "faiss.Index":
+        if faiss is None:
+            raise ImportError("faiss-cpu is required")
+        d = int(X.shape[1])
+        if index_cfg.type == "flat":
+            idx = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
+            idx.add(X)
+            return idx
+        if index_cfg.type == "hnsw":
+            idx = faiss.IndexHNSWFlat(d, index_cfg.hnsw_M)
+            idx.hnsw.efSearch = index_cfg.hnsw_efSearch
+            idx.add(X)
+            return idx
+        if index_cfg.type == "ivf":
+            quant = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
+            idx = faiss.IndexIVFFlat(
+                quant,
+                d,
+                index_cfg.nlist,
+                faiss.METRIC_INNER_PRODUCT if self.normalize else faiss.METRIC_L2,
+            )
+            ntrain = min(X.shape[0], max(10000, index_cfg.nlist * 40))
+            samp = X[np.random.choice(X.shape[0], ntrain, replace=False)]
+            idx.train(samp)
+            idx.add(X)
+            idx.nprobe = index_cfg.nprobe
+            return idx
+        if index_cfg.type == "ivfpq":
+            quant = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
+            idx = faiss.IndexIVFPQ(quant, d, index_cfg.nlist, index_cfg.pq_m, index_cfg.pq_bits)
+            ntrain = min(X.shape[0], max(50000, getattr(index_cfg, "train_size", 100000)))
+            samp = X[np.random.choice(X.shape[0], ntrain, replace=False)]
+            idx.train(samp)
+            idx.add(X)
+            idx.nprobe = index_cfg.nprobe
+            return idx
+        raise ValueError(f"Unknown index type: {index_cfg.type}")
 
     def _embed(self, texts: List[str], show_bar: Optional[bool] = False) -> np.ndarray:
         if show_bar:
@@ -1344,7 +1407,7 @@ class EmbeddingStore:
         """
         Build or reuse cached chunk_meta, embeddings, and FAISS index.
     
-        Cache layout: <cache_dir>/chunks/<fingerprint>/{chunk_meta.json, chunk_embeddings.npy, faiss_*.index, manifest.json}
+        Cache layout: <cache_dir>/chunks/<fingerprint>/{chunk_meta.json, chunk_embeddings.npz, faiss_*.index, manifest.json}
         Fingerprint depends on corpus (doc_id + hash), splitter, embedder, normalize flag.
         """
         index_cfg = index_cfg or IndexConfig()
@@ -1405,7 +1468,7 @@ class EmbeddingStore:
         elif isinstance(X, np.memmap):
             self.X = np.asarray(X, dtype=np.float32)
         else:
-            loaded = np.load(paths["emb"], mmap_mode="r")
+            loaded = self._load_cached_embeddings(paths["emb"], paths.get("emb_legacy"))
             self.X = loaded.astype(np.float32) if loaded.dtype != np.float32 else loaded
         self.chunk_meta = meta
         self._remap_unit_ids(notes_df)
@@ -1424,49 +1487,25 @@ class EmbeddingStore:
                 except Exception:
                     pass
         self.bm25_indices = bm25_loaded or {}
-    
+
         # 4) FAISS index: try load; else build and persist
         if faiss is None:
             raise ImportError("faiss-cpu is required")
-        d = int(self.X.shape[1])
-        idx = None if force_reindex else self._try_load_faiss_index(paths["faiss"], expected_n=int(self.X.shape[0]))
+        persist_index = bool(getattr(index_cfg, "persist", True))
+        idx = None
+        if persist_index and not force_reindex:
+            idx = self._try_load_faiss_index(paths["faiss"], expected_n=int(self.X.shape[0]))
         if idx is None:
             print("Building index...")
-            # (re)build index
-            if index_cfg.type == "flat":
-                idx = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
-                idx.add(self.X)
-            elif index_cfg.type == "hnsw":
-                idx = faiss.IndexHNSWFlat(d, index_cfg.hnsw_M)
-                idx.hnsw.efSearch = index_cfg.hnsw_efSearch
-                idx.add(self.X)
-            elif index_cfg.type == "ivf":
-                quant = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
-                idx = faiss.IndexIVFFlat(quant, d, index_cfg.nlist,
-                                         faiss.METRIC_INNER_PRODUCT if self.normalize else faiss.METRIC_L2)
-                ntrain = min(self.X.shape[0], max(10000, index_cfg.nlist * 40))
-                samp = self.X[np.random.choice(self.X.shape[0], ntrain, replace=False)]
-                idx.train(samp)
-                idx.add(self.X)
-                idx.nprobe = index_cfg.nprobe
-            elif index_cfg.type == "ivfpq":
-                quant = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
-                idx = faiss.IndexIVFPQ(quant, d, index_cfg.nlist, index_cfg.pq_m, index_cfg.pq_bits)
-                ntrain = min(self.X.shape[0], max(50000, getattr(index_cfg, "train_size", 100000)))
-                samp = self.X[np.random.choice(self.X.shape[0], ntrain, replace=False)]
-                idx.train(samp)
-                idx.add(self.X)
-                idx.nprobe = index_cfg.nprobe
-            else:
-                raise ValueError(f"Unknown index type: {index_cfg.type}")
-    
+            idx = self._build_faiss_index(self.X, index_cfg)
             # Persist index
-            try:
-                print("Saving index...")
-                faiss.write_index(idx, paths["faiss"])
-            except Exception:
-                pass
-    
+            if persist_index:
+                try:
+                    print("Saving index...")
+                    faiss.write_index(idx, paths["faiss"])
+                except Exception:
+                    pass
+
         self.faiss_index = idx
         # Keep the cache dir for later search() lazy loads
         self._chunk_cache_dir_path = chunk_dir
@@ -1479,7 +1518,7 @@ class EmbeddingStore:
             if hasattr(self, "_chunk_cache_dir_path"):
                 paths = self._paths_for_cache(self._chunk_cache_dir_path, index_cfg)
                 # load X + meta
-                emb = np.load(paths["emb"], mmap_mode="r")
+                emb = self._load_cached_embeddings(paths["emb"], paths.get("emb_legacy"))
                 self.X = emb.astype(np.float32) if emb.dtype != np.float32 else emb
                 meta = None
                 for mp in (paths["meta"], paths["meta"].replace(".gz", "")):
@@ -1493,12 +1532,12 @@ class EmbeddingStore:
                         continue
                 self.chunk_meta = meta or []
                 # load or build index
-                idx = self._try_load_faiss_index(paths["faiss"], expected_n=int(self.X.shape[0]))
+                persist_index = bool(getattr(index_cfg, "persist", True))
+                idx = None
+                if persist_index:
+                    idx = self._try_load_faiss_index(paths["faiss"], expected_n=int(self.X.shape[0]))
                 if idx is None:
-                    # minimal flat index fallback
-                    d = int(self.X.shape[1])
-                    idx = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
-                    idx.add(self.X)
+                    idx = self._build_faiss_index(self.X, index_cfg)
                 self.faiss_index = idx
                 # rebuild unit_to_chunk lookup
                 unit_to_idxs = defaultdict(list)
@@ -5169,6 +5208,10 @@ def parse_args(argv=None):
     ap.add_argument("--index-nprobe", type=int, default=32)
     ap.add_argument("--hnsw-M", type=int, default=32)
     ap.add_argument("--hnsw-efSearch", type=int, default=64)
+    ap.add_argument("--persist-faiss-index", dest="persist_faiss_index", action="store_true", default=True,
+                    help="Persist FAISS index to disk (default: true)")
+    ap.add_argument("--no-persist-faiss-index", dest="persist_faiss_index", action="store_false",
+                    help="Disable persistence; rebuild FAISS index from embeddings each run")
 
     # LLM-first probe knobs
     ap.add_argument("--probe-per-label", type=int, default=400)
@@ -5188,7 +5231,7 @@ def main(argv=None):
     args = parse_args(argv)
     paths = Paths(notes_path=args.notes, annotations_path=args.annotations, outdir=args.outdir)
     cfg = OrchestratorConfig(
-        index=IndexConfig(type=args.index_type, nlist=args.index_nlist, nprobe=args.index_nprobe, hnsw_M=args.hnsw_M, hnsw_efSearch=args.hnsw_efSearch),
+        index=IndexConfig(type=args.index_type, nlist=args.index_nlist, nprobe=args.index_nprobe, hnsw_M=args.hnsw_M, hnsw_efSearch=args.hnsw_efSearch, persist=args.persist_faiss_index),
         rag=RAGConfig(),
         llm=LLMConfig(),
         select=SelectionConfig(batch_size=args.batch_size),
