@@ -839,6 +839,7 @@ class RoundBuilder:
                 orchestrator.cfg.rag,
                 orchestrator.cfg.index,
             )
+            orchestrator.ensure_llm_backend()
             _, _, current_rules_map, current_label_types = orchestrator._label_maps()
             family_labeler = FamilyLabeler(
                 orchestrator.llm,

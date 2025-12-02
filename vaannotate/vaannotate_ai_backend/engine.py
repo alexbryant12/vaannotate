@@ -4375,10 +4375,7 @@ class ActiveLearningLLMFirst:
             notes_by_doc=self.repo.notes_by_doc(),
             repo=self.repo,
         )
-        self.llm = LLMAnnotator(self.cfg.llm, self.cfg.scjitter, cache_dir=self.paths.cache_dir)
-        # Ensure the annotator has access to the materialised label configuration
-        # so that option lookups during JSON prompting succeed.
-        self.llm.label_config = self.label_config
+        self.llm: LLMAnnotator | None = None
         self.pooler = LabelAwarePooler(
             self.repo,
             self.store,
@@ -4390,6 +4387,17 @@ class ActiveLearningLLMFirst:
             use_negative=bool(int(os.getenv('POOLER_USE_NEG', '0'))),
             llmfirst_cfg=self.cfg.llmfirst,
         )
+
+    def ensure_llm_backend(self) -> None:
+        """Lazily construct the LLM backend so embeddings can load first."""
+
+        if self.llm is not None:
+            return
+
+        self.llm = LLMAnnotator(self.cfg.llm, self.cfg.scjitter, cache_dir=self.paths.cache_dir)
+        # Ensure the annotator has access to the materialised label configuration
+        # so that option lookups during JSON prompting succeed.
+        self.llm.label_config = self.label_config
     def config_for_labelset(self, labelset_id: Optional[str]) -> Dict[str, object]:
         return self.label_config_bundle.config_for_labelset(labelset_id)
 
@@ -4900,7 +4908,10 @@ class ActiveLearningLLMFirst:
         print("Building label prototypes ...")
         check_cancelled()
         self.pooler.build_prototypes()
-    
+        # Load the LLM backend only after embeddings/cross-encoders have been loaded and
+        # used, so GPU memory can be allocated to them before the ExLlamaV2 model.
+        self.ensure_llm_backend()
+
         (
             legacy_rules_map,
             legacy_label_types,
