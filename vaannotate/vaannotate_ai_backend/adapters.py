@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Any, Mapping
+from typing import Callable, Dict, List, Optional, Tuple, Any, Mapping, Iterable
 import json
 import sqlite3
 
@@ -669,6 +669,20 @@ def _scope_corpus_to_annotations(
     )
     return filtered
 
+
+def _unit_identifier_from_row(row: Mapping[str, Any], level: str) -> Optional[str]:
+    keys = ["unit_id"]
+    if str(level or "single_doc") == "multi_doc":
+        keys.append("patient_icn")
+    else:
+        keys.extend(["doc_id", "patient_icn"])
+    for key in keys:
+        value = row.get(key) if hasattr(row, "get") else None
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
 def run_ai_backend_and_collect(
     project_root: Path,
     pheno_id: str,
@@ -685,10 +699,13 @@ def run_ai_backend_and_collect(
     corpus_record: Optional[Mapping[str, Any] | sqlite3.Row | Dict[str, Any]] = None,
     corpus_id: Optional[str] = None,
     corpus_path: Optional[str] = None,
+    exclude_unit_ids: Optional[Iterable[str]] = None,
+    sampling_metadata: Optional[Mapping[str, object]] = None,
     scope_corpus_to_annotations: bool = False,
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
+    excluded_ids = {str(uid) for uid in (exclude_unit_ids or []) if str(uid)}
     shared_cache_dir: Optional[Path] = None
     record_dict = _normalize_record(corpus_record)
     normalized_corpus_path = corpus_path or record_dict.get("relative_path") or record_dict.get("path")
@@ -763,6 +780,22 @@ def run_ai_backend_and_collect(
         log_callback=log_callback,
         cache_dir=shared_cache_dir,
     )
+    if sampling_metadata:
+        artifacts.setdefault("sampling", dict(sampling_metadata))
+    if excluded_ids:
+        identifiers = final_df.apply(lambda row: _unit_identifier_from_row(row, level), axis=1)
+        mask = identifiers.isin(excluded_ids)
+        removed = int(mask.sum())
+        if removed:
+            final_df = final_df.loc[~mask].reset_index(drop=True)
+            log(f"Excluded {removed} previously reviewed units from AI suggestions")
+            csv_path = Path(artifacts["ai_next_batch_csv"])
+            final_df.to_csv(csv_path, index=False)
+            artifacts["ai_next_batch_csv"] = str(csv_path)
+            if final_df.empty:
+                raise RuntimeError(
+                    "No candidate units remain after excluding previously reviewed units."
+                )
     csv_path = Path(artifacts["ai_next_batch_csv"])
     log(f"AI backend produced {len(final_df)} candidate units")
 

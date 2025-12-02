@@ -13,7 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Set
 
 from .project import build_label_config, fetch_labelset
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
@@ -1098,6 +1098,12 @@ class RoundBuilder:
         ai_backend_cfg = config.get("ai_backend")
         if isinstance(ai_backend_cfg, Mapping):
             candidates.append(ai_backend_cfg.get("final_llm_include_reasoning"))
+            overrides = ai_backend_cfg.get("config_overrides")
+            if isinstance(overrides, Mapping):
+                candidates.append(overrides.get("final_llm_include_reasoning"))
+                llm_overrides = overrides.get("llm")
+                if isinstance(llm_overrides, Mapping):
+                    candidates.append(llm_overrides.get("include_reasoning"))
         for candidate in candidates:
             parsed = self._coerce_optional_bool(candidate)
             if parsed is not None:
@@ -1239,6 +1245,7 @@ class RoundBuilder:
                 Paths,
                 _jsonify_cols,
             )
+            from vaannotate.vaannotate_ai_backend import orchestrator as orchestrator_module
         except ImportError as exc:  # pragma: no cover - runtime guard
             raise RuntimeError("AI backend components are required for final LLM labeling") from exc
 
@@ -1274,12 +1281,21 @@ class RoundBuilder:
         notes_df.to_parquet(notes_path, index=False)
         ann_df.to_parquet(ann_path, index=False)
 
+        ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        config_overrides = ai_backend_config.get("config_overrides") if isinstance(ai_backend_config, Mapping) else None
+
         consistency = 1
         candidates: list[Any] = [config.get("final_llm_labeling_n_consistency")]
         llm_cfg = config.get("llm_labeling")
         if isinstance(llm_cfg, Mapping):
             for key in ("consistency_runs", "n_consistency", "final_llm_label_consistency"):
                 candidates.append(llm_cfg.get(key))
+        if isinstance(config_overrides, Mapping):
+            candidates.append(config_overrides.get("final_llm_labeling_n_consistency"))
+            override_llm = config_overrides.get("llm_labeling")
+            if isinstance(override_llm, Mapping):
+                for key in ("consistency_runs", "n_consistency", "final_llm_label_consistency"):
+                    candidates.append(override_llm.get(key))
         for candidate in candidates:
             if candidate is None:
                 continue
@@ -1292,6 +1308,24 @@ class RoundBuilder:
                 break
 
         cfg = OrchestratorConfig()
+        overrides: Dict[str, Any] = {}
+        if isinstance(config_overrides, Mapping):
+            overrides.update(config_overrides)
+
+        llmfirst_overrides = (
+            ai_backend_config.get("llmfirst")
+            if isinstance(ai_backend_config.get("llmfirst"), Mapping)
+            else {}
+        )
+        if llmfirst_overrides:
+            overrides.setdefault("llmfirst", {}).update(llmfirst_overrides)
+
+        if overrides:
+            try:
+                orchestrator_module._apply_overrides(cfg, overrides)
+            except Exception:  # noqa: BLE001
+                pass
+
         cfg.final_llm_labeling = True
         cfg.final_llm_labeling_n_consistency = max(1, consistency)
         setattr(cfg.llmfirst, "final_llm_label_consistency", cfg.final_llm_labeling_n_consistency)
@@ -1302,24 +1336,6 @@ class RoundBuilder:
                 setattr(cfg.llm, "few_shot_examples", few_shot_examples)
             except Exception:  # noqa: BLE001
                 pass
-
-        ai_backend_config = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
-        llmfirst_overrides = (
-            ai_backend_config.get("llmfirst")
-            if isinstance(ai_backend_config.get("llmfirst"), Mapping)
-            else {}
-        )
-        mode_override = llmfirst_overrides.get("single_doc_context")
-        if mode_override:
-            setattr(cfg.llmfirst, "single_doc_context", str(mode_override))
-        limit_override = llmfirst_overrides.get("single_doc_full_context_max_chars")
-        if limit_override is not None:
-            try:
-                limit_value = int(limit_override)
-            except (TypeError, ValueError):
-                limit_value = None
-            if limit_value and limit_value > 0:
-                setattr(cfg.llmfirst, "single_doc_full_context_max_chars", limit_value)
 
         phenotype_level = str(pheno_row["level"] or "multi_doc")
         label_config_payload = build_label_config(labelset)
