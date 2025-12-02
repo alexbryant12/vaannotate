@@ -783,8 +783,14 @@ def run_ai_backend_and_collect(
     if sampling_metadata:
         artifacts.setdefault("sampling", dict(sampling_metadata))
     if excluded_ids:
+        applicable_mask = None
+        if "selection_reason" in final_df.columns:
+            reasons = final_df["selection_reason"].astype(str)
+            applicable_mask = reasons.str.startswith("llm_") | reasons.str.startswith("diversity")
         identifiers = final_df.apply(lambda row: _unit_identifier_from_row(row, level), axis=1)
         mask = identifiers.isin(excluded_ids)
+        if applicable_mask is not None:
+            mask &= applicable_mask
         removed = int(mask.sum())
         if removed:
             final_df = final_df.loc[~mask].reset_index(drop=True)
