@@ -65,6 +65,8 @@ PROJECT_SCHEMA = [
         unit TEXT,
         min REAL,
         max REAL,
+        keywords_json TEXT,
+        few_shot_json TEXT,
         PRIMARY KEY(labelset_id, label_id)
     );
     """,

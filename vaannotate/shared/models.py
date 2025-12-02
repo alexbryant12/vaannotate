@@ -170,6 +170,8 @@ class Label(Record):
     unit: Optional[str]
     min: Optional[float]
     max: Optional[float]
+    keywords_json: Optional[str] = None
+    few_shot_json: Optional[str] = None
 
     __tablename__ = "labels"
     __schema__ = (
@@ -187,6 +189,8 @@ class Label(Record):
             unit TEXT NULL,
             min REAL NULL,
             max REAL NULL,
+            keywords_json TEXT NULL,
+            few_shot_json TEXT NULL,
             PRIMARY KEY(labelset_id, label_id),
             FOREIGN KEY(labelset_id) REFERENCES label_sets(labelset_id)
         )

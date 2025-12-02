@@ -1703,6 +1703,12 @@ class ProjectContext(QtCore.QObject):
                     unit=label.get("unit"),
                     min=label.get("min"),
                     max=label.get("max"),
+                    keywords_json=json.dumps(label.get("keywords"))
+                    if isinstance(label.get("keywords"), (list, dict))
+                    else None,
+                    few_shot_json=json.dumps(label.get("few_shot_examples"))
+                    if isinstance(label.get("few_shot_examples"), list)
+                    else None,
                 )
                 label_record.save(conn)
                 for opt_index, option in enumerate(label.get("options", [])):
@@ -2141,6 +2147,8 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.ctx = ctx
         self.labels: List[Dict[str, object]] = []
+        self.label_keywords: Dict[str, List[str]] = {}
+        self.label_few_shot: Dict[str, List[Dict[str, str]]] = {}
         self.setWindowTitle("Create label set")
         self.resize(520, 640)
         self._setup_ui()
@@ -2188,6 +2196,16 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         button_row.addWidget(down_btn)
         button_row.addStretch(1)
         layout.addLayout(button_row)
+
+        self.resources_tabs = QtWidgets.QTabWidget()
+        self.keywords_tab = QtWidgets.QWidget()
+        self.few_shot_tab = QtWidgets.QWidget()
+        self.resources_tabs.addTab(self.keywords_tab, "Keywords")
+        self.resources_tabs.addTab(self.few_shot_tab, "Few-shot examples")
+        layout.addWidget(self.resources_tabs)
+        self._keyword_editor: Optional[LabelKeywordsEditor] = None
+        self._few_shot_editor: Optional[LabelFewShotExamplesEditor] = None
+        self._refresh_label_resources()
 
         self.button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -2278,9 +2296,20 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
                 updated = re.sub(rf"\b{re.escape(old_id)}\b", new_id, updated)
             label["gating_expr"] = updated
         self.labels = new_labels
+        self.label_keywords = {
+            str(label.get("label_id") or ""): label.get("keywords", [])
+            for label in new_labels
+            if label.get("keywords")
+        }
+        self.label_few_shot = {
+            str(label.get("label_id") or ""): label.get("few_shot_examples", [])
+            for label in new_labels
+            if label.get("few_shot_examples")
+        }
         self._refresh_label_list()
         if self.labels:
             self.label_list.setCurrentRow(0)
+        self._refresh_label_resources()
         notes_text = str(payload.get("notes") or "").strip()
         self.notes_edit.setPlainText(notes_text)
         creator_text = str(payload.get("created_by") or "").strip()
@@ -2296,6 +2325,44 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             summary = f"{label['name']} ({label['type']})"
             item = QtWidgets.QListWidgetItem(summary)
             self.label_list.addItem(item)
+        self._refresh_label_resources()
+
+    def _refresh_label_resources(self) -> None:
+        existing_keywords = (
+            self._keyword_editor.to_mapping()
+            if isinstance(self._keyword_editor, LabelKeywordsEditor)
+            else self.label_keywords
+        )
+        existing_examples = (
+            self._few_shot_editor.to_mapping()
+            if isinstance(self._few_shot_editor, LabelFewShotExamplesEditor)
+            else self.label_few_shot
+        )
+        label_ids = {str(label.get("label_id") or "") for label in self.labels if label.get("label_id")}
+        self.label_keywords = {k: v for k, v in existing_keywords.items() if k in label_ids and v}
+        self.label_few_shot = {k: v for k, v in existing_examples.items() if k in label_ids and v}
+
+        for tab, editor_attr in (
+            (self.keywords_tab, "_keyword_editor"),
+            (self.few_shot_tab, "_few_shot_editor"),
+        ):
+            old_layout = tab.layout()
+            if isinstance(old_layout, QtWidgets.QLayout):
+                while old_layout.count():
+                    item = old_layout.takeAt(0)
+                    widget = item.widget()
+                    if widget:
+                        widget.setParent(None)
+                QtWidgets.QWidget().setLayout(old_layout)  # type: ignore[arg-type]
+            tab.setLayout(QtWidgets.QVBoxLayout())
+            tab.layout().setContentsMargins(0, 0, 0, 0)  # type: ignore[union-attr]
+            tab.layout().setSpacing(0)  # type: ignore[union-attr]
+            if editor_attr == "_keyword_editor":
+                editor = LabelKeywordsEditor(self.labels, self.label_keywords)
+            else:
+                editor = LabelFewShotExamplesEditor(self.labels, self.label_few_shot)
+            tab.layout().addWidget(editor)  # type: ignore[union-attr]
+            setattr(self, editor_attr, editor)
 
     def _add_label(self) -> None:
         existing_ids = {
@@ -2369,11 +2436,26 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         super().accept()
 
     def values(self) -> Dict[str, object]:
+        keyword_map = self._keyword_editor.to_mapping() if isinstance(self._keyword_editor, LabelKeywordsEditor) else {}
+        few_shot_map = (
+            self._few_shot_editor.to_mapping()
+            if isinstance(self._few_shot_editor, LabelFewShotExamplesEditor)
+            else {}
+        )
+        labels_payload: List[Dict[str, object]] = []
+        for label in self.labels:
+            label_id = str(label.get("label_id") or "")
+            data = dict(label)
+            if label_id and label_id in keyword_map:
+                data["keywords"] = keyword_map[label_id]
+            if label_id and label_id in few_shot_map:
+                data["few_shot_examples"] = few_shot_map[label_id]
+            labels_payload.append(data)
         return {
             "labelset_id": self.id_edit.text().strip(),
             "created_by": self.creator_edit.text().strip() or "admin",
             "notes": self.notes_edit.toPlainText().strip() or "",
-            "labels": self.labels,
+            "labels": labels_payload,
         }
 
 
@@ -3514,6 +3596,67 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return None
         return payload if isinstance(payload, Mapping) else None
 
+    def _on_labelset_changed(self) -> None:
+        schema = self._active_label_schema()
+        keywords: Dict[str, List[str]] = {}
+        few_shot: Dict[str, List[Dict[str, str]]] = {}
+        labels = schema.get("labels") if isinstance(schema, Mapping) else None
+        if isinstance(labels, Sequence):
+            for label in labels:
+                if not isinstance(label, Mapping):
+                    continue
+                label_id = str(label.get("label_id") or "")
+                if not label_id:
+                    continue
+                label_keywords = label.get("keywords")
+                if isinstance(label_keywords, Sequence):
+                    kw_values = [str(kw).strip() for kw in label_keywords if str(kw).strip()]
+                    if kw_values:
+                        keywords[label_id] = kw_values
+                label_examples = label.get("few_shot_examples")
+                if isinstance(label_examples, Sequence):
+                    parsed_examples: List[Dict[str, str]] = []
+                    for entry in label_examples:
+                        if not isinstance(entry, Mapping):
+                            continue
+                        example: Dict[str, str] = {}
+                        if entry.get("context"):
+                            example["context"] = str(entry.get("context"))
+                        if entry.get("answer"):
+                            example["answer"] = str(entry.get("answer"))
+                        if example:
+                            parsed_examples.append(example)
+                    if parsed_examples:
+                        few_shot[label_id] = parsed_examples
+
+        updated = False
+        rag_cfg = self._ai_engine_overrides.get("rag") if isinstance(self._ai_engine_overrides.get("rag"), Mapping) else {}
+        llm_cfg = self._ai_engine_overrides.get("llm") if isinstance(self._ai_engine_overrides.get("llm"), Mapping) else {}
+        if keywords:
+            rag_cfg = dict(rag_cfg)
+            rag_cfg["label_keywords"] = keywords
+            self._ai_engine_overrides["rag"] = rag_cfg
+            updated = True
+        elif isinstance(rag_cfg, Mapping) and "label_keywords" in rag_cfg:
+            rag_cfg = dict(rag_cfg)
+            rag_cfg.pop("label_keywords", None)
+            self._ai_engine_overrides["rag"] = rag_cfg
+            updated = True
+
+        if few_shot:
+            llm_cfg = dict(llm_cfg)
+            llm_cfg["few_shot_examples"] = few_shot
+            self._ai_engine_overrides["llm"] = llm_cfg
+            updated = True
+        elif isinstance(llm_cfg, Mapping) and "few_shot_examples" in llm_cfg:
+            llm_cfg = dict(llm_cfg)
+            llm_cfg.pop("few_shot_examples", None)
+            self._ai_engine_overrides["llm"] = llm_cfg
+            updated = True
+
+        if updated:
+            self._apply_ai_config_to_controls(self._ai_engine_overrides)
+
     def _open_ai_advanced_settings(self) -> None:
         config = self._build_ai_config_snapshot()
         dialog = AIAdvancedConfigDialog(self, config, label_schema=self._active_label_schema())
@@ -3688,6 +3831,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         line_edit = self.labelset_combo.lineEdit()
         if line_edit:
             line_edit.setPlaceholderText("Select or enter label set ID")
+        self.labelset_combo.currentTextChanged.connect(lambda _text: self._on_labelset_changed())
         self.seed_spin = QtWidgets.QSpinBox()
         self.seed_spin.setMaximum(2**31 - 1)
         self.overlap_spin = QtWidgets.QSpinBox()
@@ -4330,6 +4474,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             default_id = f"auto_{self.pheno_row['pheno_id']}"
             self.labelset_combo.setEditText(default_id)
         self.labelset_combo.blockSignals(False)
+        self._on_labelset_changed()
 
     def _refresh_reviewer_options(self) -> None:
         self._available_reviewers = self._load_existing_reviewers()
@@ -5478,6 +5623,33 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 )
             schema_labels = []
             for label in labels:
+                keywords: List[str] = []
+                raw_keywords = label["keywords_json"]
+                if isinstance(raw_keywords, str):
+                    try:
+                        parsed_keywords = json.loads(raw_keywords)
+                        if isinstance(parsed_keywords, list):
+                            keywords = [str(item).strip() for item in parsed_keywords if str(item).strip()]
+                    except Exception:  # noqa: BLE001
+                        keywords = []
+                few_shot_examples: List[Dict[str, str]] = []
+                raw_examples = label["few_shot_json"]
+                if isinstance(raw_examples, str):
+                    try:
+                        parsed_examples = json.loads(raw_examples)
+                        if isinstance(parsed_examples, list):
+                            for entry in parsed_examples:
+                                if not isinstance(entry, Mapping):
+                                    continue
+                                example: Dict[str, str] = {}
+                                if entry.get("context"):
+                                    example["context"] = str(entry.get("context"))
+                                if entry.get("answer"):
+                                    example["answer"] = str(entry.get("answer"))
+                                if example:
+                                    few_shot_examples.append(example)
+                    except Exception:  # noqa: BLE001
+                        few_shot_examples = []
                 schema_labels.append(
                     {
                         "label_id": label["label_id"],
@@ -5490,6 +5662,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         "range": {"min": label["min"], "max": label["max"]},
                         "gating_expr": label["gating_expr"],
                         "options": sorted(option_map.get(label["label_id"], []), key=lambda o: o["order_index"]),
+                        "keywords": keywords,
+                        "few_shot_examples": few_shot_examples,
                     }
                 )
             payload: Dict[str, object] = {"labelset_id": labelset_id, "labels": schema_labels}
