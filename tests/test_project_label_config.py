@@ -9,6 +9,7 @@ from vaannotate.project import (
     add_labelset,
     add_phenotype,
     build_label_config,
+    fetch_labelset,
     get_connection,
     init_project,
     resolve_label_config_path,
@@ -170,3 +171,58 @@ def test_add_labelset_allows_duplicate_ids_across_sets(tmp_path: Path) -> None:
             ("ls_one", "shared"),
             ("ls_two", "shared"),
         ]
+
+
+def test_label_keywords_and_examples_round_trip(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    labelset_payload = {
+        "labelset_id": "ls_features",
+        "project_id": "proj",
+        "pheno_id": "phen",
+        "version": 1,
+        "created_by": "tester",
+        "notes": None,
+        "labels": [
+            {
+                "label_id": "kw1",
+                "name": "Keywords",
+                "type": "text",
+                "required": False,
+                "keywords": ["alpha", "beta"],
+                "few_shot_examples": [
+                    {"context": "example context", "answer": "answer text"}
+                ],
+            }
+        ],
+    }
+
+    with get_connection(paths.project_db) as conn:
+        add_phenotype(
+            conn,
+            pheno_id="phen",
+            project_id="proj",
+            name="Phenotype",
+            level="single_doc",
+            storage_path="phenotypes/phen",
+        )
+        add_labelset(conn, **labelset_payload)
+
+        fetched = fetch_labelset(conn, "ls_features")
+
+    labels = fetched.get("labels", [])
+    assert isinstance(labels, list) and labels
+    label = labels[0]
+    assert label["keywords"] == ["alpha", "beta"]
+    assert label["few_shot_examples"] == [
+        {"context": "example context", "answer": "answer text"}
+    ]
+
+    config = build_label_config(fetched)
+    entry = config.get("kw1")
+    assert isinstance(entry, dict)
+    assert entry.get("keywords") == ["alpha", "beta"]
+    assert entry.get("few_shot_examples") == [
+        {"context": "example context", "answer": "answer text"}
+    ]
