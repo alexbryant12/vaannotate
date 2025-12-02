@@ -2201,6 +2201,8 @@ class AnnotationForm(QtWidgets.QScrollArea):
     def _has_value(self, widgets: Dict[str, object]) -> bool:
         if "na_box" in widgets and widgets["na_box"].isChecked():  # type: ignore[index]
             return True
+        if "unknown_box" in widgets and widgets["unknown_box"].isChecked():  # type: ignore[index]
+            return True
         if "button_group" in widgets:
             group: QtWidgets.QButtonGroup = widgets["button_group"]  # type: ignore[assignment]
             return any(button.isChecked() for button in group.buttons())
