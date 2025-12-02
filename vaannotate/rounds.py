@@ -1561,7 +1561,10 @@ class RoundBuilder:
             "labels": schema_labels,
         }
         if labelset_id is not None:
-            payload["labelset_name"] = labelset_id
+            labelset_name = None
+            if isinstance(labelset, Mapping):
+                labelset_name = labelset.get("labelset_name")
+            payload["labelset_name"] = labelset_name or labelset_id
         if isinstance(labelset, Mapping):
             for key in ("created_by", "created_at", "notes"):
                 value = labelset.get(key)
