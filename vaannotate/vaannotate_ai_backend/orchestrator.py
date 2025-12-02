@@ -24,6 +24,20 @@ def _default_paths(outdir: Path, cache_dir: Path | None = None) -> engine.Paths:
 
 
 def _apply_overrides(target: object, overrides: Mapping[str, Any]) -> None:
+    if isinstance(target, dict):
+        for key, value in overrides.items():
+            if isinstance(value, Mapping):
+                current = target.get(key)
+                if isinstance(current, Mapping):
+                    nested = dict(current)
+                    _apply_overrides(nested, value)
+                    target[key] = nested
+                else:
+                    target[key] = dict(value)
+            else:
+                target[key] = value
+        return
+
     for key, value in overrides.items():
         if isinstance(value, Mapping):
             current = getattr(target, key, None)
