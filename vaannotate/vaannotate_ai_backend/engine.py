@@ -5001,7 +5001,9 @@ class ActiveLearningLLMFirst:
                 print("[1/4] Disagreement quota is zero; refreshing schema only ...")
             check_cancelled()
             dis_pairs = self.build_disagreement_bucket(seen_pairs, legacy_rules_map, legacy_label_types)
-            dis_pairs = _filter_units(dis_pairs, seen_units | selected_units)
+            # Keep prior-round units eligible for disagreement reviews while still
+            # preventing duplicates within the current batch.
+            dis_pairs = _filter_units(dis_pairs, selected_units)
             dis_units = _head_units(_to_unit_only(dis_pairs), n_dis)
         dis_units.to_parquet(dis_path, index=False)
         selected_rows.append(dis_units)

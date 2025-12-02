@@ -163,6 +163,9 @@ class RoundCreationContext:
     created_at: str
     created_by: str
     db: Database
+    independent: bool = False
+    excluded_unit_ids: Set[str] = field(default_factory=set)
+    sampling_metadata: Dict[str, object] = field(default_factory=dict)
     assisted_review_enabled: bool = False
     assisted_review_top_n: int = 0
     ai_backend_overrides: Dict[str, object] = field(default_factory=dict)
@@ -782,6 +785,8 @@ class AIRoundWorker(QtCore.QObject):
                     cancel_callback=self._cancel_event.is_set,
                     corpus_record=self.job.context.corpus_record,
                     corpus_id=self.job.context.corpus_id,
+                    exclude_unit_ids=self.job.context.excluded_unit_ids,
+                    sampling_metadata=self.job.context.sampling_metadata,
                 )
             finally:
                 for key, prior in original_env.items():
@@ -987,6 +992,8 @@ class AIRoundWorker(QtCore.QObject):
             "preselected_units_csv": str(csv_path),
             "prior_rounds": list(self.job.prior_rounds),
         }
+        if context.sampling_metadata:
+            payload["sampling"] = context.sampling_metadata
         if context.corpus_record:
             try:
                 payload["corpus_name"] = context.corpus_record["name"]
@@ -4712,6 +4719,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if not corpus_id:
             QtWidgets.QMessageBox.warning(self, "Round", "Select a corpus for this round.")
             return None
+        independent = bool(self.independent_checkbox.isChecked()) if hasattr(self, "independent_checkbox") else False
+        sampling_metadata: Dict[str, object] = {"independent": independent}
+        excluded_units = self._load_reviewed_unit_ids(corpus_id) if independent else set()
+        if independent:
+            sampling_metadata["previously_reviewed_units"] = len(excluded_units)
         try:
             corpus_record = self.ctx.get_corpus(corpus_id)
         except Exception:  # noqa: BLE001
@@ -4809,6 +4821,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             created_at=created_at,
             created_by=created_by,
             db=db,
+            independent=independent,
+            excluded_unit_ids=excluded_units,
+            sampling_metadata=sampling_metadata,
             assisted_review_enabled=assisted_enabled,
             assisted_review_top_n=assisted_top_n,
             ai_backend_overrides=backend_cfg,
