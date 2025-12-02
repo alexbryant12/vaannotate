@@ -5151,6 +5151,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             include_reasoning_value = bool(include_checkbox.isChecked())
             overrides["final_llm_include_reasoning"] = include_reasoning_value
         llmfirst_overrides: Dict[str, Any] = {}
+        if isinstance(overrides.get("llmfirst"), Mapping):
+            llmfirst_overrides.update(overrides.get("llmfirst", {}))
         if (
             str(self.pheno_row["level"] or "single_doc") == "single_doc"
             and isinstance(self.ai_single_doc_context_combo, QtWidgets.QComboBox)
@@ -5166,6 +5168,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if llmfirst_overrides:
             overrides["llmfirst"] = llmfirst_overrides
         llm_overrides: Dict[str, Any] = {}
+        if isinstance(overrides.get("llm"), Mapping):
+            llm_overrides.update(overrides.get("llm", {}))
         backend_choice = self._current_ai_backend()
         if backend_choice:
             llm_overrides["backend"] = backend_choice

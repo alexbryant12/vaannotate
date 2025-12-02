@@ -1441,14 +1441,42 @@ class AnnotationForm(QtWidgets.QScrollArea):
             validator = QtGui.QIntValidator() if label.type == "integer" else QtGui.QDoubleValidator()
             line.setValidator(validator)
             line.editingFinished.connect(lambda lid=label.label_id, widget=line: self._on_numeric(lid, widget))
-            value_widget = line
+            unknown_box = QtWidgets.QCheckBox("Unknown")
+            unknown_box.stateChanged.connect(
+                lambda _state, lid=label.label_id, widget=line, toggle=unknown_box: self._on_numeric_unknown(
+                    lid, widget, toggle
+                )
+            )
+            numeric_layout = QtWidgets.QHBoxLayout()
+            numeric_layout.setContentsMargins(0, 0, 0, 0)
+            numeric_layout.addWidget(line)
+            numeric_layout.addWidget(unknown_box)
+            numeric_layout.addStretch()
+            numeric_widget = QtWidgets.QWidget()
+            numeric_widget.setLayout(numeric_layout)
+            value_widget = numeric_widget
             state["line_edit"] = line
+            state["unknown_box"] = unknown_box
         elif label.type == "date":
             date = QtWidgets.QDateEdit()
             date.setCalendarPopup(True)
             date.dateChanged.connect(lambda _date, lid=label.label_id, widget=date: self._on_date(lid, widget))
-            value_widget = date
+            unknown_box = QtWidgets.QCheckBox("Unknown")
+            unknown_box.stateChanged.connect(
+                lambda _state, lid=label.label_id, widget=date, toggle=unknown_box: self._on_date_unknown(
+                    lid, widget, toggle
+                )
+            )
+            date_layout = QtWidgets.QHBoxLayout()
+            date_layout.setContentsMargins(0, 0, 0, 0)
+            date_layout.addWidget(date)
+            date_layout.addWidget(unknown_box)
+            date_layout.addStretch()
+            date_widget = QtWidgets.QWidget()
+            date_widget.setLayout(date_layout)
+            value_widget = date_widget
             state["date_edit"] = date
+            state["unknown_box"] = unknown_box
         else:
             text = QtWidgets.QTextEdit()
             text.textChanged.connect(lambda lid=label.label_id, widget=text: self._on_text(lid, widget))
@@ -1898,10 +1926,22 @@ class AnnotationForm(QtWidgets.QScrollArea):
                 cb.setChecked(cb.property("option_value") in values)
         if "line_edit" in widgets:
             widgets["line_edit"].setText(annotation.get("value") or "")  # type: ignore[index]
+        if "unknown_box" in widgets and annotation.get("value") == "unknown":
+            unknown_box: QtWidgets.QCheckBox = widgets["unknown_box"]  # type: ignore[assignment]
+            unknown_box.setChecked(True)
+            line_widget = widgets.get("line_edit")
+            if isinstance(line_widget, QtWidgets.QLineEdit):
+                line_widget.clear()
+                line_widget.setEnabled(False)
+            date_widget = widgets.get("date_edit")
+            if isinstance(date_widget, QtWidgets.QDateEdit):
+                date_widget.setEnabled(False)
         if "date_edit" in widgets:
             date_widget: QtWidgets.QDateEdit = widgets["date_edit"]  # type: ignore[assignment]
             if annotation.get("value_date"):
                 date_widget.setDate(QtCore.QDate.fromString(annotation["value_date"], QtCore.Qt.ISODate))
+            elif annotation.get("value") != "unknown":
+                date_widget.setEnabled(True)
         if "text_edit" in widgets:
             widgets["text_edit"].setPlainText(annotation.get("value") or "")  # type: ignore[index]
         if "na_box" in widgets:
@@ -1928,12 +1968,16 @@ class AnnotationForm(QtWidgets.QScrollArea):
                 cb.setChecked(False)
         if "line_edit" in widgets:
             widgets["line_edit"].clear()  # type: ignore[index]
+            widgets["line_edit"].setEnabled(True)  # type: ignore[index]
         if "date_edit" in widgets:
             widgets["date_edit"].setDate(QtCore.QDate.currentDate())  # type: ignore[index]
+            widgets["date_edit"].setEnabled(True)  # type: ignore[index]
         if "text_edit" in widgets:
             widgets["text_edit"].clear()  # type: ignore[index]
         if "na_box" in widgets:
             widgets["na_box"].setChecked(False)  # type: ignore[index]
+        if "unknown_box" in widgets:
+            widgets["unknown_box"].setChecked(False)  # type: ignore[index]
         if "notes" in widgets:
             widgets["notes"].clear()  # type: ignore[index]
 
@@ -1960,6 +2004,9 @@ class AnnotationForm(QtWidgets.QScrollArea):
             na_box = state.get("na_box")
             if isinstance(na_box, QtWidgets.QCheckBox):
                 widgets.append(na_box)
+            unknown_box = state.get("unknown_box")
+            if isinstance(unknown_box, QtWidgets.QCheckBox):
+                widgets.append(unknown_box)
             notes = state.get("notes")
             if isinstance(notes, QtWidgets.QLineEdit):
                 widgets.append(notes)
@@ -1994,6 +2041,10 @@ class AnnotationForm(QtWidgets.QScrollArea):
     def _on_numeric(self, label_id: str, widget: QtWidgets.QLineEdit) -> None:
         if not self.current_unit_id:
             return
+        widgets = self.label_widgets.get(label_id, {})
+        unknown_box = widgets.get("unknown_box")
+        if isinstance(unknown_box, QtWidgets.QCheckBox) and unknown_box.isChecked():
+            return
         text = widget.text().strip()
         payload = {"value": text, "value_num": float(text) if text else None}
         self.ctx.save_annotation(self.current_unit_id, label_id, payload)
@@ -2003,7 +2054,49 @@ class AnnotationForm(QtWidgets.QScrollArea):
     def _on_date(self, label_id: str, widget: QtWidgets.QDateEdit) -> None:
         if not self.current_unit_id:
             return
+        widgets = self.label_widgets.get(label_id, {})
+        unknown_box = widgets.get("unknown_box")
+        if isinstance(unknown_box, QtWidgets.QCheckBox) and unknown_box.isChecked():
+            return
         payload = {"value_date": widget.date().toString(QtCore.Qt.ISODate)}
+        self.ctx.save_annotation(self.current_unit_id, label_id, payload)
+        self._update_gating()
+        self._update_completion()
+
+    def _on_numeric_unknown(
+        self,
+        label_id: str,
+        line_widget: QtWidgets.QLineEdit,
+        checkbox: QtWidgets.QCheckBox,
+    ) -> None:
+        checked = checkbox.isChecked()
+        line_widget.setEnabled(not checked)
+        if not self.current_unit_id:
+            return
+        if checked:
+            line_widget.clear()
+            payload = {"value": "unknown", "value_num": None}
+        else:
+            text = line_widget.text().strip()
+            payload = {"value": text, "value_num": float(text) if text else None}
+        self.ctx.save_annotation(self.current_unit_id, label_id, payload)
+        self._update_gating()
+        self._update_completion()
+
+    def _on_date_unknown(
+        self,
+        label_id: str,
+        date_widget: QtWidgets.QDateEdit,
+        checkbox: QtWidgets.QCheckBox,
+    ) -> None:
+        checked = checkbox.isChecked()
+        date_widget.setEnabled(not checked)
+        if not self.current_unit_id:
+            return
+        if checked:
+            payload = {"value": "unknown", "value_date": None}
+        else:
+            payload = {"value": None, "value_date": date_widget.date().toString(QtCore.Qt.ISODate)}
         self.ctx.save_annotation(self.current_unit_id, label_id, payload)
         self._update_gating()
         self._update_completion()
