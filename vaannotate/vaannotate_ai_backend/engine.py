@@ -1109,9 +1109,10 @@ class EmbeddingStore:
                 continue
             if p.endswith(".npz"):
                 with np.load(p) as data:
-                    arr = data.get("embeddings") or data.get("arr_0")
-                    if arr is not None:
-                        return arr
+                    if "embeddings" in data:
+                        return data["embeddings"]
+                    if "arr_0" in data:
+                        return data["arr_0"]
                 continue
             return np.load(p, mmap_mode="r")
         raise FileNotFoundError("No cached embeddings found")
