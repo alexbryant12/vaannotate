@@ -1303,7 +1303,7 @@ class EmbeddingStore:
         os.replace(tmp, meta_p)
         # Save embeddings (np.save is atomic-ish via temp file on most FS; to be safe, write to tmp then replace)
         X_to_save = X.astype(np.float16)
-        emb_tmp = emb_p + ".tmp"
+        emb_tmp = emb_p + ".tmp.npz"
         np.savez_compressed(emb_tmp, embeddings=X_to_save)
         os.replace(emb_tmp, emb_p)
         if emb_legacy and os.path.exists(emb_legacy):
