@@ -732,6 +732,28 @@ def run_ai_backend_and_collect(
     )
     if scope_corpus_to_annotations:
         notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
+
+    def _exclude_reviewed(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+        if df.empty or not excluded_ids:
+            return df, 0
+        identifiers = df.apply(lambda row: _unit_identifier_from_row(row, level), axis=1)
+        mask = identifiers.isin(excluded_ids)
+        removed = int(mask.sum())
+        if not removed:
+            return df, 0
+        return df.loc[~mask].reset_index(drop=True), removed
+
+    notes_df, notes_removed = _exclude_reviewed(notes_df)
+    ann_df, ann_removed = _exclude_reviewed(ann_df)
+    if notes_removed or ann_removed:
+        log(
+            "Excluded "
+            f"{notes_removed} corpus rows and {ann_removed} annotations "
+            "matching previously reviewed units"
+        )
+    if notes_df.empty:
+        raise RuntimeError("No candidate units remain after excluding previously reviewed units.")
+
     ai_dir = Path(round_dir) / "imports" / "ai"
     ai_dir.mkdir(parents=True, exist_ok=True)
     log(f"Exported {len(notes_df)} corpus rows and {len(ann_df)} prior annotations")
