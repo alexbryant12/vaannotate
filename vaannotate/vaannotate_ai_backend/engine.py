@@ -251,6 +251,7 @@ class OrchestratorConfig:
     scjitter: SCJitterConfig = field(default_factory=SCJitterConfig)
     final_llm_labeling: bool = True
     final_llm_labeling_n_consistency: int = 1
+    excluded_unit_ids: set[str] = field(default_factory=set)
 
 
 # ------------------------------
@@ -648,6 +649,37 @@ class DataRepository:
 
     def labelset_for_round(self, round_identifier: str) -> Optional[str]:
         return self._round_labelset_map.get(str(round_identifier))
+
+    def exclude_units(self, unit_ids: set[str] | list[str]) -> int:
+        """Remove excluded units from notes/annotations and reset caches.
+
+        Returns the number of notes rows removed.
+        """
+        if not unit_ids:
+            return 0
+
+        excluded = {str(u) for u in unit_ids if str(u)}
+        if self.notes.empty or not excluded:
+            return 0
+
+        mask = ~self.notes["unit_id"].astype(str).isin(excluded)
+        removed_notes = int(len(self.notes) - mask.sum())
+        if removed_notes:
+            self.notes = self.notes.loc[mask].reset_index(drop=True)
+            self._notes_by_doc_cache = None
+
+        if not self.ann.empty and "unit_id" in self.ann.columns and excluded:
+            ann_mask = ~self.ann["unit_id"].astype(str).isin(excluded)
+            if int(len(self.ann) - ann_mask.sum()):
+                self.ann = self.ann.loc[ann_mask].reset_index(drop=True)
+
+        # Trim any stale unit->doc lookup entries for single_doc mode
+        if self._unit_doc_lookup:
+            for uid in list(self._unit_doc_lookup.keys()):
+                if uid in excluded:
+                    self._unit_doc_lookup.pop(uid, None)
+
+        return removed_notes
 
     def labelset_for_annotation(
         self,
@@ -4365,6 +4397,7 @@ class ActiveLearningLLMFirst:
         self.label_config_bundle = bundle
         self.label_config = bundle.current or {}
         self.legacy_label_configs = dict(bundle.legacy)
+        self.excluded_unit_ids = set(getattr(cfg, "excluded_unit_ids", []) or [])
 
         self.store = EmbeddingStore(self.models, cache_dir=self.paths.cache_dir, normalize=self.cfg.rag.normalize_embeddings)
         self.rag = RAGRetriever(
@@ -4883,13 +4916,20 @@ class ActiveLearningLLMFirst:
                 "selection_reason": "random_topoff",
             } for (u, l) in take]
         )
-    
+
         return pd.concat([sel, add], ignore_index=True)
 
-    
+
+    def _apply_excluded_units(self) -> int:
+        removed = self.repo.exclude_units(self.excluded_unit_ids)
+        if removed:
+            self.rag._notes_by_doc = self.repo.notes_by_doc()
+        return removed
+
+
     def run(self):
         import time, os, pandas as pd
-        
+
         t0 = time.time()
         
         run_id = time.strftime("%Y%m%d-%H%M%S")
@@ -4905,6 +4945,11 @@ class ActiveLearningLLMFirst:
         print("Indexing chunks ...")
         check_cancelled()
         self.store.build_chunk_index(self.repo.notes, self.cfg.rag, self.cfg.index)
+        removed = self._apply_excluded_units()
+        if removed:
+            print(f"Excluded {removed} previously reviewed units from candidate pool")
+        if self.repo.notes.empty:
+            raise RuntimeError("No candidate units remain after excluding previously reviewed units.")
         print("Building label prototypes ...")
         check_cancelled()
         self.pooler.build_prototypes()
