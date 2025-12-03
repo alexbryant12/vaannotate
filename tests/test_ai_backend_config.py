@@ -85,3 +85,20 @@ def test_llm_config_respects_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert cfg_azure.backend == "azure"
     assert cfg_azure.azure_endpoint == "https://example.azure.com"
     assert cfg_azure.azure_api_key == "key"
+
+
+def test_cross_encoder_default_max_length_applied() -> None:
+    reranker = type("_StubRerankerNoMax", (), {})()
+
+    ENGINE_MODULE._ensure_default_ce_max_length(reranker, default=777)
+
+    assert hasattr(reranker, "max_length")
+    assert reranker.max_length == 777
+
+
+def test_cross_encoder_existing_max_length_preserved() -> None:
+    reranker = type("_StubRerankerWithMax", (), {"max_length": 1024})()
+
+    ENGINE_MODULE._ensure_default_ce_max_length(reranker, default=777)
+
+    assert reranker.max_length == 1024

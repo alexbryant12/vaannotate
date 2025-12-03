@@ -4365,6 +4365,26 @@ def _detect_device():
         pass
     return "cpu"
 
+
+def _ensure_default_ce_max_length(reranker: CrossEncoder, *, default: int = 512) -> None:
+    """Ensure CrossEncoder inputs are truncated when max length is unspecified.
+
+    Some sentence-transformer cross encoders ship without a ``max_length`` defined
+    in their configuration. In those cases we fall back to a conservative value
+    of 512 tokens to avoid unbounded sequence growth.
+    """
+
+    try:
+        max_length = getattr(reranker, "max_length", None)
+    except Exception:
+        max_length = None
+
+    if max_length is None:
+        try:
+            reranker.max_length = int(default)
+        except Exception:
+            pass
+
 # ------------------------------
 
 class ActiveLearningLLMFirst:
@@ -4391,6 +4411,7 @@ class ActiveLearningLLMFirst:
         device = _detect_device()
         embedder = SentenceTransformer(embed_name, device=device)
         reranker = CrossEncoder(rerank_name, device=device)
+        _ensure_default_ce_max_length(reranker)
         emb_bs = int(os.getenv('EMB_BATCH', '32' if device == "cpu" else "64"))
         rr_bs = int(os.getenv('RERANK_BATCH', '16' if device == "cpu" else "64"))
         self.models = Models(embedder, reranker, device=device, emb_batch=emb_bs, rerank_batch=rr_bs)
