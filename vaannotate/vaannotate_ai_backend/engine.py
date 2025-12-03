@@ -2566,7 +2566,10 @@ class LLMAnnotator:
             answer = entry.get("answer")
             context = entry.get("context")
             if context is not None:
-                messages.append({"role": "user", "content": str(context)})
+                ctx_text = str(context)
+                if ctx_text.strip():
+                    ctx_text = f"EHR context:\n{ctx_text}"
+                messages.append({"role": "user", "content": ctx_text})
             if answer is not None:
                 messages.append({"role": "assistant", "content": str(answer)})
         return messages
@@ -2632,12 +2635,12 @@ class LLMAnnotator:
         # --- run n_consistency votes (each vote = fresh jitter if enabled) ---
         preds, runs = [], []
     
-        # Prebuild immutable "system" header (we add a tiny meta line per vote to avoid LLM-side cache collisions)
-        system_base = ("You are a meticulous clinical annotator for EHR data. "
-                       "Follow the label rules precisely. Return strict JSON only.")
+        # Prebuild immutable introduction (per-vote metadata added below to avoid cache collisions)
+        system_intro = "You are a meticulous clinical annotator for EHR data."
     
         for i in range(n_consistency):
             # ----- sample jitter for this vote -----
+            sc_meta = ""
             if jitter_params:
                 # top-K
                 kmin, kmax = rag_topk_range
@@ -2656,12 +2659,11 @@ class LLMAnnotator:
                 t = rng.uniform(float(t_lo), float(t_hi))
                 # meta string to perturb the prompt slightly (transparent to the schema)
                 sc_meta = f"<!-- sc:vote={i};k={k};drop={drop_p:.2f};shuf={int(shuffle_context)};temp={t:.2f} -->"
-                system = system_base + "\n" + sc_meta
                 ctx_text = _build_context_text(cand)
                 temperature_this_vote = t
             else:
                 # legacy behavior: use original ranked snippets (no jitter), fixed temperature
-                system = system_base
+                sc_meta = ""
                 ctx_text = _build_context_text(snippets)
                 temperature_this_vote = self.cfg.temperature
     
@@ -2678,33 +2680,37 @@ class LLMAnnotator:
             use_options = bool(opts) and lt_norm in categorical_types
             option_values = [str(opt) for opt in (opts or [])]
 
-            segments: list[str] = [
-                f"Label: '{label_id}' (type: {label_type}). Use the evidence snippets from this patient's notes.",
+            guideline_text = label_rules if label_rules else "(no additional guidelines)"
+            response_keys = "reasoning, prediction" if include_reasoning else "prediction"
+
+            system_segments: list[str] = [
+                system_intro,
+                f"Your task: label '{label_id}' (type: {label_type}). Use the evidence snippets from this patient's notes.",
+                f"Label rules:\n{guideline_text}",
             ]
             if use_options:
-                segments.append("Choose the single best option from the list below based on the evidence.")
-            else:
-                segments.append("If insufficient evidence, reply with 'unknown'.")
-            segments.append("")
-            guideline_text = label_rules if label_rules else "(no additional guidelines)"
-            segments.append(f"Guidelines:\n{guideline_text}")
-            if use_options:
-                segments.append("")
-                segments.append("Options:")
-                segments.extend(f"- {opt}" for opt in option_values)
-                segments.append("")
-                segments.append(
+                system_segments.append("Choose the single best option from the list below based on the evidence.")
+                system_segments.append("Options:")
+                system_segments.extend(f"- {opt}" for opt in option_values)
+                system_segments.append(
                     f"Set prediction to exactly one of: {', '.join(option_values)}. Do not invent new options."
                 )
-            segments.append("")
-            segments.append("Evidence snippets:")
-            segments.append(ctx_text)
+            else:
+                system_segments.append("If insufficient evidence, reply with 'unknown'.")
+
             if include_reasoning:
-                segments.append("Think step-by-step citing specific evidence, and keep the reasoning concise.")
-            segments.append("")
-            response_keys = "reasoning, prediction" if include_reasoning else "prediction"
-            segments.append(f"RESPONSE JSON keys: {response_keys}")
-            task = "\n".join(segments)
+                system_segments.append(
+                    "Think step-by-step citing specific evidence, and keep the reasoning concise."
+                )
+            system_segments.append(f"Return strict JSON only with keys: {response_keys}.")
+            system_segments.append("No additional keys or text.")
+
+            system_body = "\n\n".join(system_segments)
+            system = system_body + ("\n" + sc_meta if sc_meta else "")
+
+            user_content = f"EHR context:\n{ctx_text}" if ctx_text else "EHR context: (no snippets)"
+
+            task = user_content
             few_shot_messages = self._few_shot_messages(label_id)
             messages = [
                 {"role": "system", "content": system},
@@ -2778,7 +2784,7 @@ class LLMAnnotator:
                             "label_id": label_id,
                             "label_type": label_type,
                             "vote_idx": i,
-                            "prompt": {"system": system, "user": task},
+                            "prompt": {"system": system, "user": task, "few_shot": few_shot_messages},
                             "params": {
                                 "temperature": temperature_this_vote,
                                 "n_consistency": int(n_consistency),
