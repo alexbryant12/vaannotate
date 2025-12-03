@@ -219,7 +219,15 @@ class AzureOpenAIBackend(LLMBackend):
             "logprobs": bool(logprobs),
         }
         if response_format:
-            kwargs["response_format"] = response_format
+            # Azure currently rejects nested JSON schema fields ("response_format.json_schema")
+            # with a 400 error. We therefore strip the schema detail and rely on the
+            # model's default JSON mode behaviour instead.
+            if "json_schema" in response_format:
+                rf_clean = dict(response_format)
+                rf_clean.pop("json_schema", None)
+                kwargs["response_format"] = rf_clean
+            else:
+                kwargs["response_format"] = response_format
         if logprobs and top_logprobs:
             kwargs["top_logprobs"] = int(top_logprobs)
         t0 = time.time()
