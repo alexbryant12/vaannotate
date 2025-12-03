@@ -89,6 +89,33 @@ def _to_serializable(value: Any) -> Any:
     return str(value)
 
 
+def _normalize_messages(messages: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
+    """Return a normalised, backend-agnostic copy of chat messages.
+
+    Both backends expect the same canonical roles and string content.  This helper
+    mirrors the role/content coercion applied by the ExLlamaV2 chat template so
+    that Azure receives identical inputs and downstream logging sees consistent
+    prompts regardless of backend.
+    """
+
+    normalised: list[dict[str, str]] = []
+
+    def _role(role_name: str) -> str:
+        normalized = role_name.lower()
+        if normalized not in {"system", "user", "assistant", "tool"}:
+            return "user"
+        return normalized
+
+    for msg in messages:
+        role_val = _role(str(msg.get("role", "user")))
+        content_val = msg.get("content", "")
+        if content_val is None:
+            content_val = ""
+        normalised.append({"role": role_val, "content": str(content_val)})
+
+    return normalised
+
+
 def _reasoning_first(obj: Mapping[str, Any] | Any) -> Mapping[str, Any] | Any:
     """Return a shallow copy with the reasoning key (if present) first."""
 
@@ -220,8 +247,13 @@ class AzureOpenAIBackend(LLMBackend):
         }
         if response_format:
             kwargs["response_format"] = response_format
+        else:
+            # Force Azure JSON mode so the service validates structure and
+            # populates the parsed field when available.
+            kwargs["response_format"] = {"type": "json_object"}
         if logprobs and top_logprobs:
             kwargs["top_logprobs"] = int(top_logprobs)
+        kwargs["messages"] = _normalize_messages(messages)
         t0 = time.time()
         resp = self.client.chat.completions.create(**kwargs)
         latency = time.time() - t0
@@ -283,7 +315,12 @@ class AzureOpenAIBackend(LLMBackend):
             logprobs=True,
             top_logprobs=int(top_logprobs),
             max_tokens=1,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            messages=_normalize_messages(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+            ),
         )
         t0 = time.time()
         resp = self.client.chat.completions.create(**kwargs)
@@ -398,15 +435,9 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
     def _format_messages(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Render messages using the Meta Llama 3.x chat template."""
 
-        def _role(role_name: str) -> str:
-            normalized = role_name.lower()
-            if normalized not in {"system", "user", "assistant", "tool"}:
-                return "user"
-            return normalized
-
         parts: List[str] = ["<|begin_of_text|>"]
-        for msg in messages:
-            role = _role(msg.get("role", "user"))
+        for msg in _normalize_messages(messages):
+            role = msg.get("role", "user")
             content = msg.get("content", "")
             parts.append(
                 f"<|start_header_id|>{role}<|end_header_id|>\n{content.strip()}<|eot_id|>"
