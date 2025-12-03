@@ -157,6 +157,8 @@ class LLMConfig:
     local_max_new_tokens: Optional[int] = field(
         default_factory=lambda: _env_int("LOCAL_LLM_MAX_NEW_TOKENS")
     )
+    # Context ordering for snippets
+    context_order: str = "relevance"  # relevance | chronological
     
 @dataclass
 class SelectionConfig:
