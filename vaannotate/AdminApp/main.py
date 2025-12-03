@@ -2313,10 +2313,10 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             for label in new_labels
             if label.get("few_shot_examples")
         }
-        self._refresh_label_list()
+        self._refresh_label_list(preserve_resources=False)
         if self.labels:
             self.label_list.setCurrentRow(0)
-        self._refresh_label_resources()
+        self._refresh_label_resources(preserve_existing=False)
         notes_text = str(payload.get("notes") or "").strip()
         self.notes_edit.setPlainText(notes_text)
         creator_text = str(payload.get("created_by") or "").strip()
@@ -2326,23 +2326,23 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         if base_labelset_id:
             self.id_edit.setPlaceholderText(f"{base_labelset_id}_copy")
 
-    def _refresh_label_list(self) -> None:
+    def _refresh_label_list(self, preserve_resources: bool = True) -> None:
         self.label_list.clear()
         for label in self.labels:
             summary = f"{label['name']} ({label['type']})"
             item = QtWidgets.QListWidgetItem(summary)
             self.label_list.addItem(item)
-        self._refresh_label_resources()
+        self._refresh_label_resources(preserve_existing=preserve_resources)
 
-    def _refresh_label_resources(self) -> None:
+    def _refresh_label_resources(self, preserve_existing: bool = True) -> None:
         existing_keywords = (
             self._keyword_editor.to_mapping()
-            if isinstance(self._keyword_editor, LabelKeywordsEditor)
+            if preserve_existing and isinstance(self._keyword_editor, LabelKeywordsEditor)
             else self.label_keywords
         )
         existing_examples = (
             self._few_shot_editor.to_mapping()
-            if isinstance(self._few_shot_editor, LabelFewShotExamplesEditor)
+            if preserve_existing and isinstance(self._few_shot_editor, LabelFewShotExamplesEditor)
             else self.label_few_shot
         )
         label_ids = {str(label.get("label_id") or "") for label in self.labels if label.get("label_id")}
