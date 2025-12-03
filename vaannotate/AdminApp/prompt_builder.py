@@ -81,6 +81,8 @@ class PromptBuilderConfig:
             llm_cfg["embedding_model_dir"] = self.embedding_model_dir
         if self.reranker_model_dir:
             llm_cfg["reranker_model_dir"] = self.reranker_model_dir
+        if self.context_order:
+            llm_cfg["context_order"] = self.context_order
 
         rag_cfg: Dict[str, object] = {
             "chunk_size": self.rag_chunk_size,
@@ -94,15 +96,11 @@ class PromptBuilderConfig:
             "system_prompt": self.system_prompt,
         }
 
-        llmfirst_cfg: Dict[str, object] = {}
-        if self.context_order:
-            llmfirst_cfg["context_order"] = self.context_order
-
         return {
             "llm": llm_cfg,
             "rag": rag_cfg,
             "prompt_builder": prompt_cfg,
-            "llmfirst": llmfirst_cfg,
+            "llmfirst": {},
         }
 
 

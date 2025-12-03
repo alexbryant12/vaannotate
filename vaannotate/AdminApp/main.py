@@ -5176,15 +5176,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if not isinstance(mode_value, str) or not mode_value:
                 mode_value = "rag"
             llmfirst_overrides["single_doc_context"] = mode_value
-        if isinstance(getattr(self, "ai_context_order_combo", None), QtWidgets.QComboBox):
-            order_value = self.ai_context_order_combo.currentData()
-            if isinstance(order_value, str) and order_value:
-                llmfirst_overrides["context_order"] = order_value
         if llmfirst_overrides:
             overrides["llmfirst"] = llmfirst_overrides
         llm_overrides: Dict[str, Any] = {}
         if isinstance(overrides.get("llm"), Mapping):
             llm_overrides.update(overrides.get("llm", {}))
+        if isinstance(getattr(self, "ai_context_order_combo", None), QtWidgets.QComboBox):
+            order_value = self.ai_context_order_combo.currentData()
+            if isinstance(order_value, str) and order_value:
+                llm_overrides["context_order"] = order_value
         backend_choice = self._current_ai_backend()
         if backend_choice:
             llm_overrides["backend"] = backend_choice
