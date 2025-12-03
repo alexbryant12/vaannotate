@@ -22,6 +22,7 @@ from .shared.metadata import (
     MetadataField,
     discover_corpus_metadata,
     extract_document_metadata,
+    normalize_date_value,
 )
 from .shared.sampling import SamplingFilters, candidate_documents
 from .utils import (
@@ -37,6 +38,9 @@ def _date_sort_value(value: object) -> tuple:
     if value is None:
         return ("", "")
     text = str(value)
+    normalized = normalize_date_value(text)
+    if normalized:
+        return (normalized, text)
     return (text, text)
 
 

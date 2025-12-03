@@ -47,6 +47,9 @@ def _date_sort_value(value: object) -> tuple:
     if value is None:
         return ("", "")
     text = str(value)
+    normalized = normalize_date_value(text)
+    if normalized:
+        return (normalized, text)
     return (text, text)
 
 
