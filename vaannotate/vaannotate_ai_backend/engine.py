@@ -2327,25 +2327,43 @@ class RAGRetriever:
         mmr_query_embs: list[np.ndarray] = []
 
         query_texts: list[str] = []
-        query_embs: list[np.ndarray] = []
+        query_embs: list[np.ndarray | None] = []
+        query_sources: list[str] = []
 
+        # Build prioritized query list: manual override > exemplars > label rules
         if manual_query:
-            query_texts = [manual_query]
-            query_embs = list(self.store._embed(query_texts))
-            query_source = "manual"
-        elif exemplar_texts:
-            query_texts = [t for t in exemplar_texts if isinstance(t, str) and t.strip()]
-            if query_texts:
-                if cached_exemplar_embs is not None and getattr(cached_exemplar_embs, "ndim", 1) == 2:
-                    query_embs = [cached_exemplar_embs[i] for i in range(min(len(query_texts), cached_exemplar_embs.shape[0]))]
+            query_texts.append(manual_query)
+            query_embs.append(None)
+            query_sources.append("manual")
+
+        valid_exemplars = [t for t in exemplar_texts if isinstance(t, str) and t.strip()]
+        if valid_exemplars:
+            query_texts.extend(valid_exemplars)
+            query_sources.extend(["exemplar"] * len(valid_exemplars))
+            if cached_exemplar_embs is not None and getattr(cached_exemplar_embs, "ndim", 1) == 2:
+                query_embs.extend(
+                    [cached_exemplar_embs[i] for i in range(min(len(valid_exemplars), cached_exemplar_embs.shape[0]))]
+                )
                 if len(query_embs) < len(query_texts):
-                    query_embs = list(self.store._embed(query_texts))
-            query_source = "exemplar" if query_texts else "rules"
-        else:
+                    # pad for later embedding
+                    query_embs.extend([None] * (len(query_texts) - len(query_embs)))
+            else:
+                query_embs.extend([None] * len(valid_exemplars))
+
+        if not query_texts:
             fallback_rules = (label_rules or "").strip()
             query_texts = [fallback_rules]
-            query_embs = list(self.store._embed(query_texts))
-            query_source = "rules"
+            query_embs = [None]
+            query_sources = ["rules"]
+
+        # Fill any missing embeddings
+        missing_idxs = [i for i, emb in enumerate(query_embs) if emb is None]
+        if missing_idxs:
+            missing_embs = list(self.store._embed([query_texts[i] for i in missing_idxs]))
+            for idx, emb in zip(missing_idxs, missing_embs):
+                query_embs[idx] = emb
+
+        query_source = query_sources[0] if query_sources else "rules"
 
         diagnostics.update(
             {
@@ -2354,15 +2372,14 @@ class RAGRetriever:
                 "queries": query_texts,
                 "exemplar_queries": exemplar_texts,
                 "query_source": query_source,
+                "query_sources": query_sources,
             }
         )
 
-        for q_text, q_emb in zip(query_texts, query_embs):
+        for q_text, q_emb, q_src in zip(query_texts, query_embs, query_sources):
             hits = _patient_local_rank(str(unit_id), q_emb, need=mmr_select_k * 2)
             for it in hits:
-                it["source"] = "patient_manual" if manual_query else (
-                    "patient_exemplar" if exemplar_texts else "patient_rule"
-                )
+                it["source"] = f"patient_{q_src}"
             semantic_runs.append(hits)
             mmr_query_embs.append(q_emb)
 
