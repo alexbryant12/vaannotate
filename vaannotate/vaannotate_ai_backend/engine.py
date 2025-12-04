@@ -2469,6 +2469,55 @@ class LLMAnnotator:
         return re.sub(r"\s+", " ", s).strip()
 
     @staticmethod
+    def _is_yes(value: Any) -> bool:
+        if isinstance(value, bool):
+            return bool(value)
+        if value is None:
+            return False
+        s = _canon_str(value).lower()
+        return s in {"yes", "y", "true", "1", "present", "selected", "include"}
+
+    @staticmethod
+    def _canon_multi_selection(prediction: Any, option_values: list[str]) -> str | None:
+        """Return a canonical, comma-joined string of selected options from a multi-choice prediction.
+
+        Accepts several shapes (object of option->Yes/No, list/tuple/set of options, or string with delimiters)
+        and only keeps options that match the configured option list. Missing/falsey options are treated as not
+        selected. Returns ``None`` when no option is affirmed.
+        """
+
+        opts = [str(o) for o in (option_values or [])]
+        # map canonical lowercase -> original option token to preserve casing/order
+        option_lookup = { _canon_str(o).lower(): o for o in opts }
+        selected: list[str] = []
+
+        def _add_if_selected(key: Any, val: Any = True) -> None:
+            canon_key = _canon_str(key).lower()
+            opt_value = option_lookup.get(canon_key)
+            if not opt_value:
+                return
+            if not LLMAnnotator._is_yes(val):
+                return
+            if opt_value not in selected:
+                selected.append(opt_value)
+
+        if isinstance(prediction, Mapping):
+            for k, v in prediction.items():
+                _add_if_selected(k, v)
+        elif isinstance(prediction, (list, tuple, set)):
+            for item in prediction:
+                _add_if_selected(item)
+        elif isinstance(prediction, str):
+            parts = re.split(r"[,;\n]\s*", prediction)
+            for p in parts:
+                if p:
+                    _add_if_selected(p)
+        else:
+            _add_if_selected(prediction)
+
+        return ",".join(selected) if selected else None
+
+    @staticmethod
     def _parse_float(value):
         try:
             if value is None:
@@ -2718,10 +2767,13 @@ class LLMAnnotator:
                 "boolean",
                 "categorical",
                 "categorical_single",
+                "categorical_multi",
                 "ordinal",
             }
             use_options = bool(opts) and lt_norm in categorical_types
             option_values = [str(opt) for opt in (opts or [])]
+            is_multi_select = lt_norm == "categorical_multi"
+            unknown_option_configured = any(_canon_str(o).lower() == "unknown" for o in option_values)
 
             guideline_text = label_rules if label_rules else "(no additional guidelines)"
             response_keys = "reasoning, prediction" if include_reasoning else "prediction"
@@ -2732,12 +2784,21 @@ class LLMAnnotator:
                 f"Label rules:\n{guideline_text}",
             ]
             if use_options:
-                system_segments.append("Choose the single best option from the list below based on the evidence.")
-                system_segments.append("Options:")
-                system_segments.extend(f"- {opt}" for opt in option_values)
-                system_segments.append(
-                    f"Set prediction to exactly one of: {', '.join(option_values)}. Do not invent new options."
-                )
+                if is_multi_select:
+                    system_segments.append("Select every option that is supported by the evidence from the list below.")
+                    system_segments.append("Options:")
+                    system_segments.extend(f"- {opt}" for opt in option_values)
+                    deny_unknown = " Do NOT answer 'unknown' unless it appears in the options above." if not unknown_option_configured else ""
+                    system_segments.append(
+                        "Return a compact JSON object where each included option key is set to 'Yes' if it applies (omit or set to 'No' when it does not)." + deny_unknown
+                    )
+                else:
+                    system_segments.append("Choose the single best option from the list below based on the evidence.")
+                    system_segments.append("Options:")
+                    system_segments.extend(f"- {opt}" for opt in option_values)
+                    system_segments.append(
+                        f"Set prediction to exactly one of: {', '.join(option_values)}. Do not invent new options."
+                    )
             else:
                 system_segments.append("If insufficient evidence, reply with 'unknown'.")
 
@@ -2761,12 +2822,19 @@ class LLMAnnotator:
                 {"role": "user", "content": task},
             ]
 
+            multi_prediction_schema = {
+                "oneOf": [
+                    {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "null"]}},
+                    {"type": "array", "items": {"type": ["string", "number", "boolean", "null"]}},
+                    {"type": ["string", "number", "boolean", "null"]},
+                ]
+            }
             if include_reasoning:
                 response_schema = {
                     "type": "object",
                     "properties": {
                         "reasoning": {"type": ["string", "null"]},
-                        "prediction": {"type": ["string", "number", "boolean", "null"]},
+                        "prediction": multi_prediction_schema if is_multi_select else {"type": ["string", "number", "boolean", "null"]},
                     },
                     "required": ["reasoning", "prediction"],
                     "additionalProperties": False,
@@ -2775,7 +2843,7 @@ class LLMAnnotator:
                 response_schema = {
                     "type": "object",
                     "properties": {
-                        "prediction": {"type": ["string", "number", "boolean", "null"]},
+                        "prediction": multi_prediction_schema if is_multi_select else {"type": ["string", "number", "boolean", "null"]},
                     },
                     "required": ["prediction"],
                     "additionalProperties": False,
@@ -2806,6 +2874,10 @@ class LLMAnnotator:
                         data_map.pop("reasoning", None)
 
                     pred = data_map.get(self.cfg.prediction_field, data_map.get("prediction"))
+                    if is_multi_select and use_options:
+                        pred_canon = self._canon_multi_selection(pred, option_values)
+                        data_map["canonical_prediction"] = pred_canon
+                        pred = pred_canon
 
                     preds.append(str(pred) if pred is not None else None)
 
