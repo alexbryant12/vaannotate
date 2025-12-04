@@ -2332,6 +2332,7 @@ class RAGRetriever:
         if manual_query:
             query_texts = [manual_query]
             query_embs = list(self.store._embed(query_texts))
+            query_source = "manual"
         elif exemplar_texts:
             query_texts = [t for t in exemplar_texts if isinstance(t, str) and t.strip()]
             if query_texts:
@@ -2339,10 +2340,12 @@ class RAGRetriever:
                     query_embs = [cached_exemplar_embs[i] for i in range(min(len(query_texts), cached_exemplar_embs.shape[0]))]
                 if len(query_embs) < len(query_texts):
                     query_embs = list(self.store._embed(query_texts))
+            query_source = "exemplar" if query_texts else "rules"
         else:
             fallback_rules = (label_rules or "").strip()
             query_texts = [fallback_rules]
             query_embs = list(self.store._embed(query_texts))
+            query_source = "rules"
 
         diagnostics.update(
             {
@@ -2350,6 +2353,7 @@ class RAGRetriever:
                 "manual_query": manual_query,
                 "queries": query_texts,
                 "exemplar_queries": exemplar_texts,
+                "query_source": query_source,
             }
         )
 
