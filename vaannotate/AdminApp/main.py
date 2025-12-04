@@ -3736,7 +3736,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         return base_cfg
 
     def _apply_ai_config_to_controls(self, config: Mapping[str, Any]) -> None:
-        select_cfg = config.get("select", {}) if isinstance(config.get("select"), Mapping) else {}
+        effective_cfg = (
+            config.get("config_overrides")
+            if isinstance(config.get("config_overrides"), Mapping)
+            else config
+        )
+        select_cfg = (
+            effective_cfg.get("select", {})
+            if isinstance(effective_cfg.get("select"), Mapping)
+            else {}
+        )
         batch_size = select_cfg.get("batch_size")
         if hasattr(self, "total_n_spin") and isinstance(batch_size, (int, float)):
             try:
@@ -3753,17 +3762,21 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             value = select_cfg.get(key)
             if isinstance(widget, QtWidgets.QDoubleSpinBox) and isinstance(value, (int, float)):
                 widget.setValue(float(value))
-        llm_cfg = config.get("llm", {}) if isinstance(config.get("llm"), Mapping) else {}
+        llm_cfg = (
+            effective_cfg.get("llm", {})
+            if isinstance(effective_cfg.get("llm"), Mapping)
+            else {}
+        )
         backend_choice = llm_cfg.get("backend")
         if backend_choice and hasattr(self, "ai_backend_combo"):
             idx = self.ai_backend_combo.findData(str(backend_choice))
             if idx >= 0:
                 self.ai_backend_combo.setCurrentIndex(idx)
                 self._update_ai_backend_fields()
-        embed_path = config.get("embedding_model_dir")
+        embed_path = effective_cfg.get("embedding_model_dir")
         if hasattr(self, "ai_embedding_path_edit") and isinstance(embed_path, str):
             self.ai_embedding_path_edit.setText(embed_path)
-        reranker_path = config.get("reranker_model_dir")
+        reranker_path = effective_cfg.get("reranker_model_dir")
         if hasattr(self, "ai_reranker_path_edit") and isinstance(reranker_path, str):
             self.ai_reranker_path_edit.setText(reranker_path)
         include_reasoning = llm_cfg.get("include_reasoning")
@@ -3790,9 +3803,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     self.ai_local_max_new_tokens_spin.setValue(int(llm_cfg.get("local_max_new_tokens")))
                 except Exception:  # noqa: BLE001
                     pass
-        if hasattr(self, "ai_final_llm_checkbox") and "final_llm_labeling" in config:
+        if hasattr(self, "ai_final_llm_checkbox") and "final_llm_labeling" in effective_cfg:
             try:
-                self.ai_final_llm_checkbox.setChecked(bool(config.get("final_llm_labeling")))
+                self.ai_final_llm_checkbox.setChecked(
+                    bool(effective_cfg.get("final_llm_labeling"))
+                )
             except Exception:  # noqa: BLE001
                 pass
         if (
@@ -3800,7 +3815,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             and isinstance(getattr(self, "ai_single_doc_context_combo", None), QtWidgets.QComboBox)
         ):
             value = None
-            llmfirst_cfg = config.get("llmfirst", {}) if isinstance(config.get("llmfirst"), Mapping) else {}
+            llmfirst_cfg = (
+                effective_cfg.get("llmfirst", {})
+                if isinstance(effective_cfg.get("llmfirst"), Mapping)
+                else {}
+            )
             if llmfirst_cfg:
                 value = llmfirst_cfg.get("single_doc_context")
             if value:
@@ -4684,8 +4703,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     pass
         ai_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         if isinstance(ai_cfg, Mapping):
-            self._ai_engine_overrides = copy.deepcopy(ai_cfg)
-            llm_cfg_source = ai_cfg.get("llm") if isinstance(ai_cfg.get("llm"), Mapping) else {}
+            config_overrides = ai_cfg.get("config_overrides")
+            overrides_payload = (
+                config_overrides if isinstance(config_overrides, Mapping) else ai_cfg
+            )
+            self._ai_engine_overrides = copy.deepcopy(overrides_payload)
+            llm_cfg_source = (
+                overrides_payload.get("llm")
+                if isinstance(overrides_payload.get("llm"), Mapping)
+                else {}
+            )
             llm_overrides: dict[str, object] = {}
             if isinstance(self._ai_engine_overrides.get("llm"), Mapping):
                 llm_overrides.update(self._ai_engine_overrides["llm"])
