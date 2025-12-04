@@ -2360,6 +2360,7 @@ class RAGRetriever:
                 query_embs[idx] = emb
 
         query_source = query_sources[0] if query_sources else "rules"
+        rerank_query_texts = list(query_texts)
 
         diagnostics.update(
             {
@@ -2369,6 +2370,7 @@ class RAGRetriever:
                 "exemplar_queries": exemplar_texts,
                 "query_source": query_source,
                 "query_sources": query_sources,
+                "rerank_queries": rerank_query_texts,
             }
         )
 
@@ -2480,7 +2482,7 @@ class RAGRetriever:
         # CE fallback if mapping failed
         if not cand_idxs:
             texts = [it["text"] for it in pool]
-            rr = _cross_scores_for_queries(query_texts, texts)
+            rr = _cross_scores_for_queries(rerank_query_texts, texts)
             for it, s in zip(pool, rr):
                 it["score"] = float(s)
             pool.sort(key=lambda d: d["score"], reverse=True)
@@ -2498,7 +2500,7 @@ class RAGRetriever:
     
         # CE last, CE-only score
         texts = [it["text"] for it in pre]
-        rr = _cross_scores_for_queries(query_texts, texts)
+        rr = _cross_scores_for_queries(rerank_query_texts, texts)
         for it, s in zip(pre, rr):
             it["score"] = float(s)
     
@@ -2519,7 +2521,7 @@ class RAGRetriever:
             picked = set((o["doc_id"], int(o["chunk_id"])) for o in out)
             rest = [it for it in pool if (it["doc_id"], int(it["chunk_id"])) not in picked]
             if rest:
-                rr2 = _cross_scores_for_queries(query_texts, [it["text"] for it in rest])
+                rr2 = _cross_scores_for_queries(rerank_query_texts, [it["text"] for it in rest])
                 for it, s in zip(rest, rr2):
                     it["score"] = float(s)
                 rest.sort(key=lambda d: d["score"], reverse=True)
