@@ -2,6 +2,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable, Optional, Dict, Any, Tuple
+from dataclasses import replace
 import contextlib
 import io
 import logging
@@ -51,6 +52,42 @@ def _apply_overrides(target: object, overrides: Mapping[str, Any]) -> None:
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _apply_label_queries(
+    bundle: LabelConfigBundle, label_queries: Mapping[str, str] | None
+) -> LabelConfigBundle:
+    """Return a bundle whose current config includes manual label queries.
+
+    The AI backend accepts manual query strings via ``rag.label_queries`` in the
+    configuration overrides, but the retriever consumes them from the
+    materialised label configuration. This helper mirrors the RoundBuilder logic
+    to merge queries into the current label config before instantiating the
+    engine.
+    """
+
+    if not label_queries:
+        return bundle
+
+    parsed: Dict[str, str] = {}
+    for label_id, query in label_queries.items():
+        if isinstance(query, str) and query.strip():
+            parsed[str(label_id)] = query.strip()
+
+    if not parsed:
+        return bundle
+
+    current_config = dict(bundle.current or {})
+    for label_id, query in parsed.items():
+        entry = current_config.get(label_id)
+        entry_payload = dict(entry) if isinstance(entry, Mapping) else {}
+        entry_payload["search_query"] = query
+        current_config[label_id] = entry_payload
+
+    return replace(
+        bundle,
+        current=current_config,
+    )
 
 class _CallbackTee(io.TextIOBase):
     """Write to the original stream and emit complete lines to a callback."""
@@ -220,10 +257,17 @@ def build_next_batch(
     cfg = engine.OrchestratorConfig()
     overrides = dict(cfg_overrides or {})
     phenotype_level = overrides.pop("phenotype_level", None)
+    rag_overrides = overrides.get("rag") if isinstance(overrides.get("rag"), Mapping) else {}
+    label_queries_override = None
+    if isinstance(rag_overrides, Mapping):
+        candidate = rag_overrides.get("label_queries")
+        if isinstance(candidate, Mapping):
+            label_queries_override = candidate
     if overrides:
         _apply_overrides(cfg, overrides)
 
     bundle = (label_config_bundle or EMPTY_BUNDLE).with_current_fallback(label_config)
+    bundle = _apply_label_queries(bundle, label_queries_override)
 
     with _capture_logs(log_callback):
         with engine.cancellation_scope(cancel_callback):
