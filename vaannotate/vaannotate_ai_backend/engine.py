@@ -1963,10 +1963,9 @@ class RAGRetriever:
         return scores
 
     def _build_query(self, label_id: str, label_rules: Optional[str]) -> str:
-        base = f"Evidence relevant to patient-level label '{label_id}'. "
-        if label_rules and isinstance(label_rules,str) and label_rules.strip():
-            base += "Guidelines: " + re.sub(r"\s+"," ",label_rules.strip()) + " "
-        return base.strip()
+        if label_rules and isinstance(label_rules, str):
+            return label_rules.strip()
+        return ""
 
     def _tokenize(self, text: str) -> List[str]:
         if not text:
@@ -2314,7 +2313,7 @@ class RAGRetriever:
         ) or []
         if opts:
             K_use = max(K_use, len(opts))
-        Q = self._get_label_query_embs(label_id, label_rules, K=K_use)
+        cached_exemplar_embs = self._get_label_query_embs(label_id, label_rules, K=K_use)
         exemplar_texts = self._get_label_query_texts(label_id, label_rules, K=K_use) or []
 
         lblcfg = self.label_configs.get(label_id, {}) if isinstance(self.label_configs, dict) else {}
@@ -2327,46 +2326,41 @@ class RAGRetriever:
         semantic_runs: list[list[dict]] = []
         mmr_query_embs: list[np.ndarray] = []
 
+        query_texts: list[str] = []
+        query_embs: list[np.ndarray] = []
+
         if manual_query:
-            rule_query = manual_query
-            rerank_query = manual_query
+            query_texts = [manual_query]
+            query_embs = list(self.store._embed(query_texts))
+        elif exemplar_texts:
+            query_texts = [t for t in exemplar_texts if isinstance(t, str) and t.strip()]
+            if query_texts:
+                if cached_exemplar_embs is not None and getattr(cached_exemplar_embs, "ndim", 1) == 2:
+                    query_embs = [cached_exemplar_embs[i] for i in range(min(len(query_texts), cached_exemplar_embs.shape[0]))]
+                if len(query_embs) < len(query_texts):
+                    query_embs = list(self.store._embed(query_texts))
         else:
-            exemplar_query = " ".join(exemplar_texts).strip()
-            if exemplar_query:
-                parts = [exemplar_query]
-                rules_text = (label_rules or "").strip()
-                if rules_text:
-                    parts.append("Guidelines: " + re.sub(r"\s+", " ", rules_text))
-                rule_query = " ".join(parts)
-            else:
-                rule_query = self._build_query(label_id, label_rules)
-            rerank_query = self._build_query(label_id, self._rerank_rules_text(label_id, label_rules))
+            fallback_rules = (label_rules or "").strip()
+            query_texts = [fallback_rules]
+            query_embs = list(self.store._embed(query_texts))
 
         diagnostics.update(
             {
                 "stage": "queries",
                 "manual_query": manual_query,
-                "rule_query": rule_query,
-                "rerank_query": rerank_query,
+                "queries": query_texts,
                 "exemplar_queries": exemplar_texts,
             }
         )
 
-        rule_emb = self.store._embed([rule_query])[0]
-        mmr_query_embs.append(rule_emb)
-
-        rule_hits = _patient_local_rank(str(unit_id), rule_emb, need=mmr_select_k * 2)
-        for it in rule_hits:
-            it["source"] = "patient_rule"
-        semantic_runs.append(rule_hits)
-
-        if manual_query is None and Q is not None and getattr(Q, "ndim", 1) == 2 and Q.shape[0] > 0:
-            for i in range(Q.shape[0]):
-                ex_hits = _patient_local_rank(str(unit_id), Q[i], need=mmr_select_k * 2)
-                for it in ex_hits:
-                    it["source"] = "patient_exemplar"
-                semantic_runs.append(ex_hits)
-                mmr_query_embs.append(Q[i])
+        for q_text, q_emb in zip(query_texts, query_embs):
+            hits = _patient_local_rank(str(unit_id), q_emb, need=mmr_select_k * 2)
+            for it in hits:
+                it["source"] = "patient_manual" if manual_query else (
+                    "patient_exemplar" if exemplar_texts else "patient_rule"
+                )
+            semantic_runs.append(hits)
+            mmr_query_embs.append(q_emb)
 
         all_semantic_hits = [hit for run in semantic_runs for hit in run]
         diagnostics["semantic_search"] = {
@@ -2380,8 +2374,8 @@ class RAGRetriever:
         else:
             items = self._reciprocal_rank_fusion(semantic_runs)
 
-        q_emb = np.mean(np.vstack(mmr_query_embs), axis=0) if mmr_query_embs else rule_emb
-        query = rerank_query
+        q_emb = np.mean(np.vstack(mmr_query_embs), axis=0) if mmr_query_embs else None
+        query = query_texts[0] if query_texts else ""
 
         #  + (optional) keywords
         bm25_hits: List[dict] = []
@@ -2456,10 +2450,20 @@ class RAGRetriever:
             Counter(str(it.get("source")) for it in pool)
         )
 
+        if q_emb is None:
+            embed_text = query if query_texts else ""
+            q_emb = self.store._embed([embed_text])[0]
+
+        def _cross_scores_for_queries(q_texts: list[str], cand_texts: list[str]) -> list[float]:
+            if not q_texts:
+                return [float(s) for s in self._cross_scores_cached(query, cand_texts)]
+            per_query = [self._cross_scores_cached(qt, cand_texts) for qt in q_texts]
+            return list(np.max(np.vstack(per_query), axis=0)) if per_query else [0.0] * len(cand_texts)
+
         # CE fallback if mapping failed
         if not cand_idxs:
             texts = [it["text"] for it in pool]
-            rr = self._cross_scores_cached(query, texts)
+            rr = _cross_scores_for_queries(query_texts, texts)
             for it, s in zip(pool, rr):
                 it["score"] = float(s)
             pool.sort(key=lambda d: d["score"], reverse=True)
@@ -2477,7 +2481,7 @@ class RAGRetriever:
     
         # CE last, CE-only score
         texts = [it["text"] for it in pre]
-        rr = self._cross_scores_cached(query, texts)
+        rr = _cross_scores_for_queries(query_texts, texts)
         for it, s in zip(pre, rr):
             it["score"] = float(s)
     
@@ -2498,7 +2502,7 @@ class RAGRetriever:
             picked = set((o["doc_id"], int(o["chunk_id"])) for o in out)
             rest = [it for it in pool if (it["doc_id"], int(it["chunk_id"])) not in picked]
             if rest:
-                rr2 = self._cross_scores_cached(query, [it["text"] for it in rest])
+                rr2 = _cross_scores_for_queries(query_texts, [it["text"] for it in rest])
                 for it, s in zip(rest, rr2):
                     it["score"] = float(s)
                 rest.sort(key=lambda d: d["score"], reverse=True)
