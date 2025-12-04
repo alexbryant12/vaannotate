@@ -4509,12 +4509,12 @@ class ActiveLearningLLMFirst:
 
         if not self.llm or not isinstance(rules_map, Mapping):
             return {}
-        threshold_default = 1200  # ~512-token budget
+        threshold_default = 150  # ~512-token budget
         try:
             threshold = int(os.getenv("RERANK_RULE_PARAPHRASE_CHARS", str(threshold_default)))
         except Exception:
             threshold = threshold_default
-        threshold = max(200, threshold)
+        threshold = max(150, threshold)
 
         overrides: dict[str, str] = {}
         for label_id, raw_text in rules_map.items():
