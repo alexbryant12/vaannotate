@@ -4704,10 +4704,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         ai_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         if isinstance(ai_cfg, Mapping):
             config_overrides = ai_cfg.get("config_overrides")
-            overrides_payload = (
-                config_overrides if isinstance(config_overrides, Mapping) else ai_cfg
-            )
-            self._ai_engine_overrides = copy.deepcopy(overrides_payload)
+            overrides_payload = copy.deepcopy(ai_cfg)
+            if isinstance(config_overrides, Mapping):
+                overrides_payload = _deep_update_dict(
+                    overrides_payload, config_overrides
+                )
+                overrides_payload.pop("config_overrides", None)
+            self._ai_engine_overrides = overrides_payload
             llm_cfg_source = (
                 overrides_payload.get("llm")
                 if isinstance(overrides_payload.get("llm"), Mapping)
