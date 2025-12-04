@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
+from vaannotate.rounds import RoundBuilder
 from vaannotate.project import (
     add_labelset,
     add_phenotype,
@@ -226,3 +227,20 @@ def test_label_keywords_and_examples_round_trip(tmp_path: Path) -> None:
     assert entry.get("few_shot_examples") == [
         {"context": "example context", "answer": "answer text"}
     ]
+
+
+def test_apply_label_queries_and_extract(tmp_path: Path) -> None:
+    base_config = {"lab1": {"label_id": "lab1", "name": "Query label"}}
+    merged = RoundBuilder._apply_label_queries(base_config, {"lab1": "custom query text"})
+    assert merged["lab1"]["search_query"] == "custom query text"
+
+    config_override = {
+        "rag": {
+            "label_queries": {
+                "lab1": "override query",
+                "lab2": " second ",
+            }
+        }
+    }
+    extracted = RoundBuilder._extract_label_queries(config_override)
+    assert extracted == {"lab1": "override query", "lab2": "second"}

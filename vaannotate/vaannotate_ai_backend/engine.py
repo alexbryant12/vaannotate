@@ -2256,20 +2256,43 @@ class RAGRetriever:
         if opts:
             K_use = max(K_use, len(opts))
         Q = self._get_label_query_embs(label_id, label_rules, K=K_use)
+        exemplar_texts = self._get_label_query_texts(label_id, label_rules, K=K_use) or []
         mmr_select_k = final_k * mmr_mult
 
-        rule_query = self._build_query(label_id, label_rules)
-        rerank_query = self._build_query(label_id, self._rerank_rules_text(label_id, label_rules))
-        rule_emb = self.store._embed([rule_query])[0]
-        mmr_query_embs: list[np.ndarray] = [rule_emb]
+        lblcfg = self.label_configs.get(label_id, {}) if isinstance(self.label_configs, dict) else {}
+        manual_query = None
+        if isinstance(lblcfg, Mapping):
+            raw_manual = lblcfg.get("search_query") or lblcfg.get("rag_query")
+            if isinstance(raw_manual, str) and raw_manual.strip():
+                manual_query = raw_manual.strip()
+
         semantic_runs: list[list[dict]] = []
+        mmr_query_embs: list[np.ndarray] = []
+
+        if manual_query:
+            rule_query = manual_query
+            rerank_query = manual_query
+        else:
+            exemplar_query = " ".join(exemplar_texts).strip()
+            if exemplar_query:
+                parts = [exemplar_query]
+                rules_text = (label_rules or "").strip()
+                if rules_text:
+                    parts.append("Guidelines: " + re.sub(r"\s+", " ", rules_text))
+                rule_query = " ".join(parts)
+            else:
+                rule_query = self._build_query(label_id, label_rules)
+            rerank_query = self._build_query(label_id, self._rerank_rules_text(label_id, label_rules))
+
+        rule_emb = self.store._embed([rule_query])[0]
+        mmr_query_embs.append(rule_emb)
 
         rule_hits = _patient_local_rank(str(unit_id), rule_emb, need=mmr_select_k * 2)
         for it in rule_hits:
             it["source"] = "patient_rule"
         semantic_runs.append(rule_hits)
 
-        if Q is not None and getattr(Q, "ndim", 1) == 2 and Q.shape[0] > 0:
+        if manual_query is None and Q is not None and getattr(Q, "ndim", 1) == 2 and Q.shape[0] > 0:
             for i in range(Q.shape[0]):
                 ex_hits = _patient_local_rank(str(unit_id), Q[i], need=mmr_select_k * 2)
                 for it in ex_hits:
