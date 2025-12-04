@@ -2326,31 +2326,27 @@ class RAGRetriever:
         semantic_runs: list[list[dict]] = []
         mmr_query_embs: list[np.ndarray] = []
 
-        query_texts: list[str] = []
-        query_embs: list[np.ndarray | None] = []
-        query_sources: list[str] = []
+        valid_exemplars = [t for t in exemplar_texts if isinstance(t, str) and t.strip()]
 
         # Build prioritized query list: manual override > exemplars > label rules
         if manual_query:
-            query_texts.append(manual_query)
-            query_embs.append(None)
-            query_sources.append("manual")
-
-        valid_exemplars = [t for t in exemplar_texts if isinstance(t, str) and t.strip()]
-        if valid_exemplars:
-            query_texts.extend(valid_exemplars)
-            query_sources.extend(["exemplar"] * len(valid_exemplars))
+            query_texts = [manual_query]
+            query_embs = [None]
+            query_sources = ["manual"]
+        elif valid_exemplars:
+            query_texts = list(valid_exemplars)
+            query_sources = ["exemplar"] * len(valid_exemplars)
             if cached_exemplar_embs is not None and getattr(cached_exemplar_embs, "ndim", 1) == 2:
-                query_embs.extend(
-                    [cached_exemplar_embs[i] for i in range(min(len(valid_exemplars), cached_exemplar_embs.shape[0]))]
-                )
+                query_embs = [
+                    cached_exemplar_embs[i]
+                    for i in range(min(len(valid_exemplars), cached_exemplar_embs.shape[0]))
+                ]
                 if len(query_embs) < len(query_texts):
                     # pad for later embedding
                     query_embs.extend([None] * (len(query_texts) - len(query_embs)))
             else:
-                query_embs.extend([None] * len(valid_exemplars))
-
-        if not query_texts:
+                query_embs = [None] * len(valid_exemplars)
+        else:
             fallback_rules = (label_rules or "").strip()
             query_texts = [fallback_rules]
             query_embs = [None]
@@ -2364,6 +2360,7 @@ class RAGRetriever:
                 query_embs[idx] = emb
 
         query_source = query_sources[0] if query_sources else "rules"
+        rerank_query_texts = list(query_texts)
 
         diagnostics.update(
             {
@@ -2373,6 +2370,7 @@ class RAGRetriever:
                 "exemplar_queries": exemplar_texts,
                 "query_source": query_source,
                 "query_sources": query_sources,
+                "rerank_queries": rerank_query_texts,
             }
         )
 
@@ -2484,7 +2482,7 @@ class RAGRetriever:
         # CE fallback if mapping failed
         if not cand_idxs:
             texts = [it["text"] for it in pool]
-            rr = _cross_scores_for_queries(query_texts, texts)
+            rr = _cross_scores_for_queries(rerank_query_texts, texts)
             for it, s in zip(pool, rr):
                 it["score"] = float(s)
             pool.sort(key=lambda d: d["score"], reverse=True)
@@ -2502,7 +2500,7 @@ class RAGRetriever:
     
         # CE last, CE-only score
         texts = [it["text"] for it in pre]
-        rr = _cross_scores_for_queries(query_texts, texts)
+        rr = _cross_scores_for_queries(rerank_query_texts, texts)
         for it, s in zip(pre, rr):
             it["score"] = float(s)
     
@@ -2523,7 +2521,7 @@ class RAGRetriever:
             picked = set((o["doc_id"], int(o["chunk_id"])) for o in out)
             rest = [it for it in pool if (it["doc_id"], int(it["chunk_id"])) not in picked]
             if rest:
-                rr2 = _cross_scores_for_queries(query_texts, [it["text"] for it in rest])
+                rr2 = _cross_scores_for_queries(rerank_query_texts, [it["text"] for it in rest])
                 for it, s in zip(rest, rr2):
                     it["score"] = float(s)
                 rest.sort(key=lambda d: d["score"], reverse=True)
@@ -3053,6 +3051,14 @@ class LLMAnnotator:
                     runs.append(run_entry)
 
                     try:
+                        rag_queries = {}
+                        if isinstance(rag_diagnostics, Mapping):
+                            rag_queries = {
+                                "manual_query": rag_diagnostics.get("manual_query"),
+                                "query_source": rag_diagnostics.get("query_source"),
+                                "queries": rag_diagnostics.get("queries"),
+                                "query_sources": rag_diagnostics.get("query_sources"),
+                            }
                         # Capture the exact prompt + minimal context identifiers used this vote
                         LLM_RECORDER.record("json_vote", {
                             "unit_id": unit_id,
@@ -3067,6 +3073,7 @@ class LLMAnnotator:
                             "snippets": [{"doc_id": c.get("doc_id"), "chunk_id": c.get("chunk_id")} for c in (cand if jitter_params else snippets)],
                             "output": {"prediction": pred, "raw": data_map, "content": content},
                             "rag_diagnostics": rag_diagnostics or {},
+                            "rag_queries": rag_queries,
                         })
                     except Exception:
                         LLM_RECORDER.record("json_vote_error", {"rag_diagnostics": rag_diagnostics or {}})
@@ -3907,6 +3914,12 @@ class FamilyLabeler:
                     "latency_s": result.latency_s,
                 },
                 "rag_diagnostics": rag_diag or {},
+                "rag_queries": {
+                    "manual_query": rag_diag.get("manual_query") if isinstance(rag_diag, Mapping) else None,
+                    "query_source": rag_diag.get("query_source") if isinstance(rag_diag, Mapping) else None,
+                    "queries": rag_diag.get("queries") if isinstance(rag_diag, Mapping) else None,
+                    "query_sources": rag_diag.get("query_sources") if isinstance(rag_diag, Mapping) else None,
+                },
             })
         except Exception:
             pass
