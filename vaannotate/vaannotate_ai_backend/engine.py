@@ -2281,6 +2281,7 @@ class RAGRetriever:
         mmr_mult  = max(1, getattr(cfg_rag, "mmr_multiplier", 3))  # pool size before CE = final_k * mmr_mult
         hops      = int(getattr(cfg_rag, "neighbor_hops", 1))
         use_kw    = bool(getattr(cfg_rag, "use_keywords", True))
+        mmr_select_k = final_k * mmr_mult
 
         # λ (0..1)
         lam = mmr_lambda_override
@@ -2315,7 +2316,6 @@ class RAGRetriever:
             K_use = max(K_use, len(opts))
         Q = self._get_label_query_embs(label_id, label_rules, K=K_use)
         exemplar_texts = self._get_label_query_texts(label_id, label_rules, K=K_use) or []
-        mmr_select_k = final_k * mmr_mult
 
         lblcfg = self.label_configs.get(label_id, {}) if isinstance(self.label_configs, dict) else {}
         manual_query = None
