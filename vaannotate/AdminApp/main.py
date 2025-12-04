@@ -399,6 +399,50 @@ class LabelKeywordsEditor(QtWidgets.QWidget):
         return mapping
 
 
+class _FewShotEntryDialog(QtWidgets.QDialog):
+    """Dialog for entering a single few-shot example."""
+
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget] = None,
+        *,
+        context: str = "",
+        answer: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit few-shot example")
+        self.resize(760, 520)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self.context_edit = QtWidgets.QPlainTextEdit()
+        self.context_edit.setPlaceholderText("Enter the input context shown to the model.")
+        self.context_edit.setPlainText(str(context))
+        form.addRow("Context", self.context_edit)
+
+        self.answer_edit = QtWidgets.QPlainTextEdit()
+        self.answer_edit.setPlaceholderText(
+            "Enter the expected answer (text or JSON string)."
+        )
+        self.answer_edit.setPlainText(str(answer))
+        form.addRow("Answer", self.answer_edit)
+
+        layout.addLayout(form)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> tuple[str, str]:
+        return self.context_edit.toPlainText().strip(), self.answer_edit.toPlainText().strip()
+
+
 class _FewShotTable(QtWidgets.QWidget):
     """Simple table for entering context/answer pairs."""
 
@@ -410,19 +454,40 @@ class _FewShotTable(QtWidgets.QWidget):
 
         self._table = QtWidgets.QTableWidget(0, 2)
         self._table.setHorizontalHeaderLabels(["Context", "Answer (JSON or text)"])
-        self._table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        self._table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        self._table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self._table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._table.cellDoubleClicked.connect(self._on_edit_cell)
         layout.addWidget(self._table)
 
         buttons = QtWidgets.QHBoxLayout()
         add_btn = QtWidgets.QPushButton("Add example")
         add_btn.clicked.connect(self._on_add)
+        edit_btn = QtWidgets.QPushButton("Edit selected")
+        edit_btn.clicked.connect(self._on_edit)
         remove_btn = QtWidgets.QPushButton("Remove selected")
         remove_btn.clicked.connect(self._on_remove)
+        move_up_btn = QtWidgets.QPushButton("Move up")
+        move_up_btn.clicked.connect(lambda: self._on_move(-1))
+        move_down_btn = QtWidgets.QPushButton("Move down")
+        move_down_btn.clicked.connect(lambda: self._on_move(1))
         buttons.addWidget(add_btn)
+        buttons.addWidget(edit_btn)
         buttons.addWidget(remove_btn)
+        buttons.addWidget(move_up_btn)
+        buttons.addWidget(move_down_btn)
         buttons.addStretch()
         layout.addLayout(buttons)
 
@@ -432,23 +497,65 @@ class _FewShotTable(QtWidgets.QWidget):
                     continue
                 context = entry.get("context")
                 answer = entry.get("answer")
-                self._add_row(context if context is not None else "", answer if answer is not None else "")
+                self._add_row(
+                    context if context is not None else "",
+                    answer if answer is not None else "",
+                )
 
     def _add_row(self, context: str = "", answer: str = "") -> None:
         row = self._table.rowCount()
         self._table.insertRow(row)
         self._table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(context)))
         self._table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(answer)))
-        if not context and not answer:
-            self._table.editItem(self._table.item(row, 0))
+        self._table.selectRow(row)
 
     def _on_add(self) -> None:
-        self._add_row()
+        dialog = _FewShotEntryDialog(self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            context, answer = dialog.values()
+            self._add_row(context, answer)
+
+    def _on_edit(self) -> None:
+        row = self._table.currentRow()
+        if row >= 0:
+            self._edit_row(row)
+
+    def _on_edit_cell(self, row: int, column: int) -> None:  # noqa: ARG002 - required by Qt
+        self._edit_row(row)
 
     def _on_remove(self) -> None:
         row = self._table.currentRow()
         if row >= 0:
             self._table.removeRow(row)
+
+    def _on_move(self, delta: int) -> None:
+        row = self._table.currentRow()
+        if row < 0:
+            return
+        target_row = row + delta
+        if target_row < 0 or target_row >= self._table.rowCount():
+            return
+        for col in range(self._table.columnCount()):
+            current_item = self._table.item(row, col)
+            target_item = self._table.item(target_row, col)
+            current_text = current_item.text() if current_item else ""
+            target_text = target_item.text() if target_item else ""
+            self._table.setItem(row, col, QtWidgets.QTableWidgetItem(target_text))
+            self._table.setItem(target_row, col, QtWidgets.QTableWidgetItem(current_text))
+        self._table.selectRow(target_row)
+
+    def _edit_row(self, row: int) -> None:
+        context_item = self._table.item(row, 0)
+        answer_item = self._table.item(row, 1)
+        dialog = _FewShotEntryDialog(
+            self,
+            context=context_item.text() if context_item else "",
+            answer=answer_item.text() if answer_item else "",
+        )
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            context, answer = dialog.values()
+            self._table.setItem(row, 0, QtWidgets.QTableWidgetItem(context))
+            self._table.setItem(row, 1, QtWidgets.QTableWidgetItem(answer))
 
     def to_examples(self) -> list[dict[str, str]]:
         examples: list[dict[str, str]] = []
@@ -3548,6 +3655,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if idx >= 0:
                 self.ai_backend_combo.setCurrentIndex(idx)
                 self._update_ai_backend_fields()
+        embed_path = config.get("embedding_model_dir")
+        if hasattr(self, "ai_embedding_path_edit") and isinstance(embed_path, str):
+            self.ai_embedding_path_edit.setText(embed_path)
+        reranker_path = config.get("reranker_model_dir")
+        if hasattr(self, "ai_reranker_path_edit") and isinstance(reranker_path, str):
+            self.ai_reranker_path_edit.setText(reranker_path)
         include_reasoning = llm_cfg.get("include_reasoning")
         checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
         if isinstance(checkbox, QtWidgets.QCheckBox) and isinstance(include_reasoning, bool):
@@ -4372,6 +4485,85 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self._on_assisted_review_toggled(self.assisted_review_checkbox.isChecked())
         self.total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
         self._on_generation_mode_changed()
+        self._apply_latest_round_defaults()
+
+    def _apply_latest_round_defaults(self) -> None:
+        try:
+            rounds = self.ctx.list_rounds(self.pheno_row["pheno_id"])
+        except Exception:  # noqa: BLE001
+            return
+        latest_round: Optional[Mapping[str, object]] = None
+        latest_number: Optional[int] = None
+        for round_row in rounds:
+            round_number = self._safe_mapping_get(round_row, "round_number")
+            round_id = self._safe_mapping_get(round_row, "round_id")
+            if round_number is None or round_id is None:
+                continue
+            try:
+                round_number_int = int(round_number)
+            except Exception:  # noqa: BLE001
+                continue
+            if latest_number is None or round_number_int > latest_number:
+                latest_number = round_number_int
+                latest_round = round_row
+        if not latest_round:
+            return
+        round_id_value = self._safe_mapping_get(latest_round, "round_id")
+        if not isinstance(round_id_value, str):
+            return
+        config = self.ctx.get_round_config(round_id_value)
+        if not isinstance(config, Mapping):
+            return
+        labelset_id = config.get("labelset_id")
+        if isinstance(labelset_id, str) and hasattr(self, "labelset_combo"):
+            self.labelset_combo.setEditText(labelset_id)
+        corpus_id = config.get("corpus_id")
+        if hasattr(self, "corpus_combo") and corpus_id is not None:
+            for idx in range(self.corpus_combo.count()):
+                data = self.corpus_combo.itemData(idx)
+                if data == corpus_id:
+                    self.corpus_combo.setCurrentIndex(idx)
+                    break
+        rng_seed = config.get("rng_seed")
+        if hasattr(self, "seed_spin") and isinstance(rng_seed, (int, float)):
+            try:
+                self.seed_spin.setValue(int(rng_seed))
+            except Exception:  # noqa: BLE001
+                pass
+        overlap_n = config.get("overlap_n")
+        if hasattr(self, "overlap_spin") and isinstance(overlap_n, (int, float)):
+            try:
+                self.overlap_spin.setValue(int(overlap_n))
+            except Exception:  # noqa: BLE001
+                pass
+        total_n = config.get("total_n")
+        if hasattr(self, "total_n_spin") and isinstance(total_n, (int, float)):
+            try:
+                self.total_n_spin.setValue(int(total_n))
+            except Exception:  # noqa: BLE001
+                pass
+        status_value = config.get("status")
+        if hasattr(self, "status_combo") and isinstance(status_value, str):
+            idx = self.status_combo.findText(status_value)
+            if idx >= 0:
+                self.status_combo.setCurrentIndex(idx)
+        sampling_cfg = config.get("sampling", {}) if isinstance(config.get("sampling"), Mapping) else {}
+        independent_value = sampling_cfg.get("independent") if isinstance(sampling_cfg, Mapping) else None
+        if hasattr(self, "independent_checkbox") and isinstance(independent_value, bool):
+            self.independent_checkbox.setChecked(independent_value)
+        assisted_cfg = config.get("assisted_review") if isinstance(config.get("assisted_review"), Mapping) else {}
+        if isinstance(assisted_cfg, Mapping) and hasattr(self, "assisted_review_checkbox"):
+            enabled = bool(assisted_cfg.get("enabled"))
+            self.assisted_review_checkbox.setChecked(enabled)
+            if hasattr(self, "assisted_review_spin"):
+                try:
+                    self.assisted_review_spin.setValue(int(assisted_cfg.get("top_snippets", 0)))
+                except Exception:  # noqa: BLE001
+                    pass
+        ai_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        if isinstance(ai_cfg, Mapping):
+            self._ai_engine_overrides = copy.deepcopy(ai_cfg)
+            self._apply_ai_config_to_controls(self._ai_engine_overrides)
 
     def _collect_filters(self) -> SamplingFilters:
         conditions: List[MetadataFilterCondition] = []

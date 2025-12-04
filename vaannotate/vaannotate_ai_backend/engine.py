@@ -1850,6 +1850,8 @@ class RAGRetriever:
         self._bm25_cache: Dict[str, dict] = {}
         self._label_query_texts = {}   # (label_id, rules_hash, K) -> List[str]
         self._label_query_embs  = {}   # (label_id, rules_hash, K) -> np.ndarray[K,d]
+        # Optional concise rule text to keep re-ranker context compact
+        self.rerank_rule_overrides: dict[str, str] = {}
 
     def set_label_exemplars(self, label_id: str, rules: str, K: int, texts: list[str]):
         key = (str(label_id), _stable_rules_hash(label_id, rules, K, getattr(self.models.embedder, "name_or_path", "")), int(K))
@@ -1865,6 +1867,16 @@ class RAGRetriever:
     def _get_label_query_texts(self, label_id: str, rules: str, K: int):
         key = (str(label_id), _stable_rules_hash(label_id, rules, K, getattr(self.models.embedder, "name_or_path", "")), int(K))
         return self._label_query_texts.get(key)
+
+    def _rerank_rules_text(self, label_id: str, label_rules: str | None) -> str:
+        """Return a compact rule string when available for re-ranking only."""
+
+        if self.rerank_rule_overrides and label_id in self.rerank_rule_overrides:
+            return self.rerank_rule_overrides[label_id]
+        key = str(label_id)
+        if self.rerank_rule_overrides and key in self.rerank_rule_overrides:
+            return self.rerank_rule_overrides[key]
+        return label_rules or ""
     
     def _extract_meta(self, m:dict) -> dict:
         """
@@ -2247,6 +2259,7 @@ class RAGRetriever:
         mmr_select_k = final_k * mmr_mult
 
         rule_query = self._build_query(label_id, label_rules)
+        rerank_query = self._build_query(label_id, self._rerank_rules_text(label_id, label_rules))
         rule_emb = self.store._embed([rule_query])[0]
         mmr_query_embs: list[np.ndarray] = [rule_emb]
         semantic_runs: list[list[dict]] = []
@@ -2270,7 +2283,7 @@ class RAGRetriever:
             items = self._reciprocal_rank_fusion(semantic_runs)
 
         q_emb = np.mean(np.vstack(mmr_query_embs), axis=0) if mmr_query_embs else rule_emb
-        query = rule_query
+        query = rerank_query
 
         #  + (optional) keywords
         bm25_hits: List[dict] = []
@@ -2573,6 +2586,36 @@ class LLMAnnotator:
             if answer is not None:
                 messages.append({"role": "assistant", "content": str(answer)})
         return messages
+
+    def summarize_label_rule_for_rerank(self, label_id: str, label_rules: str, max_sentences: int = 2) -> str:
+        """Generate a concise paraphrase of a label rule for re-ranker queries."""
+
+        if not getattr(self, "backend", None):
+            return ""
+        system_msg = (
+            "You condense clinical labeling guidelines for a cross-encoder reranker. "
+            "Return a succinct 1-2 sentence summary that preserves the key inclusion/" \
+            "exclusion cues. Avoid meta commentary."
+        )
+        user_msg = (
+            "Label ID: {label_id}\n"
+            "Rewrite the following label rule into at most {limit} sentences capturing the essence:\n{rules}"
+        ).format(label_id=label_id, limit=max_sentences, rules=label_rules)
+        result = self.backend.json_call(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            logprobs=False,
+            top_logprobs=None,
+        )
+        text = re.sub(r"\s+", " ", str(getattr(result, "content", "") or "")).strip()
+        if not text:
+            return ""
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        trimmed = " ".join(sentences[:max_sentences]).strip()
+        return trimmed or text
 
     def annotate(
         self,
@@ -4460,6 +4503,33 @@ class ActiveLearningLLMFirst:
         # Ensure the annotator has access to the materialised label configuration
         # so that option lookups during JSON prompting succeed.
         self.llm.label_config = self.label_config
+
+    def _build_rerank_rule_overrides(self, rules_map: Mapping[str, str]) -> dict[str, str]:
+        """Generate concise rule summaries for re-ranker queries when needed."""
+
+        if not self.llm or not isinstance(rules_map, Mapping):
+            return {}
+        threshold_default = 1200  # ~512-token budget
+        try:
+            threshold = int(os.getenv("RERANK_RULE_PARAPHRASE_CHARS", str(threshold_default)))
+        except Exception:
+            threshold = threshold_default
+        threshold = max(200, threshold)
+
+        overrides: dict[str, str] = {}
+        for label_id, raw_text in rules_map.items():
+            text = str(raw_text or "").strip()
+            if len(text) <= threshold:
+                continue
+            try:
+                summary = self.llm.summarize_label_rule_for_rerank(str(label_id), text)
+            except Exception as exc:
+                print(f"Reranker rule paraphrase failed for label {label_id}: {exc}")
+                continue
+            concise = str(summary or "").strip()
+            if concise and len(concise) < len(text):
+                overrides[str(label_id)] = concise
+        return overrides
     def config_for_labelset(self, labelset_id: Optional[str]) -> Dict[str, object]:
         return self.label_config_bundle.config_for_labelset(labelset_id)
 
@@ -4999,6 +5069,11 @@ class ActiveLearningLLMFirst:
         current_label_ids = set(current_rules_map.keys())
         if not current_label_ids:
             current_label_ids = set(legacy_label_ids)
+
+        # Build concise rule overrides for reranker-only queries to preserve context
+        # budget without altering retrieval embeddings.
+        overrides = self._build_rerank_rule_overrides(current_rules_map)
+        self.rag.rerank_rule_overrides = overrides or {}
     
         # ---------- small helpers ----------
         def _empty_unit_frame() -> "pd.DataFrame":
