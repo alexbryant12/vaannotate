@@ -260,17 +260,21 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
         "chunk_size": "Maximum characters per text chunk before embedding.",
         "chunk_overlap": "Overlap between consecutive chunks to preserve context.",
         "normalize_embeddings": "L2-normalize embeddings before indexing/searching.",
-        "per_label_topk": "Top-k chunks to keep per label during retrieval.",
+        "per_label_topk": "Top-k chunks to keep per label during retrieval (legacy; use top_k_final).",
+        "top_k_final": "Final number of chunks kept per label after reranking.",
         "use_mmr": "Use maximal marginal relevance to diversify retrieved chunks.",
         "mmr_lambda": "MMR trade-off between relevance (1.0) and diversity (0.0).",
         "mmr_candidates": "Candidate pool size for MMR selection.",
-        "use_keywords": "Blend keyword search results into retrieval.",
+        "use_keywords": "Enable keyword/BM25 retrieval when keyword_fraction > 0.",
+        "keyword_fraction": "Blend between BM25 keywords and semantic search when constructing the pre–rerank pool (0=semantic only, 1=keywords only).",
         "keyword_topk": "How many keyword hits to include when enabled.",
         "keywords": "Comma-separated keywords to seed lexical retrieval across all labels.",
         "label_keywords": "Optional JSON mapping of label_id → keywords (list or comma-separated string) for BM25 search.",
         "min_context_chunks": "Minimum chunks of context to pass to the LLM.",
         "mmr_multiplier": "Scale the number of chunks considered for MMR diversification.",
         "neighbor_hops": "How many hops to explore around selected chunks for neighbors.",
+        "pool_factor": "Multiplier for the combined semantic/keyword pool size before reranking.",
+        "pool_oversample": "Oversample factor for each channel before deduplication to boost recall.",
     },
     "llm": {
         "model_name": "LLM deployment/model identifier.",
@@ -698,8 +702,11 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
             widgets: Dict[str, QtWidgets.QWidget] = {}
             for field_name, value in section_values.items():
-                if key == "rag" and self._label_schema_labels and field_name == "label_queries":
-                    continue
+                if key == "rag":
+                    if self._label_schema_labels and field_name == "label_queries":
+                        continue
+                    if field_name in {"per_label_topk", "use_keywords", "keyword_topk"}:
+                        continue
                 widget = self._build_field_widget(
                     key, field_name, value, section_values=section_values
                 )

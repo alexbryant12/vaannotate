@@ -47,6 +47,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
 from .llm_backends import JSONCallResult, ForcedChoiceResult, build_llm_backend
+from .retrieval_coordinator import RetrievalCoordinator, SemanticQuery
 
 try:
     import faiss  # faiss-cpu
@@ -98,16 +99,20 @@ class RAGConfig:
     chunk_overlap: int = 150
     normalize_embeddings: bool = True
     per_label_topk: int = 6
+    top_k_final: int = 6
     use_mmr: bool = True
     mmr_lambda: float = 0.7
     mmr_candidates: int = 200
-    use_keywords: bool = False
+    use_keywords: bool = True
     keyword_topk: int = 20
+    keyword_fraction: float = 0.3
     keywords: List[str] = field(default_factory=list)
     label_keywords: dict[str, list[str]] = field(default_factory=dict)
     min_context_chunks: int = 3
     mmr_multiplier: int = 3
     neighbor_hops: int = 1
+    pool_factor: int = 3
+    pool_oversample: float = 1.5
         
 def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
     val = os.getenv(name)
@@ -2275,11 +2280,18 @@ class RAGRetriever:
         
         # ---- config ----
         cfg_rag = getattr(self, "cfg", getattr(self, "rag", None)) or self.cfg
-        final_k   = int(topk_override or getattr(cfg_rag, "per_label_topk", 6))
+        cfg_final_k = getattr(cfg_rag, "top_k_final", None)
+        final_k_raw = topk_override or cfg_final_k or getattr(cfg_rag, "per_label_topk", 6)
+        try:
+            final_k = max(1, int(final_k_raw))
+        except Exception:
+            final_k = 1
         min_k     = min_k_override or max(1, getattr(cfg_rag, "min_context_chunks", 3))
         mmr_mult  = max(1, getattr(cfg_rag, "mmr_multiplier", 3))  # pool size before CE = final_k * mmr_mult
         hops      = int(getattr(cfg_rag, "neighbor_hops", 1))
-        use_kw    = bool(getattr(cfg_rag, "use_keywords", True))
+        keyword_fraction = float(getattr(cfg_rag, "keyword_fraction", 0.0))
+        keyword_fraction = max(0.0, min(1.0, keyword_fraction))
+        use_kw    = keyword_fraction > 0.0 and bool(getattr(cfg_rag, "use_keywords", True))
         mmr_select_k = final_k * mmr_mult
 
         # λ (0..1)
@@ -2323,8 +2335,8 @@ class RAGRetriever:
             if isinstance(raw_manual, str) and raw_manual.strip():
                 manual_query = raw_manual.strip()
 
-        semantic_runs: list[list[dict]] = []
         mmr_query_embs: list[np.ndarray] = []
+        semantic_queries_struct: list[SemanticQuery] = []
 
         valid_exemplars = [t for t in exemplar_texts if isinstance(t, str) and t.strip()]
 
@@ -2375,33 +2387,19 @@ class RAGRetriever:
         )
 
         for q_text, q_emb, q_src in zip(query_texts, query_embs, query_sources):
-            hits = _patient_local_rank(str(unit_id), q_emb, need=mmr_select_k * 2)
-            for it in hits:
-                it["source"] = f"patient_{q_src}"
-            semantic_runs.append(hits)
-            mmr_query_embs.append(q_emb)
-
-        all_semantic_hits = [hit for run in semantic_runs for hit in run]
-        diagnostics["semantic_search"] = {
-            "runs": [len(run) for run in semantic_runs],
-            "sources": dict(Counter([str(it.get("source")) for it in all_semantic_hits])),
-            "score_stats": _score_stats(all_semantic_hits),
-        }
-
-        if len(semantic_runs) == 1:
-            items = semantic_runs[0]
-        else:
-            items = self._reciprocal_rank_fusion(semantic_runs)
+            semantic_queries_struct.append(
+                SemanticQuery(text=q_text, embedding=q_emb, source=q_src)
+            )
+            if q_emb is not None:
+                mmr_query_embs.append(q_emb)
 
         q_emb = np.mean(np.vstack(mmr_query_embs), axis=0) if mmr_query_embs else None
         query = query_texts[0] if query_texts else ""
 
-        #  + (optional) keywords
-        bm25_hits: List[dict] = []
+        keywords: list[str] = []
         if use_kw:
             lblcfg = self.label_configs.get(label_id, {}) if isinstance(self.label_configs, dict) else {}
             cfg_keywords = getattr(cfg_rag, "keywords", [])
-            keywords: list[str] = []
             if isinstance(cfg_keywords, (list, tuple)):
                 keywords.extend(str(k) for k in cfg_keywords if isinstance(k, str) and k.strip())
             per_label_kw_cfg = getattr(cfg_rag, "label_keywords", {})
@@ -2412,36 +2410,52 @@ class RAGRetriever:
             lbl_keywords = lblcfg.get("keywords", []) if isinstance(lblcfg, Mapping) else []
             if isinstance(lbl_keywords, (list, tuple)):
                 keywords.extend(str(k) for k in lbl_keywords if isinstance(k, str) and k.strip())
-            if keywords:
-                # de-duplicate while preserving order
-                seen_kw = set()
-                uniq_keywords = []
-                for kw in keywords:
-                    if kw in seen_kw:
-                        continue
-                    seen_kw.add(kw)
-                    uniq_keywords.append(kw)
-                bm25_hits = self._bm25_hits_for_patient(str(unit_id), uniq_keywords)
-                diagnostics["keyword_search"] = {
-                    "keywords": uniq_keywords,
-                    "hit_count": len(bm25_hits),
-                }
-        if bm25_hits:
-            if items:
-                items = self._reciprocal_rank_fusion([items, bm25_hits])
-            else:
-                items = bm25_hits
 
-        diagnostics["pool"] = {
-            "semantic": len(all_semantic_hits),
-            "bm25": len(bm25_hits),
-            "fused": len(items),
+        uniq_keywords: list[str] = []
+        if keywords:
+            seen_kw = set()
+            for kw in keywords:
+                if kw in seen_kw:
+                    continue
+                seen_kw.add(kw)
+                uniq_keywords.append(kw)
+
+        pool_factor = int(getattr(cfg_rag, "pool_factor", 3))
+        pool_oversample = float(getattr(cfg_rag, "pool_oversample", 1.5))
+
+        coordinator = RetrievalCoordinator(
+            semantic_searcher=lambda sq, need: _patient_local_rank(str(unit_id), sq.embedding, need),
+            keyword_searcher=lambda kws, need: (self._bm25_hits_for_patient(str(unit_id), kws) or [])[:need],
+        )
+
+        pool, pool_diag = coordinator.build_candidate_pool(
+            semantic_queries=semantic_queries_struct,
+            keywords=uniq_keywords,
+            top_k_final=final_k,
+            keyword_fraction=keyword_fraction,
+            pool_factor=pool_factor,
+            oversample=pool_oversample,
+        )
+
+        diagnostics["retrieval_coordinator"] = pool_diag
+        diagnostics["keyword_search"] = {
+            "keywords": uniq_keywords,
+            "hit_count": pool_diag.get("keyword_hits", 0),
         }
-
-        # Dedup
-        pool = _dedup_only(items)
-
-        diagnostics["pool"]["deduped"] = len(pool)
+        diagnostics["semantic_search"] = {
+            "runs": len(semantic_queries_struct),
+            "score_stats": _score_stats(pool),
+        }
+        diagnostics["pool"] = {
+            "semantic": pool_diag.get("semantic_hits", 0),
+            "bm25": pool_diag.get("keyword_hits", 0),
+            "deduped": pool_diag.get("final_pool", 0),
+            "targets": {
+                "semantic": pool_diag.get("semantic_target", 0),
+                "keyword": pool_diag.get("keyword_target", 0),
+                "pool": pool_diag.get("pool_target", 0),
+            },
+        }
 
         # Neighbor padding for short pools
         if len(pool) < max(min_k, final_k):
