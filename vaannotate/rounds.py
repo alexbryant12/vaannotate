@@ -1,6 +1,7 @@
 """Round creation, sampling, and aggregation."""
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import logging
@@ -751,8 +752,11 @@ class RoundBuilder:
         phenotype_level = str(pheno_row["level"] or "multi_doc")
         label_config_payload = build_label_config(labelset)
         label_keywords = self._extract_label_keywords(config)
+        label_queries = self._extract_label_queries(config)
         if label_keywords:
             label_config_payload = self._apply_label_keywords(label_config_payload, label_keywords)
+        if label_queries:
+            label_config_payload = self._apply_label_queries(label_config_payload, label_queries)
         paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
         few_shot_examples = self._extract_few_shot_examples(config, labelset)
         if few_shot_examples:
@@ -1218,6 +1222,32 @@ class RoundBuilder:
         return parsed
 
     @staticmethod
+    def _extract_label_queries(config: Mapping[str, Any]) -> Dict[str, str]:
+        ai_backend_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        rag_cfg = ai_backend_cfg.get("rag") if isinstance(ai_backend_cfg, Mapping) and isinstance(ai_backend_cfg.get("rag"), Mapping) else {}
+        top_rag_cfg = config.get("rag") if isinstance(config.get("rag"), Mapping) else {}
+        raw_candidates: list[object] = []
+        if isinstance(rag_cfg, Mapping):
+            raw_candidates.append(rag_cfg.get("label_queries"))
+        if isinstance(top_rag_cfg, Mapping):
+            raw_candidates.append(top_rag_cfg.get("label_queries"))
+
+        raw: Mapping[str, object] | None = None
+        for candidate in raw_candidates:
+            if isinstance(candidate, Mapping):
+                raw = candidate
+                break
+
+        if not raw:
+            return {}
+
+        parsed: Dict[str, str] = {}
+        for label_id, query in raw.items():
+            if isinstance(query, str) and query.strip():
+                parsed[str(label_id)] = query.strip()
+        return parsed
+
+    @staticmethod
     def _apply_label_keywords(
         label_config: Mapping[str, object], label_keywords: Mapping[str, Sequence[str]]
     ) -> Dict[str, object]:
@@ -1228,6 +1258,20 @@ class RoundBuilder:
             entry = merged.get(label_id)
             entry_payload = copy.deepcopy(entry) if isinstance(entry, Mapping) else {}
             entry_payload["keywords"] = list(keywords)
+            merged[label_id] = entry_payload
+        return merged
+
+    @staticmethod
+    def _apply_label_queries(
+        label_config: Mapping[str, object], label_queries: Mapping[str, str]
+    ) -> Dict[str, object]:
+        merged = {key: copy.deepcopy(value) for key, value in label_config.items()}
+        for label_id, query in label_queries.items():
+            if not isinstance(query, str) or not query.strip():
+                continue
+            entry = merged.get(label_id)
+            entry_payload = copy.deepcopy(entry) if isinstance(entry, Mapping) else {}
+            entry_payload["search_query"] = query.strip()
             merged[label_id] = entry_payload
         return merged
 
@@ -1348,8 +1392,11 @@ class RoundBuilder:
         phenotype_level = str(pheno_row["level"] or "multi_doc")
         label_config_payload = build_label_config(labelset)
         label_keywords = self._extract_label_keywords(config)
+        label_queries = self._extract_label_queries(config)
         if label_keywords:
             label_config_payload = self._apply_label_keywords(label_config_payload, label_keywords)
+        if label_queries:
+            label_config_payload = self._apply_label_queries(label_config_payload, label_queries)
         paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
         orchestrator = ActiveLearningLLMFirst(
             paths=paths,

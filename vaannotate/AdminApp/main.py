@@ -355,36 +355,64 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
 
 
 class LabelKeywordsEditor(QtWidgets.QWidget):
-    """Friendly editor for per-label BM25 keywords."""
+    """Friendly editor for per-label BM25 keywords and custom queries."""
 
-    def __init__(self, labels: Sequence[Mapping[str, object]], existing: Mapping[str, object]) -> None:
+    def __init__(
+        self,
+        labels: Sequence[Mapping[str, object]],
+        existing_keywords: Mapping[str, object],
+        existing_queries: Mapping[str, object] | None = None,
+        *,
+        include_queries: bool = False,
+    ) -> None:
         super().__init__()
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
-        info = QtWidgets.QLabel(
+        info_text = (
             "Enter comma-separated keywords for each label. Keywords will be tokenized "
             "for BM25 search; leave blank to skip a label."
         )
+        if include_queries:
+            info_text += " You can also supply a custom semantic query to override exemplars/rules."
+        info = QtWidgets.QLabel(info_text)
         info.setWordWrap(True)
         layout.addWidget(info)
         form = QtWidgets.QFormLayout()
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self._label_inputs: Dict[str, QtWidgets.QLineEdit] = {}
+        self._label_query_inputs: Dict[str, QtWidgets.QLineEdit] = {}
         for label in labels:
             label_id = str(label.get("label_id") or "")
             if not label_id:
                 continue
             display_name = str(label.get("name") or label_id)
-            edit = QtWidgets.QLineEdit()
-            existing_value = existing.get(label_id)
+            keyword_edit = QtWidgets.QLineEdit()
+            existing_value = existing_keywords.get(label_id)
             if isinstance(existing_value, list):
-                edit.setText(", ".join(str(v) for v in existing_value))
+                keyword_edit.setText(", ".join(str(v) for v in existing_value))
             elif isinstance(existing_value, str):
-                edit.setText(existing_value)
-            edit.setPlaceholderText("keyword1, keyword2")
-            form.addRow(f"{display_name} ({label_id})", edit)
-            self._label_inputs[label_id] = edit
+                keyword_edit.setText(existing_value)
+            keyword_edit.setPlaceholderText("keyword1, keyword2")
+
+            container = QtWidgets.QWidget()
+            vbox = QtWidgets.QVBoxLayout(container)
+            vbox.setContentsMargins(0, 0, 0, 0)
+            vbox.setSpacing(4)
+            vbox.addWidget(keyword_edit)
+
+            if include_queries:
+                query_edit = QtWidgets.QLineEdit()
+                if isinstance(existing_queries, Mapping):
+                    existing_query = existing_queries.get(label_id)
+                    if isinstance(existing_query, str):
+                        query_edit.setText(existing_query)
+                query_edit.setPlaceholderText("Optional custom search query")
+                vbox.addWidget(query_edit)
+                self._label_query_inputs[label_id] = query_edit
+
+            form.addRow(f"{display_name} ({label_id})", container)
+            self._label_inputs[label_id] = keyword_edit
         layout.addLayout(form)
 
     def to_mapping(self) -> Dict[str, list[str]]:
@@ -396,6 +424,16 @@ class LabelKeywordsEditor(QtWidgets.QWidget):
             keywords = [kw.strip() for kw in raw.split(",") if kw.strip()]
             if keywords:
                 mapping[label_id] = keywords
+        return mapping
+
+    def to_query_mapping(self) -> Dict[str, str]:
+        if not self._label_query_inputs:
+            return {}
+        mapping: Dict[str, str] = {}
+        for label_id, edit in self._label_query_inputs.items():
+            raw = edit.text().strip()
+            if raw:
+                mapping[label_id] = raw
         return mapping
 
 
@@ -2262,6 +2300,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         self.ctx = ctx
         self.labels: List[Dict[str, object]] = []
         self.label_keywords: Dict[str, List[str]] = {}
+        self.label_queries: Dict[str, str] = {}
         self.label_few_shot: Dict[str, List[Dict[str, str]]] = {}
         self.setWindowTitle("Create label set")
         self.resize(520, 640)
@@ -2415,6 +2454,11 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             for label in new_labels
             if label.get("keywords")
         }
+        self.label_queries = {
+            str(label.get("label_id") or ""): str(label.get("search_query") or "")
+            for label in new_labels
+            if isinstance(label.get("search_query"), str) and str(label.get("search_query")).strip()
+        }
         self.label_few_shot = {
             str(label.get("label_id") or ""): label.get("few_shot_examples", [])
             for label in new_labels
@@ -2447,6 +2491,11 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             if preserve_existing and isinstance(self._keyword_editor, LabelKeywordsEditor)
             else self.label_keywords
         )
+        existing_queries = (
+            self._keyword_editor.to_query_mapping()
+            if preserve_existing and isinstance(self._keyword_editor, LabelKeywordsEditor)
+            else self.label_queries
+        )
         existing_examples = (
             self._few_shot_editor.to_mapping()
             if preserve_existing and isinstance(self._few_shot_editor, LabelFewShotExamplesEditor)
@@ -2454,6 +2503,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         )
         label_ids = {str(label.get("label_id") or "") for label in self.labels if label.get("label_id")}
         self.label_keywords = {k: v for k, v in existing_keywords.items() if k in label_ids and v}
+        self.label_queries = {k: v for k, v in existing_queries.items() if k in label_ids and v}
         self.label_few_shot = {k: v for k, v in existing_examples.items() if k in label_ids and v}
 
         for tab, editor_attr in (
@@ -2472,7 +2522,12 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             tab.layout().setContentsMargins(0, 0, 0, 0)  # type: ignore[union-attr]
             tab.layout().setSpacing(0)  # type: ignore[union-attr]
             if editor_attr == "_keyword_editor":
-                editor = LabelKeywordsEditor(self.labels, self.label_keywords)
+                editor = LabelKeywordsEditor(
+                    self.labels,
+                    self.label_keywords,
+                    self.label_queries,
+                    include_queries=True,
+                )
             else:
                 editor = LabelFewShotExamplesEditor(self.labels, self.label_few_shot)
             tab.layout().addWidget(editor)  # type: ignore[union-attr]
@@ -2551,6 +2606,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
 
     def values(self) -> Dict[str, object]:
         keyword_map = self._keyword_editor.to_mapping() if isinstance(self._keyword_editor, LabelKeywordsEditor) else {}
+        query_map = self._keyword_editor.to_query_mapping() if isinstance(self._keyword_editor, LabelKeywordsEditor) else {}
         few_shot_map = (
             self._few_shot_editor.to_mapping()
             if isinstance(self._few_shot_editor, LabelFewShotExamplesEditor)
@@ -2562,6 +2618,8 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             data = dict(label)
             if label_id and label_id in keyword_map:
                 data["keywords"] = keyword_map[label_id]
+            if label_id and label_id in query_map:
+                data["search_query"] = query_map[label_id]
             if label_id and label_id in few_shot_map:
                 data["few_shot_examples"] = few_shot_map[label_id]
             labels_payload.append(data)
@@ -3719,6 +3777,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
     def _on_labelset_changed(self) -> None:
         schema = self._active_label_schema()
         keywords: Dict[str, List[str]] = {}
+        queries: Dict[str, str] = {}
         few_shot: Dict[str, List[Dict[str, str]]] = {}
         labels = schema.get("labels") if isinstance(schema, Mapping) else None
         if isinstance(labels, Sequence):
@@ -3733,6 +3792,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     kw_values = [str(kw).strip() for kw in label_keywords if str(kw).strip()]
                     if kw_values:
                         keywords[label_id] = kw_values
+                label_query = label.get("search_query")
+                if isinstance(label_query, str) and label_query.strip():
+                    queries[label_id] = label_query.strip()
                 label_examples = label.get("few_shot_examples")
                 if isinstance(label_examples, Sequence):
                     parsed_examples: List[Dict[str, str]] = []
@@ -3760,6 +3822,19 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         elif isinstance(rag_cfg, Mapping) and "label_keywords" in rag_cfg:
             rag_cfg = dict(rag_cfg)
             rag_cfg.pop("label_keywords", None)
+            self._ai_engine_overrides["rag"] = rag_cfg
+            updated = True
+
+        # Refresh rag_cfg after keyword updates
+        rag_cfg = self._ai_engine_overrides.get("rag") if isinstance(self._ai_engine_overrides.get("rag"), Mapping) else rag_cfg
+        if queries:
+            rag_cfg = dict(rag_cfg)
+            rag_cfg["label_queries"] = queries
+            self._ai_engine_overrides["rag"] = rag_cfg
+            updated = True
+        elif isinstance(rag_cfg, Mapping) and "label_queries" in rag_cfg:
+            rag_cfg = dict(rag_cfg)
+            rag_cfg.pop("label_queries", None)
             self._ai_engine_overrides["rag"] = rag_cfg
             updated = True
 
