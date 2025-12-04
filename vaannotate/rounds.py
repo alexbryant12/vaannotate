@@ -213,11 +213,15 @@ class RoundBuilder:
                 continue
             missing_predictions = [unit_id for unit_id in unit_ids if unit_id not in predictions]
             if missing_predictions:
-                missing_preview = ", ".join(sorted(missing_predictions))
-                raise RuntimeError(
-                    "Final LLM outputs missing predictions for reviewer "
-                    f"{reviewer_id}: {missing_preview}"
+                logging.getLogger(__name__).warning(
+                    "Skipping %d unit(s) missing LLM predictions for reviewer %s: %s",
+                    len(missing_predictions),
+                    reviewer_id,
+                    ", ".join(sorted(missing_predictions)),
                 )
+            unit_ids = [unit_id for unit_id in unit_ids if unit_id in predictions]
+            if not unit_ids:
+                continue
             assign_dir = round_dir / "assignments" / reviewer_id
             db_path = assign_dir / "assignment.db"
             if not db_path.exists():

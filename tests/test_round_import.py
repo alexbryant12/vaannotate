@@ -1732,6 +1732,31 @@ def test_generate_round_auto_submit_llm_missing_predictions(
     config_path = tmp_path / "ph_test_r3.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="missing predictions"):
-        builder.generate_round("ph_test", config_path, created_by="tester")
+    result = builder.generate_round("ph_test", config_path, created_by="tester")
+
+    round_dir = Path(result["round_dir"])
+    assignment_dir = round_dir / "assignments" / RoundBuilder.LLM_REVIEWER_ID
+    with sqlite3.connect(assignment_dir / "assignment.db") as conn:
+        conn.row_factory = sqlite3.Row
+        completions = {
+            row["unit_id"]: row["complete"]
+            for row in conn.execute(
+                "SELECT unit_id, complete FROM units ORDER BY unit_id"
+            ).fetchall()
+        }
+        annotations = conn.execute(
+            "SELECT unit_id, label_id, value, value_num, na FROM annotations"
+        ).fetchall()
+
+    assert completions["doc_0"] == 1
+    assert completions["doc_1"] == 0
+    observed = {(row["unit_id"], row["label_id"]): row for row in annotations}
+
+    assert observed[("doc_0", "Flag")]["value"] == "yes"
+    assert observed[("doc_0", "Score")]["value_num"] == pytest.approx(1.0)
+
+    for label_id in ("Flag", "Score"):
+        missing_row = observed[("doc_1", label_id)]
+        assert missing_row["value"] in (None, "")
+        assert missing_row["value_num"] is None
 
