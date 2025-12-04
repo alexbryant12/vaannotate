@@ -1678,6 +1678,22 @@ def _contexts_for_unit_label(
             metadata = {}
         metadata.setdefault("other_meta", "")
 
+        try:
+            retriever.set_last_diagnostics(
+                resolved_unit_id,
+                label_id,
+                {
+                    "rag_mode": "full_doc",
+                    "unit_id": resolved_unit_id,
+                    "label_id": str(label_id),
+                    "stage": "full_doc",
+                    "final_selection": {"count": 1, "score_stats": {"min": 1.0, "max": 1.0, "mean": 1.0}},
+                },
+                original_unit_id=str(unit_id),
+            )
+        except Exception:
+            pass
+
         return [
             {
                 "doc_id": doc_id,
@@ -1696,6 +1712,7 @@ def _contexts_for_unit_label(
         topk_override=topk_override,
         min_k_override=min_k_override,
         mmr_lambda_override=mmr_lambda_override,
+        original_unit_id=str(unit_id),
     )
 
 
@@ -1852,6 +1869,20 @@ class RAGRetriever:
         self._label_query_embs  = {}   # (label_id, rules_hash, K) -> np.ndarray[K,d]
         # Optional concise rule text to keep re-ranker context compact
         self.rerank_rule_overrides: dict[str, str] = {}
+        self._last_diagnostics: dict[tuple[str, str], dict] = {}
+
+    def set_last_diagnostics(
+        self, unit_id: str, label_id: str, diagnostics: dict, original_unit_id: str | None = None
+    ):
+        """Cache the most recent retrieval diagnostics for a (unit, label) pair."""
+
+        key = (str(unit_id), str(label_id))
+        self._last_diagnostics[key] = diagnostics or {}
+        if original_unit_id is not None:
+            self._last_diagnostics[(str(original_unit_id), str(label_id))] = diagnostics or {}
+
+    def get_last_diagnostics(self, unit_id: str, label_id: str) -> dict:
+        return self._last_diagnostics.get((str(unit_id), str(label_id)), {})
 
     def set_label_exemplars(self, label_id: str, rules: str, K: int, texts: list[str]):
         key = (str(label_id), _stable_rules_hash(label_id, rules, K, getattr(self.models.embedder, "name_or_path", "")), int(K))
@@ -2125,7 +2156,9 @@ class RAGRetriever:
         label_rules: str | None,
         topk_override: int | None = None,
         min_k_override: int | None = None,
-        mmr_lambda_override: float | None = None,   
+        mmr_lambda_override: float | None = None,
+        *,
+        original_unit_id: str | None = None,
     ) -> list[dict]:
         """
         Patient-only RAG for (unit_id, label_id).
@@ -2138,6 +2171,22 @@ class RAGRetriever:
         import numpy as _np
         
         # ---- helpers ----
+        diagnostics: dict[str, object] = {
+            "unit_id": str(unit_id),
+            "label_id": str(label_id),
+            "stage": "init",
+        }
+
+        def _score_stats(items: list[dict]) -> dict:
+            scores = [float(it.get("score", 0.0)) for it in items if isinstance(it.get("score"), (int, float))]
+            if not scores:
+                return {}
+            return {
+                "min": float(min(scores)),
+                "max": float(max(scores)),
+                "mean": float(_np.mean(scores)),
+            }
+
         def _patient_local_rank(_unit: str, _q_emb: _np.ndarray, need: int) -> list[dict]:
             idxs = self.store.get_patient_chunk_indices(_unit)
             if not idxs:
@@ -2232,12 +2281,22 @@ class RAGRetriever:
         mmr_mult  = max(1, getattr(cfg_rag, "mmr_multiplier", 3))  # pool size before CE = final_k * mmr_mult
         hops      = int(getattr(cfg_rag, "neighbor_hops", 1))
         use_kw    = bool(getattr(cfg_rag, "use_keywords", True))
-        
+        mmr_select_k = final_k * mmr_mult
+
         # λ (0..1)
         lam = mmr_lambda_override
         if lam is None: lam = getattr(cfg_rag, "mmr_lambda", None)
         lam = None if lam is None else float(lam)
         if lam is not None: lam = max(0.0, min(1.0, lam))
+        diagnostics.update(
+            {
+                "stage": "config",
+                "rag_mode": "patient_local",
+                "final_k": final_k,
+                "min_k": min_k,
+                "mmr": {"lambda": lam, "multiplier": mmr_mult, "select_k": mmr_select_k},
+            }
+        )
 
         # ---- label-aware query + embedding ----
         try:
@@ -2257,7 +2316,6 @@ class RAGRetriever:
             K_use = max(K_use, len(opts))
         Q = self._get_label_query_embs(label_id, label_rules, K=K_use)
         exemplar_texts = self._get_label_query_texts(label_id, label_rules, K=K_use) or []
-        mmr_select_k = final_k * mmr_mult
 
         lblcfg = self.label_configs.get(label_id, {}) if isinstance(self.label_configs, dict) else {}
         manual_query = None
@@ -2284,6 +2342,16 @@ class RAGRetriever:
                 rule_query = self._build_query(label_id, label_rules)
             rerank_query = self._build_query(label_id, self._rerank_rules_text(label_id, label_rules))
 
+        diagnostics.update(
+            {
+                "stage": "queries",
+                "manual_query": manual_query,
+                "rule_query": rule_query,
+                "rerank_query": rerank_query,
+                "exemplar_queries": exemplar_texts,
+            }
+        )
+
         rule_emb = self.store._embed([rule_query])[0]
         mmr_query_embs.append(rule_emb)
 
@@ -2299,6 +2367,13 @@ class RAGRetriever:
                     it["source"] = "patient_exemplar"
                 semantic_runs.append(ex_hits)
                 mmr_query_embs.append(Q[i])
+
+        all_semantic_hits = [hit for run in semantic_runs for hit in run]
+        diagnostics["semantic_search"] = {
+            "runs": [len(run) for run in semantic_runs],
+            "sources": dict(Counter([str(it.get("source")) for it in all_semantic_hits])),
+            "score_stats": _score_stats(all_semantic_hits),
+        }
 
         if len(semantic_runs) == 1:
             items = semantic_runs[0]
@@ -2334,20 +2409,35 @@ class RAGRetriever:
                     seen_kw.add(kw)
                     uniq_keywords.append(kw)
                 bm25_hits = self._bm25_hits_for_patient(str(unit_id), uniq_keywords)
+                diagnostics["keyword_search"] = {
+                    "keywords": uniq_keywords,
+                    "hit_count": len(bm25_hits),
+                }
         if bm25_hits:
             if items:
                 items = self._reciprocal_rank_fusion([items, bm25_hits])
             else:
                 items = bm25_hits
 
+        diagnostics["pool"] = {
+            "semantic": len(all_semantic_hits),
+            "bm25": len(bm25_hits),
+            "fused": len(items),
+        }
+
         # Dedup
         pool = _dedup_only(items)
-    
+
+        diagnostics["pool"]["deduped"] = len(pool)
+
         # Neighbor padding for short pools
         if len(pool) < max(min_k, final_k):
             extra = _neighbors(pool, hops=hops)
             pool = _dedup_only(pool + extra)
+            diagnostics["pool"]["neighbors_added"] = len(pool) - diagnostics["pool"].get("deduped", 0)
         if not pool:
+            diagnostics["stage"] = "empty_pool"
+            self.set_last_diagnostics(unit_id, label_id, diagnostics, original_unit_id=original_unit_id)
             return []
     
         # Build (doc,chunk) -> ix map with STRING doc_id, INT chunk_id
@@ -2361,7 +2451,11 @@ class RAGRetriever:
             ix = by_doc.get(did, {}).get(cid)
             if ix is not None:
                 cand_idxs.append(ix); cand_items.append(it)
-    
+
+        diagnostics.setdefault("pool", {})["source_counts"] = dict(
+            Counter(str(it.get("source")) for it in pool)
+        )
+
         # CE fallback if mapping failed
         if not cand_idxs:
             texts = [it["text"] for it in pool]
@@ -2373,6 +2467,7 @@ class RAGRetriever:
     
         # Preselect for CE (MMR or head)
         k_pre = min(len(cand_items), max(final_k, min_k, mmr_select_k))
+        diagnostics.setdefault("mmr", {}).update({"candidate_pool": len(cand_items), "select_size": k_pre})
         if lam is not None:
             sel = self._mmr_select(q_emb, cand_idxs, k=k_pre, lam=lam)
             idx_to_item = {ix: it for ix, it in zip(cand_idxs, cand_items)}
@@ -2388,7 +2483,16 @@ class RAGRetriever:
     
         pre.sort(key=lambda d: d["score"], reverse=True)
         out = pre[:final_k]
-    
+
+        diagnostics.setdefault("mmr", {}).update(
+            {
+                "used_lambda": lam,
+                "pre_ce_count": len(pre),
+                "final_before_topoff": len(out),
+                "pre_score_stats": _score_stats(pre),
+            }
+        )
+
         # Top-off to min_k using CE on the rest
         if len(out) < min_k:
             picked = set((o["doc_id"], int(o["chunk_id"])) for o in out)
@@ -2400,7 +2504,14 @@ class RAGRetriever:
                 rest.sort(key=lambda d: d["score"], reverse=True)
                 need = min_k - len(out)
                 out.extend(rest[:need])
-    
+
+        diagnostics["final_selection"] = {
+            "count": len(out),
+            "score_stats": _score_stats(out),
+        }
+
+        diagnostics["stage"] = "complete"
+        self.set_last_diagnostics(unit_id, label_id, diagnostics, original_unit_id=original_unit_id)
         return out[:final_k]
 
     def expand_from_snippets(self, label_id: str, snippets: List[str], seen_pairs: set, per_seed_k: int=100) -> Dict[str,float]:
@@ -2698,6 +2809,7 @@ class LLMAnnotator:
         snippets: List[dict],
         n_consistency: int = 1,
         jitter_params: bool = False,
+        rag_diagnostics: Optional[dict] = None,
     ) -> dict:
         import json, time
 
@@ -2929,9 +3041,10 @@ class LLMAnnotator:
                             },
                             "snippets": [{"doc_id": c.get("doc_id"), "chunk_id": c.get("chunk_id")} for c in (cand if jitter_params else snippets)],
                             "output": {"prediction": pred, "raw": data_map, "content": content},
+                            "rag_diagnostics": rag_diagnostics or {},
                         })
                     except Exception:
-                        LLM_RECORDER.record("json_vote_error", {})
+                        LLM_RECORDER.record("json_vote_error", {"rag_diagnostics": rag_diagnostics or {}})
                         pass
                     
                     break  # success
@@ -3724,6 +3837,7 @@ class FamilyLabeler:
             single_doc_context_mode=getattr(self.cfg, "single_doc_context", "rag"),
             full_doc_char_limit=getattr(self.cfg, "single_doc_full_context_max_chars", None),
         )
+        rag_diag = self.retriever.get_last_diagnostics(unit_id, label_id)
         ctx_lines = []
         for snip in snippets:
             md = snip.get("metadata") or {}
@@ -3767,6 +3881,7 @@ class FamilyLabeler:
                     "prediction": pred,
                     "latency_s": result.latency_s,
                 },
+                "rag_diagnostics": rag_diag or {},
             })
         except Exception:
             pass
@@ -3809,13 +3924,14 @@ class FamilyLabeler:
                 single_doc_context_mode=getattr(self.cfg, "single_doc_context", "rag"),
                 full_doc_char_limit=getattr(self.cfg, "single_doc_full_context_max_chars", None),
             )
+            rag_diag = self.retriever.get_last_diagnostics(unit_id, lid)
             # Decide FC vs JSON
             opts = _options_for_label(lid, ltype, getattr(self.retriever, 'label_configs', {}))
             used_fc = False
             row = {"unit_id": unit_id, "label_id": lid, "label_type": ltype, "rag_context": ctx}
-            
+
             if json_only:
-                res = self.llm.annotate(unit_id, lid, ltype, rules, ctx, n_consistency=max(1, int(json_n_consistency)), jitter_params=bool(json_jitter))
+                res = self.llm.annotate(unit_id, lid, ltype, rules, ctx, n_consistency=max(1, int(json_n_consistency)), jitter_params=bool(json_jitter), rag_diagnostics=rag_diag)
                 row["prediction"] = res.get("prediction")
                 row["consistency"] = res.get("consistency_agreement")
                 row["runs"] = res.get("runs")
@@ -3840,7 +3956,7 @@ class FamilyLabeler:
                             used_fc = False
                 if not used_fc:
                     # JSON with self-consistency if configured
-                    res = self.llm.annotate(unit_id, lid, ltype, rules, ctx, n_consistency=self.llm.cfg.n_consistency, jitter_params=True)
+                    res = self.llm.annotate(unit_id, lid, ltype, rules, ctx, n_consistency=self.llm.cfg.n_consistency, jitter_params=True, rag_diagnostics=rag_diag)
                     row["prediction"] = res.get("prediction")
                     row["consistency"] = res.get("consistency_agreement")
                     row["runs"] = res.get("runs")

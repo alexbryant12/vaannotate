@@ -366,6 +366,7 @@ class LabelKeywordsEditor(QtWidgets.QWidget):
         include_queries: bool = False,
     ) -> None:
         super().__init__()
+        self.setProperty("include_queries", bool(include_queries))
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
@@ -697,10 +698,28 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
             widgets: Dict[str, QtWidgets.QWidget] = {}
             for field_name, value in section_values.items():
-                widget = self._build_field_widget(key, field_name, value)
+                if key == "rag" and self._label_schema_labels and field_name == "label_queries":
+                    continue
+                widget = self._build_field_widget(
+                    key, field_name, value, section_values=section_values
+                )
                 widgets[field_name] = widget
                 label_text = field_name.replace("_", " ").capitalize()
                 form.addRow(label_text, widget)
+            if key == "rag" and self._label_schema_labels and "label_keywords" not in widgets:
+                keywords_value = (
+                    section_values.get("label_keywords")
+                    if isinstance(section_values, Mapping)
+                    else {}
+                )
+                widget = self._build_field_widget(
+                    key,
+                    "label_keywords",
+                    keywords_value,
+                    section_values=section_values,
+                )
+                widgets["label_keywords"] = widget
+                form.addRow("Label keywords", widget)
             self._section_widgets[key] = widgets
             container_layout.addWidget(group)
 
@@ -728,10 +747,34 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
-    def _build_field_widget(self, section: str, name: str, value: Any) -> QtWidgets.QWidget:
+    def _build_field_widget(
+        self,
+        section: str,
+        name: str,
+        value: Any,
+        *,
+        section_values: Optional[Mapping[str, object]] = None,
+    ) -> QtWidgets.QWidget:
         tooltip = AI_CONFIG_TOOLTIPS.get(section, {}).get(name, "")
         widget: QtWidgets.QWidget
-        if name == "type" and section == "index":
+        if (
+            section == "rag"
+            and name == "label_keywords"
+            and self._label_schema_labels
+        ):
+            existing = value if isinstance(value, Mapping) else {}
+            queries: Mapping[str, object] = {}
+            if isinstance(section_values, Mapping):
+                raw_queries = section_values.get("label_queries")
+                if isinstance(raw_queries, Mapping):
+                    queries = raw_queries
+            widget = LabelKeywordsEditor(
+                self._label_schema_labels,
+                existing,
+                queries,
+                include_queries=True,
+            )
+        elif name == "type" and section == "index":
             combo = QtWidgets.QComboBox()
             for label, data in (("Flat", "flat"), ("HNSW", "hnsw"), ("IVF", "ivf")):
                 combo.addItem(label, data)
@@ -840,6 +883,10 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
                     values[key] = text
             elif isinstance(widget, (LabelKeywordsEditor, LabelFewShotExamplesEditor)):
                 values[key] = widget.to_mapping()
+                if isinstance(widget, LabelKeywordsEditor) and widget.property(
+                    "include_queries"
+                ):
+                    values["label_queries"] = widget.to_query_mapping()
             elif isinstance(widget, QtWidgets.QLineEdit):
                 if widget.property("value_type") == "tuple":
                     text = widget.text().strip()
@@ -4638,7 +4685,89 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         ai_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         if isinstance(ai_cfg, Mapping):
             self._ai_engine_overrides = copy.deepcopy(ai_cfg)
+            llm_cfg_source = ai_cfg.get("llm") if isinstance(ai_cfg.get("llm"), Mapping) else {}
+            llm_overrides: dict[str, object] = {}
+            if isinstance(self._ai_engine_overrides.get("llm"), Mapping):
+                llm_overrides.update(self._ai_engine_overrides["llm"])
+            backend_choice = llm_overrides.get("backend") or ai_cfg.get("backend")
+            if backend_choice and "backend" not in llm_overrides:
+                llm_overrides["backend"] = backend_choice
+            embed_path = ai_cfg.get("embedding_model_dir")
+            if isinstance(embed_path, str) and hasattr(self, "random_embedding_path_edit"):
+                self.random_embedding_path_edit.setText(embed_path)
+            rerank_path = ai_cfg.get("reranker_model_dir")
+            if isinstance(rerank_path, str) and hasattr(self, "random_reranker_path_edit"):
+                self.random_reranker_path_edit.setText(rerank_path)
+            azure_version = llm_cfg_source.get("azure_api_version") or ai_cfg.get("azure_api_version")
+            if isinstance(azure_version, str):
+                if "azure_api_version" not in llm_overrides:
+                    llm_overrides["azure_api_version"] = azure_version
+                if hasattr(self, "random_azure_version_edit"):
+                    self.random_azure_version_edit.setText(azure_version)
+            azure_endpoint = llm_cfg_source.get("azure_endpoint") or ai_cfg.get("azure_endpoint")
+            if isinstance(azure_endpoint, str):
+                if "azure_endpoint" not in llm_overrides:
+                    llm_overrides["azure_endpoint"] = azure_endpoint
+                if hasattr(self, "random_azure_endpoint_edit"):
+                    self.random_azure_endpoint_edit.setText(azure_endpoint)
+            local_model = llm_cfg_source.get("local_model_dir") or ai_cfg.get("local_model_dir")
+            if isinstance(local_model, str):
+                if "local_model_dir" not in llm_overrides:
+                    llm_overrides["local_model_dir"] = local_model
+                if hasattr(self, "random_local_model_path_edit"):
+                    self.random_local_model_path_edit.setText(local_model)
+            max_seq = llm_cfg_source.get("local_max_seq_len") or ai_cfg.get("local_max_seq_len")
+            if isinstance(max_seq, (int, float)):
+                if "local_max_seq_len" not in llm_overrides:
+                    llm_overrides["local_max_seq_len"] = max_seq
+                if hasattr(self, "random_local_max_seq_spin"):
+                    try:
+                        self.random_local_max_seq_spin.setValue(int(max_seq))
+                    except Exception:  # noqa: BLE001
+                        pass
+            max_new = llm_cfg_source.get("local_max_new_tokens") or ai_cfg.get("local_max_new_tokens")
+            if isinstance(max_new, (int, float)):
+                if "local_max_new_tokens" not in llm_overrides:
+                    llm_overrides["local_max_new_tokens"] = max_new
+                if hasattr(self, "random_local_max_new_tokens_spin"):
+                    try:
+                        self.random_local_max_new_tokens_spin.setValue(int(max_new))
+                    except Exception:  # noqa: BLE001
+                        pass
+            if llm_overrides:
+                self._ai_engine_overrides["llm"] = llm_overrides
             self._apply_ai_config_to_controls(self._ai_engine_overrides)
+            if isinstance(backend_choice, str) and hasattr(self, "random_backend_combo"):
+                idx = self.random_backend_combo.findData(backend_choice)
+                if idx >= 0:
+                    self.random_backend_combo.setCurrentIndex(idx)
+                    self._update_random_backend_fields()
+        reviewers_cfg = config.get("reviewers")
+        if isinstance(reviewers_cfg, Sequence) and hasattr(self, "reviewer_list"):
+            self.reviewer_list.clear()
+            self._selected_reviewer_ids.clear()
+            for reviewer in reviewers_cfg:
+                if not isinstance(reviewer, Mapping):
+                    continue
+                reviewer_id = reviewer.get("id") or reviewer.get("reviewer_id")
+                if not reviewer_id:
+                    continue
+                entry = {
+                    "id": str(reviewer_id),
+                    "name": str(reviewer.get("name") or reviewer_id),
+                    "email": str(reviewer.get("email") or ""),
+                }
+                self._add_reviewer_entry(entry)
+        final_llm_value = config.get("final_llm_labeling")
+        if hasattr(self, "random_final_llm_checkbox") and isinstance(final_llm_value, bool):
+            self.random_final_llm_checkbox.setChecked(final_llm_value)
+            self._on_random_final_llm_toggled(final_llm_value)
+        include_reasoning_value = config.get("final_llm_include_reasoning")
+        if (
+            hasattr(self, "random_include_reasoning_checkbox")
+            and isinstance(include_reasoning_value, bool)
+        ):
+            self.random_include_reasoning_checkbox.setChecked(include_reasoning_value)
 
     def _collect_filters(self) -> SamplingFilters:
         conditions: List[MetadataFilterCondition] = []
