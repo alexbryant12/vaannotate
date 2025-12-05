@@ -705,7 +705,13 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
                 if key == "rag":
                     if self._label_schema_labels and field_name == "label_queries":
                         continue
-                    if field_name in {"per_label_topk", "use_keywords", "keyword_topk"}:
+                    if field_name in {
+                        "per_label_topk",
+                        "use_keywords",
+                        "keyword_topk",
+                        "mmr_candidates",
+                        "mmr_multiplier",
+                    }:
                         continue
                 widget = self._build_field_widget(
                     key, field_name, value, section_values=section_values
