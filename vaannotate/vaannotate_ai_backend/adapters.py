@@ -920,6 +920,47 @@ def _join_corpus_with_prior_units(
     return filtered
 
 
+def _enforce_scoped_corpus(
+    notes_df: pd.DataFrame, scoped_csv: Path, log: Callable[[str], None]
+) -> pd.DataFrame:
+    """Filter ``notes_df`` to the doc_ids present in a scoped corpus CSV.
+
+    Inference-only runs are expected to operate on a pre-scoped corpus. If the
+    in-memory notes unexpectedly contains rows outside that scope (e.g., due to
+    upstream fallbacks), this helper trims them back to the explicit scope.
+    """
+
+    try:
+        scoped_df = pd.read_csv(scoped_csv)
+    except Exception as exc:  # noqa: BLE001
+        log(f"Warning: failed to read scoped corpus CSV ({exc}); proceeding without enforcement")
+        return notes_df
+
+    if "doc_id" not in scoped_df.columns:
+        log("Warning: scoped corpus CSV is missing doc_id; cannot enforce scope")
+        return notes_df
+
+    allowed_doc_ids = scoped_df["doc_id"].dropna().astype(str).str.strip()
+    allowed_doc_ids = allowed_doc_ids.loc[allowed_doc_ids != ""]
+    if allowed_doc_ids.empty:
+        log("Warning: scoped corpus CSV contains no doc_id values; cannot enforce scope")
+        return notes_df
+
+    filtered = notes_df.copy()
+    filtered["doc_id"] = filtered["doc_id"].astype(str).str.strip()
+    mask = filtered["doc_id"].isin(set(allowed_doc_ids))
+    if mask.all():
+        return filtered
+
+    kept = int(mask.sum())
+    removed = len(filtered) - kept
+    log(
+        "Restricted inference corpus to scoped CSV doc_ids: "
+        f"kept {kept}, dropped {removed}"
+    )
+    return filtered.loc[mask]
+
+
 def _unit_identifier_from_row(row: Mapping[str, Any], level: str) -> Optional[str]:
     keys = ["unit_id"]
     if str(level or "single_doc") == "multi_doc":
@@ -1019,6 +1060,8 @@ def run_ai_backend_and_collect(
         log("Inference-only mode: exporting scoped corpus for LLM labeling.")
         scoped_notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
         scoped_notes_df = _join_corpus_with_prior_units(scoped_notes_df, ann_df, log)
+        if scoped_csv_path:
+            scoped_notes_df = _enforce_scoped_corpus(scoped_notes_df, scoped_csv_path, log)
         if len(scoped_notes_df) != len(notes_df):
             log(
                 "Restricted inference corpus to scoped units: "
