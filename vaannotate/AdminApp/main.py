@@ -5653,6 +5653,35 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     llm_overrides["local_max_new_tokens"] = max_new
         if llm_overrides:
             overrides["llm"] = llm_overrides
+
+        # Keep a single top-k value in sync across LLM-first probes and final RAG retrieval
+        shared_topk: Optional[int] = None
+        rag_cfg = overrides.get("rag") if isinstance(overrides.get("rag"), Mapping) else {}
+        llmfirst_cfg = overrides.get("llmfirst") if isinstance(overrides.get("llmfirst"), Mapping) else {}
+        try:
+            candidate = int(rag_cfg.get("top_k_final")) if rag_cfg else None
+            if candidate and candidate > 0:
+                shared_topk = candidate
+        except Exception:  # noqa: BLE001
+            shared_topk = None
+        if shared_topk is None:
+            try:
+                candidate = int(llmfirst_cfg.get("topk")) if llmfirst_cfg else None
+                if candidate and candidate > 0:
+                    shared_topk = candidate
+            except Exception:  # noqa: BLE001
+                shared_topk = None
+
+        if shared_topk is not None:
+            rag_cfg = dict(rag_cfg)
+            rag_cfg["top_k_final"] = shared_topk
+            rag_cfg["per_label_topk"] = shared_topk
+            overrides["rag"] = rag_cfg
+
+            llmfirst_cfg = dict(llmfirst_cfg)
+            llmfirst_cfg["topk"] = shared_topk
+            overrides["llmfirst"] = llmfirst_cfg
+
         return overrides
 
     def _on_ai_thread_finished(self) -> None:
