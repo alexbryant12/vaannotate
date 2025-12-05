@@ -125,7 +125,104 @@ def test_export_inputs_uses_storage_path(tmp_path: Path) -> None:
     assert ann_df.loc[0, "round_id"] == "ph_test_r1"
     assert ann_df.loc[0, "reviewer_id"] == "rev1"
     assert ann_df.loc[0, "document_text"] == "Sample text"
-    assert ann_df.loc[0, "labelset_id"] == "ls_test"
+
+
+def test_export_inputs_filters_rounds_by_labelset(tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    pheno_id = "ph_labelset_filter"
+    storage_relative = Path("phenotypes") / pheno_id
+    phenotype_dir = project_root / storage_relative
+    (phenotype_dir / "rounds").mkdir(parents=True, exist_ok=True)
+
+    with get_connection(paths.project_db) as conn:
+        add_phenotype(
+            conn,
+            pheno_id=pheno_id,
+            project_id="proj",
+            name="Phenotype",
+            level="single_doc",
+            storage_path=str(storage_relative.as_posix()),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO rounds(round_id, pheno_id, round_number, labelset_id, config_hash, rng_seed, status, created_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            ("ph_labelset_filter_r1", pheno_id, 1, "ls_primary", "hash", 0, "finalized", "2020-01-01T00:00:00"),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO rounds(round_id, pheno_id, round_number, labelset_id, config_hash, rng_seed, status, created_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            ("ph_labelset_filter_r2", pheno_id, 2, "ls_secondary", "hash", 0, "finalized", "2020-01-02T00:00:00"),
+        )
+        conn.commit()
+
+    corpus_dir = project_root / "Corpora" / pheno_id
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    corpus_db = corpus_dir / "corpus.db"
+    with initialize_corpus_db(corpus_db) as conn:
+        conn.execute("INSERT INTO patients(patient_icn) VALUES (?)", ("p1",))
+        conn.execute("INSERT INTO patients(patient_icn) VALUES (?)", ("p2",))
+        conn.execute(
+            """
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
+            """,
+            ("doc_primary", "p1", "2020-01-01", "hash1", "Primary text", "{}"),
+        )
+        conn.execute(
+            """
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
+            """,
+            ("doc_secondary", "p2", "2020-01-02", "hash2", "Secondary text", "{}"),
+        )
+        conn.commit()
+
+    for round_number, label, doc_id in [(1, "ls_primary", "doc_primary"), (2, "ls_secondary", "doc_secondary")]:
+        round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
+        imports_dir = round_dir / "imports"
+        imports_dir.mkdir(parents=True, exist_ok=True)
+        assignment_db = imports_dir / "rev_assignment.db"
+        with initialize_assignment_db(assignment_db) as conn:
+            conn.execute(
+                "INSERT INTO units(unit_id, display_rank, patient_icn, doc_id, note_count) VALUES (?,?,?,?,?)",
+                (f"unit_{round_number}", round_number, f"p{round_number}", doc_id, 1),
+            )
+            conn.execute(
+                "INSERT INTO documents(doc_id, hash, text, metadata_json) VALUES (?,?,?,?)",
+                (doc_id, f"hash{round_number}", f"{doc_id} text", "{}"),
+            )
+            conn.execute(
+                "INSERT INTO unit_notes(unit_id, doc_id, order_index) VALUES (?,?,?)",
+                (f"unit_{round_number}", doc_id, 0),
+            )
+            conn.execute(
+                "INSERT INTO annotations(unit_id, label_id, value, value_num, na, notes) VALUES (?,?,?,?,?,?)",
+                (f"unit_{round_number}", "LabelA", "yes", None, 0, "note"),
+            )
+            conn.commit()
+
+    messages: list[str] = []
+    notes_df, ann_df = export_inputs_from_repo(
+        project_root,
+        pheno_id,
+        [1, 2],
+        corpus_id=f"cor_{pheno_id}",
+        corpus_path=str(corpus_db.relative_to(project_root)),
+        labelset_id="ls_primary",
+        log_callback=messages.append,
+    )
+
+    assert not ann_df.empty
+    assert set(ann_df["round_id"]) == {"ph_labelset_filter_r1"}
+    assert set(ann_df["labelset_id"]) == {"ls_primary"}
+    assert "doc_secondary" not in ann_df.get("doc_id", []).tolist()
+    assert any("label set mismatches" in msg for msg in messages)
 
 
 def test_export_inputs_cold_start_uses_selected_corpus(tmp_path: Path) -> None:

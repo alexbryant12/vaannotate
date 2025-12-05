@@ -693,7 +693,10 @@ def export_inputs_from_repo(
     corpus_record: Optional[Mapping[str, Any] | sqlite3.Row | Dict[str, Any]] = None,
     corpus_id: Optional[str] = None,
     corpus_path: Optional[str] = None,
+    labelset_id: Optional[str] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    log = log_callback or (lambda message: None)
     prior_rounds = sorted({int(r) for r in prior_rounds})
     root = Path(project_root)
     phenotype_dir = _resolve_phenotype_dir(root, pheno_id)
@@ -709,11 +712,17 @@ def export_inputs_from_repo(
 
     ann_frames = []
     round_details = _load_round_details(project_root, pheno_id, prior_rounds)
+    skipped_rounds: list[int] = []
     for r in prior_rounds:
         round_dir = phenotype_dir / "rounds" / f"round_{r}"
         if not round_dir.exists():
             continue
         detail = round_details.get(r, {})
+        if labelset_id:
+            round_labelset = detail.get("labelset_id")
+            if round_labelset and str(round_labelset) != str(labelset_id):
+                skipped_rounds.append(r)
+                continue
         frame = _read_round_annotations(
             round_dir,
             pheno_id,
@@ -721,9 +730,14 @@ def export_inputs_from_repo(
             root,
             round_id=detail.get("round_id"),
             labelset_id=detail.get("labelset_id"),
-        )
+            )
         if not frame.empty:
             ann_frames.append(frame)
+    if skipped_rounds:
+        log(
+            "Ignoring rounds with label set mismatches: "
+            + ", ".join(str(r) for r in sorted(skipped_rounds))
+        )
 
     ann_df = (
         pd.concat(ann_frames, ignore_index=True)
@@ -860,6 +874,8 @@ def run_ai_backend_and_collect(
         corpus_record=record_dict,
         corpus_id=corpus_id,
         corpus_path=normalized_corpus_path,
+        labelset_id=labelset_id,
+        log_callback=log_callback,
     )
     if consensus_only:
         ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
