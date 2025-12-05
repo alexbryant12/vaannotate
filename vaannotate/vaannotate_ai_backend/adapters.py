@@ -965,7 +965,15 @@ def run_ai_backend_and_collect(
         notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
 
     if inference_only:
-        log("Inference-only mode: exporting full corpus for LLM labeling.")
+        log("Inference-only mode: exporting scoped corpus for LLM labeling.")
+        scoped_notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
+        scoped_notes_df = _join_corpus_with_prior_units(scoped_notes_df, ann_df, log)
+        if len(scoped_notes_df) != len(notes_df):
+            log(
+                "Restricted inference corpus to scoped units: "
+                f"kept {len(scoped_notes_df)}, dropped {len(notes_df) - len(scoped_notes_df)}"
+            )
+        notes_df = scoped_notes_df
         ai_dir = Path(round_dir) / "imports" / "ai"
         ai_dir.mkdir(parents=True, exist_ok=True)
         corpus_csv = ai_dir / "inference_corpus.csv"
