@@ -987,13 +987,12 @@ def run_ai_backend_and_collect(
 
         overrides: Dict[str, Any] = dict(cfg_overrides or {})
         select_overrides: Dict[str, Any] = dict(overrides.get("select", {}))
-        select_overrides["batch_size"] = max(int(select_overrides.get("batch_size", 0) or 0), len(notes_df))
-        select_overrides["write_buckets"] = False
+        select_overrides["batch_size"] = max(
+            int(select_overrides.get("batch_size", 0) or 0), len(notes_df)
+        )
+        # Keep active-learning buckets disabled for inference runs while still
+        # allowing chunking/indexing and downstream LLM family labeling to run.
         select_overrides["skip_active_learning"] = True
-        select_overrides["pct_disagreement"] = 0.0
-        select_overrides["pct_diversity"] = 0.0
-        select_overrides["pct_uncertain"] = 0.0
-        select_overrides["pct_easy_qc"] = 0.0
         overrides["select"] = select_overrides
         cfg_overrides = overrides
 
