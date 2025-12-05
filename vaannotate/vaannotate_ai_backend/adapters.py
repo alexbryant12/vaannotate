@@ -648,6 +648,7 @@ def export_inputs_from_repo(
     corpus_id: Optional[str] = None,
     corpus_path: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    prior_rounds = sorted({int(r) for r in prior_rounds})
     root = Path(project_root)
     phenotype_dir = _resolve_phenotype_dir(root, pheno_id)
     corpus_db = _find_corpus_db(
@@ -731,12 +732,14 @@ def _scope_corpus_to_annotations(
     if ann_df.empty or "doc_id" not in ann_df.columns or "doc_id" not in notes_df.columns:
         return notes_df
 
-    ann_doc_ids = ann_df["doc_id"].dropna().astype(str)
+    ann_doc_ids = ann_df["doc_id"].dropna().astype(str).str.strip()
+    ann_doc_ids = ann_doc_ids.loc[ann_doc_ids != ""]
     if ann_doc_ids.empty:
         return notes_df
 
     scoped_notes = notes_df.copy()
-    scoped_notes["doc_id"] = scoped_notes["doc_id"].astype(str)
+    scoped_notes["doc_id"] = scoped_notes["doc_id"].astype(str).str.strip()
+    scoped_notes = scoped_notes.loc[scoped_notes["doc_id"] != ""]
     mask = scoped_notes["doc_id"].isin(set(ann_doc_ids))
     if mask.all():
         return scoped_notes
