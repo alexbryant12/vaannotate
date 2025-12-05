@@ -173,6 +173,7 @@ class SelectionConfig:
     pct_easy_qc: float = 0.1      # LLM-certain
     pct_diversity: float = 0.3
     write_buckets: bool = True
+    skip_active_learning: bool = False
 
 @dataclass
 class LLMFirstConfig:
@@ -5413,7 +5414,19 @@ class ActiveLearningLLMFirst:
         # budget without altering retrieval embeddings.
         overrides = self._build_rerank_rule_overrides(current_rules_map)
         self.rag.rerank_rule_overrides = overrides or {}
-    
+
+        if getattr(self.cfg.select, "skip_active_learning", False):
+            print("Skipping active learning bucket generation (inference-only mode).")
+            final = self.repo.notes.copy()
+            if "unit_id" not in final.columns:
+                if "doc_id" in final.columns:
+                    final["unit_id"] = final["doc_id"].astype(str)
+                else:
+                    final["unit_id"] = final.index.astype(str)
+            final["selection_reason"] = "inference_only"
+            final = final.drop_duplicates(subset=["unit_id"], keep="first")
+            return final
+
         # ---------- small helpers ----------
         def _empty_unit_frame() -> "pd.DataFrame":
             return pd.DataFrame(
