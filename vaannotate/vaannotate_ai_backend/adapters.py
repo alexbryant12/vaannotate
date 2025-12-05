@@ -1003,6 +1003,9 @@ def run_ai_backend_and_collect(
         select_overrides["skip_active_learning"] = True
         overrides["select"] = select_overrides
         cfg_overrides = overrides
+        # Avoid shared caches so inference runs never pick up stale corpora from
+        # earlier experiments that targeted a larger base corpus.
+        shared_cache_dir = None
 
     ai_dir = Path(round_dir) / "imports" / "ai"
     ai_dir.mkdir(parents=True, exist_ok=True)
