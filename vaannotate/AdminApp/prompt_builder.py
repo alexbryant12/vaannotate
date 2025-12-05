@@ -347,6 +347,7 @@ class PromptInferenceJob:
                     corpus_id=self.corpus_id,
                     corpus_path=str(self.corpus_path) if self.corpus_path else None,
                     scope_corpus_to_annotations=True,
+                    intersect_corpus_with_prior_units=True,
                     consensus_only=True,
                     inference_only=True,
                 )

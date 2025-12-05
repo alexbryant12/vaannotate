@@ -827,6 +827,63 @@ def _scope_corpus_to_annotations(
     return filtered
 
 
+def _join_corpus_with_prior_units(
+    notes_df: pd.DataFrame, ann_df: pd.DataFrame, log: Callable[[str], None]
+) -> pd.DataFrame:
+    """Intersect the selected corpus with units present in prior rounds."""
+
+    if ann_df.empty:
+        return notes_df
+
+    unit_ids: set[str] = set()
+    doc_ids: set[str] = set()
+
+    if "unit_id" in ann_df.columns:
+        unit_ids = {
+            uid
+            for uid in ann_df["unit_id"].dropna().astype(str).str.strip()
+            if uid
+        }
+    if "doc_id" in ann_df.columns:
+        doc_ids = {
+            did
+            for did in ann_df["doc_id"].dropna().astype(str).str.strip()
+            if did
+        }
+
+    if not unit_ids and not doc_ids:
+        return notes_df
+
+    filtered = notes_df.copy()
+    mask_applied = False
+
+    if unit_ids and "unit_id" in filtered.columns:
+        filtered["unit_id"] = filtered["unit_id"].astype(str).str.strip()
+        mask = filtered["unit_id"].isin(unit_ids)
+        filtered = filtered.loc[mask]
+        mask_applied = True
+
+    if doc_ids and "doc_id" in filtered.columns:
+        filtered["doc_id"] = filtered["doc_id"].astype(str).str.strip()
+        mask = filtered["doc_id"].isin(doc_ids)
+        filtered = filtered.loc[mask]
+        mask_applied = True
+
+    if not mask_applied:
+        return notes_df
+
+    removed = len(notes_df) - len(filtered)
+    if removed:
+        log(
+            "Intersected corpus with prior round units; "
+            f"removed {removed} rows not present in selected rounds"
+        )
+    else:
+        log("Intersected corpus with prior round units; no rows removed")
+
+    return filtered
+
+
 def _unit_identifier_from_row(row: Mapping[str, Any], level: str) -> Optional[str]:
     keys = ["unit_id"]
     if str(level or "single_doc") == "multi_doc":
@@ -859,6 +916,7 @@ def run_ai_backend_and_collect(
     exclude_unit_ids: Optional[Iterable[str]] = None,
     sampling_metadata: Optional[Mapping[str, object]] = None,
     scope_corpus_to_annotations: bool = False,
+    intersect_corpus_with_prior_units: bool = False,
     consensus_only: bool = False,
     inference_only: bool = False,
 ) -> BackendResult:
@@ -892,6 +950,20 @@ def run_ai_backend_and_collect(
         labelset_id=labelset_id,
         log_callback=log_callback,
     )
+    if consensus_only:
+        ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
+        if doc_ids:
+            try:
+                notes_df = notes_df[notes_df["doc_id"].astype(str).isin(doc_ids)]
+            except Exception:  # noqa: BLE001
+                log("Warning: failed to filter corpus by consensus doc IDs; using full corpus")
+    if ann_df.empty:
+        log("No annotations available after consensus filtering; inference may lack gold labels.")
+    if intersect_corpus_with_prior_units:
+        notes_df = _join_corpus_with_prior_units(notes_df, ann_df, log)
+    if scope_corpus_to_annotations:
+        notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
+
     if inference_only:
         log("Inference-only mode: exporting full corpus for LLM labeling.")
         ai_dir = Path(round_dir) / "imports" / "ai"
@@ -924,17 +996,6 @@ def run_ai_backend_and_collect(
         select_overrides["pct_easy_qc"] = 0.0
         overrides["select"] = select_overrides
         cfg_overrides = overrides
-    if consensus_only:
-        ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
-        if doc_ids:
-            try:
-                notes_df = notes_df[notes_df["doc_id"].astype(str).isin(doc_ids)]
-            except Exception:  # noqa: BLE001
-                log("Warning: failed to filter corpus by consensus doc IDs; using full corpus")
-    if ann_df.empty:
-        log("No annotations available after consensus filtering; inference may lack gold labels.")
-    if scope_corpus_to_annotations:
-        notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
 
     ai_dir = Path(round_dir) / "imports" / "ai"
     ai_dir.mkdir(parents=True, exist_ok=True)
