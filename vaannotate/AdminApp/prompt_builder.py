@@ -348,6 +348,7 @@ class PromptInferenceJob:
                     corpus_path=str(self.corpus_path) if self.corpus_path else None,
                     scope_corpus_to_annotations=True,
                     consensus_only=True,
+                    inference_only=True,
                 )
                 result = PromptExperimentResult(
                     name=variant.name,

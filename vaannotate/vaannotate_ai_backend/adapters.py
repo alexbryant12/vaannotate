@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Any, Mapping, Iterable
@@ -25,6 +25,7 @@ class BackendResult:
     dataframe: pd.DataFrame
     artifacts: Dict[str, Any]
     params_path: Path
+    metrics: Dict[str, float] = field(default_factory=dict)
 
 
 def _materialize_label_config(conn: sqlite3.Connection, labelset_id: str) -> Optional[Dict[str, Any]]:
@@ -846,6 +847,7 @@ def run_ai_backend_and_collect(
     sampling_metadata: Optional[Mapping[str, object]] = None,
     scope_corpus_to_annotations: bool = False,
     consensus_only: bool = False,
+    inference_only: bool = False,
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
@@ -877,6 +879,37 @@ def run_ai_backend_and_collect(
         labelset_id=labelset_id,
         log_callback=log_callback,
     )
+    if inference_only:
+        log("Inference-only mode: skipping active learning batch construction.")
+        ai_dir = Path(round_dir) / "imports" / "ai"
+        ai_dir.mkdir(parents=True, exist_ok=True)
+        corpus_csv = ai_dir / "inference_corpus.csv"
+        notes_df.to_csv(corpus_csv, index=False)
+        ann_csv = ai_dir / "inference_annotations.csv"
+        ann_df.to_csv(ann_csv, index=False)
+        params = {
+            "phenotype_id": pheno_id,
+            "prior_rounds": list(sorted(prior_rounds)),
+            "phenotype_level": level,
+            "invoked_by": user,
+            "timestamp": timestamp or datetime.utcnow().isoformat(),
+            "backend_version": __version__,
+            "mode": "inference_only",
+        }
+        params_path = ai_dir / "params.json"
+        params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
+        log("Prepared inference inputs without running the active learning backend.")
+        return BackendResult(
+            csv_path=corpus_csv,
+            dataframe=notes_df,
+            artifacts={
+                "annotations_csv": str(ann_csv),
+                "corpus_csv": str(corpus_csv),
+                "mode": "inference_only",
+            },
+            params_path=params_path,
+            metrics={},
+        )
     if consensus_only:
         ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
         if doc_ids:
@@ -981,4 +1014,11 @@ def run_ai_backend_and_collect(
     params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
     log(f"Wrote parameters to {params_path}")
 
-    return BackendResult(csv_path=csv_path, dataframe=final_df, artifacts=artifacts, params_path=params_path)
+    metrics = artifacts.get("metrics", {}) if isinstance(artifacts, Mapping) else {}
+    return BackendResult(
+        csv_path=csv_path,
+        dataframe=final_df,
+        artifacts=artifacts,
+        params_path=params_path,
+        metrics=dict(metrics) if isinstance(metrics, Mapping) else {},
+    )
