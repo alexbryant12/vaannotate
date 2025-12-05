@@ -177,12 +177,25 @@ def _candidate_corpus_paths(
     pheno_id: str,
     hints: Optional[List[str]] = None,
 ) -> List[Path]:
-    candidates: List[Path] = [
-        phenotype_dir / "corpus" / "corpus.db",
-        phenotype_dir / "corpus.db",
-        phenotype_dir / "corpus.sqlite",
-        phenotype_dir / f"{pheno_id}.db",
-    ]
+    # Prioritize explicit hints (e.g., user-selected corpora) before falling back to
+    # phenotype-local defaults. Previously hints were appended after defaults, which meant
+    # an existing default corpus.db would shadow a user-specified inference corpus.
+    candidates: List[Path] = []
+
+    for hint in hints or []:
+        path = Path(hint)
+        if not path.is_absolute():
+            path = (project_root / path).resolve()
+        candidates.append(path)
+
+    candidates.extend(
+        [
+            phenotype_dir / "corpus" / "corpus.db",
+            phenotype_dir / "corpus.db",
+            phenotype_dir / "corpus.sqlite",
+            phenotype_dir / f"{pheno_id}.db",
+        ]
+    )
 
     for corpora_folder in (project_root / "corpora", project_root / "Corpora"):
         candidates.extend(
@@ -194,12 +207,6 @@ def _candidate_corpus_paths(
                 corpora_folder / f"{pheno_id}.sqlite",
             ]
         )
-
-    for hint in hints or []:
-        path = Path(hint)
-        if not path.is_absolute():
-            path = (project_root / path).resolve()
-        candidates.append(path)
 
     seen: set[Path] = set()
     unique: List[Path] = []
@@ -242,13 +249,19 @@ def _find_corpus_db(
 
     record_dict = _normalize_record(corpus_record)
 
+    explicit_selection = False
+
     if corpus_path:
+        explicit_selection = True
         hints.append(corpus_path)
     relative_hint = record_dict.get("relative_path") or record_dict.get("path")
     if isinstance(relative_hint, str) and relative_hint.strip():
+        explicit_selection = True
         hints.append(relative_hint)
     if not corpus_id:
         corpus_id = str(record_dict.get("corpus_id") or "").strip() or None
+    if corpus_id:
+        explicit_selection = True
 
     if project_db.exists():
         con = sqlite3.connect(str(project_db))
@@ -261,47 +274,80 @@ def _find_corpus_db(
                 ).fetchone()
                 if corpus_row and corpus_row["relative_path"]:
                     hints.append(corpus_row["relative_path"])
-            round_ids: List[str] = []
-            if prior_rounds:
-                round_ids.extend(f"{pheno_id}_r{number}" for number in sorted(prior_rounds, reverse=True))
-            rows = con.execute(
-                "SELECT round_id FROM rounds WHERE pheno_id=? ORDER BY round_number DESC",
-                (pheno_id,),
-            ).fetchall()
-            round_ids.extend(row["round_id"] for row in rows)
 
-            seen_rounds: set[str] = set()
-            for round_id in round_ids:
-                if round_id in seen_rounds:
-                    continue
-                seen_rounds.add(round_id)
-                cfg_row = con.execute(
-                    "SELECT config_json FROM round_configs WHERE round_id=?",
-                    (round_id,),
-                ).fetchone()
-                if not cfg_row:
-                    continue
-                try:
-                    config = json.loads(cfg_row["config_json"])
-                except Exception:  # noqa: BLE001
-                    continue
-                corpus_id = config.get("corpus_id")
-                if corpus_id:
-                    corpus_row = con.execute(
-                        "SELECT relative_path FROM project_corpora WHERE corpus_id=?",
-                        (corpus_id,),
+            if not explicit_selection:
+                round_ids: List[str] = []
+                if prior_rounds:
+                    round_ids.extend(f"{pheno_id}_r{number}" for number in sorted(prior_rounds, reverse=True))
+                rows = con.execute(
+                    "SELECT round_id FROM rounds WHERE pheno_id=? ORDER BY round_number DESC",
+                    (pheno_id,),
+                ).fetchall()
+                round_ids.extend(row["round_id"] for row in rows)
+
+                seen_rounds: set[str] = set()
+                for round_id in round_ids:
+                    if round_id in seen_rounds:
+                        continue
+                    seen_rounds.add(round_id)
+                    cfg_row = con.execute(
+                        "SELECT config_json FROM round_configs WHERE round_id=?",
+                        (round_id,),
                     ).fetchone()
-                    if corpus_row and corpus_row["relative_path"]:
-                        hints.append(corpus_row["relative_path"])
-                corpus_path = config.get("corpus_path")
-                if corpus_path:
-                    hints.append(corpus_path)
+                    if not cfg_row:
+                        continue
+                    try:
+                        config = json.loads(cfg_row["config_json"])
+                    except Exception:  # noqa: BLE001
+                        continue
+                    corpus_id = config.get("corpus_id")
+                    if corpus_id:
+                        corpus_row = con.execute(
+                            "SELECT relative_path FROM project_corpora WHERE corpus_id=?",
+                            (corpus_id,),
+                        ).fetchone()
+                        if corpus_row and corpus_row["relative_path"]:
+                            hints.append(corpus_row["relative_path"])
+                    corpus_path = config.get("corpus_path")
+                    if corpus_path:
+                        hints.append(corpus_path)
         finally:
             con.close()
 
-    for candidate in _candidate_corpus_paths(project_root, phenotype_dir, pheno_id, hints=hints):
+    def _unique_paths(candidates: List[str | Path]) -> List[Path]:
+        seen: set[Path] = set()
+        unique: List[Path] = []
+        for candidate in candidates:
+            resolved = (
+                candidate
+                if isinstance(candidate, Path) and candidate.is_absolute()
+                else (project_root / candidate).resolve()
+            )
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            unique.append(resolved)
+        return unique
+
+    if explicit_selection:
+        if not hints:
+            raise FileNotFoundError(
+                "A corpus was explicitly selected for inference but no path could be resolved."
+            )
+        candidates = _unique_paths([Path(hint) for hint in hints])
+    else:
+        candidates = _candidate_corpus_paths(project_root, phenotype_dir, pheno_id, hints=hints)
+
+    for candidate in candidates:
         if candidate.exists():
             return candidate
+
+    if explicit_selection:
+        checked = [str(p) for p in candidates]
+        raise FileNotFoundError(
+            "A corpus was explicitly selected for inference but none of the provided "
+            f"paths exist; checked {checked}"
+        )
 
     legacy = Path(project_root) / "phenotypes" / pheno_id / "corpus" / "corpus.db"
     if legacy.exists():
@@ -806,6 +852,7 @@ def run_ai_backend_and_collect(
         corpus_db_path = None
     else:
         shared_cache_dir = corpus_db_path.parent / "ai_cache"
+        log(f"Using corpus DB: {corpus_db_path}")
     notes_df, ann_df = export_inputs_from_repo(
         project_root,
         pheno_id,
