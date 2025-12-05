@@ -716,15 +716,25 @@ def export_inputs_from_repo(
         filtered_rounds.append(r)
 
     prior_rounds = filtered_rounds
-    corpus_db = _find_corpus_db(
-        root,
-        pheno_id,
-        prior_rounds,
-        corpus_record=corpus_record,
-        corpus_id=corpus_id,
-        corpus_path=corpus_path,
-    )
-    notes_df = _read_corpus_db(corpus_db)
+    corpus_csv: Optional[Path] = None
+    if corpus_path:
+        maybe_csv = (root / corpus_path).resolve() if not Path(corpus_path).is_absolute() else Path(corpus_path)
+        if maybe_csv.suffix.lower() == ".csv" and maybe_csv.exists():
+            corpus_csv = maybe_csv
+
+    if corpus_csv:
+        log(f"Using scoped corpus CSV: {corpus_csv}")
+        notes_df = pd.read_csv(corpus_csv)
+    else:
+        corpus_db = _find_corpus_db(
+            root,
+            pheno_id,
+            prior_rounds,
+            corpus_record=corpus_record,
+            corpus_id=corpus_id,
+            corpus_path=corpus_path,
+        )
+        notes_df = _read_corpus_db(corpus_db)
 
     ann_frames = []
     for r in prior_rounds:
