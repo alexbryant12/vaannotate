@@ -47,9 +47,53 @@ def test_llm_annotator_omits_reasoning_when_disabled(monkeypatch, tmp_path):
         jitter_params=False,
     )
 
-    user_message = next(msg["content"] for msg in calls["messages"] if msg["role"] == "user")
-    assert "prediction" in user_message
-    assert "reasoning" not in user_message
+    system_message = next(msg["content"] for msg in calls["messages"] if msg["role"] == "system")
+    assert "prediction" in system_message
+    assert "reasoning" not in system_message
 
     run = result["runs"][0]
     assert "reasoning" not in run["raw"]
+
+
+def test_llm_annotator_multicategorical_inline_keys(monkeypatch, tmp_path):
+    calls: dict[str, object] = {}
+
+    class DummyBackend:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def json_call(self, messages, **kwargs):  # noqa: D401
+            calls["messages"] = list(messages)
+            payload = {
+                "reasoning": "evidence",
+                "Option A": "Yes",
+                "Option B": "No",
+            }
+            return JSONCallResult(
+                data=payload,
+                content=json.dumps(payload),
+                raw_response=None,
+                latency_s=0.01,
+                logprobs=None,
+            )
+
+    monkeypatch.setattr(engine, "build_llm_backend", lambda cfg: DummyBackend(cfg))
+
+    llm_cfg = engine.LLMConfig()
+    llm_cfg.include_reasoning = True
+    annotator = engine.LLMAnnotator(llm_cfg, engine.SCJitterConfig(), cache_dir=str(tmp_path))
+    annotator.label_config = {"Flag": {"options": ["Option A", "Option B"]}}
+
+    result = annotator.annotate(
+        unit_id="unit-2",
+        label_id="Flag",
+        label_type="categorical_multi",
+        label_rules="",
+        snippets=[{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}],
+        n_consistency=1,
+        jitter_params=False,
+    )
+
+    run = result["runs"][0]
+    assert run["prediction"] == "Option A"
+    assert run["raw"].get("canonical_prediction") == "Option A"
