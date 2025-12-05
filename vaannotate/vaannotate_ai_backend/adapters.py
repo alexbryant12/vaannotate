@@ -893,7 +893,7 @@ def run_ai_backend_and_collect(
         log_callback=log_callback,
     )
     if inference_only:
-        log("Inference-only mode: skipping active learning batch construction.")
+        log("Inference-only mode: exporting full corpus for LLM labeling.")
         ai_dir = Path(round_dir) / "imports" / "ai"
         ai_dir.mkdir(parents=True, exist_ok=True)
         corpus_csv = ai_dir / "inference_corpus.csv"
@@ -911,19 +911,13 @@ def run_ai_backend_and_collect(
         }
         params_path = ai_dir / "params.json"
         params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
-        log("Prepared inference inputs without running the active learning backend.")
-        return BackendResult(
-            csv_path=corpus_csv,
-            dataframe=notes_df,
-            artifacts={
-                "annotations_csv": str(ann_csv),
-                "corpus_csv": str(corpus_csv),
-                "mode": "inference_only",
-            },
-            params_path=params_path,
-            artifacts_dir=ai_dir,
-            metrics={},
-        )
+        log("Prepared inference inputs; running AI backend to label all units.")
+
+        overrides: Dict[str, Any] = dict(cfg_overrides or {})
+        select_overrides: Dict[str, Any] = dict(overrides.get("select", {}))
+        select_overrides["batch_size"] = max(int(select_overrides.get("batch_size", 0) or 0), len(notes_df))
+        overrides["select"] = select_overrides
+        cfg_overrides = overrides
     if consensus_only:
         ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
         if doc_ids:
@@ -986,6 +980,14 @@ def run_ai_backend_and_collect(
         log_callback=log_callback,
         cache_dir=shared_cache_dir,
     )
+    if inference_only:
+        bucket_paths = artifacts.pop("buckets", None)
+        if isinstance(bucket_paths, Mapping):
+            for path in bucket_paths.values():
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    log(f"Warning: failed to clean up inference bucket file {path}")
     if sampling_metadata:
         artifacts.setdefault("sampling", dict(sampling_metadata))
     if excluded_ids:
@@ -1024,6 +1026,8 @@ def run_ai_backend_and_collect(
             "rounds": bundle.round_labelsets,
         },
     }
+    if inference_only:
+        params["mode"] = "inference_only"
     params_path = ai_dir / "params.json"
     params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
     log(f"Wrote parameters to {params_path}")
