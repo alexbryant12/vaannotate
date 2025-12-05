@@ -434,6 +434,71 @@ def test_export_inputs_requires_explicit_corpus(tmp_path: Path) -> None:
         )
 
 
+def test_scoped_corpus_csv_ignored_for_round_builder(tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    pheno_id = "ph_no_scoped_csv"
+    storage_relative = Path("phenotypes") / pheno_id
+    phenotype_dir = project_root / storage_relative
+    (phenotype_dir / "rounds").mkdir(parents=True, exist_ok=True)
+
+    with get_connection(paths.project_db) as conn:
+        add_phenotype(
+            conn,
+            pheno_id=pheno_id,
+            project_id="proj",
+            name="Phenotype without scoped CSV",
+            level="single_doc",
+            storage_path=str(storage_relative.as_posix()),
+        )
+        conn.commit()
+
+    corpus_db = phenotype_dir / "corpus.db"
+    with initialize_corpus_db(corpus_db) as conn:
+        conn.execute("INSERT INTO patients(patient_icn) VALUES (?)", ("p1",))
+        conn.execute(
+            """
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
+            """,
+            ("doc_a", "p1", "2020-01-01", "hash1", "Doc A", "{}"),
+        )
+        conn.execute(
+            """
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
+            """,
+            ("doc_b", "p1", "2020-01-02", "hash2", "Doc B", "{}"),
+        )
+        conn.execute("ALTER TABLE documents ADD COLUMN patienticn TEXT")
+        conn.execute("UPDATE documents SET patienticn = patient_icn")
+        conn.execute("ALTER TABLE documents ADD COLUMN notetype TEXT")
+        conn.execute("UPDATE documents SET notetype = ''")
+        conn.commit()
+
+    scoped_csv = project_root / "scoped.csv"
+    pd.DataFrame(
+        [
+            {
+                "doc_id": "doc_a",
+                "patient_icn": "p1",
+                "text": "Doc A scoped",
+            }
+        ]
+    ).to_csv(scoped_csv, index=False)
+
+    notes_df, ann_df = export_inputs_from_repo(
+        project_root,
+        pheno_id,
+        [],
+        corpus_path=str(scoped_csv),
+    )
+
+    assert set(notes_df["doc_id"]) == {"doc_a", "doc_b"}
+    assert ann_df.empty
+
+
 def test_contexts_for_unit_label_full_mode() -> None:
     notes_df = pd.DataFrame(
         [
