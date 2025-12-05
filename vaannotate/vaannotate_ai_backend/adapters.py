@@ -697,6 +697,7 @@ def export_inputs_from_repo(
     corpus_path: Optional[str] = None,
     labelset_id: Optional[str] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    allow_scoped_corpus_csv: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     log = log_callback or (lambda message: None)
     prior_rounds = sorted({int(r) for r in prior_rounds})
@@ -716,15 +717,34 @@ def export_inputs_from_repo(
         filtered_rounds.append(r)
 
     prior_rounds = filtered_rounds
-    corpus_db = _find_corpus_db(
-        root,
-        pheno_id,
-        prior_rounds,
-        corpus_record=corpus_record,
-        corpus_id=corpus_id,
-        corpus_path=corpus_path,
-    )
-    notes_df = _read_corpus_db(corpus_db)
+    corpus_csv: Optional[Path] = None
+    corpus_path_for_db = corpus_path
+    if allow_scoped_corpus_csv and corpus_path:
+        corpus_path_obj = Path(corpus_path)
+        if corpus_path_obj.suffix.lower() == ".csv":
+            corpus_csv = _resolve_scoped_corpus_csv(root, corpus_path)
+        else:
+            corpus_path_for_db = corpus_path
+    elif corpus_path and Path(corpus_path).suffix.lower() == ".csv":
+        log(
+            "Scoped corpus CSVs are only supported for inference-only runs; "
+            "falling back to locating a corpus database instead."
+        )
+        corpus_path_for_db = None
+
+    if corpus_csv:
+        log(f"Using scoped corpus CSV: {corpus_csv}")
+        notes_df = pd.read_csv(corpus_csv)
+    else:
+        corpus_db = _find_corpus_db(
+            root,
+            pheno_id,
+            prior_rounds,
+            corpus_record=corpus_record,
+            corpus_id=corpus_id,
+            corpus_path=corpus_path_for_db,
+        )
+        notes_df = _read_corpus_db(corpus_db)
 
     ann_frames = []
     for r in prior_rounds:
@@ -827,6 +847,22 @@ def _scope_corpus_to_annotations(
     return filtered
 
 
+def _resolve_scoped_corpus_csv(project_root: Path, corpus_path: str) -> Path:
+    """Resolve and validate a scoped corpus CSV path relative to the project root."""
+
+    candidate = Path(corpus_path)
+    if not candidate.is_absolute():
+        candidate = (project_root / candidate).resolve()
+
+    if candidate.suffix.lower() != ".csv":
+        raise ValueError(f"Scoped corpus path must be a CSV file: {candidate}")
+
+    if not candidate.exists():
+        raise FileNotFoundError(f"Scoped corpus CSV not found: {candidate}")
+
+    return candidate
+
+
 def _join_corpus_with_prior_units(
     notes_df: pd.DataFrame, ann_df: pd.DataFrame, log: Callable[[str], None]
 ) -> pd.DataFrame:
@@ -926,20 +962,34 @@ def run_ai_backend_and_collect(
     shared_cache_dir: Optional[Path] = None
     record_dict = _normalize_record(corpus_record)
     normalized_corpus_path = corpus_path or record_dict.get("relative_path") or record_dict.get("path")
-    try:
-        corpus_db_path = _find_corpus_db(
-            project_root,
-            pheno_id,
-            prior_rounds,
-            corpus_record=record_dict,
-            corpus_id=corpus_id,
-            corpus_path=normalized_corpus_path,
-        )
-    except FileNotFoundError:
-        corpus_db_path = None
-    else:
-        shared_cache_dir = corpus_db_path.parent / "ai_cache"
-        log(f"Using corpus DB: {corpus_db_path}")
+    scoped_csv_path: Optional[Path] = None
+    if (
+        inference_only
+        and normalized_corpus_path
+        and Path(normalized_corpus_path).suffix.lower() == ".csv"
+    ):
+        scoped_csv_path = _resolve_scoped_corpus_csv(project_root, str(normalized_corpus_path))
+        normalized_corpus_path = str(scoped_csv_path)
+
+    corpus_path_for_db = normalized_corpus_path
+    if normalized_corpus_path and Path(normalized_corpus_path).suffix.lower() == ".csv" and not inference_only:
+        corpus_path_for_db = None
+
+    if not scoped_csv_path:
+        try:
+            corpus_db_path = _find_corpus_db(
+                project_root,
+                pheno_id,
+                prior_rounds,
+                corpus_record=record_dict,
+                corpus_id=corpus_id,
+                corpus_path=corpus_path_for_db,
+            )
+        except FileNotFoundError:
+            corpus_db_path = None
+        else:
+            shared_cache_dir = corpus_db_path.parent / "ai_cache"
+            log(f"Using corpus DB: {corpus_db_path}")
     notes_df, ann_df = export_inputs_from_repo(
         project_root,
         pheno_id,
@@ -949,6 +999,7 @@ def run_ai_backend_and_collect(
         corpus_path=normalized_corpus_path,
         labelset_id=labelset_id,
         log_callback=log_callback,
+        allow_scoped_corpus_csv=inference_only,
     )
     if consensus_only:
         ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
