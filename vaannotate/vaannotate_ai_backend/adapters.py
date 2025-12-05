@@ -177,12 +177,25 @@ def _candidate_corpus_paths(
     pheno_id: str,
     hints: Optional[List[str]] = None,
 ) -> List[Path]:
-    candidates: List[Path] = [
-        phenotype_dir / "corpus" / "corpus.db",
-        phenotype_dir / "corpus.db",
-        phenotype_dir / "corpus.sqlite",
-        phenotype_dir / f"{pheno_id}.db",
-    ]
+    # Prioritize explicit hints (e.g., user-selected corpora) before falling back to
+    # phenotype-local defaults. Previously hints were appended after defaults, which meant
+    # an existing default corpus.db would shadow a user-specified inference corpus.
+    candidates: List[Path] = []
+
+    for hint in hints or []:
+        path = Path(hint)
+        if not path.is_absolute():
+            path = (project_root / path).resolve()
+        candidates.append(path)
+
+    candidates.extend(
+        [
+            phenotype_dir / "corpus" / "corpus.db",
+            phenotype_dir / "corpus.db",
+            phenotype_dir / "corpus.sqlite",
+            phenotype_dir / f"{pheno_id}.db",
+        ]
+    )
 
     for corpora_folder in (project_root / "corpora", project_root / "Corpora"):
         candidates.extend(
@@ -194,12 +207,6 @@ def _candidate_corpus_paths(
                 corpora_folder / f"{pheno_id}.sqlite",
             ]
         )
-
-    for hint in hints or []:
-        path = Path(hint)
-        if not path.is_absolute():
-            path = (project_root / path).resolve()
-        candidates.append(path)
 
     seen: set[Path] = set()
     unique: List[Path] = []
@@ -806,6 +813,7 @@ def run_ai_backend_and_collect(
         corpus_db_path = None
     else:
         shared_cache_dir = corpus_db_path.parent / "ai_cache"
+        log(f"Using corpus DB: {corpus_db_path}")
     notes_df, ann_df = export_inputs_from_repo(
         project_root,
         pheno_id,
