@@ -249,7 +249,7 @@ class PromptInferenceJob:
         self.pheno_id = pheno_id
         self.labelset_id = labelset_id
         self.phenotype_level = phenotype_level
-        self.adjudicated_rounds = list(adjudicated_rounds)
+        self.adjudicated_rounds = sorted({int(r) for r in adjudicated_rounds})
         self.corpus_id = corpus_id
         self.corpus_path = Path(corpus_path) if corpus_path else None
         self.run_root = Path(run_root) if run_root else Path(project_root) / "prompt_runs"
