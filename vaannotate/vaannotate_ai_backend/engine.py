@@ -1468,6 +1468,7 @@ class EmbeddingStore:
         if meta is None or X is None:
              # --- chunk from notes_df with progress ---
             chunk_meta = []
+            skipped_empty = 0
             total_docs = int(len(notes_df))
             for row in iter_with_bar(
                     step="Chunking docs",
@@ -1475,7 +1476,16 @@ class EmbeddingStore:
                     total=total_docs,
                     min_interval_s=float(getattr(getattr(self, "models", None), "progress_min_interval_s", 0.6) or 0.6)):
                 # Chunk the text
-                chunks = splitter.split_text(getattr(row, "text"))
+                raw_text = getattr(row, "text", None)
+                if raw_text is None or (isinstance(raw_text, float) and math.isnan(raw_text)):
+                    skipped_empty += 1
+                    continue
+                text = normalize_text(raw_text if isinstance(raw_text, str) else str(raw_text))
+                if not text:
+                    skipped_empty += 1
+                    continue
+
+                chunks = splitter.split_text(text)
                 for i, ch in enumerate(chunks):
                     md = {"unit_id": getattr(row, "unit_id"),
                           "doc_id": getattr(row, "doc_id"),
@@ -1491,7 +1501,10 @@ class EmbeddingStore:
                     chunk_meta.append(md)
             
             if not chunk_meta:
-                raise RuntimeError("No chunks generated from notes")
+                msg = "No chunks generated from notes"
+                if skipped_empty:
+                    msg += f"; skipped {skipped_empty} notes with empty or null text"
+                raise RuntimeError(msg)
 
             # Embed (even if force_reembed only)
             texts = [m["text"] for m in chunk_meta]

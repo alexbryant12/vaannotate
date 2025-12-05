@@ -149,3 +149,25 @@ def test_cached_embeddings_reuse_for_multi_doc(tmp_path: Path) -> None:
     multi_units = {meta["unit_id"] for meta in store_multi.chunk_meta}
     assert multi_units == {"p1"}
     assert set(store_multi.unit_to_chunk_idxs.keys()) == {"p1"}
+
+
+def test_chunk_index_skips_empty_notes(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    rag_cfg, index_cfg = _rag_index_cfg()
+
+    notes = pd.DataFrame(
+        [
+            {"unit_id": "u1", "doc_id": "d1", "text": None},
+            {"unit_id": "u2", "doc_id": "d2", "text": "   "},
+            {"unit_id": "u3", "doc_id": "d3", "text": "useful note"},
+        ]
+    )
+
+    store, embedder = _make_store(cache_dir, "stub-embed")
+    store.build_chunk_index(notes, rag_cfg, index_cfg)
+
+    assert embedder.calls == 1
+    assert len(store.chunk_meta) == 1
+    assert store.chunk_meta[0]["doc_id"] == "d3"
+    assert store.chunk_meta[0]["text"].strip() == "useful note"
+    assert store.unit_to_chunk_idxs == {"u3": [0]}
