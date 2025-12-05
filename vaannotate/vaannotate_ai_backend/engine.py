@@ -2139,6 +2139,39 @@ class RAGRetriever:
             i = int(np.argmax(scores)); sel.append(i); used[i]=True
         return [cand_idxs[i] for i in sel]
 
+    def _mmr_select_ranked(
+        self,
+        cand_idxs: list[int],
+        rel_scores: list[float],
+        k: int,
+        lam: float,
+    ) -> list[int]:
+        """
+        Greedy MMR using CE relevance scores and embedding cosine similarity.
+        Expects cand_idxs to align 1:1 with rel_scores.
+        """
+        if k <= 0 or not cand_idxs:
+            return []
+        import numpy as _np
+
+        rel = _np.asarray(rel_scores, dtype=float)
+        X = self.store.X[cand_idxs]
+        Xn = X / (_np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+        used = _np.zeros(len(cand_idxs), dtype=bool)
+        sel: list[int] = []
+        for _ in range(min(k, len(cand_idxs))):
+            if not sel:
+                i = int(_np.argmax(rel))
+            else:
+                M = Xn[used]
+                maxsim = (Xn @ M.T).max(axis=1)
+                scores = lam * rel - (1 - lam) * maxsim
+                scores[used] = -1e9
+                i = int(_np.argmax(scores))
+            sel.append(i)
+            used[i] = True
+        return [cand_idxs[i] for i in sel]
+
     def _dedup_rerank(self, query: str, items: List[dict], final_topk: int) -> List[dict]:
         if not items: return []
         seen = set(); dedup = []
@@ -2502,24 +2535,42 @@ class RAGRetriever:
             pool.sort(key=lambda d: d["score"], reverse=True)
             return pool[:final_k]
     
-        # Preselect for CE (MMR or head)
+        # Preselect for CE scoring (head)
         k_pre = min(len(cand_items), max(final_k, min_k, mmr_select_k))
-        diagnostics.setdefault("mmr", {}).update({"candidate_pool": len(cand_items), "select_size": k_pre})
-        if lam is not None:
-            sel = self._mmr_select(q_emb, cand_idxs, k=k_pre, lam=lam)
-            idx_to_item = {ix: it for ix, it in zip(cand_idxs, cand_items)}
-            pre = [idx_to_item[ix] for ix in sel if ix in idx_to_item]
-        else:
-            pre = cand_items[:k_pre]
-    
+        diagnostics.setdefault("mmr", {}).update(
+            {"candidate_pool": len(cand_items), "select_size": k_pre}
+        )
+        pre: list[dict] = []
+        pre_idxs: list[int] = []
+        for ix, it in zip(cand_idxs[:k_pre], cand_items[:k_pre]):
+            pre.append(it)
+            pre_idxs.append(ix)
+
         # CE last, CE-only score
         texts = [it["text"] for it in pre]
         rr = _cross_scores_for_queries(rerank_query_texts, texts)
         for it, s in zip(pre, rr):
             it["score"] = float(s)
-    
-        pre.sort(key=lambda d: d["score"], reverse=True)
-        out = pre[:final_k]
+
+        # Sort by CE to feed MMR or take head
+        scored = [
+            {"item": it, "store_idx": ix}
+            for it, ix in sorted(
+                zip(pre, pre_idxs), key=lambda t: t[0].get("score", 0.0), reverse=True
+            )
+        ]
+
+        if lam is not None:
+            sel = self._mmr_select_ranked(
+                [d["store_idx"] for d in scored],
+                [float(d["item"].get("score", 0.0)) for d in scored],
+                k=final_k,
+                lam=lam,
+            )
+            idx_to_item = {d["store_idx"]: d["item"] for d in scored}
+            out = [idx_to_item[i] for i in sel if i in idx_to_item]
+        else:
+            out = [d["item"] for d in scored[:final_k]]
 
         diagnostics.setdefault("mmr", {}).update(
             {
