@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -190,6 +191,43 @@ def test_export_inputs_cold_start_uses_selected_corpus(tmp_path: Path) -> None:
     assert not notes_df.empty
     assert notes_df.loc[0, "doc_id"] == "doc_1"
     assert ann_df.empty
+
+
+def test_export_inputs_requires_explicit_corpus(tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    pheno_id = "ph_explicit"
+    storage_relative = Path("phenotypes") / pheno_id
+    phenotype_dir = project_root / storage_relative
+    (phenotype_dir / "rounds").mkdir(parents=True, exist_ok=True)
+
+    with get_connection(paths.project_db) as conn:
+        add_phenotype(
+            conn,
+            pheno_id=pheno_id,
+            project_id="proj",
+            name="Phenotype with explicit corpus",
+            level="single_doc",
+            storage_path=str(storage_relative.as_posix()),
+        )
+        conn.commit()
+
+    # Create a default corpus that would otherwise be used as a fallback.
+    default_corpus = phenotype_dir / "corpus.db"
+    with initialize_corpus_db(default_corpus) as conn:
+        conn.execute("INSERT INTO patients(patient_icn) VALUES (?)", ("p1",))
+        conn.commit()
+
+    missing_corpus = "Corpora/nonexistent/corpus.db"
+
+    with pytest.raises(FileNotFoundError):
+        export_inputs_from_repo(
+            project_root,
+            pheno_id,
+            [],
+            corpus_path=missing_corpus,
+        )
 
 
 def test_contexts_for_unit_label_full_mode() -> None:
