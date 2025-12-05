@@ -2908,6 +2908,7 @@ class PromptInferenceDialog(QtWidgets.QDialog):
         self.pheno_level = str(self.pheno.get("level") or "single_doc")
         self._worker_thread: Optional[QtCore.QThread] = None
         self._worker: Optional[PromptInferenceWorker] = None
+        self._ai_backend_overrides: Dict[str, object] = {}
         self.setWindowTitle(f"Inference • {self.pheno_name}")
         self.resize(900, 720)
         self._build_ui()
@@ -2974,6 +2975,9 @@ class PromptInferenceDialog(QtWidgets.QDialog):
         self.context_order_combo.addItem("Chronological", "chronological")
         form.addRow("Context order", self.context_order_combo)
 
+        self.advanced_settings_btn = QtWidgets.QPushButton("Advanced settings…")
+        form.addRow("Advanced", self.advanced_settings_btn)
+
         self.system_prompt = QtWidgets.QPlainTextEdit()
         self.system_prompt.setPlaceholderText("Optional system prompt override")
         form.addRow("System prompt", self.system_prompt)
@@ -3000,33 +3004,23 @@ class PromptInferenceDialog(QtWidgets.QDialog):
         ]
         self._update_backend_fields()
 
+        self.advanced_settings_btn.clicked.connect(self._open_advanced_settings)
+
         layout.addLayout(form)
 
         sweep_group = QtWidgets.QGroupBox("Sweep options")
         sweep_layout = QtWidgets.QGridLayout(sweep_group)
 
-        self.enable_zero_shot = QtWidgets.QCheckBox("Include zero-shot")
-        self.enable_zero_shot.setChecked(True)
-        self.enable_few_shot = QtWidgets.QCheckBox("Include few-shot")
-        self.enable_few_shot.setChecked(True)
-        self.include_family_tree = QtWidgets.QCheckBox("Family-tree mode")
-        self.include_family_tree.setChecked(True)
-        self.include_single_shot = QtWidgets.QCheckBox("Single-shot mode")
-        self.include_single_shot.setChecked(True)
-        sweep_layout.addWidget(self.enable_zero_shot, 0, 0)
-        sweep_layout.addWidget(self.enable_few_shot, 0, 1)
-        sweep_layout.addWidget(self.include_family_tree, 1, 0)
-        sweep_layout.addWidget(self.include_single_shot, 1, 1)
-
         self.mmr_values = QtWidgets.QLineEdit("0.7")
         self.chunk_sizes = QtWidgets.QLineEdit("1500")
         self.num_chunks = QtWidgets.QLineEdit("6")
-        sweep_layout.addWidget(QtWidgets.QLabel("MMR λ (comma-separated)"), 2, 0)
-        sweep_layout.addWidget(self.mmr_values, 2, 1)
-        sweep_layout.addWidget(QtWidgets.QLabel("Chunk sizes"), 3, 0)
-        sweep_layout.addWidget(self.chunk_sizes, 3, 1)
-        sweep_layout.addWidget(QtWidgets.QLabel("Chunks per label"), 4, 0)
-        sweep_layout.addWidget(self.num_chunks, 4, 1)
+        self.mmr_values_label = QtWidgets.QLabel("MMR λ (base value)")
+        sweep_layout.addWidget(self.mmr_values_label, 0, 0)
+        sweep_layout.addWidget(self.mmr_values, 0, 1)
+        sweep_layout.addWidget(QtWidgets.QLabel("Chunk sizes"), 1, 0)
+        sweep_layout.addWidget(self.chunk_sizes, 1, 1)
+        sweep_layout.addWidget(QtWidgets.QLabel("Chunks per label"), 2, 0)
+        sweep_layout.addWidget(self.num_chunks, 2, 1)
 
         layout.addWidget(sweep_group)
 
@@ -3113,6 +3107,62 @@ class PromptInferenceDialog(QtWidgets.QDialog):
         idx = self.backend_combo.findData(backend_key)
         self.backend_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._update_backend_fields()
+        self._prefill_from_latest_round()
+
+    def _prefill_from_latest_round(self) -> None:
+        try:
+            rounds = self.ctx.list_rounds(self.pheno_id)
+        except Exception:  # noqa: BLE001
+            return
+        ordered = sorted(
+            [r for r in rounds if isinstance(r, Mapping)],
+            key=lambda r: int(r.get("round_number", 0) or 0),
+            reverse=True,
+        )
+        for round_row in ordered:
+            round_id = round_row.get("round_id") if isinstance(round_row, Mapping) else None
+            if not round_id:
+                continue
+            config = self.ctx.get_round_config(str(round_id))
+            if config:
+                self._apply_round_defaults(config)
+                break
+
+    def _apply_round_defaults(self, config: Mapping[str, object]) -> None:
+        labelset_id = config.get("labelset_id") if isinstance(config, Mapping) else None
+        if isinstance(labelset_id, str) and labelset_id:
+            idx = self.labelset_combo.findData(labelset_id)
+            if idx >= 0:
+                self.labelset_combo.setCurrentIndex(idx)
+        ai_backend = config.get("ai_backend") if isinstance(config, Mapping) else None
+        if not isinstance(ai_backend, Mapping):
+            return
+        backend_choice = ai_backend.get("backend")
+        if isinstance(backend_choice, str) and backend_choice:
+            idx = self.backend_combo.findData(backend_choice)
+            if idx >= 0:
+                self.backend_combo.setCurrentIndex(idx)
+                self._update_backend_fields()
+        for attr, key in (
+            ("embedding_path_edit", "embedding_model_dir"),
+            ("reranker_path_edit", "reranker_model_dir"),
+            ("azure_key_edit", "azure_api_key"),
+            ("azure_version_edit", "azure_api_version"),
+            ("azure_endpoint_edit", "azure_endpoint"),
+            ("local_model_path_edit", "local_model_dir"),
+        ):
+            widget = getattr(self, attr, None)
+            value = ai_backend.get(key)
+            if isinstance(widget, QtWidgets.QLineEdit) and isinstance(value, str):
+                widget.setText(value)
+        if isinstance(ai_backend.get("local_max_seq_len"), (int, float)):
+            self.local_max_seq_spin.setValue(int(ai_backend["local_max_seq_len"]))
+        if isinstance(ai_backend.get("local_max_new_tokens"), (int, float)):
+            self.local_max_new_tokens_spin.setValue(int(ai_backend["local_max_new_tokens"]))
+        config_overrides = ai_backend.get("config_overrides")
+        if isinstance(config_overrides, Mapping):
+            self._ai_backend_overrides = dict(config_overrides)
+            self._apply_advanced_overrides_to_fields()
 
     @staticmethod
     def _parse_float_list(value: str, default: Sequence[float]) -> list[float]:
@@ -3150,6 +3200,32 @@ class PromptInferenceDialog(QtWidgets.QDialog):
         for widget in getattr(self, "_local_widgets", []):
             if isinstance(widget, QtWidgets.QWidget):
                 widget.setVisible(show_local)
+
+    def _open_advanced_settings(self) -> None:
+        dialog = AIAdvancedConfigDialog(self, self._ai_backend_overrides, label_schema=None)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._ai_backend_overrides = dialog.result_config or {}
+            self._apply_advanced_overrides_to_fields()
+
+    def _apply_advanced_overrides_to_fields(self) -> None:
+        overrides = self._ai_backend_overrides if isinstance(self._ai_backend_overrides, Mapping) else {}
+        rag_cfg = overrides.get("rag", {}) if isinstance(overrides.get("rag"), Mapping) else {}
+        pb_cfg = overrides.get("prompt_builder", {}) if isinstance(overrides.get("prompt_builder"), Mapping) else {}
+        if "chunk_size" in rag_cfg:
+            try:
+                self.chunk_sizes.setText(str(int(rag_cfg["chunk_size"])))
+            except Exception:  # noqa: BLE001
+                pass
+        if "per_label_topk" in rag_cfg:
+            try:
+                self.num_chunks.setText(str(int(rag_cfg["per_label_topk"])))
+            except Exception:  # noqa: BLE001
+                pass
+        if "mmr_lambda" in rag_cfg:
+            try:
+                self.mmr_values.setText(str(float(rag_cfg["mmr_lambda"])))
+            except Exception:  # noqa: BLE001
+                pass
 
     def _selected_rounds(self) -> list[int]:
         return [
@@ -3266,18 +3342,21 @@ class PromptInferenceDialog(QtWidgets.QDialog):
             embedding_model_dir=self.embedding_path_edit.text().strip(),
             reranker_model_dir=self.reranker_path_edit.text().strip(),
             context_order=str(self.context_order_combo.currentData() or "relevance"),
+            backend_overrides=copy.deepcopy(self._ai_backend_overrides),
         )
+        pb_overrides = base_config.backend_overrides.get("prompt_builder")
+        if isinstance(pb_overrides, Mapping) and pb_overrides.get("inference_mode"):
+            base_config.inference_mode = str(pb_overrides.get("inference_mode"))
+        rag_cfg = base_config.backend_overrides.get("rag", {})
+        if isinstance(rag_cfg, Mapping):
+            mmr_values = self._parse_float_list(self.mmr_values.text(), [rag_cfg.get("mmr_lambda", base_config.rag_mmr_lambda)])
+            if mmr_values:
+                base_config.rag_mmr_lambda = mmr_values[0]
+                rag_cfg["mmr_lambda"] = base_config.rag_mmr_lambda
         sweep = PromptExperimentSweep(base=base_config)
-        sweep.zero_shot = self.enable_zero_shot.isChecked()
-        sweep.few_shot = self.enable_few_shot.isChecked()
-        sweep.mmr_lambdas = self._parse_float_list(self.mmr_values.text(), sweep.mmr_lambdas)
         sweep.chunk_sizes = self._parse_int_list(self.chunk_sizes.text(), sweep.chunk_sizes)
         sweep.num_chunks = self._parse_int_list(self.num_chunks.text(), sweep.num_chunks)
         variants = sweep.variants()
-        if not self.include_family_tree.isChecked():
-            variants = [v for v in variants if v.config.inference_mode != "family_tree"]
-        if not self.include_single_shot.isChecked():
-            variants = [v for v in variants if v.config.inference_mode != "single_shot"]
         if not variants:
             QtWidgets.QMessageBox.warning(self, "Inference", "No experiment variants to run.")
             return

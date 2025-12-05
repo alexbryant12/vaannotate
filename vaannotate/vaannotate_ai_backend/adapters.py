@@ -559,6 +559,86 @@ def _read_round_annotations(
 
     return pd.DataFrame(rows, columns=columns)
 
+
+def _consensus_annotations(
+    ann_df: pd.DataFrame, level: str, log: Callable[[str], None]
+) -> tuple[pd.DataFrame, set[str]]:
+    """Return consensus annotations per unit/label and the doc_ids to retain."""
+
+    if ann_df.empty:
+        log("No prior annotations available for consensus; continuing with empty set.")
+        return ann_df, set()
+
+    required_columns = {"unit_id", "label_id"}
+    missing = {col for col in required_columns if col not in ann_df.columns}
+    if missing:
+        log(f"Skipping consensus projection; missing columns: {', '.join(sorted(missing))}")
+        return ann_df, set()
+
+    def _row_value(row: Mapping[str, Any]) -> Optional[str]:
+        for key in ("label_value", "label_value_num", "label_value_date"):
+            value = row.get(key) if hasattr(row, "get") else None
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    consensus_rows: list[dict[str, Any]] = []
+    doc_ids: set[str] = set()
+
+    for (unit_id, label_id), group in ann_df.groupby(["unit_id", "label_id"], dropna=True):
+        values: Dict[str, int] = {}
+        canonical_to_original: Dict[str, str] = {}
+        for _, row in group.iterrows():
+            value = _row_value(row)
+            if value is None:
+                continue
+            key = value.strip().lower()
+            canonical_to_original.setdefault(key, str(value))
+            values[key] = values.get(key, 0) + 1
+        if not values:
+            continue
+        max_count = max(values.values())
+        best = [k for k, v in values.items() if v == max_count]
+        if len(best) != 1:
+            continue
+        winner = canonical_to_original[best[0]]
+        first_row = group.iloc[0]
+        doc_id = str(first_row.get("doc_id") or "")
+        if doc_id:
+            doc_ids.add(doc_id)
+        consensus_rows.append(
+            {
+                "round_id": first_row.get("round_id", ""),
+                "phenotype_id": first_row.get("phenotype_id", ""),
+                "unit_id": str(unit_id),
+                "doc_id": doc_id,
+                "patient_icn": first_row.get("patient_icn", ""),
+                "reviewer_id": "consensus",
+                "reviewer_name": "consensus",
+                "label_id": str(label_id),
+                "labelset_id": first_row.get("labelset_id", ""),
+                "label_name": first_row.get("label_name", ""),
+                "label_value": winner,
+                "label_value_num": first_row.get("label_value_num"),
+                "label_value_date": first_row.get("label_value_date"),
+                "label_na": 0,
+                "reviewer_notes": first_row.get("reviewer_notes", ""),
+                "rationales_json": first_row.get("rationales_json", ""),
+                "document_text": first_row.get("document_text", ""),
+                "document_metadata_json": first_row.get("document_metadata_json", ""),
+                "label_rules": first_row.get("label_rules", ""),
+                "label_change_history": first_row.get("label_change_history", ""),
+            }
+        )
+
+    if not consensus_rows:
+        log("No consensus annotations could be derived; proceeding without gold labels.")
+        return ann_df, set()
+
+    log(f"Derived consensus for {len(consensus_rows)} unit/label pairs across {len(doc_ids)} docs")
+    consensus_df = pd.DataFrame(consensus_rows, columns=list(ann_df.columns))
+    return consensus_df, doc_ids
+
 def export_inputs_from_repo(
     project_root: Path,
     pheno_id: str,
@@ -702,6 +782,7 @@ def run_ai_backend_and_collect(
     exclude_unit_ids: Optional[Iterable[str]] = None,
     sampling_metadata: Optional[Mapping[str, object]] = None,
     scope_corpus_to_annotations: bool = False,
+    consensus_only: bool = False,
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
@@ -730,6 +811,15 @@ def run_ai_backend_and_collect(
         corpus_id=corpus_id,
         corpus_path=normalized_corpus_path,
     )
+    if consensus_only:
+        ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
+        if doc_ids:
+            try:
+                notes_df = notes_df[notes_df["doc_id"].astype(str).isin(doc_ids)]
+            except Exception:  # noqa: BLE001
+                log("Warning: failed to filter corpus by consensus doc IDs; using full corpus")
+    if ann_df.empty:
+        log("No annotations available after consensus filtering; inference may lack gold labels.")
     if scope_corpus_to_annotations:
         notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
 
