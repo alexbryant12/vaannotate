@@ -701,6 +701,20 @@ def export_inputs_from_repo(
     prior_rounds = sorted({int(r) for r in prior_rounds})
     root = Path(project_root)
     phenotype_dir = _resolve_phenotype_dir(root, pheno_id)
+    round_details = _load_round_details(project_root, pheno_id, prior_rounds)
+
+    skipped_rounds: list[int] = []
+    filtered_rounds: list[int] = []
+    for r in prior_rounds:
+        detail = round_details.get(r, {})
+        if labelset_id:
+            round_labelset = detail.get("labelset_id")
+            if round_labelset and str(round_labelset) != str(labelset_id):
+                skipped_rounds.append(r)
+                continue
+        filtered_rounds.append(r)
+
+    prior_rounds = filtered_rounds
     corpus_db = _find_corpus_db(
         root,
         pheno_id,
@@ -712,8 +726,6 @@ def export_inputs_from_repo(
     notes_df = _read_corpus_db(corpus_db)
 
     ann_frames = []
-    round_details = _load_round_details(project_root, pheno_id, prior_rounds)
-    skipped_rounds: list[int] = []
     for r in prior_rounds:
         round_dir = phenotype_dir / "rounds" / f"round_{r}"
         if not round_dir.exists():
