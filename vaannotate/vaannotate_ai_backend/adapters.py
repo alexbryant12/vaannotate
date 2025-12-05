@@ -25,6 +25,7 @@ class BackendResult:
     dataframe: pd.DataFrame
     artifacts: Dict[str, Any]
     params_path: Path
+    artifacts_dir: Optional[Path] = None
     metrics: Dict[str, float] = field(default_factory=dict)
 
 
@@ -920,6 +921,7 @@ def run_ai_backend_and_collect(
                 "mode": "inference_only",
             },
             params_path=params_path,
+            artifacts_dir=ai_dir,
             metrics={},
         )
     if consensus_only:
@@ -1032,5 +1034,6 @@ def run_ai_backend_and_collect(
         dataframe=final_df,
         artifacts=artifacts,
         params_path=params_path,
+        artifacts_dir=ai_dir,
         metrics=dict(metrics) if isinstance(metrics, Mapping) else {},
     )
