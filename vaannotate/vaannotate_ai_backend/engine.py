@@ -5415,6 +5415,121 @@ class ActiveLearningLLMFirst:
         overrides = self._build_rerank_rule_overrides(current_rules_map)
         self.rag.rerank_rule_overrides = overrides or {}
 
+        def _run_final_family_labeling(final_df: pd.DataFrame) -> pd.DataFrame:
+            """Optionally run family labeling for the provided final selection."""
+            if not self.cfg.final_llm_labeling:
+                return final_df
+
+            fam_rows = []
+            fam = FamilyLabeler(
+                self.llm,
+                self.rag,
+                self.repo,
+                self.label_config,
+                self.cfg.scjitter,
+                self.cfg.llmfirst,
+            )
+            unit_ids = final_df["unit_id"].tolist()
+            rules_map = current_rules_map
+            types = current_label_types
+            _progress_every = float(fam.cfg.progress_min_interval_s or 1)
+            for uid in iter_with_bar(
+                step="Final family labeling",
+                iterable=unit_ids,
+                total=len(unit_ids),
+                min_interval_s=_progress_every,
+            ):
+                fam_rows.extend(
+                    fam.label_family_for_unit(
+                        uid,
+                        types,
+                        rules_map,
+                        json_only=True,
+                        json_n_consistency=getattr(
+                            self.cfg.llmfirst, "final_llm_label_consistency", 1
+                        ),
+                        json_jitter=False,
+                    )
+                )
+            fam_df = pd.DataFrame(fam_rows)
+            if not fam_df.empty:
+                if "runs" in fam_df.columns:
+                    fam_df.rename(columns={"runs": "llm_runs"}, inplace=True)
+                if "consistency" in fam_df.columns:
+                    fam_df.rename(columns={"consistency": "llm_consistency"}, inplace=True)
+                if "prediction" in fam_df.columns:
+                    fam_df.rename(columns={"prediction": "llm_prediction"}, inplace=True)
+                if "llm_runs" in fam_df.columns:
+                    fam_df["llm_reasoning"] = fam_df["llm_runs"].map(
+                        lambda rs: (
+                            rs[0].get("raw", {}).get("reasoning")
+                            if isinstance(rs, list) and rs
+                            else None
+                        )
+                    )
+                fam_df = _jsonify_cols(
+                    fam_df,
+                    [c for c in ["rag_context", "llm_runs", "fc_probs"] if c in fam_df.columns],
+                )
+            fam_df.to_parquet(
+                os.path.join(self.paths.outdir, "final_llm_family_probe.parquet"),
+                index=False,
+            )
+
+            final_out = final_df
+            if not fam_df.empty:
+                pv = fam_df[["unit_id", "label_id", "llm_prediction"]].copy()
+                pv["col"] = pv["label_id"].astype(str) + "_llm"
+                fam_wide = (
+                    pv.pivot_table(
+                        index="unit_id", columns="col", values="llm_prediction", aggfunc="first"
+                    )
+                    .reset_index()
+                )
+                if "llm_reasoning" in fam_df.columns:
+                    rv = fam_df[["unit_id", "label_id", "llm_reasoning"]].copy()
+                    rv["colr"] = rv["label_id"].astype(str) + "_llm_reason"
+                    fam_reason_wide = (
+                        rv.pivot_table(
+                            index="unit_id", columns="colr", values="llm_reasoning", aggfunc="first"
+                        )
+                        .reset_index()
+                    )
+                    fam_wide = fam_wide.merge(fam_reason_wide, on="unit_id", how="left")
+                final_units = (
+                    final_df[["unit_id", "label_id", "label_type", "selection_reason"]]
+                    .drop_duplicates()
+                )
+                final_out = final_units.merge(fam_wide, on="unit_id", how="left")
+                final_out.to_parquet(
+                    os.path.join(self.paths.outdir, "final_selection_with_llm.parquet"), index=False
+                )
+
+                labels_path = Path(self.paths.outdir) / "final_llm_labels.parquet"
+                try:
+                    fam_wide.to_parquet(labels_path, index=False)
+                except Exception:
+                    pass
+                else:
+                    try:
+                        labels_path.with_suffix(".json").write_text(
+                            fam_wide.to_json(orient="records", indent=2, force_ascii=False),
+                            encoding="utf-8",
+                        )
+                    except TypeError:
+                        labels_path.with_suffix(".json").write_text(
+                            fam_wide.to_json(orient="records"),
+                            encoding="utf-8",
+                        )
+
+            try:
+                probe_json_path = Path(self.paths.outdir) / "final_llm_family_probe.json"
+                fam_df.to_json(probe_json_path, orient="records", indent=2, force_ascii=False)
+            except TypeError:
+                fam_df.to_json(probe_json_path, orient="records")
+
+            return final_out
+
         if getattr(self.cfg.select, "skip_active_learning", False):
             print("Skipping active learning bucket generation (inference-only mode).")
             final = self.repo.notes.copy()
@@ -5423,9 +5538,13 @@ class ActiveLearningLLMFirst:
                     final["unit_id"] = final["doc_id"].astype(str)
                 else:
                     final["unit_id"] = final.index.astype(str)
+            if "label_id" not in final.columns:
+                final["label_id"] = ""
+            if "label_type" not in final.columns:
+                final["label_type"] = ""
             final["selection_reason"] = "inference_only"
             final = final.drop_duplicates(subset=["unit_id"], keep="first")
-            return final
+            return _run_final_family_labeling(final)
 
         # ---------- small helpers ----------
         def _empty_unit_frame() -> "pd.DataFrame":
@@ -5603,82 +5722,7 @@ class ActiveLearningLLMFirst:
         final.to_parquet(os.path.join(self.paths.outdir, "final_selection.parquet"), index=False)
         result_df = final
 
-        # (Optional) run family labeling on the final units for transparency/audit
-        final_out = None
-        if self.cfg.final_llm_labeling:
-            fam_rows = []
-            fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
-            unit_ids = final["unit_id"].tolist()
-            rules_map = current_rules_map
-            types = current_label_types
-            _progress_every = float(fam.cfg.progress_min_interval_s or 1)
-            for uid in iter_with_bar(
-                    step="Final family labeling",
-                    iterable=unit_ids,
-                    total=len(unit_ids),
-                    min_interval_s=_progress_every):
-                fam_rows.extend(
-                    fam.label_family_for_unit(uid, types, rules_map,
-                                              json_only=True,
-                                              json_n_consistency=getattr(self.cfg.llmfirst, "final_llm_label_consistency", 1),
-                                              json_jitter=False)
-                )
-            fam_df = pd.DataFrame(fam_rows)
-            if not fam_df.empty:
-                if "runs" in fam_df.columns: fam_df.rename(columns={"runs":"llm_runs"}, inplace=True)
-                if "consistency" in fam_df.columns: fam_df.rename(columns={"consistency":"llm_consistency"}, inplace=True)
-                if "prediction" in fam_df.columns: fam_df.rename(columns={"prediction":"llm_prediction"}, inplace=True)
-                if "llm_runs" in fam_df.columns:
-                    fam_df["llm_reasoning"] = fam_df["llm_runs"].map(
-                        lambda rs: (rs[0].get("raw", {}).get("reasoning") if isinstance(rs, list) and rs else None)
-                    )
-                fam_df = _jsonify_cols(fam_df, [c for c in ["rag_context","llm_runs","fc_probs"] if c in fam_df.columns])
-            fam_df.to_parquet(os.path.join(self.paths.outdir, "final_llm_family_probe.parquet"), index=False)
-    
-            # Build wide convenience view & save merged
-            if not fam_df.empty:
-                pv = fam_df[["unit_id","label_id","llm_prediction"]].copy()
-                pv["col"] = pv["label_id"].astype(str) + "_llm"
-                fam_wide = (
-                    pv.pivot_table(index="unit_id", columns="col", values="llm_prediction", aggfunc="first")
-                      .reset_index()
-                )
-                if "llm_reasoning" in fam_df.columns:
-                    rv = fam_df[["unit_id","label_id","llm_reasoning"]].copy()
-                    rv["colr"] = rv["label_id"].astype(str) + "_llm_reason"
-                    fam_reason_wide = (
-                        rv.pivot_table(index="unit_id", columns="colr", values="llm_reasoning", aggfunc="first")
-                          .reset_index()
-                    )
-                    fam_wide = fam_wide.merge(fam_reason_wide, on="unit_id", how="left")
-                final_units = final[["unit_id", "label_id", "label_type", "selection_reason"]].drop_duplicates()
-                final_out = final_units.merge(fam_wide, on="unit_id", how="left")
-                final_out.to_parquet(os.path.join(self.paths.outdir, "final_selection_with_llm.parquet"), index=False)
-
-                labels_path = Path(self.paths.outdir) / "final_llm_labels.parquet"
-                try:
-                    fam_wide.to_parquet(labels_path, index=False)
-                except Exception:
-                    pass
-                else:
-                    try:
-                        labels_path.with_suffix(".json").write_text(
-                            fam_wide.to_json(orient="records", indent=2, force_ascii=False),
-                            encoding="utf-8",
-                        )
-                    except TypeError:
-                        labels_path.with_suffix(".json").write_text(
-                            fam_wide.to_json(orient="records"),
-                            encoding="utf-8",
-                        )
-
-            try:
-                probe_json_path = Path(self.paths.outdir) / "final_llm_family_probe.json"
-                fam_df.to_json(probe_json_path, orient="records", indent=2, force_ascii=False)
-            except TypeError:
-                fam_df.to_json(probe_json_path, orient="records")
-        if final_out is not None:
-            result_df = final_out
+        result_df = _run_final_family_labeling(final)
         
         diagnostics = {
             "total_selected": int(len(final)),
