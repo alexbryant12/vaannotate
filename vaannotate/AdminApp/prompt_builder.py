@@ -13,7 +13,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from vaannotate.utils import ensure_dir
 from vaannotate.vaannotate_ai_backend import run_ai_backend_and_collect
@@ -42,6 +42,7 @@ class PromptBuilderConfig:
     rag_chunk_size: int = 1500
     rag_num_chunks: int = 6
     rag_mmr_lambda: float = 0.7
+    backend_overrides: Dict[str, object] = field(default_factory=dict)
 
     def label_config_payload(self) -> Dict[str, object]:
         """Build a label_config-like payload consumed by the AI backend."""
@@ -97,10 +98,12 @@ class PromptBuilderConfig:
         }
 
         return {
-            "llm": llm_cfg,
-            "rag": rag_cfg,
-            "prompt_builder": prompt_cfg,
-            "llmfirst": {},
+            "llm": _deep_update_dict(llm_cfg, self.backend_overrides.get("llm", {})),
+            "rag": _deep_update_dict(rag_cfg, self.backend_overrides.get("rag", {})),
+            "prompt_builder": _deep_update_dict(
+                prompt_cfg, self.backend_overrides.get("prompt_builder", {})
+            ),
+            "llmfirst": _deep_update_dict({}, self.backend_overrides.get("llmfirst", {})),
         }
 
 
@@ -136,49 +139,37 @@ class PromptExperimentSweep:
     """Helper that expands user-specified sweeps into concrete configs."""
 
     base: PromptBuilderConfig
-    zero_shot: bool = True
-    few_shot: bool = True
-    mmr_lambdas: Sequence[float] = (0.7,)
     chunk_sizes: Sequence[int] = (1500,)
     num_chunks: Sequence[int] = (6,)
 
     def variants(self) -> List[PromptExperimentConfig]:
         entries: List[PromptExperimentConfig] = []
-        for mode in ("family_tree", "single_shot"):
-            for few_shot in (False, True):
-                if few_shot and not self.few_shot:
-                    continue
-                if not few_shot and not self.zero_shot:
-                    continue
-                for lam in self.mmr_lambdas:
-                    for chunk_size in self.chunk_sizes:
-                        for num_chunks in self.num_chunks:
-                            cfg = PromptBuilderConfig(
-                                labelset_id=self.base.labelset_id,
-                                system_prompt=self.base.system_prompt,
-                                use_few_shot=few_shot,
-                                few_shot_examples=self.base.few_shot_examples,
-                                label_rule_overrides=self.base.label_rule_overrides,
-                                inference_mode=mode,
-                                backend=self.base.backend,
-                                azure_api_key=self.base.azure_api_key,
-                                azure_api_version=self.base.azure_api_version,
-                                azure_endpoint=self.base.azure_endpoint,
-                                local_model_dir=self.base.local_model_dir,
-                                local_max_seq_len=self.base.local_max_seq_len,
-                                local_max_new_tokens=self.base.local_max_new_tokens,
-                                embedding_model_dir=self.base.embedding_model_dir,
-                                reranker_model_dir=self.base.reranker_model_dir,
-                                context_order=self.base.context_order,
-                                rag_chunk_size=chunk_size,
-                                rag_num_chunks=num_chunks,
-                                rag_mmr_lambda=lam,
-                            )
-                            name = (
-                                f"{mode}-{'few' if few_shot else 'zero'}"
-                                f"-lam{lam}-chunk{chunk_size}-k{num_chunks}"
-                            )
-                            entries.append(PromptExperimentConfig(name=name, config=cfg))
+        for chunk_size in self.chunk_sizes:
+            for num_chunks in self.num_chunks:
+                cfg = PromptBuilderConfig(
+                    labelset_id=self.base.labelset_id,
+                    system_prompt=self.base.system_prompt,
+                    use_few_shot=self.base.use_few_shot,
+                    few_shot_examples=self.base.few_shot_examples,
+                    label_rule_overrides=self.base.label_rule_overrides,
+                    inference_mode=self.base.inference_mode,
+                    backend=self.base.backend,
+                    azure_api_key=self.base.azure_api_key,
+                    azure_api_version=self.base.azure_api_version,
+                    azure_endpoint=self.base.azure_endpoint,
+                    local_model_dir=self.base.local_model_dir,
+                    local_max_seq_len=self.base.local_max_seq_len,
+                    local_max_new_tokens=self.base.local_max_new_tokens,
+                    embedding_model_dir=self.base.embedding_model_dir,
+                    reranker_model_dir=self.base.reranker_model_dir,
+                    context_order=self.base.context_order,
+                    rag_chunk_size=chunk_size,
+                    rag_num_chunks=num_chunks,
+                    rag_mmr_lambda=self.base.rag_mmr_lambda,
+                    backend_overrides=self.base.backend_overrides,
+                )
+                name = f"chunk{chunk_size}-k{num_chunks}"
+                entries.append(PromptExperimentConfig(name=name, config=cfg))
         return entries
 
 
@@ -334,6 +325,7 @@ class PromptInferenceJob:
                     corpus_id=self.corpus_id,
                     corpus_path=str(self.corpus_path) if self.corpus_path else None,
                     scope_corpus_to_annotations=True,
+                    consensus_only=True,
                 )
                 result = PromptExperimentResult(
                     name=variant.name,
@@ -351,3 +343,18 @@ class PromptInferenceJob:
                 self._write_checkpoint(ckpt)
                 raise
         return results
+
+def _deep_update_dict(target: Dict[str, object], updates: Mapping[str, object]) -> Dict[str, object]:
+    """Recursively merge ``updates`` into ``target`` and return the target dict."""
+
+    merged = dict(target)
+    for key, value in updates.items():
+        if isinstance(value, Mapping):
+            current = merged.get(key)
+            if isinstance(current, Mapping):
+                merged[key] = _deep_update_dict(dict(current), value)
+            else:
+                merged[key] = dict(value)
+        else:
+            merged[key] = value
+    return merged
