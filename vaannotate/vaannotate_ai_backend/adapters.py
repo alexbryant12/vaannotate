@@ -720,9 +720,11 @@ def export_inputs_from_repo(
     corpus_csv: Optional[Path] = None
     corpus_path_for_db = corpus_path
     if allow_scoped_corpus_csv and corpus_path:
-        maybe_csv = (root / corpus_path).resolve() if not Path(corpus_path).is_absolute() else Path(corpus_path)
-        if maybe_csv.suffix.lower() == ".csv" and maybe_csv.exists():
-            corpus_csv = maybe_csv
+        corpus_path_obj = Path(corpus_path)
+        if corpus_path_obj.suffix.lower() == ".csv":
+            corpus_csv = _resolve_scoped_corpus_csv(root, corpus_path)
+        else:
+            corpus_path_for_db = corpus_path
     elif corpus_path and Path(corpus_path).suffix.lower() == ".csv":
         log(
             "Scoped corpus CSVs are only supported for inference-only runs; "
@@ -845,6 +847,22 @@ def _scope_corpus_to_annotations(
     return filtered
 
 
+def _resolve_scoped_corpus_csv(project_root: Path, corpus_path: str) -> Path:
+    """Resolve and validate a scoped corpus CSV path relative to the project root."""
+
+    candidate = Path(corpus_path)
+    if not candidate.is_absolute():
+        candidate = (project_root / candidate).resolve()
+
+    if candidate.suffix.lower() != ".csv":
+        raise ValueError(f"Scoped corpus path must be a CSV file: {candidate}")
+
+    if not candidate.exists():
+        raise FileNotFoundError(f"Scoped corpus CSV not found: {candidate}")
+
+    return candidate
+
+
 def _join_corpus_with_prior_units(
     notes_df: pd.DataFrame, ann_df: pd.DataFrame, log: Callable[[str], None]
 ) -> pd.DataFrame:
@@ -944,15 +962,20 @@ def run_ai_backend_and_collect(
     shared_cache_dir: Optional[Path] = None
     record_dict = _normalize_record(corpus_record)
     normalized_corpus_path = corpus_path or record_dict.get("relative_path") or record_dict.get("path")
-    use_scoped_csv = bool(
+    scoped_csv_path: Optional[Path] = None
+    if (
         inference_only
         and normalized_corpus_path
         and Path(normalized_corpus_path).suffix.lower() == ".csv"
-    )
+    ):
+        scoped_csv_path = _resolve_scoped_corpus_csv(project_root, str(normalized_corpus_path))
+        normalized_corpus_path = str(scoped_csv_path)
+
     corpus_path_for_db = normalized_corpus_path
     if normalized_corpus_path and Path(normalized_corpus_path).suffix.lower() == ".csv" and not inference_only:
         corpus_path_for_db = None
-    if not use_scoped_csv:
+
+    if not scoped_csv_path:
         try:
             corpus_db_path = _find_corpus_db(
                 project_root,
