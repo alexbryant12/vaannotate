@@ -266,6 +266,8 @@ def build_next_batch(
     if overrides:
         _apply_overrides(cfg, overrides)
 
+    write_buckets = bool(getattr(cfg.select, "write_buckets", True))
+
     bundle = (label_config_bundle or EMPTY_BUNDLE).with_current_fallback(label_config)
     bundle = _apply_label_queries(bundle, label_queries_override)
 
@@ -312,7 +314,9 @@ def build_next_batch(
             "llm_uncertain": str(outdir_path / "bucket_llm_uncertain.parquet"),
             "llm_certain": str(outdir_path / "bucket_llm_certain.parquet"),
             "diversity": str(outdir_path / "bucket_diversity.parquet"),
-        },
+        }
+        if write_buckets
+        else {},
         "final_labels": str(outdir_path / "final_llm_labels.parquet")
         if (outdir_path / "final_llm_labels.parquet").exists()
         else None,
