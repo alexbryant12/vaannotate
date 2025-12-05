@@ -39,7 +39,10 @@ if "langchain" not in sys.modules:
 
 from vaannotate.project import add_phenotype, get_connection, init_project
 from vaannotate.schema import initialize_assignment_db, initialize_corpus_db
-from vaannotate.vaannotate_ai_backend.adapters import export_inputs_from_repo
+from vaannotate.vaannotate_ai_backend.adapters import (
+    export_inputs_from_repo,
+    run_ai_backend_and_collect,
+)
 from vaannotate.vaannotate_ai_backend.engine import DataRepository, _contexts_for_unit_label
 
 
@@ -597,6 +600,107 @@ def test_scoped_corpus_csv_ignored_for_round_builder(tmp_path: Path) -> None:
 
     assert set(notes_df["doc_id"]) == {"doc_a", "doc_b"}
     assert ann_df.empty
+
+
+def test_inference_run_enforces_scoped_corpus(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    pheno_id = "ph_scoped_inference"
+    storage_relative = Path("phenotypes") / pheno_id
+    phenotype_dir = project_root / storage_relative
+    (phenotype_dir / "rounds").mkdir(parents=True, exist_ok=True)
+
+    with get_connection(paths.project_db) as conn:
+        add_phenotype(
+            conn,
+            pheno_id=pheno_id,
+            project_id="proj",
+            name="Phenotype with scoped inference corpus",
+            level="single_doc",
+            storage_path=str(storage_relative.as_posix()),
+        )
+        conn.commit()
+
+    scoped_csv = project_root / "scoped.csv"
+    pd.DataFrame(
+        [
+            {"doc_id": "doc_scoped", "patient_icn": "p1", "text": "Scoped"},
+        ]
+    ).to_csv(scoped_csv, index=False)
+
+    def fake_export_inputs(*args: object, **kwargs: object) -> tuple[pd.DataFrame, pd.DataFrame]:
+        notes_df = pd.DataFrame(
+            [
+                {"doc_id": "doc_scoped", "patient_icn": "p1", "text": "Scoped"},
+                {"doc_id": "doc_extra", "patient_icn": "p2", "text": "Extra"},
+            ]
+        )
+        ann_df = pd.DataFrame(
+            {
+                "round_id": pd.Series(dtype="object"),
+                "unit_id": pd.Series(dtype="object"),
+                "doc_id": pd.Series(dtype="object"),
+                "label_id": pd.Series(dtype="object"),
+                "reviewer_id": pd.Series(dtype="object"),
+                "label_value": pd.Series(dtype="object"),
+            }
+        )
+        return notes_df, ann_df
+
+    captured: dict[str, set[str]] = {}
+
+    def fake_build_next_batch(
+        notes_df: pd.DataFrame,
+        ann_df: pd.DataFrame,
+        outdir: Path,
+        label_config_bundle: object,
+        *,
+        label_config: object | None = None,
+        cfg_overrides: object | None = None,
+        cancel_callback: object | None = None,
+        log_callback: object | None = None,
+        cache_dir: Path | None = None,
+    ) -> tuple[pd.DataFrame, dict]:
+        captured["doc_ids"] = set(notes_df["doc_id"])
+        final_df = notes_df.copy()
+        final_df["selection_reason"] = "inference_only"
+        outdir_path = Path(outdir)
+        outdir_path.mkdir(parents=True, exist_ok=True)
+        csv_path = outdir_path / "ai_next_batch.csv"
+        final_df.to_csv(csv_path, index=False)
+        return final_df, {"ai_next_batch_csv": str(csv_path), "buckets": {}, "metrics": {}}
+
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.adapters.export_inputs_from_repo",
+        fake_export_inputs,
+    )
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.adapters.build_next_batch",
+        fake_build_next_batch,
+    )
+
+    round_dir = phenotype_dir / "rounds" / "round_1"
+    round_dir.mkdir(parents=True, exist_ok=True)
+
+    result = run_ai_backend_and_collect(
+        project_root,
+        pheno_id,
+        None,
+        [],
+        round_dir,
+        "single_doc",
+        "tester",
+        corpus_path=str(scoped_csv),
+        inference_only=True,
+    )
+
+    assert captured.get("doc_ids") == {"doc_scoped"}
+
+    inference_corpus = round_dir / "imports" / "ai" / "inference_corpus.csv"
+    exported = pd.read_csv(inference_corpus)
+    assert set(exported["doc_id"]) == {"doc_scoped"}
+    assert set(result.dataframe["doc_id"]) == {"doc_scoped"}
 
 
 def test_contexts_for_unit_label_full_mode() -> None:
