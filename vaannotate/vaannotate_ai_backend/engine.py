@@ -3098,9 +3098,20 @@ class LLMAnnotator:
 
                     pred = data_map.get(self.cfg.prediction_field, data_map.get("prediction"))
                     if is_multi_select and use_options:
-                        pred_canon = self._canon_multi_selection(pred, option_values)
+                        pred_for_canon = pred
+                        if (pred_for_canon is None or pred_for_canon == {}) and isinstance(data_map, Mapping):
+                            inline_options = {
+                                key: val
+                                for key, val in data_map.items()
+                                if _canon_str(key).lower() in {_canon_str(o).lower() for o in option_values}
+                                and key not in {self.cfg.prediction_field, "canonical_prediction", "reasoning"}
+                            }
+                            if inline_options:
+                                pred_for_canon = inline_options
+
+                        pred_canon = self._canon_multi_selection(pred_for_canon, option_values)
                         data_map["canonical_prediction"] = pred_canon
-                        pred = pred_canon
+                        pred = pred_canon if pred_canon is not None else pred
 
                     preds.append(str(pred) if pred is not None else None)
 
