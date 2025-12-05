@@ -3065,8 +3065,10 @@ class PromptInferenceDialog(QtWidgets.QDialog):
                 display = f"{display} (assigned)"
             self.labelset_combo.addItem(display, labelset_id)
         self.rounds_list.clear()
+        self._round_metadata: Dict[int, Dict[str, object]] = {}
         for round_row in self.ctx.list_rounds(self.pheno_id):
             round_number = int(round_row.get("round_number") or 0)
+            self._round_metadata[round_number] = dict(round_row)
             status = str(round_row.get("status") or "")
             label = f"Round {round_number} — {status}"
             item = QtWidgets.QListWidgetItem(label)
@@ -3326,6 +3328,33 @@ class PromptInferenceDialog(QtWidgets.QDialog):
                 "Choose at least one adjudicated round to evaluate against.",
             )
             return
+        round_metadata = getattr(self, "_round_metadata", {}) if isinstance(getattr(self, "_round_metadata", {}), dict) else {}
+        if labelset_id:
+            filtered_rounds = []
+            mismatched_rounds = []
+            for round_number in rounds:
+                detail = round_metadata.get(round_number) or {}
+                round_labelset = str(detail.get("labelset_id") or "")
+                if round_labelset and round_labelset != labelset_id:
+                    mismatched_rounds.append(round_number)
+                    continue
+                filtered_rounds.append(round_number)
+            if mismatched_rounds:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Inference",
+                    "Some selected rounds use a different label set than the inference "
+                    "configuration and will be ignored: "
+                    + ", ".join(str(r) for r in sorted(mismatched_rounds)),
+                )
+            rounds = filtered_rounds
+            if not rounds:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Inference",
+                    "No compatible adjudicated rounds remain after filtering by label set.",
+                )
+                return
         base_config = PromptBuilderConfig(
             labelset_id=labelset_id,
             system_prompt=self.system_prompt.toPlainText(),

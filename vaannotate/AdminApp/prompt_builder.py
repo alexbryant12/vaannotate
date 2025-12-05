@@ -259,11 +259,33 @@ class PromptInferenceJob:
             else self.run_root / f"{pheno_id}_prompt_checkpoint.json"
         )
 
+    def _checkpoint_matches(self, ckpt: PromptInferenceCheckpoint) -> bool:
+        corpus_path = str(self.corpus_path) if self.corpus_path else None
+        return (
+            Path(ckpt.project_root) == self.project_root
+            and ckpt.pheno_id == self.pheno_id
+            and ckpt.labelset_id == self.labelset_id
+            and ckpt.phenotype_level == self.phenotype_level
+            and sorted(ckpt.adjudicated_rounds) == self.adjudicated_rounds
+            and (ckpt.corpus_id or None) == (self.corpus_id or None)
+            and (ckpt.corpus_path or None) == corpus_path
+        )
+
     def _load_or_create_checkpoint(
-        self, variants: Iterable[PromptExperimentConfig]
+        self,
+        variants: Iterable[PromptExperimentConfig],
+        *,
+        log_callback: Optional[Callable[[str], None]] = None,
     ) -> PromptInferenceCheckpoint:
+        log = log_callback or (lambda msg: None)
         if self.checkpoint_path.exists():
-            return PromptInferenceCheckpoint.load(self.checkpoint_path)
+            ckpt = PromptInferenceCheckpoint.load(self.checkpoint_path)
+            if self._checkpoint_matches(ckpt):
+                return ckpt
+            log(
+                "Existing checkpoint is incompatible with current inference settings; "
+                "starting a new run."
+            )
         return PromptInferenceCheckpoint.new(
             project_root=self.project_root,
             pheno_id=self.pheno_id,
@@ -289,7 +311,7 @@ class PromptInferenceJob:
         """Run the experiment sweep with checkpointing and resume support."""
 
         log = log_callback or (lambda msg: None)
-        ckpt = self._load_or_create_checkpoint(variants)
+        ckpt = self._load_or_create_checkpoint(variants, log_callback=log_callback)
         results: List[PromptExperimentResult] = []
 
         for idx, variant in enumerate(
@@ -326,6 +348,7 @@ class PromptInferenceJob:
                     corpus_path=str(self.corpus_path) if self.corpus_path else None,
                     scope_corpus_to_annotations=True,
                     consensus_only=True,
+                    inference_only=True,
                 )
                 result = PromptExperimentResult(
                     name=variant.name,

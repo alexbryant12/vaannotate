@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Any, Mapping, Iterable
@@ -25,6 +25,7 @@ class BackendResult:
     dataframe: pd.DataFrame
     artifacts: Dict[str, Any]
     params_path: Path
+    metrics: Dict[str, float] = field(default_factory=dict)
 
 
 def _materialize_label_config(conn: sqlite3.Connection, labelset_id: str) -> Optional[Dict[str, Any]]:
@@ -693,10 +694,27 @@ def export_inputs_from_repo(
     corpus_record: Optional[Mapping[str, Any] | sqlite3.Row | Dict[str, Any]] = None,
     corpus_id: Optional[str] = None,
     corpus_path: Optional[str] = None,
+    labelset_id: Optional[str] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    log = log_callback or (lambda message: None)
     prior_rounds = sorted({int(r) for r in prior_rounds})
     root = Path(project_root)
     phenotype_dir = _resolve_phenotype_dir(root, pheno_id)
+    round_details = _load_round_details(project_root, pheno_id, prior_rounds)
+
+    skipped_rounds: list[int] = []
+    filtered_rounds: list[int] = []
+    for r in prior_rounds:
+        detail = round_details.get(r, {})
+        if labelset_id:
+            round_labelset = detail.get("labelset_id")
+            if round_labelset and str(round_labelset) != str(labelset_id):
+                skipped_rounds.append(r)
+                continue
+        filtered_rounds.append(r)
+
+    prior_rounds = filtered_rounds
     corpus_db = _find_corpus_db(
         root,
         pheno_id,
@@ -708,12 +726,16 @@ def export_inputs_from_repo(
     notes_df = _read_corpus_db(corpus_db)
 
     ann_frames = []
-    round_details = _load_round_details(project_root, pheno_id, prior_rounds)
     for r in prior_rounds:
         round_dir = phenotype_dir / "rounds" / f"round_{r}"
         if not round_dir.exists():
             continue
         detail = round_details.get(r, {})
+        if labelset_id:
+            round_labelset = detail.get("labelset_id")
+            if round_labelset and str(round_labelset) != str(labelset_id):
+                skipped_rounds.append(r)
+                continue
         frame = _read_round_annotations(
             round_dir,
             pheno_id,
@@ -721,9 +743,14 @@ def export_inputs_from_repo(
             root,
             round_id=detail.get("round_id"),
             labelset_id=detail.get("labelset_id"),
-        )
+            )
         if not frame.empty:
             ann_frames.append(frame)
+    if skipped_rounds:
+        log(
+            "Ignoring rounds with label set mismatches: "
+            + ", ".join(str(r) for r in sorted(skipped_rounds))
+        )
 
     ann_df = (
         pd.concat(ann_frames, ignore_index=True)
@@ -832,6 +859,7 @@ def run_ai_backend_and_collect(
     sampling_metadata: Optional[Mapping[str, object]] = None,
     scope_corpus_to_annotations: bool = False,
     consensus_only: bool = False,
+    inference_only: bool = False,
 ) -> BackendResult:
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
@@ -860,7 +888,40 @@ def run_ai_backend_and_collect(
         corpus_record=record_dict,
         corpus_id=corpus_id,
         corpus_path=normalized_corpus_path,
+        labelset_id=labelset_id,
+        log_callback=log_callback,
     )
+    if inference_only:
+        log("Inference-only mode: skipping active learning batch construction.")
+        ai_dir = Path(round_dir) / "imports" / "ai"
+        ai_dir.mkdir(parents=True, exist_ok=True)
+        corpus_csv = ai_dir / "inference_corpus.csv"
+        notes_df.to_csv(corpus_csv, index=False)
+        ann_csv = ai_dir / "inference_annotations.csv"
+        ann_df.to_csv(ann_csv, index=False)
+        params = {
+            "phenotype_id": pheno_id,
+            "prior_rounds": list(sorted(prior_rounds)),
+            "phenotype_level": level,
+            "invoked_by": user,
+            "timestamp": timestamp or datetime.utcnow().isoformat(),
+            "backend_version": __version__,
+            "mode": "inference_only",
+        }
+        params_path = ai_dir / "params.json"
+        params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
+        log("Prepared inference inputs without running the active learning backend.")
+        return BackendResult(
+            csv_path=corpus_csv,
+            dataframe=notes_df,
+            artifacts={
+                "annotations_csv": str(ann_csv),
+                "corpus_csv": str(corpus_csv),
+                "mode": "inference_only",
+            },
+            params_path=params_path,
+            metrics={},
+        )
     if consensus_only:
         ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
         if doc_ids:
@@ -965,4 +1026,11 @@ def run_ai_backend_and_collect(
     params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
     log(f"Wrote parameters to {params_path}")
 
-    return BackendResult(csv_path=csv_path, dataframe=final_df, artifacts=artifacts, params_path=params_path)
+    metrics = artifacts.get("metrics", {}) if isinstance(artifacts, Mapping) else {}
+    return BackendResult(
+        csv_path=csv_path,
+        dataframe=final_df,
+        artifacts=artifacts,
+        params_path=params_path,
+        metrics=dict(metrics) if isinstance(metrics, Mapping) else {},
+    )
