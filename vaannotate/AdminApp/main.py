@@ -261,7 +261,7 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
         "chunk_overlap": "Overlap between consecutive chunks to preserve context.",
         "normalize_embeddings": "L2-normalize embeddings before indexing/searching.",
         "per_label_topk": "Top-k chunks to keep per label during retrieval (legacy; use top_k_final).",
-        "top_k_final": "Final number of chunks kept per label after reranking.",
+        "top_k_final": "Final number of chunks kept per label after reranking; also used for LLM-first probes.",
         "use_mmr": "Use maximal marginal relevance to diversify retrieved chunks.",
         "mmr_lambda": "MMR trade-off between relevance (1.0) and diversity (0.0).",
         "mmr_candidates": "Candidate pool size for MMR selection.",
@@ -306,7 +306,6 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
     },
     "llmfirst": {
         "n_probe_units": "How many units to probe when estimating uncertainty.",
-        "topk": "Top-K relevant chunks to feed into LLM-first probes.",
         "json_trace_policy": "Fallback policy for JSON traces (e.g., 'fallback').",
         "progress_min_interval_s": "Minimum seconds between progress updates.",
         "exemplar_K": "Number of exemplar documents to retrieve per label.",
@@ -713,6 +712,8 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
                         "mmr_multiplier",
                     }:
                         continue
+                if key == "llmfirst" and field_name == "topk":
+                    continue
                 widget = self._build_field_widget(
                     key, field_name, value, section_values=section_values
                 )
@@ -5666,7 +5667,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             shared_topk = None
         if shared_topk is None:
             try:
-                candidate = int(llmfirst_cfg.get("topk")) if llmfirst_cfg else None
+                candidate = int(rag_cfg.get("per_label_topk")) if rag_cfg else None
                 if candidate and candidate > 0:
                     shared_topk = candidate
             except Exception:  # noqa: BLE001
