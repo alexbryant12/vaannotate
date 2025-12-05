@@ -916,6 +916,7 @@ def run_ai_backend_and_collect(
         overrides: Dict[str, Any] = dict(cfg_overrides or {})
         select_overrides: Dict[str, Any] = dict(overrides.get("select", {}))
         select_overrides["batch_size"] = max(int(select_overrides.get("batch_size", 0) or 0), len(notes_df))
+        select_overrides["write_buckets"] = False
         overrides["select"] = select_overrides
         cfg_overrides = overrides
     if consensus_only:

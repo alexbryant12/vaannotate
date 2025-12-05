@@ -172,6 +172,7 @@ class SelectionConfig:
     pct_uncertain: float = 0.3    # LLM-uncertain
     pct_easy_qc: float = 0.1      # LLM-certain
     pct_diversity: float = 0.3
+    write_buckets: bool = True
 
 @dataclass
 class LLMFirstConfig:
@@ -5471,11 +5472,12 @@ class ActiveLearningLLMFirst:
 
         run_id = time.strftime("%Y%m%d-%H%M%S")
         LLM_RECORDER.start(outdir=self.paths.outdir, run_id=run_id)
-    
+
         # progressively exclude units
         selected_units: set[str] = set()
         selected_rows: list[pd.DataFrame] = []
-    
+        write_buckets = bool(getattr(self.cfg.select, "write_buckets", True))
+
         # 1) Disagreement (unit-level, excluding seen + already-picked)
         dis_units = _empty_unit_frame()
         dis_path = os.path.join(self.paths.outdir, "bucket_disagreement.parquet")
@@ -5492,7 +5494,8 @@ class ActiveLearningLLMFirst:
             # preventing duplicates within the current batch.
             dis_pairs = _filter_units(dis_pairs, selected_units)
             dis_units = _head_units(_to_unit_only(dis_pairs), n_dis)
-        dis_units.to_parquet(dis_path, index=False)
+        if write_buckets:
+            dis_units.to_parquet(dis_path, index=False)
         selected_rows.append(dis_units)
         selected_units |= set(dis_units["unit_id"])
 
@@ -5524,7 +5527,8 @@ class ActiveLearningLLMFirst:
         )
         sel_div_pairs = _filter_units(sel_div_pairs, seen_units | selected_units)
         sel_div_units = _head_units(_to_unit_only(sel_div_pairs), want_div)
-        sel_div_units.to_parquet(os.path.join(self.paths.outdir, "bucket_diversity.parquet"), index=False)
+        if write_buckets:
+            sel_div_units.to_parquet(os.path.join(self.paths.outdir, "bucket_diversity.parquet"), index=False)
         selected_rows.append(sel_div_units)
         selected_units |= set(sel_div_units["unit_id"])
     
@@ -5540,7 +5544,8 @@ class ActiveLearningLLMFirst:
                 )
                 sel_unc_pairs = _filter_units(sel_unc_pairs, seen_units | selected_units)
                 sel_unc_units = _head_units(_to_unit_only(sel_unc_pairs), want_unc)
-                sel_unc_units.to_parquet(os.path.join(self.paths.outdir, "bucket_llm_uncertain.parquet"), index=False)
+                if write_buckets:
+                    sel_unc_units.to_parquet(os.path.join(self.paths.outdir, "bucket_llm_uncertain.parquet"), index=False)
                 selected_rows.append(sel_unc_units)
                 selected_units |= set(sel_unc_units["unit_id"])
             else:
@@ -5558,7 +5563,8 @@ class ActiveLearningLLMFirst:
                 )
                 sel_cer_pairs = _filter_units(sel_cer_pairs, seen_units | selected_units)
                 sel_cer_units = _head_units(_to_unit_only(sel_cer_pairs), want_cer)
-                sel_cer_units.to_parquet(os.path.join(self.paths.outdir, "bucket_llm_certain.parquet"), index=False)
+                if write_buckets:
+                    sel_cer_units.to_parquet(os.path.join(self.paths.outdir, "bucket_llm_certain.parquet"), index=False)
                 selected_rows.append(sel_cer_units)
                 selected_units |= set(sel_cer_units["unit_id"])
             else:
