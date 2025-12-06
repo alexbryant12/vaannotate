@@ -1050,6 +1050,9 @@ def run_ai_backend_and_collect(
             shared_cache_dir = corpus_db_path.parent / "ai_cache"
             log(f"Using corpus DB: {corpus_db_path}")
 
+    log(f"[backend] inference_only={inference_only}, corpus_path arg={corpus_path!r}")
+    log(f"[backend] normalized_corpus_path={normalized_corpus_path!r}")
+
     # Export notes + annotations; allow_scoped_corpus_csv ensures a CSV
     # corpus_path is read directly instead of going back to corpus.db.
     notes_df, ann_df = export_inputs_from_repo(
@@ -1064,6 +1067,16 @@ def run_ai_backend_and_collect(
         allow_scoped_corpus_csv=inference_only,
     )
 
+    log(f"[backend] rows after export_inputs_from_repo: {len(notes_df)}")
+
+    if inference_only and scoped_csv_path is not None:
+        log(f"[backend] enforcing scope using {scoped_csv_path}")
+        before = len(notes_df)
+        notes_df = _enforce_scoped_corpus(notes_df, scoped_csv_path, log)
+        log(f"[backend] rows after _enforce_scoped_corpus: {before} → {len(notes_df)}")
+    
+    log(f"Exported {len(notes_df)} corpus rows and {len(ann_df)} prior annotations")
+    
     if consensus_only:
         ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
         if doc_ids:
@@ -1178,6 +1191,8 @@ def run_ai_backend_and_collect(
     if excluded_ids:
         overrides["excluded_unit_ids"] = sorted(excluded_ids)
     overrides.setdefault("phenotype_level", level)
+
+
 
     bundle = _load_label_config_bundle(
         project_root,
