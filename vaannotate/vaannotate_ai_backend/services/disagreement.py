@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 
 from vaannotate.vaannotate_ai_backend.core.data import DataRepository
+from vaannotate.vaannotate_ai_backend.services.disagreement_expander import DisagreementExpander
+from vaannotate.vaannotate_ai_backend.services.label_dependencies import build_label_dependencies
 
 
 class DisagreementScorer:
@@ -18,7 +20,7 @@ class DisagreementScorer:
         select_config,
         pooler,
         retriever,
-        expander,
+        expander: DisagreementExpander,
         *,
         context_builder=None,
         kcenter_select_fn: Optional[Callable] = None,
@@ -184,8 +186,6 @@ class DisagreementScorer:
             if key not in dep_cache:
                 config = self.expander.label_config_bundle.config_for_labelset(labelset_id)
                 try:
-                    from vaannotate.vaannotate_ai_backend.engine import build_label_dependencies
-
                     deps = build_label_dependencies(config)
                 except Exception:
                     deps = ({}, {}, [])

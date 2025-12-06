@@ -3,7 +3,7 @@ from typing import Any
 
 import numpy as np
 
-from vaannotate.vaannotate_ai_backend.engine import RAGRetriever
+from vaannotate.vaannotate_ai_backend.services.rag_retriever import RAGRetriever
 
 
 def test_manual_and_exemplar_queries_used_for_semantic_and_ce() -> None:

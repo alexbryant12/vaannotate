@@ -98,7 +98,7 @@ class InferencePipeline:
         fam_cls = getattr(self.llm, "family_labeler_cls", None)
         fam = fam_cls(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst) if fam_cls else None
         if fam is None:
-            from ..engine import FamilyLabeler  # type: ignore
+            from ..services.family_labeler import FamilyLabeler
 
             fam = FamilyLabeler(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
 
