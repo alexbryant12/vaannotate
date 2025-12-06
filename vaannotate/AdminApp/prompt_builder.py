@@ -345,6 +345,7 @@ class PromptInferenceJob:
                     log_callback=log_callback,
                     cancel_callback=cancel_callback,
                     corpus_id=self.corpus_id,
+                    # IMPORTANT: this should be the path to your *scoped* corpus CSV
                     corpus_path=str(self.corpus_path) if self.corpus_path else None,
                     scope_corpus_to_annotations=True,
                     intersect_corpus_with_prior_units=True,
