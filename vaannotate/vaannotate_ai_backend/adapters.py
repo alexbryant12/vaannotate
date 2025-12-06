@@ -1001,21 +1001,39 @@ def run_ai_backend_and_collect(
     log("Preparing AI backend inputs…")
     excluded_ids = {str(uid) for uid in (exclude_unit_ids or []) if str(uid)}
     shared_cache_dir: Optional[Path] = None
+
+    # Normalize the corpus selection from either a record or direct path.
     record_dict = _normalize_record(corpus_record)
-    normalized_corpus_path = corpus_path or record_dict.get("relative_path") or record_dict.get("path")
+    normalized_corpus_path = (
+        corpus_path
+        or record_dict.get("relative_path")
+        or record_dict.get("path")
+    )
+
+    # If we're in inference-only mode and the user selected a CSV, treat it as a
+    # scoped corpus and resolve it relative to the project root.
     scoped_csv_path: Optional[Path] = None
     if (
         inference_only
         and normalized_corpus_path
         and Path(normalized_corpus_path).suffix.lower() == ".csv"
     ):
-        scoped_csv_path = _resolve_scoped_corpus_csv(project_root, str(normalized_corpus_path))
+        scoped_csv_path = _resolve_scoped_corpus_csv(
+            project_root, str(normalized_corpus_path)
+        )
         normalized_corpus_path = str(scoped_csv_path)
 
+    # For non-inference runs, a CSV corpus_path should *not* be passed directly
+    # into _find_corpus_db; force it to fall back to the usual DB heuristics.
     corpus_path_for_db = normalized_corpus_path
-    if normalized_corpus_path and Path(normalized_corpus_path).suffix.lower() == ".csv" and not inference_only:
+    if (
+        normalized_corpus_path
+        and Path(normalized_corpus_path).suffix.lower() == ".csv"
+        and not inference_only
+    ):
         corpus_path_for_db = None
 
+    # Only try to locate a corpus DB when we are *not* explicitly using a scoped CSV.
     if not scoped_csv_path:
         try:
             corpus_db_path = _find_corpus_db(
@@ -1031,6 +1049,9 @@ def run_ai_backend_and_collect(
         else:
             shared_cache_dir = corpus_db_path.parent / "ai_cache"
             log(f"Using corpus DB: {corpus_db_path}")
+
+    # Export notes + annotations; allow_scoped_corpus_csv ensures a CSV
+    # corpus_path is read directly instead of going back to corpus.db.
     notes_df, ann_df = export_inputs_from_repo(
         project_root,
         pheno_id,
@@ -1042,38 +1063,57 @@ def run_ai_backend_and_collect(
         log_callback=log_callback,
         allow_scoped_corpus_csv=inference_only,
     )
+
     if consensus_only:
         ann_df, doc_ids = _consensus_annotations(ann_df, level, log)
         if doc_ids:
             try:
                 notes_df = notes_df[notes_df["doc_id"].astype(str).isin(doc_ids)]
             except Exception:  # noqa: BLE001
-                log("Warning: failed to filter corpus by consensus doc IDs; using full corpus")
+                log(
+                    "Warning: failed to filter corpus by consensus doc IDs; "
+                    "using full corpus"
+                )
+
     if ann_df.empty:
-        log("No annotations available after consensus filtering; inference may lack gold labels.")
+        log(
+            "No annotations available after consensus filtering; "
+            "inference may lack gold labels."
+        )
+
     if intersect_corpus_with_prior_units:
         notes_df = _join_corpus_with_prior_units(notes_df, ann_df, log)
     if scope_corpus_to_annotations:
         notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
 
+    # Inference-only mode: fully scope the corpus and emit CSVs that the LLM
+    # backend will label, without touching active-learning buckets.
     if inference_only:
         log("Inference-only mode: exporting scoped corpus for LLM labeling.")
         scoped_notes_df = _scope_corpus_to_annotations(notes_df, ann_df, log)
         scoped_notes_df = _join_corpus_with_prior_units(scoped_notes_df, ann_df, log)
         if scoped_csv_path:
-            scoped_notes_df = _enforce_scoped_corpus(scoped_notes_df, scoped_csv_path, log)
+            scoped_notes_df = _enforce_scoped_corpus(
+                scoped_notes_df, scoped_csv_path, log
+            )
+
         if len(scoped_notes_df) != len(notes_df):
             log(
                 "Restricted inference corpus to scoped units: "
-                f"kept {len(scoped_notes_df)}, dropped {len(notes_df) - len(scoped_notes_df)}"
+                f"kept {len(scoped_notes_df)}, "
+                f"dropped {len(notes_df) - len(scoped_notes_df)}"
             )
+
         notes_df = scoped_notes_df
+
         ai_dir = Path(round_dir) / "imports" / "ai"
         ai_dir.mkdir(parents=True, exist_ok=True)
+
         corpus_csv = ai_dir / "inference_corpus.csv"
         notes_df.to_csv(corpus_csv, index=False)
         ann_csv = ai_dir / "inference_annotations.csv"
         ann_df.to_csv(ann_csv, index=False)
+
         params = {
             "phenotype_id": pheno_id,
             "prior_rounds": list(sorted(prior_rounds)),
@@ -1087,44 +1127,50 @@ def run_ai_backend_and_collect(
         params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
         log("Prepared inference inputs; running AI backend to label all units.")
 
+        # Force a single batch over the scoped corpus and disable active-learning
+        # selection while still letting the RAG/prompt machinery run.
         overrides: Dict[str, Any] = dict(cfg_overrides or {})
         select_overrides: Dict[str, Any] = dict(overrides.get("select", {}))
         select_overrides["batch_size"] = max(
             int(select_overrides.get("batch_size", 0) or 0), len(notes_df)
         )
-        # Keep active-learning buckets disabled for inference runs while still
-        # allowing chunking/indexing and downstream LLM family labeling to run.
         select_overrides["skip_active_learning"] = True
         overrides["select"] = select_overrides
         cfg_overrides = overrides
-        # Avoid shared caches so inference runs never pick up stale corpora from
-        # earlier experiments that targeted a larger base corpus.
+
+        # Avoid shared caches for inference runs so they never pick up stale
+        # indexes from larger base corpora.
         shared_cache_dir = None
 
     ai_dir = Path(round_dir) / "imports" / "ai"
     ai_dir.mkdir(parents=True, exist_ok=True)
     log(f"Exported {len(notes_df)} corpus rows and {len(ann_df)} prior annotations")
 
+    # Load / override label_config as before...
     label_config_payload: Optional[Dict[str, Any]] = label_config
     if label_config_payload is None:
         candidates: List[Path] = []
         if labelset_id:
             candidates.append(resolve_label_config_path(project_root, labelset_id))
-        candidates.append(Path(project_root) / "phenotypes" / pheno_id / "ai" / "label_config.json")
+        candidates.append(
+            Path(project_root) / "phenotypes" / pheno_id / "ai" / "label_config.json"
+        )
         for candidate in candidates:
             if not candidate.exists():
                 continue
             try:
-                label_config_payload = json.loads(candidate.read_text(encoding="utf-8"))
+                label_config_payload = json.loads(
+                    candidate.read_text(encoding="utf-8")
+                )
                 log(f"Loaded label_config.json overrides from {candidate}")
                 break
             except Exception as exc:  # noqa: BLE001
                 log(f"Warning: failed to parse label_config.json ({exc})")
 
     overrides: Dict[str, Any] = dict(cfg_overrides or {})
-    select_overrides: Dict[str, Any] = dict(overrides.get("select", {}))
+    select_overrides = dict(overrides.get("select", {}))
     if not prior_rounds:
-        # Cold start: no reviewer disagreements yet, skip the bucket entirely.
+        # Cold start: no disagreement yet, skip that bucket.
         if select_overrides.get("pct_disagreement") is None:
             select_overrides["pct_disagreement"] = 0.0
         log("No prior rounds detected; skipping disagreement bucket for round zero.")
@@ -1151,6 +1197,7 @@ def run_ai_backend_and_collect(
         log_callback=log_callback,
         cache_dir=shared_cache_dir,
     )
+
     if inference_only:
         bucket_paths = artifacts.pop("buckets", None)
         if isinstance(bucket_paths, Mapping):
@@ -1159,14 +1206,20 @@ def run_ai_backend_and_collect(
                     Path(path).unlink(missing_ok=True)
                 except Exception:  # noqa: BLE001
                     log(f"Warning: failed to clean up inference bucket file {path}")
+
     if sampling_metadata:
         artifacts.setdefault("sampling", dict(sampling_metadata))
+
     if excluded_ids:
         applicable_mask = None
         if "selection_reason" in final_df.columns:
             reasons = final_df["selection_reason"].astype(str)
-            applicable_mask = reasons.str.startswith("llm_") | reasons.str.startswith("diversity")
-        identifiers = final_df.apply(lambda row: _unit_identifier_from_row(row, level), axis=1)
+            applicable_mask = reasons.str.startswith("llm_") | reasons.str.startswith(
+                "diversity"
+            )
+        identifiers = final_df.apply(
+            lambda row: _unit_identifier_from_row(row, level), axis=1
+        )
         mask = identifiers.isin(excluded_ids)
         if applicable_mask is not None:
             mask &= applicable_mask
@@ -1181,6 +1234,7 @@ def run_ai_backend_and_collect(
                 raise RuntimeError(
                     "No candidate units remain after excluding previously reviewed units."
                 )
+
     csv_path = Path(artifacts["ai_next_batch_csv"])
     log(f"AI backend produced {len(final_df)} candidate units")
 
@@ -1212,3 +1266,4 @@ def run_ai_backend_and_collect(
         artifacts_dir=ai_dir,
         metrics=dict(metrics) if isinstance(metrics, Mapping) else {},
     )
+
