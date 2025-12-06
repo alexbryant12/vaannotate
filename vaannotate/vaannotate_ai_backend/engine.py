@@ -37,17 +37,19 @@ from typing import Callable, List, Dict, Tuple, Optional, Any, Mapping
 import numpy as np
 import logging
 import pandas as pd
-from sentence_transformers import SentenceTransformer, CrossEncoder
-
+from .core.data import DataRepository
+from .core.embeddings import (
+    EmbeddingStore,
+    IndexConfig,
+    Models,
+    build_models_from_env,
+)
+from .services import ContextBuilder, LLMLabeler, LLM_RECORDER
+from .services.disagreement import DisagreementScorer
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
-from .llm_backends import JSONCallResult, ForcedChoiceResult, build_llm_backend
-from .retrieval_coordinator import RetrievalCoordinator, SemanticQuery
+from .llm_backends import build_llm_backend
+from .core.retrieval import RetrievalCoordinator, SemanticQuery
 
-try:
-    import faiss  # faiss-cpu
-except Exception:
-    faiss = None
-    
 try:
     from cachetools import LRUCache
 except Exception:
@@ -66,26 +68,14 @@ except Exception:
             if k in self._order: self._order.move_to_end(k)
             return super().get(k, default)
         
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except Exception:
-    try:
-        from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
-    except Exception:
-        raise ImportError("Please install langchain-text-splitters or langchain to use RecursiveCharacterTextSplitter.")
+"""
+Note: Embedding/index primitives (IndexConfig, Models, EmbeddingStore) now live
+in ``core.embeddings``.
+"""
 
 # ------------------------------
 # Config
 # ------------------------------
-
-@dataclass
-class IndexConfig:
-    type: str = "flat"    # flat | hnsw | ivf
-    nlist: int = 2048     # IVF lists
-    nprobe: int = 32      # IVF search probes
-    hnsw_M: int = 32      # HNSW graph degree
-    hnsw_efSearch: int = 64
-    persist: bool = True
 
 @dataclass
 class RAGConfig:
@@ -471,25 +461,6 @@ def write_table(df: pd.DataFrame, path: str):
     else:
         raise ValueError(f"Unsupported table extension: {path}")
 
-def normalize_text(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    return re.sub(r"\s+"," ", s).strip()
-
-def safe_json_loads(x):
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return None
-    if isinstance(x, (dict,list)):
-        return x
-    try:
-        return json.loads(x)
-    except Exception:
-        try:
-            import ast
-            return ast.literal_eval(x)
-        except Exception:
-            return None
-
 def normalize01(a: np.ndarray) -> np.ndarray:
     if a.size == 0: return a
     mn, mx = a.min(), a.max()
@@ -525,1196 +496,6 @@ def _maybe_parse_jsonish(value):
     return None
 
 
-# ------------------------------
-# Data repository
-# ------------------------------
-
-class DataRepository:
-    def __init__(
-        self,
-        notes_df: pd.DataFrame,
-        ann_df: pd.DataFrame,
-        *,
-        phenotype_level: str | None = None,
-    ):
-        level = (phenotype_level or "multi_doc").strip().lower()
-        if level not in {"single_doc", "multi_doc"}:
-            level = "multi_doc"
-        self.phenotype_level = level
-        required_notes = {"patient_icn","doc_id","text"}
-        if not required_notes.issubset(set(notes_df.columns)):
-            raise ValueError(f"Notes missing {required_notes}")
-        required_ann = {"round_id","unit_id","doc_id","label_id","reviewer_id","label_value"}
-        if not required_ann.issubset(set(ann_df.columns)):
-            raise ValueError(f"Annotations missing {required_ann}")
-
-        self.notes = notes_df.copy()
-        self.notes["patient_icn"] = self.notes["patient_icn"].astype(str)
-        self.notes["doc_id"] = self.notes["doc_id"].astype(str)
-        self.notes["text"] = self.notes["text"].astype(str).map(normalize_text)
-        original_unit_ids = None
-        if "unit_id" in self.notes.columns:
-            original_unit_ids = self.notes["unit_id"].astype(str)
-        self._notes_by_doc_cache: Optional[Dict[str, str]] = None
-        self._unit_doc_lookup: dict[str, str] = {}
-
-        if "notetype" not in self.notes.columns:
-            self.notes["notetype"] = ""
-        else:
-            self.notes["notetype"] = self.notes["notetype"].fillna("").astype(str)
-
-        if self.phenotype_level == "single_doc":
-            unit_ids = self.notes["doc_id"]
-            if original_unit_ids is not None:
-                doc_ids = self.notes["doc_id"].astype(str)
-                for raw, doc in zip(original_unit_ids.tolist(), doc_ids.tolist()):
-                    if raw:
-                        self._unit_doc_lookup.setdefault(raw, doc)
-        else:
-            unit_ids = self.notes["patient_icn"]
-        self.notes["unit_id"] = unit_ids.astype(str)
-
-        self.ann = ann_df.copy()
-        # --- Normalize multi-typed label_value columns ---
-        # 1) String label_value (categorical/binary, free text)
-        if "label_value" not in self.ann.columns:
-            self.ann["label_value"] = ""
-        self.ann["label_value"] = self.ann["label_value"].astype(str).str.strip()
-        
-        # 2) Numeric
-        import numpy as _np
-        import pandas as _pd
-        if "label_value_num" in self.ann.columns:
-            self.ann["label_value_num"] = _pd.to_numeric(self.ann["label_value_num"], errors="coerce")
-        else:
-            self.ann["label_value_num"] = _np.nan
-        
-        # 3) Date
-        if "label_value_date" in self.ann.columns:
-            self.ann["label_value_date"] = _pd.to_datetime(self.ann["label_value_date"], errors="coerce", utc=False)
-        else:
-            self.ann["label_value_date"] = _pd.NaT
-            
-        
-        for col in ("unit_id","doc_id","label_id","reviewer_id"):
-            self.ann[col] = self.ann[col].astype(str)
-        if "labelset_id" in self.ann.columns:
-            self.ann["labelset_id"] = self.ann["labelset_id"].astype(str)
-        else:
-            self.ann["labelset_id"] = ""
-        if "document_text" in self.ann.columns:
-            self.ann["document_text"] = self.ann["document_text"].astype(str).map(normalize_text)
-        else:
-            self.ann["document_text"] = ""
-        for col in ("rationales_json","document_metadata_json"):
-            if col in self.ann.columns:
-                self.ann[col] = self.ann[col].apply(safe_json_loads)
-            else:
-                self.ann[col] = None
-        for col in ("label_rules","reviewer_notes"):
-            if col in self.ann.columns:
-                self.ann[col] = self.ann[col].astype(str)
-            else:
-                self.ann[col] = ""
-
-        self.label_rules_by_label = self._collect_label_rules()
-        self._round_labelset_map = self._collect_round_labelsets()
-
-    def unit_metadata(self) -> pd.DataFrame:
-        columns = ["unit_id", "patient_icn"]
-        if self.phenotype_level == "single_doc":
-            columns.append("doc_id")
-        meta = self.notes[columns].drop_duplicates(subset=["unit_id"]).copy()
-        return meta
-
-    def _collect_label_rules(self) -> Dict[str,str]:
-        rules = {}
-        if "label_rules" in self.ann.columns:
-            df = self.ann[["label_id","label_rules"]].dropna()
-            for lid, grp in df.groupby("label_id"):
-                vals = [v for v in grp["label_rules"].tolist() if isinstance(v,str) and v.strip()]
-                if vals:
-                    rules[lid] = vals[-1]
-        return rules
-
-    def _collect_round_labelsets(self) -> Dict[str, str]:
-        mapping: Dict[str, str] = {}
-        if {"round_id", "labelset_id"}.issubset(self.ann.columns):
-            subset = self.ann[["round_id", "labelset_id"]].dropna()
-            if not subset.empty:
-                subset = subset.astype({"round_id": str, "labelset_id": str})
-                for row in subset.drop_duplicates().itertuples(index=False):
-                    if row.labelset_id:
-                        mapping[str(row.round_id)] = str(row.labelset_id)
-        return mapping
-
-    def labelset_for_round(self, round_identifier: str) -> Optional[str]:
-        return self._round_labelset_map.get(str(round_identifier))
-
-    def exclude_units(self, unit_ids: set[str] | list[str]) -> int:
-        """Remove excluded units from notes/annotations and reset caches.
-
-        Returns the number of notes rows removed.
-        """
-        if not unit_ids:
-            return 0
-
-        excluded = {str(u) for u in unit_ids if str(u)}
-        if self.notes.empty or not excluded:
-            return 0
-
-        mask = ~self.notes["unit_id"].astype(str).isin(excluded)
-        removed_notes = int(len(self.notes) - mask.sum())
-        if removed_notes:
-            self.notes = self.notes.loc[mask].reset_index(drop=True)
-            self._notes_by_doc_cache = None
-
-        if not self.ann.empty and "unit_id" in self.ann.columns and excluded:
-            ann_mask = ~self.ann["unit_id"].astype(str).isin(excluded)
-            if int(len(self.ann) - ann_mask.sum()):
-                self.ann = self.ann.loc[ann_mask].reset_index(drop=True)
-
-        # Trim any stale unit->doc lookup entries for single_doc mode
-        if self._unit_doc_lookup:
-            for uid in list(self._unit_doc_lookup.keys()):
-                if uid in excluded:
-                    self._unit_doc_lookup.pop(uid, None)
-
-        return removed_notes
-
-    def labelset_for_annotation(
-        self,
-        unit_id: str,
-        label_id: str,
-        *,
-        round_id: Optional[str] = None,
-    ) -> Optional[str]:
-        sub = self.ann
-        if round_id is not None:
-            sub = sub[sub["round_id"].astype(str) == str(round_id)]
-        sub = sub[(sub["unit_id"].astype(str) == str(unit_id)) & (sub["label_id"].astype(str) == str(label_id))]
-        if sub.empty:
-            return None
-        first = sub["labelset_id"].dropna().astype(str)
-        for value in first:
-            text = value.strip()
-            if text:
-                return text
-        return None
-
-    def notes_by_doc(self) -> Dict[str,str]:
-        if self._notes_by_doc_cache is None:
-            self._notes_by_doc_cache = dict(zip(self.notes["doc_id"].tolist(), self.notes["text"].tolist()))
-        return self._notes_by_doc_cache
-
-    def doc_id_for_unit(self, unit_id: str) -> Optional[str]:
-        if self.phenotype_level != "single_doc":
-            return None
-        unit_str = str(unit_id)
-        if not unit_str:
-            return None
-        notes = self.notes_by_doc()
-        if unit_str in notes:
-            return unit_str
-        doc = self._unit_doc_lookup.get(unit_str)
-        if doc:
-            return doc
-        matches = self.ann[self.ann["unit_id"] == unit_str]
-        if not matches.empty:
-            docs = matches["doc_id"].dropna().astype(str)
-            if not docs.empty:
-                return docs.iloc[0]
-        return None
-
-    def label_types(self) -> Dict[str, str]:
-        """
-        Infer label type per label_id using the three input columns:
-          - If any non-null in label_value_num   -> "numeric"
-          - elif any non-null in label_value_date -> "date"
-          - else infer from string: binary vs categorical
-        """
-        types: Dict[str, str] = {}
-        # group once to avoid repeated scans
-        for lid, g in self.ann.groupby("label_id", sort=False):
-            # numeric wins
-            if g["label_value_num"].notna().any():
-                types[str(lid)] = "numeric"
-                continue
-            # date next
-            if g["label_value_date"].notna().any():
-                types[str(lid)] = "date"
-                continue
-            # else string; decide binary vs categorical heuristically
-            vals = g["label_value"].astype(str).str.lower().str.strip()
-            uniq = set(v for v in vals if v not in ("", "nan", "none"))
-            # common binary token set
-            bin_tokens = {"0","1","true","false","present","absent","yes","no","neg","pos","positive","negative","unknown"}
-            if uniq and uniq.issubset(bin_tokens):
-                types[str(lid)] = "binary"
-            else:
-                types[str(lid)] = "categorical"  # use 'categorical' instead of 'text'
-        return types
-
-    def reviewer_disagreement(self, round_policy: str = 'last',
-                          decay_half_life: float = 2.0) -> pd.DataFrame:
-        """
-        Compute a per-(unit_id,label_id) disagreement score in [0,1].
-          - categorical/binary: normalized entropy
-          - numeric: reviewer range / global IQR (clipped to [0,1])
-          - date: span_days / global IQR_days (clipped)
-        """
-        import numpy as _np
-        import pandas as _pd
-    
-        ann = self.ann.copy()
-    
-        # Round selection
-        try:
-            ann["_round_ord"] = _pd.to_numeric(ann["round_id"], errors="coerce")
-            ord_series = ann["_round_ord"].fillna(ann["round_id"].astype("category").cat.codes)
-        except Exception:
-            ord_series = ann["round_id"].astype("category").cat.codes
-        ann["_round_ord"] = ord_series
-        last_ord = int(ann["_round_ord"].max()) if len(ann) else 0
-        if round_policy == "last":
-            ann = ann[ann["_round_ord"] == last_ord]
-        # else 'all' or 'decay' -> keep all; decay applied later
-    
-        types = self.label_types()
-    
-        # Precompute global IQR per label for numeric/date
-        iqr_num: Dict[str, float] = {}
-        iqr_days: Dict[str, float] = {}
-    
-        for lid, g in ann.groupby("label_id", sort=False):
-            t = types.get(str(lid), "categorical")
-            if t == "numeric" and g["label_value_num"].notna().any():
-                arr = g["label_value_num"].dropna().to_numpy(dtype="float64")
-                if arr.size >= 2:
-                    iqr = float(_np.subtract(*_np.percentile(arr, [75, 25])))
-                    iqr_num[str(lid)] = iqr if iqr > 0 else 1.0
-                else:
-                    iqr_num[str(lid)] = 1.0
-            elif t == "date" and g["label_value_date"].notna().any():
-                dt = g["label_value_date"].dropna()
-                if not dt.empty:
-                    ords = dt.map(lambda x: x.toordinal()).to_numpy(dtype="int64")
-                    iqr = float(_np.subtract(*_np.percentile(ords, [75, 25])))
-                    iqr_days[str(lid)] = iqr if iqr > 0 else 1.0
-                else:
-                    iqr_days[str(lid)] = 1.0
-    
-        rows = []
-        # group by unit, label, reviewer to assemble per (unit,label) reviewer values
-        for (uid, lid), g in ann.groupby(["unit_id","label_id"], sort=False):
-            t = types.get(str(lid), "categorical")
-            score = 0.0
-    
-            if t in ("categorical","binary"):
-                vals = g["label_value"].astype(str).str.lower().str.strip()
-                uniq, cnts = _np.unique([v for v in vals if v not in ("","nan","none")], return_counts=True)
-                total = cnts.sum() if cnts.size else 0
-                if total > 0:
-                    p = cnts / total
-                    ent = -_np.sum(p * _np.log2(_np.clip(p, 1e-12, 1)))
-                    ent_max = _np.log2(max(len(uniq), 2))
-                    score = float(ent / ent_max) if ent_max > 0 else 0.0
-                else:
-                    score = 0.0
-    
-            elif t == "numeric" and g["label_value_num"].notna().any():
-                arr = g["label_value_num"].dropna().to_numpy(dtype="float64")
-                if arr.size >= 2:
-                    rng = float(_np.nanmax(arr) - _np.nanmin(arr))
-                    denom = max(1e-6, iqr_num.get(str(lid), 1.0))
-                    score = float(max(0.0, min(1.0, rng / (4.0 * denom))))  # 0..1
-                else:
-                    score = 0.0
-    
-            elif t == "date" and g["label_value_date"].notna().any():
-                dt = g["label_value_date"].dropna()
-                if len(dt) >= 2:
-                    ords = dt.map(lambda x: x.toordinal()).to_numpy(dtype="int64")
-                    span = float(_np.nanmax(ords) - _np.nanmin(ords))  # days
-                    denom = max(1e-6, iqr_days.get(str(lid), 1.0))
-                    score = float(max(0.0, min(1.0, span / (4.0 * denom))))  # 0..1
-                else:
-                    score = 0.0
-            else:
-                score = 0.0
-    
-            # Round decay (if policy='decay')
-            if round_policy == "decay":
-                delta = (last_ord - int(g["_round_ord"].max())) if len(g) else 0
-                w = float(_np.exp(-float(delta) / max(1e-6, float(decay_half_life))))
-                score *= w
-
-            labelset_value = ""
-            if "labelset_id" in g.columns:
-                non_empty = g["labelset_id"].dropna().astype(str).str.strip()
-                if not non_empty.empty:
-                    labelset_value = str(non_empty.iloc[-1])
-
-            round_value = ""
-            if "round_id" in g.columns:
-                round_non_empty = g["round_id"].dropna().astype(str).str.strip()
-                if not round_non_empty.empty:
-                    round_value = str(round_non_empty.iloc[-1])
-
-            rows.append({
-                "unit_id": str(uid),
-                "label_id": str(lid),
-                "disagreement_score": float(score),
-                "n_reviewers": int(g["reviewer_id"].nunique()),
-                "round_id": round_value,
-                "labelset_id": labelset_value,
-            })
-        return _pd.DataFrame(rows)
-
-    def hard_disagree(self, label_types: dict, *, date_days: int = 14, num_abs: float = 1.0, num_rel: float = 0.20) -> pd.DataFrame:
-        """Return per-(unit_id,label_id) hard disagreement flags based on absolute/relative numeric and date-day spans.
-        categorical/binary: hard=True if multiple unique non-empty values
-        numeric: max pairwise |Δ| > max(num_abs, num_rel * max(|v_i|))
-        date: span_days > date_days
-        """
-        import numpy as _np
-        import pandas as _pd
-        ann = self.ann.copy()
-        rows = []
-        for (uid, lid), g in ann.groupby(["unit_id","label_id"], sort=False):
-            t = label_types.get(str(lid), "categorical")
-            hard = False
-            if t in ("categorical","binary"):
-                vals = g["label_value"].astype(str).str.lower().str.strip()
-                uniq = [v for v in vals.unique().tolist() if v not in ("","nan","none")]
-                hard = (len(uniq) >= 2)
-            elif t == "numeric" and g["label_value_num"].notna().any():
-                arr = g["label_value_num"].dropna().to_numpy(dtype="float64")
-                if arr.size >= 2:
-                    vmax = float(_np.nanmax(_np.abs(arr)))
-                    thresh = max(float(num_abs), float(num_rel) * max(1.0, vmax))
-                    dif = float(_np.nanmax(arr) - _np.nanmin(arr))
-                    hard = dif > thresh
-            elif t == "date" and g["label_value_date"].notna().any():
-                dt = g["label_value_date"].dropna()
-                if len(dt) >= 2:
-                    ords = dt.map(lambda x: x.toordinal()).to_numpy(dtype="int64")
-                    span = float(_np.nanmax(ords) - _np.nanmin(ords))
-                    hard = span > float(date_days)
-            rows.append({ "unit_id": str(uid), "label_id": str(lid), "hard_disagree": bool(hard) })
-        return _pd.DataFrame(rows)
-
-    def get_prior_rationales(self, unit_id: str, label_id: str) -> List[dict]:
-        sub = self.ann[(self.ann["unit_id"]==unit_id) & (self.ann["label_id"]==label_id)]
-        spans = []
-        for r in sub.itertuples(index=False):
-            lst = r.rationales_json
-            if isinstance(lst, list):
-                for sp in lst:
-                    if isinstance(sp, dict) and sp.get("snippet"):
-                        spans.append(sp)
-        return spans
-
-    def last_round_consensus(self) -> Dict[Tuple[str,str], str]:
-        """
-        Returns {(unit_id,label_id): consensus_value_as_string} for the last round.
-        Numeric/date are summarized by robust medians; categorical/binary by mode.
-        """
-        import numpy as _np
-        import pandas as _pd
-    
-        ann = self.ann.copy()
-        # establish last round ordering
-        try:
-            ann["_round_ord"] = _pd.to_numeric(ann["round_id"], errors="coerce")
-            ord_series = ann["_round_ord"].fillna(ann["round_id"].astype("category").cat.codes)
-        except Exception:
-            ord_series = ann["round_id"].astype("category").cat.codes
-        ann["_round_ord"] = ord_series
-        last_ord = int(ann["_round_ord"].max()) if len(ann) else 0
-        ann = ann[ann["_round_ord"] == last_ord]
-    
-        # Infer types on the last round only (cheaper)
-        types = self.label_types()
-        out: Dict[Tuple[str,str], str] = {}
-        for (uid, lid), g in ann.groupby(["unit_id","label_id"], sort=False):
-            t = types.get(str(lid), "categorical")
-            if t == "numeric" and g["label_value_num"].notna().any():
-                med = _np.nanmedian(g["label_value_num"].to_numpy(dtype="float64"))
-                out[(str(uid), str(lid))] = str(med)
-            elif t == "date" and g["label_value_date"].notna().any():
-                # median date: convert to ordinal days, then back
-                dt = g["label_value_date"].dropna()
-                if not dt.empty:
-                    ords = dt.map(lambda x: x.toordinal()).to_numpy(dtype="int64")
-                    med_ord = int(_np.median(ords))
-                    out[(str(uid), str(lid))] = str(_pd.Timestamp.fromordinal(med_ord).date())
-                else:
-                    out[(str(uid), str(lid))] = ""
-            else:
-                # categorical/binary: mode of string
-                vals = g["label_value"].astype(str).str.lower().str.strip()
-                if len(vals):
-                    mode = vals.mode(dropna=True)
-                    out[(str(uid), str(lid))] = str(mode.iloc[0]) if len(mode) else ""
-                else:
-                    out[(str(uid), str(lid))] = ""
-        return out
-
-# ------------------------------
-# Embedding, FAISS, Retrieval
-# ------------------------------
-class Models:
-    def __init__(self, embedder: SentenceTransformer, reranker: CrossEncoder, device: str='cpu', emb_batch: int=64, rerank_batch: int=64):
-        self.embedder = embedder; self.reranker = reranker
-        self.device = device; self.emb_batch = emb_batch; self.rerank_batch = rerank_batch
-
-class EmbeddingStore:
-    def __init__(self, models: Models, cache_dir: str, normalize: bool = True):
-        self.models = models; self.cache_dir = cache_dir; os.makedirs(cache_dir, exist_ok=True)
-        self.normalize = normalize
-        self.faiss_index = None
-        self.chunk_meta: List[dict] = []
-        self.X = None
-        self.unit_to_chunk_idxs: Dict[str,List[int]] = {}
-        self.bm25_indices: Dict[str, dict] = {}
-        self.idf_global: Dict[str, float] = {}
-        self.N_global: int = 0
-
-    def _backfill_chunk_metadata(self, notes_df: "pd.DataFrame") -> None:
-        """Ensure cached chunk metadata includes key fields such as notetype."""
-        if not isinstance(notes_df, pd.DataFrame) or notes_df.empty or not self.chunk_meta:
-            return
-        if "notetype" not in notes_df.columns:
-            return
-
-        doc_to_notetype: Dict[str, str] = {}
-        for row in notes_df.itertuples(index=False):
-            if not hasattr(row, "doc_id") or not hasattr(row, "notetype"):
-                continue
-            doc_id = str(getattr(row, "doc_id"))
-            note_type_val = getattr(row, "notetype")
-            if note_type_val is None:
-                continue
-            note_type_str = str(note_type_val).strip()
-            if note_type_str:
-                doc_to_notetype[doc_id] = note_type_str
-
-        if not doc_to_notetype:
-            return
-
-        for meta in self.chunk_meta:
-            if meta.get("notetype"):
-                continue
-            doc_id = str(meta.get("doc_id"))
-            note_type_str = doc_to_notetype.get(doc_id)
-            if note_type_str:
-                meta["notetype"] = note_type_str
-
-        # Nothing else to do; chunk_meta is now enriched in-memory and will be
-        # persisted on the next cache save.
-
-    def _remap_unit_ids(self, notes_df: "pd.DataFrame") -> None:
-        """Align cached chunk unit IDs with the unit granularity of the notes."""
-        if not isinstance(notes_df, pd.DataFrame) or notes_df.empty or not self.chunk_meta:
-            return
-        if "doc_id" not in notes_df.columns or "unit_id" not in notes_df.columns:
-            return
-
-        doc_to_unit: Dict[str, str] = {}
-        for row in notes_df.itertuples(index=False):
-            doc_val = getattr(row, "doc_id", None)
-            unit_val = getattr(row, "unit_id", None)
-            if doc_val is None or unit_val is None:
-                continue
-            doc_str = str(doc_val)
-            unit_str = str(unit_val)
-            if not doc_str or unit_str.lower() in {"", "nan", "none"}:
-                continue
-            doc_to_unit[doc_str] = unit_str
-
-        if not doc_to_unit:
-            return
-
-        changed = False
-        for meta in self.chunk_meta:
-            doc_val = meta.get("doc_id")
-            if doc_val is None:
-                continue
-            doc_str = str(doc_val)
-            target_unit = doc_to_unit.get(doc_str)
-            if not target_unit:
-                continue
-            current_unit = str(meta.get("unit_id", ""))
-            if current_unit != target_unit:
-                meta["unit_id"] = target_unit
-                changed = True
-
-        if not changed:
-            return
-
-        unit_to_idxs = defaultdict(list)
-        for idx, meta in enumerate(self.chunk_meta):
-            unit_to_idxs[str(meta.get("unit_id", ""))].append(idx)
-        self.unit_to_chunk_idxs = dict(unit_to_idxs)
-
-    def _embedder_id(self) -> str:
-        try:
-            return getattr(self.models.embedder, "name_or_path", "") or str(self.models.embedder)
-        except Exception:
-            return "unknown_embedder"
-    
-    def _compute_corpus_fingerprint(self, notes_df: "pd.DataFrame", rag_cfg) -> str:
-        """
-        Build a stable fingerprint for the (documents + chunker + embedder + normalize) config.
-        Prefers notes_df['hash'] if present; falls back to blake2 over doc_id+text.
-        """
-        h = hashlib.blake2b(digest_size=16)
-        # chunker + embedder config
-        h.update(f"chunk_size={rag_cfg.chunk_size},overlap={rag_cfg.chunk_overlap}".encode("utf-8"))
-        h.update(f",normalize={bool(self.normalize)}".encode("utf-8"))
-        h.update(f",embedder={self._embedder_id()}".encode("utf-8"))
-    
-        # corpus content (fast path uses a precomputed hash column if available)
-        if "hash" in notes_df.columns:
-            pairs = (notes_df[["doc_id", "hash"]]
-                     .astype({"doc_id": str, "hash": str})
-                     .sort_values("doc_id"))
-            for row in pairs.itertuples(index=False):
-                h.update(f"|{row.doc_id}:{row.hash}".encode("utf-8"))
-        else:
-            # fallback: cheap hash of doc_id + first/last 1024 chars + length (avoid hashing entire text)
-            pairs = (notes_df[["doc_id", "text"]]
-                     .astype({"doc_id": str, "text": str})
-                     .sort_values("doc_id"))
-            for row in pairs.itertuples(index=False):
-                t = row.text or ""
-                tview = (t[:1024] + "…" + t[-1024:]) if len(t) > 2048 else t
-                mini = hashlib.blake2b(tview.encode("utf-8"), digest_size=8).hexdigest()
-                h.update(f"|{row.doc_id}:{mini}:{len(t)}".encode("utf-8"))
-        return h.hexdigest()
-    
-    def _chunk_cache_dir(self, fingerprint: str) -> str:
-        d = os.path.join(self.cache_dir, "chunks", fingerprint)
-        os.makedirs(d, exist_ok=True)
-        return d
-    
-    def _manifest_path(self, chunk_dir: str) -> str:
-        return os.path.join(chunk_dir, "manifest.json")
-    
-    def _load_manifest(self, chunk_dir: str) -> dict | None:
-        p = self._manifest_path(chunk_dir)
-        if os.path.exists(p):
-            try:
-                return json.load(open(p, "r", encoding="utf-8"))
-            except Exception:
-                return None
-        return None
-    
-    def _save_manifest(self, chunk_dir: str, data: dict):
-        p = self._manifest_path(chunk_dir)
-        data = dict(data or {})
-        data["saved_at"] = time.time()
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, p)
-
-    def _update_manifest(self, chunk_dir: str, **fields: object) -> None:
-        man = self._load_manifest(chunk_dir) or {}
-        man.update(fields)
-        self._save_manifest(chunk_dir, man)
-    
-    def _paths_for_cache(self, chunk_dir: str, index_cfg) -> dict:
-        idx_name = f"faiss_{getattr(index_cfg, 'type', 'flat')}.index"
-        return {
-            "meta": os.path.join(chunk_dir, "chunk_meta.json.gz"),
-            "emb": os.path.join(chunk_dir, "chunk_embeddings.npz"),
-            "emb_legacy": os.path.join(chunk_dir, "chunk_embeddings.npy"),
-            "faiss": os.path.join(chunk_dir, idx_name),
-            "bm25": self._bm25_index_path(chunk_dir),
-        }
-
-    def _load_cached_embeddings(self, emb_path: str, legacy_path: str | None = None):
-        candidates = [p for p in (emb_path, legacy_path) if p]
-        for p in candidates:
-            if not os.path.exists(p):
-                continue
-            if p.endswith(".npz"):
-                with np.load(p) as data:
-                    if "embeddings" in data:
-                        return data["embeddings"]
-                    if "arr_0" in data:
-                        return data["arr_0"]
-                continue
-            return np.load(p, mmap_mode="r")
-        raise FileNotFoundError("No cached embeddings found")
-    
-    def _try_load_cached_chunks(self, chunk_dir: str) -> tuple[list[dict] | None, np.ndarray | None, dict | None]:
-        """
-        Returns (chunk_meta, X_mmap, manifest) or (None, None, None) if unavailable.
-        """
-        paths = self._paths_for_cache(chunk_dir, type("Cfg", (), {"type": "flat"}))
-        meta_p, emb_p = paths["meta"], paths["emb"]
-        emb_legacy = paths.get("emb_legacy")
-        man = self._load_manifest(chunk_dir)
-        emb_exists = any(os.path.exists(p) for p in (emb_p, emb_legacy) if p)
-        if not ((os.path.exists(meta_p) or os.path.exists(meta_p.replace(".gz", ""))) and emb_exists and man):
-            return (None, None, None)
-        try:
-            meta = None
-            for mp in (meta_p, meta_p.replace(".gz", "")):
-                if not os.path.exists(mp):
-                    continue
-                try:
-                    opener = gzip.open if mp.endswith(".gz") else open
-                    meta = json.load(opener(mp, "rt", encoding="utf-8"))
-                    break
-                except Exception:
-                    continue
-            if meta is None:
-                return (None, None, None)
-
-            X = self._load_cached_embeddings(emb_p, emb_legacy)
-            # sanity: manifest rows/dims
-            n = int(man.get("n_chunks", -1))
-            d = int(man.get("dim", -1))
-            if (n > 0 and n != len(meta)) or (d > 0 and d != int(X.shape[1])):
-                return (None, None, None)
-            return (meta, X, man)
-        except Exception:
-            return (None, None, None)
-
-    def _bm25_index_path(self, chunk_dir: str) -> str:
-        return os.path.join(chunk_dir, "bm25_indices.json.gz")
-
-    def _tokenize_for_bm25(self, text: str) -> List[str]:
-        if not text:
-            return []
-        stopwords = {
-            "the",
-            "and",
-            "of",
-            "to",
-            "in",
-            "for",
-            "on",
-            "with",
-            "a",
-            "an",
-        }
-        normalized = unicodedata.normalize("NFKC", str(text)).lower()
-        tokens = re.findall(r"[a-z0-9_+\-/]+", normalized)
-        return [tok for tok in tokens if tok and tok not in stopwords]
-
-    def _build_bm25_indices(self) -> Dict[str, dict]:
-        chunk_tokens: list[tuple[dict, List[str]]] = []
-        global_df: Counter[str] = Counter()
-        for meta in self.chunk_meta:
-            toks = self._tokenize_for_bm25(meta.get("text", ""))
-            if not toks:
-                continue
-            chunk_tokens.append((meta, toks))
-            global_df.update(set(toks))
-
-        N_global = len(chunk_tokens)
-        eps = 1e-12
-        # Keep common but clinically important terms (e.g., "pain", "blood") from
-        # being downweighted into negative scores by adding a +1 offset, which was
-        # used in the previous implementation.
-        idf_global = {
-            tok: math.log((N_global - freq + 0.5) / (freq + 0.5 + eps)) + 1.0
-            for tok, freq in global_df.items()
-        }
-
-        unit_docs: Dict[str, list] = defaultdict(list)
-        unit_metas: Dict[str, list] = defaultdict(list)
-        for meta, toks in chunk_tokens:
-            uid = str(meta.get("unit_id", ""))
-            unit_docs[uid].append(toks)
-            unit_metas[uid].append(meta)
-
-        bm25_units: Dict[str, dict] = {}
-        for uid, docs in unit_docs.items():
-            if not docs:
-                continue
-            avgdl = sum(len(toks) for toks in docs) / float(len(docs))
-            bm25_units[uid] = {
-                "docs": docs,
-                "metas": unit_metas.get(uid, []),
-                "avgdl": avgdl,
-            }
-
-        self.idf_global = idf_global
-        self.N_global = N_global
-        return {"units": bm25_units, "idf_global": idf_global, "N_global": N_global}
-
-    def _load_bm25_indices(self, chunk_dir: str) -> dict | None:
-        primary = self._bm25_index_path(chunk_dir)
-        legacy = os.path.join(chunk_dir, "bm25_indices.json")
-        for path in (primary, legacy):
-            if not os.path.exists(path):
-                continue
-            try:
-                opener = gzip.open if path.endswith(".gz") else open
-                with opener(path, "rt", encoding="utf-8") as f:
-                    data = json.load(f)
-                units = data.get("units") or data.get("indices") or {}
-                if not isinstance(units, dict):
-                    continue
-                expected_n = data.get("n_chunks")
-                if expected_n is not None and expected_n != len(self.chunk_meta):
-                    continue
-                idf_global = data.get("idf_global") or {}
-                N_global = data.get("N_global") or expected_n or 0
-                self.idf_global = idf_global
-                self.N_global = int(N_global)
-                return {"units": units, "idf_global": idf_global, "N_global": N_global}
-            except Exception:
-                continue
-        return None
-
-    def _save_bm25_indices(self, chunk_dir: str, indices: dict) -> None:
-        units = indices.get("units") if isinstance(indices, dict) else indices
-        payload = {
-            "version": "v2",
-            "n_chunks": len(self.chunk_meta),
-            "units": units,
-            "idf_global": indices.get("idf_global", getattr(self, "idf_global", {})) if isinstance(indices, dict) else getattr(self, "idf_global", {}),
-            "N_global": indices.get("N_global", getattr(self, "N_global", 0)) if isinstance(indices, dict) else getattr(self, "N_global", 0),
-        }
-        p = self._bm25_index_path(chunk_dir)
-        tmp = p + ".tmp"
-        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, p)
-        self._update_manifest(chunk_dir, bm25_version="v2")
-
-    def bm25_index_for_unit(self, unit_id: str) -> dict | None:
-        uid = str(unit_id)
-        bm25_units = self.bm25_indices.get("units") if isinstance(self.bm25_indices, dict) and "units" in self.bm25_indices else self.bm25_indices
-        if isinstance(bm25_units, dict):
-            cached = bm25_units.get(uid)
-            if cached is not None:
-                return cached
-
-        if hasattr(self, "_chunk_cache_dir_path"):
-            loaded = self._load_bm25_indices(self._chunk_cache_dir_path)
-            if isinstance(loaded, dict):
-                self.bm25_indices = loaded
-                bm25_units = loaded.get("units") if "units" in loaded else loaded
-                hit = bm25_units.get(uid) if isinstance(bm25_units, dict) else None
-                if hit is not None:
-                    return hit
-
-        if not self.chunk_meta:
-            return None
-
-        rebuilt = self._build_bm25_indices()
-        if not rebuilt:
-            return None
-
-        self.bm25_indices = rebuilt
-        self.idf_global = rebuilt.get("idf_global", getattr(self, "idf_global", {}))
-        self.N_global = int(rebuilt.get("N_global", getattr(self, "N_global", 0)))
-        if hasattr(self, "_chunk_cache_dir_path"):
-            try:
-                self._save_bm25_indices(self._chunk_cache_dir_path, rebuilt)
-            except Exception:
-                pass
-        bm25_units = rebuilt.get("units") if "units" in rebuilt else rebuilt
-        return bm25_units.get(uid) if isinstance(bm25_units, dict) else None
-    
-    def _save_cached_chunks(self, chunk_dir: str, meta: list[dict], X: np.ndarray, rag_cfg):
-        paths = self._paths_for_cache(chunk_dir, type("Cfg", (), {"type": "flat"}))
-        meta_p, emb_p = paths["meta"], paths["emb"]
-        emb_legacy = paths.get("emb_legacy")
-        # Save meta
-        tmp = meta_p + ".tmp"
-        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as f:
-            json.dump(meta, f, ensure_ascii=False)
-        os.replace(tmp, meta_p)
-        # Save embeddings (np.save is atomic-ish via temp file on most FS; to be safe, write to tmp then replace)
-        X_to_save = X.astype(np.float16)
-        emb_tmp = emb_p + ".tmp.npz"
-        np.savez_compressed(emb_tmp, embeddings=X_to_save)
-        os.replace(emb_tmp, emb_p)
-        if emb_legacy and os.path.exists(emb_legacy):
-            try:
-                os.remove(emb_legacy)
-            except Exception:
-                pass
-        # Manifest
-        self._save_manifest(chunk_dir, {
-            "n_chunks": int(X.shape[0]),
-            "dim": int(X.shape[1]),
-            "chunk_size": int(rag_cfg.chunk_size),
-            "chunk_overlap": int(rag_cfg.chunk_overlap),
-            "normalize": bool(self.normalize),
-            "embedder": self._embedder_id(),
-            "emb_dtype": str(X_to_save.dtype),
-            "meta_compressed": True,
-            "emb_compressed": True,
-            "version": "v2",
-        })
-    
-    def _try_load_faiss_index(self, faiss_path: str, expected_n: int) -> "faiss.Index" | None:
-        if not (os.path.exists(faiss_path) and "faiss" in globals() and faiss is not None):
-            return None
-        try:
-            idx = faiss.read_index(faiss_path)
-            ntotal = getattr(idx, "ntotal", None)
-            if ntotal == int(expected_n):
-                return idx
-            return None
-        except Exception:
-            return None
-
-    def _build_faiss_index(self, X: np.ndarray, index_cfg) -> "faiss.Index":
-        if faiss is None:
-            raise ImportError("faiss-cpu is required")
-        d = int(X.shape[1])
-        if index_cfg.type == "flat":
-            idx = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
-            idx.add(X)
-            return idx
-        if index_cfg.type == "hnsw":
-            idx = faiss.IndexHNSWFlat(d, index_cfg.hnsw_M)
-            idx.hnsw.efSearch = index_cfg.hnsw_efSearch
-            idx.add(X)
-            return idx
-        if index_cfg.type == "ivf":
-            quant = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
-            idx = faiss.IndexIVFFlat(
-                quant,
-                d,
-                index_cfg.nlist,
-                faiss.METRIC_INNER_PRODUCT if self.normalize else faiss.METRIC_L2,
-            )
-            ntrain = min(X.shape[0], max(10000, index_cfg.nlist * 40))
-            samp = X[np.random.choice(X.shape[0], ntrain, replace=False)]
-            idx.train(samp)
-            idx.add(X)
-            idx.nprobe = index_cfg.nprobe
-            return idx
-        if index_cfg.type == "ivfpq":
-            quant = faiss.IndexFlatIP(d) if self.normalize else faiss.IndexFlatL2(d)
-            idx = faiss.IndexIVFPQ(quant, d, index_cfg.nlist, index_cfg.pq_m, index_cfg.pq_bits)
-            ntrain = min(X.shape[0], max(50000, getattr(index_cfg, "train_size", 100000)))
-            samp = X[np.random.choice(X.shape[0], ntrain, replace=False)]
-            idx.train(samp)
-            idx.add(X)
-            idx.nprobe = index_cfg.nprobe
-            return idx
-        raise ValueError(f"Unknown index type: {index_cfg.type}")
-
-    def _embed(self, texts: List[str], show_bar: Optional[bool] = False) -> np.ndarray:
-        if show_bar:
-            bs = getattr(self.models, 'emb_batch', 64)
-            out = []
-            for i in iter_with_bar("Embedding chunks",
-                                   range(0, len(texts), bs),
-                                   total=(len(texts)+bs-1)//bs,
-                                   min_interval_s=10):
-                batch = texts[i:i+bs]
-                embs  = self.models.embedder.encode(
-                    batch, batch_size=bs, show_progress_bar=False,
-                    convert_to_numpy=True, normalize_embeddings=self.normalize
-                )
-                out.append(embs.astype("float32"))
-            return np.vstack(out)
-        else:
-            embs = self.models.embedder.encode(texts, batch_size=getattr(self.models, 'emb_batch', 64), show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=self.normalize)
-            return embs.astype("float32")
-
-    def build_chunk_index(
-        self,
-        notes_df: "pd.DataFrame",
-        rag_cfg,
-        index_cfg=None,
-        *,
-        force_rechunk: bool = False,
-        force_reembed: bool = False,
-        force_reindex: bool = False,
-    ):
-        """
-        Build or reuse cached chunk_meta, embeddings, and FAISS index.
-    
-        Cache layout: <cache_dir>/chunks/<fingerprint>/{chunk_meta.json, chunk_embeddings.npz, faiss_*.index, manifest.json}
-        Fingerprint depends on corpus (doc_id + hash), splitter, embedder, normalize flag.
-        """
-        index_cfg = index_cfg or IndexConfig()
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=rag_cfg.chunk_size, chunk_overlap=rag_cfg.chunk_overlap
-        )
-    
-        # 1) Compute fingerprint and cache dir
-        fp = self._compute_corpus_fingerprint(notes_df, rag_cfg)
-        chunk_dir = self._chunk_cache_dir(fp)
-        paths = self._paths_for_cache(chunk_dir, index_cfg)
-    
-        # 2) Try reuse chunk_meta + embeddings
-        meta = X = man = None
-        if not force_rechunk and not force_reembed:
-            meta, X, man = self._try_load_cached_chunks(chunk_dir)
-    
-        # 2a) If no cached chunks (or forced), (re)compute
-        if meta is None or X is None:
-             # --- chunk from notes_df with progress ---
-            chunk_meta = []
-            total_docs = int(len(notes_df))
-            for row in iter_with_bar(
-                    step="Chunking docs",
-                    iterable=notes_df.itertuples(index=False),
-                    total=total_docs,
-                    min_interval_s=float(getattr(getattr(self, "models", None), "progress_min_interval_s", 0.6) or 0.6)):
-                # Chunk the text
-                chunks = splitter.split_text(getattr(row, "text"))
-                for i, ch in enumerate(chunks):
-                    md = {"unit_id": getattr(row, "unit_id"),
-                          "doc_id": getattr(row, "doc_id"),
-                          "chunk_id": i,
-                          "text": ch}
-                    # copy a few metadata fields if they exist
-                    for k in ("date_note", "notetype", "doc_title", "author", "source_system",
-                              "document_metadata_json", "metadata_json"):
-                        if hasattr(row, k):
-                            v = getattr(row, k)
-                            if v is not None:
-                                md[k] = str(v) if k in {"date_note", "notetype", "doc_title", "author", "source_system"} else v
-                    chunk_meta.append(md)
-            
-            if not chunk_meta:
-                raise RuntimeError("No chunks generated from notes")
-
-            # Embed (even if force_reembed only)
-            texts = [m["text"] for m in chunk_meta]
-            X = self._embed(texts, show_bar=True)  # float32; normalize handled by self.normalize
-            # Save cache
-            print("Saving chunks+embeddings to disk...")
-            self._save_cached_chunks(chunk_dir, chunk_meta, X, rag_cfg)
-            meta = chunk_meta
-    
-        # 3) Bind to store
-        if isinstance(X, np.ndarray):
-            self.X = X.astype(np.float32) if X.dtype != np.float32 else X
-        elif isinstance(X, np.memmap):
-            self.X = np.asarray(X, dtype=np.float32)
-        else:
-            loaded = self._load_cached_embeddings(paths["emb"], paths.get("emb_legacy"))
-            self.X = loaded.astype(np.float32) if loaded.dtype != np.float32 else loaded
-        self.chunk_meta = meta
-        self._remap_unit_ids(notes_df)
-        self._backfill_chunk_metadata(notes_df)
-        unit_to_idxs = defaultdict(list)
-        for i, m in enumerate(self.chunk_meta):
-            unit_to_idxs[m["unit_id"]].append(i)
-        self.unit_to_chunk_idxs = dict(unit_to_idxs)
-
-        bm25_loaded = self._load_bm25_indices(chunk_dir)
-        if bm25_loaded is None:
-            bm25_loaded = self._build_bm25_indices()
-            if bm25_loaded:
-                try:
-                    self._save_bm25_indices(chunk_dir, bm25_loaded)
-                except Exception:
-                    pass
-        self.bm25_indices = bm25_loaded or {}
-
-        # 4) FAISS index: try load; else build and persist
-        if faiss is None:
-            raise ImportError("faiss-cpu is required")
-        persist_index = bool(getattr(index_cfg, "persist", True))
-        idx = None
-        if persist_index and not force_reindex:
-            idx = self._try_load_faiss_index(paths["faiss"], expected_n=int(self.X.shape[0]))
-        if idx is None:
-            print("Building index...")
-            idx = self._build_faiss_index(self.X, index_cfg)
-            # Persist index
-            if persist_index:
-                try:
-                    print("Saving index...")
-                    faiss.write_index(idx, paths["faiss"])
-                except Exception:
-                    pass
-
-        self.faiss_index = idx
-        # Keep the cache dir for later search() lazy loads
-        self._chunk_cache_dir_path = chunk_dir
-        return self
-
-    def search(self, query_texts: list[str], topk: int = 50, index_cfg=None) -> tuple[np.ndarray, np.ndarray]:
-        index_cfg = index_cfg or IndexConfig()
-        if self.faiss_index is None:
-            # try to reuse the last chunk cache dir
-            if hasattr(self, "_chunk_cache_dir_path"):
-                paths = self._paths_for_cache(self._chunk_cache_dir_path, index_cfg)
-                # load X + meta
-                emb = self._load_cached_embeddings(paths["emb"], paths.get("emb_legacy"))
-                self.X = emb.astype(np.float32) if emb.dtype != np.float32 else emb
-                meta = None
-                for mp in (paths["meta"], paths["meta"].replace(".gz", "")):
-                    if not os.path.exists(mp):
-                        continue
-                    try:
-                        opener = gzip.open if mp.endswith(".gz") else open
-                        meta = json.load(opener(mp, "rt", encoding="utf-8"))
-                        break
-                    except Exception:
-                        continue
-                self.chunk_meta = meta or []
-                # load or build index
-                persist_index = bool(getattr(index_cfg, "persist", True))
-                idx = None
-                if persist_index:
-                    idx = self._try_load_faiss_index(paths["faiss"], expected_n=int(self.X.shape[0]))
-                if idx is None:
-                    idx = self._build_faiss_index(self.X, index_cfg)
-                self.faiss_index = idx
-                # rebuild unit_to_chunk lookup
-                unit_to_idxs = defaultdict(list)
-                for i, m in enumerate(self.chunk_meta):
-                    unit_to_idxs[str(m["unit_id"])].append(i)
-                self.unit_to_chunk_idxs = dict(unit_to_idxs)
-                bm25_loaded = self._load_bm25_indices(self._chunk_cache_dir_path)
-                if bm25_loaded is None:
-                    bm25_loaded = self._build_bm25_indices()
-                    if bm25_loaded:
-                        try:
-                            self._save_bm25_indices(self._chunk_cache_dir_path, bm25_loaded)
-                        except Exception:
-                            pass
-                self.bm25_indices = bm25_loaded or {}
-            else:
-                raise RuntimeError("FAISS index not built; call build_chunk_index() first.")
-    
-        # set runtime search params if applicable
-        try:
-            if hasattr(self.faiss_index, "nprobe") and index_cfg:
-                self.faiss_index.nprobe = index_cfg.nprobe
-            if hasattr(self.faiss_index, "hnsw") and index_cfg:
-                self.faiss_index.hnsw.efSearch = index_cfg.hnsw_efSearch
-        except Exception:
-            pass
-    
-        Q = self._embed(query_texts)
-        sims, idxs = self.faiss_index.search(Q, topk)
-        return sims, idxs
-
-    def get_patient_chunk_indices(self, unit_id: str) -> List[int]:
-        uid = str(unit_id)
-        if self.unit_to_chunk_idxs:
-            return self.unit_to_chunk_idxs.get(uid, [])
-        if not self.chunk_meta:
-            Mp = os.path.join(self.cache_dir, "chunk_meta.json.gz")
-            for mp in (Mp, Mp.replace(".gz", "")):
-                if not os.path.exists(mp):
-                    continue
-                try:
-                    opener = gzip.open if mp.endswith(".gz") else open
-                    self.chunk_meta = json.load(opener(mp, "rt", encoding="utf-8"))
-                    break
-                except Exception:
-                    continue
-        return [i for i,m in enumerate(self.chunk_meta) if m.get("unit_id")==uid]
-
-
-_FULL_DOC_CONTEXT_FALLBACK_CHARS = 12000
-
-
-def _contexts_for_unit_label(
-    retriever: "RAGRetriever",
-    repo: DataRepository,
-    unit_id: str,
-    label_id: str,
-    label_rules: str,
-    *,
-    topk_override: int | None = None,
-    min_k_override: int | None = None,
-    mmr_lambda_override: float | None = None,
-    single_doc_context_mode: str = "rag",
-    full_doc_char_limit: int | None = None,
-) -> list[dict]:
-    mode_raw = single_doc_context_mode if isinstance(single_doc_context_mode, str) else "rag"
-    mode = mode_raw.strip().lower() if isinstance(mode_raw, str) else "rag"
-    resolved_unit_id = str(unit_id)
-    if getattr(repo, "phenotype_level", "").strip().lower() == "single_doc":
-        resolver = getattr(repo, "doc_id_for_unit", None)
-        if callable(resolver):
-            resolved = resolver(unit_id)
-            if resolved:
-                resolved_unit_id = str(resolved)
-    if repo.phenotype_level == "single_doc" and mode == "full":
-        doc_id = resolved_unit_id
-        text = repo.notes_by_doc().get(doc_id)
-        if not isinstance(text, str) or not text:
-            return []
-
-        limit = None
-        if full_doc_char_limit is not None:
-            try:
-                limit = int(full_doc_char_limit)
-            except (TypeError, ValueError):
-                limit = None
-        if limit is None or limit <= 0:
-            limit = _FULL_DOC_CONTEXT_FALLBACK_CHARS
-
-        snippet_text = text[:limit]
-
-        metadata: Dict[str, object] = {}
-        try:
-            idxs = retriever.store.get_patient_chunk_indices(doc_id)
-        except Exception:
-            idxs = []
-        if idxs:
-            try:
-                chunk_meta = retriever.store.chunk_meta[idxs[0]]
-                metadata = retriever._extract_meta(chunk_meta) or {}
-            except Exception:
-                metadata = {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata.setdefault("other_meta", "")
-
-        try:
-            retriever.set_last_diagnostics(
-                resolved_unit_id,
-                label_id,
-                {
-                    "rag_mode": "full_doc",
-                    "unit_id": resolved_unit_id,
-                    "label_id": str(label_id),
-                    "stage": "full_doc",
-                    "final_selection": {"count": 1, "score_stats": {"min": 1.0, "max": 1.0, "mean": 1.0}},
-                },
-                original_unit_id=str(unit_id),
-            )
-        except Exception:
-            pass
-
-        return [
-            {
-                "doc_id": doc_id,
-                "chunk_id": "__full__",
-                "text": snippet_text,
-                "score": 1.0,
-                "source": "full_doc",
-                "metadata": metadata,
-            }
-        ]
-
-    return retriever.retrieve_for_patient_label(
-        resolved_unit_id,
-        label_id,
-        label_rules,
-        topk_override=topk_override,
-        min_k_override=min_k_override,
-        mmr_lambda_override=mmr_lambda_override,
-        original_unit_id=str(unit_id),
-    )
-
-
 class DisagreementExpander:
     def __init__(
         self,
@@ -1723,6 +504,7 @@ class DisagreementExpander:
         retriever: RAGRetriever,
         label_config_bundle: LabelConfigBundle | None = None,
         llmfirst_cfg: LLMFirstConfig | None = None,
+        context_builder: ContextBuilder | None = None,
     ):
         self.cfg = cfg
         self.repo = repo
@@ -1730,6 +512,7 @@ class DisagreementExpander:
         self.label_config_bundle = label_config_bundle or EMPTY_BUNDLE
         self._dependency_cache: Dict[str, tuple[dict, dict, list]] = {}
         self.llmfirst_cfg = llmfirst_cfg
+        self.context_builder = context_builder
 
     def _dependencies_for(self, labelset_id: Optional[str]) -> tuple[dict, dict, list]:
         key = str(labelset_id or "__current__")
@@ -1803,16 +586,24 @@ class DisagreementExpander:
         spans = self.repo.get_prior_rationales(unit_id, label_id)
         snips = [sp.get("snippet") for sp in spans if isinstance(sp,dict) and sp.get("snippet")]
         if snips: return snips[: self.cfg.snippets_per_seed]
-        ctx = _contexts_for_unit_label(
-            self.retriever,
-            self.repo,
-            unit_id,
-            label_id,
-            label_rules,
-            topk_override=self.cfg.snippets_per_seed,
-            single_doc_context_mode=getattr(self.llmfirst_cfg, "single_doc_context", "rag"),
-            full_doc_char_limit=getattr(self.llmfirst_cfg, "single_doc_full_context_max_chars", None),
-        )
+        if self.context_builder is not None:
+            ctx = self.context_builder.build_context_for_label(
+                unit_id,
+                label_id,
+                label_rules,
+                topk_override=self.cfg.snippets_per_seed,
+                single_doc_context_mode=getattr(self.llmfirst_cfg, "single_doc_context", "rag"),
+                full_doc_char_limit=getattr(self.llmfirst_cfg, "single_doc_full_context_max_chars", None),
+            )
+        else:
+            ctx = self.retriever.retrieve_for_patient_label(
+                unit_id,
+                label_id,
+                label_rules,
+                topk_override=self.cfg.snippets_per_seed,
+                min_k_override=None,
+                mmr_lambda_override=None,
+            )
         return [c["text"] for c in ctx if isinstance(c.get("text"), str)]
 
     def expand(self, rules_map: Dict[str,str], seen_pairs: set) -> pd.DataFrame:
@@ -2615,589 +1406,6 @@ class RAGRetriever:
         return out
 
 
-# ---- In-memory per-run LLM call recorder ----
-class LLMRunRecorder:
-    def __init__(self):
-        self.calls = []
-        self.run_meta = {}
-        self.run_id = None
-        self.outdir = None
-
-    def start(self, outdir: str, run_id: Optional[str] = None, meta: Optional[dict] = None):
-        import time as _time, os
-        self.calls = []
-        self.run_meta = meta or {}
-        self.run_id = run_id or _time.strftime("%Y%m%d-%H%M%S")
-        self.outdir = outdir
-        os.makedirs(outdir, exist_ok=True)
-
-    def record(self, kind: str, payload: dict):
-        import time as _time
-        self.calls.append({"ts": _time.time(), "kind": kind, **(payload or {})})
-
-    def flush(self) -> Optional[str]:
-        import json, os
-        if not self.outdir: 
-            return None
-        path = os.path.join(self.outdir, f"llm_calls_{self.run_id}.json")
-        data = {
-            "run_id": self.run_id,
-            "meta": self.run_meta,
-            "count": len(self.calls),
-            "calls": self.calls,
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)  # pretty, human-readable
-        return path
-
-# Global recorder (simple and sufficient for single-process run())
-LLM_RECORDER = LLMRunRecorder()
-
-# ------------------------------
-# LLM annotator (JSON call) + forced-choice micro-probe
-# ------------------------------
-class LLMAnnotator:
-    def __init__(self, cfg: LLMConfig, scCfg: SCJitterConfig, cache_dir: str):
-        self.cfg = cfg
-        self.scCfg = scCfg
-        self.cache_dir = os.path.join(cache_dir,"llm_cache"); os.makedirs(self.cache_dir, exist_ok=True)
-        self.backend = None
-        # The label configuration is injected by the orchestrator once it has been
-        # materialised.  Default to an empty mapping so that downstream calls that
-        # access ``self.label_config`` degrade gracefully when no configuration has
-        # been supplied (e.g. during unit tests or CLI usage without overrides).
-        self.label_config: dict[str, object] = {}
-        self.backend = build_llm_backend(self.cfg)
-
-    def _save(self, key: str, data: dict):
-        # Record final aggregate per-call object in memory; the single file is written at the end of run()
-        try:
-            LLM_RECORDER.record("aggregate", {"cache_key": key, "out": data})
-        except Exception:
-            pass
-
-    # ---- normalization & parsing ----
-    @staticmethod
-    def _norm_token(x) -> str:
-        if x is None:
-            return ""
-        s = str(x)
-        return re.sub(r"\s+", " ", s).strip()
-
-    @staticmethod
-    def _is_yes(value: Any) -> bool:
-        if isinstance(value, bool):
-            return bool(value)
-        if value is None:
-            return False
-        s = _canon_str(value).lower()
-        return s in {"yes", "y", "true", "1", "present", "selected", "include"}
-
-    @staticmethod
-    def _canon_multi_selection(prediction: Any, option_values: list[str]) -> str | None:
-        """Return a canonical, comma-joined string of selected options from a multi-choice prediction.
-
-        Accepts several shapes (object of option->Yes/No, list/tuple/set of options, or string with delimiters)
-        and only keeps options that match the configured option list. Missing/falsey options are treated as not
-        selected. Returns ``None`` when no option is affirmed.
-        """
-
-        opts = [str(o) for o in (option_values or [])]
-        # map canonical lowercase -> original option token to preserve casing/order
-        option_lookup = { _canon_str(o).lower(): o for o in opts }
-        selected: list[str] = []
-
-        def _add_if_selected(key: Any, val: Any = True) -> None:
-            canon_key = _canon_str(key).lower()
-            opt_value = option_lookup.get(canon_key)
-            if not opt_value:
-                return
-            if not LLMAnnotator._is_yes(val):
-                return
-            if opt_value not in selected:
-                selected.append(opt_value)
-
-        if isinstance(prediction, Mapping):
-            for k, v in prediction.items():
-                _add_if_selected(k, v)
-        elif isinstance(prediction, (list, tuple, set)):
-            for item in prediction:
-                _add_if_selected(item)
-        elif isinstance(prediction, str):
-            parts = re.split(r"[,;\n]\s*", prediction)
-            for p in parts:
-                if p:
-                    _add_if_selected(p)
-        else:
-            _add_if_selected(prediction)
-
-        return ",".join(selected) if selected else None
-
-    @staticmethod
-    def _parse_float(value):
-        try:
-            if value is None:
-                return None
-            s = str(value).strip()
-            s = re.sub(r"[\s,]", "", s)
-            return float(s)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _parse_date(value):
-        from datetime import datetime, date
-        if value is None:
-            return None
-        s = str(value).strip()
-        fmts = ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y", "%d %b %Y", "%b %d %Y"]
-        for f in fmts:
-            try:
-                return datetime.strptime(s, f).date()
-            except Exception:
-                continue
-        m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", s)
-        if m:
-            try:
-                y, mo, da = map(int, m.groups())
-                return date(y, mo, da)
-            except Exception:
-                return None
-        return None
-
-    # ---- unknown-aware pairwise agreement ----
-    @staticmethod
-    def _is_unknown_token(s: str) -> bool:
-        if s is None:
-            return True
-        t = str(s).strip().lower()
-        return t in {"", "na", "n/a", "none", "null", "unknown", "not evaluable", "not_evaluable", "absent", "missing"}
-
-    @staticmethod
-    def _pairwise_agree_numeric(preds: List, abs_scale: float = 1.0, rel_scale: float = 0.05,
-                                w_uu: float = 0.5, w_uk: float = 0.0) -> float:
-        n = len(preds)
-        if n <= 1:
-            return 1.0
-        vals = [LLMAnnotator._parse_float(p) if not LLMAnnotator._is_unknown_token(p) else None for p in preds]
-        known_vals = [v for v in vals if v is not None]
-        if known_vals:
-            med = float(np.median(known_vals))
-            tau = max(abs_scale, rel_scale * (abs(med) if med != 0 else 1.0))
-        else:
-            tau = abs_scale
-        sim_sum, pairs = 0.0, 0
-        for i in range(n):
-            for j in range(i + 1, n):
-                ui = vals[i] is None
-                uj = vals[j] is None
-                if ui and uj:
-                    s = w_uu
-                elif ui != uj:
-                    s = w_uk
-                else:
-                    s = math.exp(-abs(vals[i] - vals[j]) / tau)
-                sim_sum += s
-                pairs += 1
-        return float(sim_sum / max(1, pairs))
-
-    @staticmethod
-    def _pairwise_agree_date(preds: List, tau_days: int = 14,
-                             w_uu: float = 0.5, w_uk: float = 0.0) -> float:
-        n = len(preds)
-        if n <= 1:
-            return 1.0
-        ords = []
-        for p in preds:
-            if LLMAnnotator._is_unknown_token(p):
-                ords.append(None)
-            else:
-                d = LLMAnnotator._parse_date(p)
-                ords.append(d.toordinal() if d is not None else None)
-        sim_sum, pairs = 0.0, 0
-        for i in range(n):
-            for j in range(i + 1, n):
-                ui = ords[i] is None
-                uj = ords[j] is None
-                if ui and uj:
-                    s = w_uu
-                elif ui != uj:
-                    s = w_uk
-                else:
-                    s = math.exp(-abs(ords[i] - ords[j]) / float(tau_days))
-                sim_sum += s
-                pairs += 1
-        return float(sim_sum / max(1, pairs))
-
-    def _few_shot_messages(self, label_id: str) -> list[dict[str, str]]:
-        examples_cfg = getattr(self.cfg, "few_shot_examples", {}) or {}
-        if not isinstance(examples_cfg, Mapping):
-            return []
-        label_key = str(label_id)
-        label_examples = examples_cfg.get(label_key) or examples_cfg.get(label_key.lower())
-        if not isinstance(label_examples, (list, tuple)):
-            return []
-        messages: list[dict[str, str]] = []
-        for entry in label_examples:
-            if not isinstance(entry, Mapping):
-                continue
-            answer = entry.get("answer")
-            context = entry.get("context")
-            if context is not None:
-                ctx_text = str(context)
-                if ctx_text.strip():
-                    ctx_text = f"EHR context:\n{ctx_text}"
-                messages.append({"role": "user", "content": ctx_text})
-            if answer is not None:
-                messages.append({"role": "assistant", "content": str(answer)})
-        return messages
-
-    def summarize_label_rule_for_rerank(self, label_id: str, label_rules: str, max_sentences: int = 2) -> str:
-        """Generate a concise paraphrase of a label rule for re-ranker queries."""
-
-        if not getattr(self, "backend", None):
-            return ""
-        system_msg = (
-            "You condense clinical labeling guidelines for a cross-encoder reranker. "
-            "Return a succinct 1-2 sentence summary that preserves the key inclusion/" \
-            "exclusion cues. Avoid meta commentary."
-        )
-        user_msg = (
-            "Label ID: {label_id}\n"
-            "Rewrite the following label rule into at most {limit} sentences capturing the essence:\n{rules}"
-        ).format(label_id=label_id, limit=max_sentences, rules=label_rules)
-        result = self.backend.json_call(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.2,
-            logprobs=False,
-            top_logprobs=None,
-        )
-        text = re.sub(r"\s+", " ", str(getattr(result, "content", "") or "")).strip()
-        if not text:
-            return ""
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        trimmed = " ".join(sentences[:max_sentences]).strip()
-        return trimmed or text
-
-    def annotate(
-        self,
-        unit_id: str,
-        label_id: str,
-        label_type: str,
-        label_rules: str,
-        snippets: List[dict],
-        n_consistency: int = 1,
-        jitter_params: bool = False,
-        rag_diagnostics: Optional[dict] = None,
-    ) -> dict:
-        import json, time
-
-        rag_topk_range = self.scCfg.rag_topk_range
-        rag_dropout_p = self.scCfg.rag_dropout_p
-        temp_range = self.scCfg.temperature_range
-        shuffle_context = self.scCfg.shuffle_context
-        context_order = getattr(self.cfg, "context_order", "relevance") or "relevance"
-
-        def _ordered_snippets(items: List[dict]) -> List[dict]:
-            if str(context_order).lower() != "chronological":
-                return list(items)
-            sortable: list[tuple[str, int, dict]] = []
-            for idx, snip in enumerate(items):
-                meta = snip.get("metadata") if isinstance(snip, Mapping) else {}
-                date_val = ""
-                if isinstance(meta, Mapping):
-                    date_val = str(meta.get("date") or "")
-                sortable.append((date_val, idx, snip))
-            sortable.sort(key=lambda t: (t[0], t[1]))
-            return [entry[2] for entry in sortable]
-
-        snippets = _ordered_snippets(snippets)
-
-        # Jitter RNG
-        rng = random.Random()
-        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
-    
-        # --- helper: build context text from a candidate chunk list with char budget ---
-        def _build_context_text(_snips: List[dict]) -> str:
-            ctx, used = [], 0
-            budget = max(1000, getattr(self.cfg, "max_context_chars", 4000))
-            for s in _snips:
-                md = s.get("metadata") or {}
-                hdr_bits = [f"doc_id={s.get('doc_id')}", f"chunk_id={s.get('chunk_id')}"]
-                if md.get("date"):      hdr_bits.append(f"date={md['date']}")
-                note_type = md.get("note_type") or md.get("notetype")
-                if note_type:
-                    hdr_bits.append(f"type={note_type}")
-                header = "[" + ", ".join(hdr_bits) + "] "
-                text_body = (s.get("text", "") or "")
-                frag = header + text_body
-                if used + len(frag) > budget:
-                    break
-                ctx.append(frag)
-                used += len(frag)
-            return "\n\n".join(ctx)
-    
-
-        # --- run n_consistency votes (each vote = fresh jitter if enabled) ---
-        preds, runs = [], []
-    
-        # Prebuild immutable introduction (per-vote metadata added below to avoid cache collisions)
-        system_intro = "You are a meticulous clinical annotator for EHR data."
-    
-        for i in range(n_consistency):
-            # ----- sample jitter for this vote -----
-            sc_meta = ""
-            if jitter_params:
-                # top-K
-                kmin, kmax = rag_topk_range
-                kmin = max(1, int(kmin or 1))
-                kmax = max(kmin, int(kmax or kmin))
-                k = min(len(snippets), rng.randint(kmin, kmax))
-                # dropout & shuffle
-                drop_p = max(0.0, min(1.0, rag_dropout_p))
-                cand = list(snippets[:k]) if k > 0 else list(snippets)
-                if drop_p > 0.0:
-                    cand = [s for s in cand if rng.random() > drop_p] or [snippets[0]]
-                if shuffle_context and len(cand) > 1:
-                    rng.shuffle(cand)
-                # temperature
-                t_lo, t_hi = temp_range
-                t = rng.uniform(float(t_lo), float(t_hi))
-                # meta string to perturb the prompt slightly (transparent to the schema)
-                sc_meta = f"<!-- sc:vote={i};k={k};drop={drop_p:.2f};shuf={int(shuffle_context)};temp={t:.2f} -->"
-                ctx_text = _build_context_text(cand)
-                temperature_this_vote = t
-            else:
-                # legacy behavior: use original ranked snippets (no jitter), fixed temperature
-                sc_meta = ""
-                ctx_text = _build_context_text(snippets)
-                temperature_this_vote = self.cfg.temperature
-    
-            # ----- build prompt for this vote -----
-            opts = _options_for_label(label_id, label_type, self.label_config)
-            lt_norm = (label_type or "").strip().lower()
-            categorical_types = {
-                "binary",
-                "boolean",
-                "categorical",
-                "categorical_single",
-                "categorical_multi",
-                "ordinal",
-            }
-            use_options = bool(opts) and lt_norm in categorical_types
-            option_values = [str(opt) for opt in (opts or [])]
-            is_multi_select = lt_norm == "categorical_multi"
-            unknown_option_configured = any(_canon_str(o).lower() == "unknown" for o in option_values)
-
-            guideline_text = label_rules if label_rules else "(no additional guidelines)"
-            response_keys = "reasoning, prediction" if include_reasoning else "prediction"
-
-            system_segments: list[str] = [
-                system_intro,
-                f"Your task: label '{label_id}' (type: {label_type}). Use the evidence snippets from this patient's notes.",
-                f"Label rules:\n{guideline_text}",
-            ]
-            if use_options:
-                if is_multi_select:
-                    system_segments.append("Select every option that is supported by the evidence from the list below.")
-                    system_segments.append("Options:")
-                    system_segments.extend(f"- {opt}" for opt in option_values)
-                    deny_unknown = " Do NOT answer 'unknown' unless it appears in the options above." if not unknown_option_configured else ""
-                    system_segments.append(
-                        "Return a compact JSON object where each included option key is set to 'Yes' if it applies (omit or set to 'No' when it does not)." + deny_unknown
-                    )
-                else:
-                    system_segments.append("Choose the single best option from the list below based on the evidence.")
-                    system_segments.append("Options:")
-                    system_segments.extend(f"- {opt}" for opt in option_values)
-                    system_segments.append(
-                        f"Set prediction to exactly one of: {', '.join(option_values)}. Do not invent new options."
-                    )
-            else:
-                system_segments.append("If insufficient evidence, reply with 'unknown'.")
-
-            if include_reasoning:
-                system_segments.append(
-                    "Think step-by-step citing specific evidence, and keep the reasoning concise."
-                )
-            system_segments.append(f"Return strict JSON only with keys: {response_keys}.")
-            system_segments.append("No additional keys or text.")
-
-            system_body = "\n\n".join(system_segments)
-            system = system_body + ("\n" + sc_meta if sc_meta else "")
-
-            user_content = f"EHR context:\n{ctx_text}" if ctx_text else "EHR context: (no snippets)"
-
-            task = user_content
-            few_shot_messages = self._few_shot_messages(label_id)
-            messages = [
-                {"role": "system", "content": system},
-                *few_shot_messages,
-                {"role": "user", "content": task},
-            ]
-
-            multi_prediction_schema = {
-                "oneOf": [
-                    {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "null"]}},
-                    {"type": "array", "items": {"type": ["string", "number", "boolean", "null"]}},
-                    {"type": ["string", "number", "boolean", "null"]},
-                ]
-            }
-            if include_reasoning:
-                response_schema = {
-                    "type": "object",
-                    "properties": {
-                        "reasoning": {"type": ["string", "null"]},
-                        "prediction": multi_prediction_schema if is_multi_select else {"type": ["string", "number", "boolean", "null"]},
-                    },
-                    "required": ["reasoning", "prediction"],
-                    "additionalProperties": False,
-                }
-            else:
-                response_schema = {
-                    "type": "object",
-                    "properties": {
-                        "prediction": multi_prediction_schema if is_multi_select else {"type": ["string", "number", "boolean", "null"]},
-                    },
-                    "required": ["prediction"],
-                    "additionalProperties": False,
-                }
-
-            # ----- per-vote LLM call -----
-            attempt = 0
-            while attempt <= self.cfg.retry_max:
-                try:
-                    result = self.backend.json_call(
-                        messages=messages,
-                        temperature=temperature_this_vote,
-                        logprobs=self.cfg.logprobs,
-                        top_logprobs=int(self.cfg.top_logprobs) if self.cfg.logprobs and int(self.cfg.top_logprobs) > 0 else None,
-                        response_format={
-                            "type": "json_object",
-                            "json_schema": response_schema,
-                        },
-                    )
-                    content = result.content
-                    data_map: dict[str, Any]
-                    raw_data = result.data
-                    if isinstance(raw_data, Mapping):
-                        data_map = dict(raw_data.items())
-                    else:
-                        data_map = {"prediction": raw_data}
-                    if not include_reasoning:
-                        data_map.pop("reasoning", None)
-
-                    pred = data_map.get(self.cfg.prediction_field, data_map.get("prediction"))
-                    if is_multi_select and use_options:
-                        pred_for_canon = pred
-                        if (pred_for_canon is None or pred_for_canon == {}) and isinstance(data_map, Mapping):
-                            inline_options = {
-                                key: val
-                                for key, val in data_map.items()
-                                if _canon_str(key).lower() in {_canon_str(o).lower() for o in option_values}
-                                and key not in {self.cfg.prediction_field, "canonical_prediction", "reasoning"}
-                            }
-                            if inline_options:
-                                pred_for_canon = inline_options
-
-                        pred_canon = self._canon_multi_selection(pred_for_canon, option_values)
-                        data_map["canonical_prediction"] = pred_canon
-                        pred = pred_canon if pred_canon is not None else pred
-
-                    preds.append(str(pred) if pred is not None else None)
-
-                    run_entry = {
-                        "prediction": pred,
-                        "raw": data_map,
-                        "jitter": ({"k": k, "drop": drop_p, "shuffle": shuffle_context, "temperature": temperature_this_vote}
-                                   if jitter_params else None),
-                    }
-                    if result.logprobs is not None:
-                        run_entry["logprobs"] = result.logprobs
-                    run_entry["response_latency_s"] = result.latency_s
-                    runs.append(run_entry)
-
-                    try:
-                        rag_queries = {}
-                        if isinstance(rag_diagnostics, Mapping):
-                            rag_queries = {
-                                "manual_query": rag_diagnostics.get("manual_query"),
-                                "query_source": rag_diagnostics.get("query_source"),
-                                "queries": rag_diagnostics.get("queries"),
-                                "query_sources": rag_diagnostics.get("query_sources"),
-                            }
-                        # Capture the exact prompt + minimal context identifiers used this vote
-                        LLM_RECORDER.record("json_vote", {
-                            "unit_id": unit_id,
-                            "label_id": label_id,
-                            "label_type": label_type,
-                            "vote_idx": i,
-                            "prompt": {"system": system, "user": task, "few_shot": few_shot_messages},
-                            "params": {
-                                "temperature": temperature_this_vote,
-                                "n_consistency": int(n_consistency),
-                            },
-                            "snippets": [{"doc_id": c.get("doc_id"), "chunk_id": c.get("chunk_id")} for c in (cand if jitter_params else snippets)],
-                            "output": {"prediction": pred, "raw": data_map, "content": content},
-                            "rag_diagnostics": rag_diagnostics or {},
-                            "rag_queries": rag_queries,
-                        })
-                    except Exception:
-                        LLM_RECORDER.record("json_vote_error", {"rag_diagnostics": rag_diagnostics or {}})
-                        pass
-                    
-                    break  # success
-                except Exception as e:
-                    if attempt >= self.cfg.retry_max:
-                        runs.append({"error": str(e)})
-                        break
-                    time.sleep(self.cfg.retry_backoff * (attempt + 1))
-                    attempt += 1
-    
-        # --- Distance-aware, unknown-aware self-consistency aggregation ---
-        pred_final, cons = None, 0.0
-        norm_preds = [self._norm_token(p) for p in preds]
-        lt = (label_type or "").lower()
-
-        if lt in ("number", "numeric", "float", "int"):
-            cons = self._pairwise_agree_numeric(norm_preds, abs_scale=1.0, rel_scale=0.05, w_uu=0.8, w_uk=0.0)
-            vals = [self._parse_float(p) for p in norm_preds if not self._is_unknown_token(p)]
-            if vals:
-                pred_final = str(float(np.median(vals)))
-            else:
-                pred_final = "unknown"
-
-        elif "date" in lt:
-            cons = self._pairwise_agree_date(norm_preds, tau_days=14, w_uu=0.8, w_uk=0.0)
-            dvals = [self._parse_date(p) for p in norm_preds if not self._is_unknown_token(p)]
-            dvals = [d for d in dvals if d is not None]
-            if dvals:
-                ords = sorted([d.toordinal() for d in dvals])
-                med_ord = ords[len(ords) // 2]
-                from datetime import date
-                pred_final = str(date.fromordinal(med_ord))
-            else:
-                pred_final = "unknown"
-
-        else:
-            # Categorical/text → majority vote
-            cnt = {p: norm_preds.count(p) for p in set(norm_preds) if p is not None}
-            if cnt:
-                pred_final = max(cnt.items(), key=lambda kv: kv[1])[0]
-                cons = cnt[pred_final] / max(1, len(norm_preds))
-    
-        out = {
-            "unit_id": unit_id, "label_id": label_id, "label_type": label_type,
-            "prediction": pred_final, 
-            "consistency_agreement": float(cons),
-             "runs": runs
-        }
-        return out
-
-
 # ------------------------------
 # Label-aware pooling with prototypes
 # ------------------------------
@@ -3335,19 +1543,36 @@ class LabelAwarePooler:
                 self.prototypes[lid] = P_load
                 
 
-    def pooled_vector(self, unit_id: str, label_id: str, retriever: RAGRetriever, label_rules: str, topk: int=6) -> np.ndarray:
+    def pooled_vector(
+        self,
+        unit_id: str,
+        label_id: str,
+        retriever: RAGRetriever,
+        label_rules: str,
+        topk: int = 6,
+        context_builder: ContextBuilder | None = None,
+    ) -> np.ndarray:
         key = (unit_id, label_id)
         if key in self._cache_vec: return self._cache_vec[key]
-        ctx = _contexts_for_unit_label(
-            retriever,
-            self.repo,
-            unit_id,
-            label_id,
-            label_rules,
-            topk_override=topk,
-            single_doc_context_mode=getattr(self.llmfirst_cfg, "single_doc_context", "rag"),
-            full_doc_char_limit=getattr(self.llmfirst_cfg, "single_doc_full_context_max_chars", None),
-        )
+        builder = context_builder
+        if builder is None:
+            builder = getattr(retriever, "context_builder", None)
+        if builder is not None:
+            ctx = builder.build_context_for_label(
+                unit_id,
+                label_id,
+                label_rules,
+                topk_override=topk,
+                single_doc_context_mode=getattr(self.llmfirst_cfg, "single_doc_context", "rag"),
+                full_doc_char_limit=getattr(self.llmfirst_cfg, "single_doc_full_context_max_chars", None),
+            )
+        else:
+            ctx = retriever.retrieve_for_patient_label(
+                unit_id,
+                label_id,
+                label_rules,
+                topk_override=topk,
+            )
         if not ctx:
             idxs = retriever.store.get_patient_chunk_indices(unit_id)
             if not idxs:
@@ -3631,13 +1856,14 @@ def evaluate_gating(child_id: str, unit_id: str, parent_preds: dict, label_types
 
 class FamilyLabeler:
     """Label entire family tree per unit, honoring parent-child gating."""
-    def __init__(self, llm: LLMAnnotator, retriever: RAGRetriever, repo: DataRepository, label_config: dict, scCfg: SCJitterConfig, llmfirst_cfg: LLMFirstConfig):
+    def __init__(self, llm: LLMLabeler, retriever: RAGRetriever, repo: DataRepository, label_config: dict, scCfg: SCJitterConfig, llmfirst_cfg: LLMFirstConfig):
         self.llm = llm
         self.retriever = retriever
         self.repo = repo
         self.label_config = label_config or {}
         self.scCfg = scCfg
         self.cfg = llmfirst_cfg
+        self.context_builder = getattr(retriever, "context_builder", None)
         self.parent_to_children, self.child_to_parents, self.roots = build_label_dependencies(self.label_config)
         
     
@@ -3923,79 +2149,6 @@ class FamilyLabeler:
             return out
 
 
-    def _fc_probe(self, unit_id: str, label_id: str, label_type: str, label_rules: str, options: list[str]) -> dict:
-        """Run a 1-token forced-choice micro-probe over provided options and return probs+entropy with reasoning."""
-        # Map options to A/B/C/... tokens
-        letters = [chr(ord('A') + i) for i in range(len(options))]
-        option_lines = [f"{letters[i]}. {options[i]}" for i in range(len(options))]
-        system = "You are a careful clinical information extraction assistant."
-        snippets = _contexts_for_unit_label(
-            self.retriever,
-            self.repo,
-            unit_id,
-            label_id,
-            label_rules,
-            topk_override=self.cfg.topk,
-            single_doc_context_mode=getattr(self.cfg, "single_doc_context", "rag"),
-            full_doc_char_limit=getattr(self.cfg, "single_doc_full_context_max_chars", None),
-        )
-        rag_diag = self.retriever.get_last_diagnostics(unit_id, label_id)
-        ctx_lines = []
-        for snip in snippets:
-            md = snip.get("metadata") or {}
-            hdr_bits = [f"doc_id={snip.get('doc_id')}", f"chunk_id={snip.get('chunk_id')}"]
-            if md.get("date"):
-                hdr_bits.append(f"date={md['date']}")
-            note_type = md.get("note_type") or md.get("notetype")
-            if note_type:
-                hdr_bits.append(f"type={note_type}")
-            header = "[" + ", ".join(hdr_bits) + "] "
-            ctx_lines.append(header + (snip.get('text', '') or ''))
-        ctx = "\n\n".join(ctx_lines)
-        user = (
-            f"Task: Choose the single best option for label '{label_id}' given the context snippets.\n" +
-            (f"Label rules/hints: {label_rules}\n" if label_rules else "") +
-            "Options:\n" + "\n".join(option_lines) + "\n" +
-            "Return ONLY the option letter.\n\n" +
-            "Context:\n" + ctx
-        )
-        result = self.llm.backend.forced_choice(
-            system=system,
-            user=user,
-            options=options,
-            letters=letters,
-            top_logprobs=int(self.llm.cfg.top_logprobs) if int(self.llm.cfg.top_logprobs) > 0 else 5,
-        )
-        opt_probs = dict(result.option_probs)
-        ent = float(result.entropy)
-        pred = result.prediction
-
-        try:
-            LLM_RECORDER.record("forced_choice", {
-                "unit_id": unit_id,
-                "label_id": label_id,
-                "label_type": label_type,
-                "prompt": {"system": system, "user": user},
-                "snippets": ctx,
-                "fc_output": {
-                    "fc_probs": opt_probs,
-                    "fc_entropy": ent,
-                    "prediction": pred,
-                    "latency_s": result.latency_s,
-                },
-                "rag_diagnostics": rag_diag or {},
-                "rag_queries": {
-                    "manual_query": rag_diag.get("manual_query") if isinstance(rag_diag, Mapping) else None,
-                    "query_source": rag_diag.get("query_source") if isinstance(rag_diag, Mapping) else None,
-                    "queries": rag_diag.get("queries") if isinstance(rag_diag, Mapping) else None,
-                    "query_sources": rag_diag.get("query_sources") if isinstance(rag_diag, Mapping) else None,
-                },
-            })
-        except Exception:
-            pass
-
-        return {"fc_probs": opt_probs, "fc_entropy": ent, "prediction": pred}
-
     def label_family_for_unit(self, unit_id: str, label_types: dict[str,str], per_label_rules: dict[str,str], *,
                               json_only: bool=False, json_n_consistency: int=1, json_jitter: bool=False) -> list[dict]:
         """Label all parents then gated children for a unit. Returns list of probe rows."""
@@ -4021,59 +2174,22 @@ class FamilyLabeler:
             if not allowed:
                 # record gated-out for transparency but do not include in probe_df to avoid selection noise
                 continue
-            # Build a small context
-            ctx = _contexts_for_unit_label(
-                self.retriever,
-                self.repo,
+            label_rows = self.llm.label_unit(
                 unit_id,
-                lid,
-                rules,
-                topk_override=self.cfg.topk,
-                single_doc_context_mode=getattr(self.cfg, "single_doc_context", "rag"),
-                full_doc_char_limit=getattr(self.cfg, "single_doc_full_context_max_chars", None),
+                [lid],
+                label_types=label_types,
+                per_label_rules=per_label_rules,
+                context_builder=self.context_builder,
+                retriever=self.retriever,
+                llmfirst_cfg=self.cfg,
+                json_only=json_only,
+                json_n_consistency=json_n_consistency,
+                json_jitter=json_jitter,
             )
-            rag_diag = self.retriever.get_last_diagnostics(unit_id, lid)
-            # Decide FC vs JSON
-            opts = _options_for_label(lid, ltype, getattr(self.retriever, 'label_configs', {}))
-            used_fc = False
-            row = {"unit_id": unit_id, "label_id": lid, "label_type": ltype, "rag_context": ctx}
-
-            if json_only:
-                res = self.llm.annotate(unit_id, lid, ltype, rules, ctx, n_consistency=max(1, int(json_n_consistency)), jitter_params=bool(json_jitter), rag_diagnostics=rag_diag)
-                row["prediction"] = res.get("prediction")
-                row["consistency"] = res.get("consistency_agreement")
-                row["runs"] = res.get("runs")
-                row["U"] = (1.0 - float(row["consistency"])) if row.get("consistency") is not None else None
-                # Prediction value for parent gating
-                parent_preds[(unit_id, lid)] = row.get("prediction")
-            else:
-                if ltype in ('categorical','binary') or (opts is not None and self.cfg.fc_enable):
-                    if opts is None:
-                        # degrade to JSON if no options configured
-                        pass
-                    else:
-                        try:
-                            fc = self._fc_probe(unit_id, lid, ltype, rules, opts)
-                            row.update(fc); used_fc = True
-                            # Uncertainty from entropy
-                            row["U"] = float(fc.get("fc_entropy", np.nan))
-                            # Prediction value for parent gating
-                            parent_preds[(unit_id, lid)] = fc.get("prediction")
-                        except Exception as e:
-                            # fallback to JSON if FC fails
-                            used_fc = False
-                if not used_fc:
-                    # JSON with self-consistency if configured
-                    res = self.llm.annotate(unit_id, lid, ltype, rules, ctx, n_consistency=self.llm.cfg.n_consistency, jitter_params=True, rag_diagnostics=rag_diag)
-                    row["prediction"] = res.get("prediction")
-                    row["consistency"] = res.get("consistency_agreement")
-                    row["runs"] = res.get("runs")
-                    # Uncertainty = 1 - consistency
-                    try:
-                        row["U"] = float(1.0 - float(res.get("consistency_agreement") or 0.0))
-                    except Exception:
-                        row["U"] = np.nan
-                    parent_preds[(unit_id, lid)] = row.get("prediction")
+            if not label_rows:
+                continue
+            row = label_rows[0]
+            parent_preds[(unit_id, lid)] = row.get("prediction")
             results.append(row)
         return results
 
@@ -4140,9 +2256,7 @@ class FamilyLabeler:
                     min_interval_s=_progress_every):
                 if uid in ex:             # redundant but explicit
                     continue
-                ctx = _contexts_for_unit_label(
-                    self.retriever,
-                    self.repo,
+                ctx = self.context_builder.build_context_for_label(
                     uid,
                     p,
                     rule,
@@ -4273,7 +2387,16 @@ def per_label_kcenter(pool_df: pd.DataFrame, pooler: LabelAwarePooler, retriever
     for lid, grp in pool_df.groupby("label_id"):
         if grp.empty: continue
         k = min(per_label_quota, len(grp))
-        vecs = [pooler.pooled_vector(r.unit_id, r.label_id, retriever, rules_map.get(r.label_id,"")) for r in grp.itertuples(index=False)]
+        vecs = [
+            pooler.pooled_vector(
+                r.unit_id,
+                r.label_id,
+                retriever,
+                rules_map.get(r.label_id, ""),
+                context_builder=self.context_builder,
+            )
+            for r in grp.itertuples(index=False)
+        ]
         V = np.vstack(vecs)
         idxs = kcenter_select(V, k=k, seed_idx=None, preselected=already_selected_vecs)
         sel = grp.iloc[idxs].copy()
@@ -4299,14 +2422,32 @@ def merge_with_global_kcenter(per_label_selected: pd.DataFrame, pool_df: pd.Data
         rem = pool_df.copy()
     if rem.empty: return selected
 
-    vecs = [pooler.pooled_vector(r.unit_id, r.label_id, retriever, rules_map.get(r.label_id,"")) for r in rem.itertuples(index=False)]
+    vecs = [
+        pooler.pooled_vector(
+            r.unit_id,
+            r.label_id,
+            retriever,
+            rules_map.get(r.label_id, ""),
+            context_builder=context_builder,
+        )
+        for r in rem.itertuples(index=False)
+    ]
     V = np.vstack(vecs)
 
     preV = None
     if already_selected_vecs is not None and already_selected_vecs.size:
         preV = already_selected_vecs
     if not selected.empty:
-        Vsel = [pooler.pooled_vector(r.unit_id, r.label_id, retriever, rules_map.get(r.label_id,"")) for r in selected.itertuples(index=False)]
+        Vsel = [
+            pooler.pooled_vector(
+                r.unit_id,
+                r.label_id,
+                retriever,
+                rules_map.get(r.label_id, ""),
+                context_builder=context_builder,
+            )
+            for r in selected.itertuples(index=False)
+        ]
         Vsel = np.vstack(Vsel); preV = Vsel if preV is None else np.vstack([preV, Vsel])
 
     idx_order = kcenter_select(V, k=min(remaining_needed, len(rem)), seed_idx=None, preselected=preV)
@@ -4719,42 +2860,6 @@ def direct_uncertainty_selection(
 
 
 
-# ------------------------------
-# Orchestrator
-def _detect_device():
-    import os
-    if os.getenv("CPU_ONLY", "0") == "1":
-        return "cpu"
-    try:
-        import torch
-        if getattr(torch, "cuda", None) and torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
-
-
-def _ensure_default_ce_max_length(reranker: CrossEncoder, *, default: int = 512) -> None:
-    """Ensure CrossEncoder inputs are truncated when max length is unspecified.
-
-    Some sentence-transformer cross encoders ship without a ``max_length`` defined
-    in their configuration. In those cases we fall back to a conservative value
-    of 512 tokens to avoid unbounded sequence growth.
-    """
-
-    try:
-        max_length = getattr(reranker, "max_length", None)
-    except Exception:
-        max_length = None
-
-    if max_length is None:
-        try:
-            reranker.max_length = int(default)
-        except Exception:
-            pass
-
-# ------------------------------
-
 class ActiveLearningLLMFirst:
     def __init__(
         self,
@@ -4774,15 +2879,7 @@ class ActiveLearningLLMFirst:
         self.phenotype_level = (phenotype_level or "multi_doc").strip().lower()
         self.repo = DataRepository(notes_df, ann_df, phenotype_level=self.phenotype_level)
 
-        embed_name = os.getenv("MED_EMBED_MODEL_NAME")
-        rerank_name = os.getenv("RERANKER_MODEL_NAME")
-        device = _detect_device()
-        embedder = SentenceTransformer(embed_name, device=device)
-        reranker = CrossEncoder(rerank_name, device=device)
-        _ensure_default_ce_max_length(reranker)
-        emb_bs = int(os.getenv('EMB_BATCH', '32' if device == "cpu" else "64"))
-        rr_bs = int(os.getenv('RERANK_BATCH', '16' if device == "cpu" else "64"))
-        self.models = Models(embedder, reranker, device=device, emb_batch=emb_bs, rerank_batch=rr_bs)
+        self.models = build_models_from_env()
 
         bundle = (label_config_bundle or EMPTY_BUNDLE).with_current_fallback(label_config)
         self.label_config_bundle = bundle
@@ -4799,7 +2896,18 @@ class ActiveLearningLLMFirst:
             notes_by_doc=self.repo.notes_by_doc(),
             repo=self.repo,
         )
-        self.llm: LLMAnnotator | None = None
+        self.context_builder = ContextBuilder(
+            self.repo,
+            self.store,
+            self.rag,
+            self.cfg.rag,
+            self.label_config_bundle,
+        )
+        try:
+            self.rag.context_builder = self.context_builder
+        except Exception:
+            pass
+        self.llm: LLMLabeler | None = None
         self.pooler = LabelAwarePooler(
             self.repo,
             self.store,
@@ -4818,7 +2926,14 @@ class ActiveLearningLLMFirst:
         if self.llm is not None:
             return
 
-        self.llm = LLMAnnotator(self.cfg.llm, self.cfg.scjitter, cache_dir=self.paths.cache_dir)
+        backend = build_llm_backend(self.cfg.llm)
+        self.llm = LLMLabeler(
+            backend,
+            self.label_config_bundle,
+            self.cfg.llm,
+            sc_cfg=self.cfg.scjitter,
+            cache_dir=self.paths.cache_dir,
+        )
         # Ensure the annotator has access to the materialised label configuration
         # so that option lookups during JSON prompting succeed.
         self.llm.label_config = self.label_config
@@ -4996,281 +3111,25 @@ class ActiveLearningLLMFirst:
           • children: last-round disagreement >= threshold AND parent's aggregated label passes gating by consensus
         Then parent-first per label, fill with children for that label, and top-up (children-first).
         """
-        import pandas as pd
-        from collections import defaultdict
-    
-        # ---------- helpers ----------
-        def _apportion_by_mix_fair(counts: pd.Series, total: int) -> Dict[str, int]:
-            """
-            Hamilton apportionment with fairness base:
-              - If total >= #present labels, give each present label 1 base seat.
-              - Distribute remainder by largest remainders of (counts / sum(counts)).
-            """
-            counts = counts[counts > 0]
-            if total <= 0 or counts.empty:
-                return {}
-            labels = counts.index.tolist()
-            L = len(labels)
-    
-            base_each = 1 if total >= L else 0
-            base = {str(l): base_each for l in labels}
-            remaining = total - base_each * L
-            if remaining < 0:
-                base = {str(l): 0 for l in labels}
-                remaining = total
-    
-            weights = counts / counts.sum()
-            exact = weights * remaining
-            floors = exact.apply(int)
-            tgt = {str(l): int(base[str(l)] + floors.get(l, 0)) for l in labels}
-            give = int(remaining - floors.sum())
-            if give > 0:
-                rema = (exact - floors).sort_values(ascending=False)
-                for l in rema.index[:give]:
-                    tgt[str(l)] = tgt.get(str(l), 0) + 1
-            return {k: int(max(0, v)) for k, v in tgt.items()}
-    
-        def _select_for_label(pool_df: pd.DataFrame, label_id: str, k: int) -> pd.DataFrame:
-            """Run per-label k-center on a single-label subset and return ≤k rows."""
-            if k <= 0:
-                return pool_df.head(0)
-            sub = pool_df[pool_df["label_id"].astype(str) == str(label_id)]
-            if sub.empty:
-                return sub
-            sel = per_label_kcenter(sub, self.pooler, self.rag, rules_map, per_label_quota=int(k))
-            return sel.head(k)
-    
-        # ---------- expand candidates (assumes seed-time gating in expander) ----------
         expander = DisagreementExpander(
             self.cfg.disagree,
             self.repo,
             self.rag,
             label_config_bundle=self.label_config_bundle,
             llmfirst_cfg=self.cfg.llmfirst,
+            context_builder=self.context_builder,
         )
-        expanded = expander.expand(rules_map, seen_pairs)
-        if expanded is None or expanded.empty:
-            return expanded
-    
-        dep_cache: Dict[str, tuple[dict, dict, list]] = {}
-
-        def _dependencies_for(labelset_id: Optional[str]) -> tuple[dict, dict, list]:
-            key = str(labelset_id or "__current__")
-            if key not in dep_cache:
-                config = self.label_config_bundle.config_for_labelset(labelset_id)
-                try:
-                    dep_cache[key] = build_label_dependencies(config)
-                except Exception:
-                    dep_cache[key] = ({}, {}, [])
-            return dep_cache[key]
-
-        consensus = self.repo.last_round_consensus()  # {(unit_id,label_id)-> str}
-        types = self.repo.label_types()
-
-        def _resolve_labelset(row: pd.Series) -> str:
-            existing = str(row.get("labelset_id") or "").strip()
-            if existing:
-                return existing
-            fallback = self.repo.labelset_for_annotation(
-                row.get("unit_id", ""),
-                row.get("label_id", ""),
-                round_id=row.get("round_id"),
-            )
-            return str(fallback).strip() if fallback else ""
-
-        df = expanded.copy()
-        df["unit_id"] = df["unit_id"].astype(str)
-        df["label_id"] = df["label_id"].astype(str)
-        if "round_id" in df.columns:
-            df["round_id"] = df["round_id"].fillna("").astype(str)
-        else:
-            df["round_id"] = ""
-        df["labelset_id"] = df.apply(_resolve_labelset, axis=1)
-
-        def _is_root(row: pd.Series) -> bool:
-            _, _, roots = _dependencies_for(str(row["labelset_id"]) or None)
-            roots_set = set(str(x) for x in (roots or []))
-            return str(row["label_id"]) in roots_set
-
-        def _gate_ok_expanded(row: pd.Series) -> bool:
-            """
-            Fail-open for expanded pool:
-              - parents: True
-              - children: if ANY parent consensus exists, evaluate; if none, allow.
-            """
-
-            labelset_id = str(row.get("labelset_id") or "").strip() or None
-            _, child_to_parents, _ = _dependencies_for(labelset_id)
-            parents = child_to_parents.get(str(row["label_id"]), [])
-            if not parents:
-                return True
-            parent_preds = {}
-            have_any = False
-            for p in parents:
-                key = (str(row["unit_id"]), str(p))
-                val = consensus.get(key, None)
-                parent_preds[key] = val
-                if val is not None and str(val).strip() != "":
-                    have_any = True
-            if not have_any:
-                return True
-            config = self.label_config_bundle.config_for_labelset(labelset_id)
-            return evaluate_gating(str(row["label_id"]), str(row["unit_id"]), parent_preds, types, config)
-
-        df["is_root_parent"] = df.apply(_is_root, axis=1)
-        df = df[df["is_root_parent"] | df.apply(_gate_ok_expanded, axis=1)].reset_index(drop=True)
-        
-        if df.empty:
-            return df
-    
-        # ---------- APPORTIONMENT FROM LAST-ROUND *VALID DISAGREEMENTS* ----------
-        # Last round disagreement table
-        last_dis = self.repo.reviewer_disagreement(round_policy='last')  # has 'disagreement_score'
-        thr = float(getattr(self.cfg.disagree, "high_entropy_threshold", 0.5))
-        if "disagreement_score" in last_dis.columns:
-            valid = last_dis[last_dis["disagreement_score"] >= thr].copy()
-        else:
-            valid = last_dis.copy()  # fallback if column name differs
-
-        # Count by label from last-round disagreements:
-        #   - parents: any valid disagreement on that parent label
-        #   - children: valid disagreement AND gate(child) passes by consensus
-        valid["unit_id"] = valid["unit_id"].astype(str)
-        valid["label_id"] = valid["label_id"].astype(str)
-
-        if "round_id" in valid.columns:
-            valid["round_id"] = valid["round_id"].fillna("").astype(str)
-        else:
-            valid["round_id"] = ""
-        if "labelset_id" in valid.columns:
-            valid["labelset_id"] = valid["labelset_id"].fillna("").astype(str)
-        else:
-            valid["labelset_id"] = valid.apply(_resolve_labelset, axis=1)
-
-        def _gate_by_cons(uid: str, lid: str, labelset_id: Optional[str]) -> bool:
-            _, child_to_parents, _ = _dependencies_for(labelset_id)
-            parents = child_to_parents.get(str(lid), [])
-            if not parents:
-                return True
-            parent_preds = {(uid, str(p)): consensus.get((uid, str(p)), None) for p in parents}
-            config = self.label_config_bundle.config_for_labelset(labelset_id)
-            return evaluate_gating(str(lid), uid, parent_preds, types, config)
-
-        counts_dict: Dict[str, int] = {}
-        present_labels = set(df["label_id"].unique().tolist())  # only apportion among labels actually available in this round
-        for (lid, lset), grp in valid.groupby(["label_id", "labelset_id"], dropna=False):
-            lid = str(lid)
-            if lid not in present_labels:
-                continue
-            labelset_id = str(lset).strip() or None
-            _, child_to_parents, roots = _dependencies_for(labelset_id)
-            roots_set = set(str(x) for x in (roots or []))
-            if lid in roots_set or not child_to_parents.get(lid, []):
-                cnt = int(len(grp))
-            else:
-                # children: only those units whose parent(s) pass the gate by LAST round consensus
-                c = 0
-                for uid in grp["unit_id"].astype(str).unique():
-                    if _gate_by_cons(str(uid), lid, labelset_id):
-                        c += 1
-                cnt = c
-            counts_dict[lid] = counts_dict.get(lid, 0) + cnt
-    
-        counts_series = pd.Series(counts_dict, dtype="int64")
-        n_dis = int(self.cfg.select.batch_size * self.cfg.select.pct_disagreement)
-    
-        # Edge case: if no counts (e.g., all disagreement below threshold), fall back to pool frequencies
-        if counts_series.sum() <= 0:
-            counts_series = df["label_id"].value_counts()
-    
-        target_per_label = _apportion_by_mix_fair(counts_series, n_dis)
-    
-        # Clamp targets by actual availability in df
-        avail = df["label_id"].value_counts()
-        for lid in list(target_per_label.keys()):
-            target_per_label[lid] = int(min(target_per_label[lid], int(avail.get(lid, 0))))
-    
-        # ---------- parent-first per label, then children to fill ----------
-        parents_pool = df[df["is_root_parent"]].copy()
-        children_pool = df[~df["is_root_parent"]].copy()
-    
-        selected_parts = []
-        taken_by_label: Dict[str, int] = defaultdict(int)
-    
-        # parents
-        par_chunks = []
-        for lid, tgt in target_per_label.items():
-            if tgt <= 0:
-                continue
-            s = _select_for_label(parents_pool, lid, tgt)
-            if not s.empty:
-                s = s.copy()
-                s["selection_reason"] = "disagreement_parent"
-                par_chunks.append(s)
-                taken_by_label[lid] += int(len(s))
-        if par_chunks:
-            selected_parts.append(pd.concat(par_chunks, ignore_index=True))
-    
-        # children per label (fill to target)
-        ch_chunks = []
-        for lid, tgt in target_per_label.items():
-            rem = tgt - int(taken_by_label.get(lid, 0))
-            if rem <= 0:
-                continue
-            s = _select_for_label(children_pool, lid, rem)
-            if not s.empty:
-                s = s.copy()
-                s["selection_reason"] = "disagreement_child"
-                ch_chunks.append(s)
-                taken_by_label[lid] += int(len(s))
-        if ch_chunks:
-            selected_parts.append(pd.concat(ch_chunks, ignore_index=True))
-    
-        if not selected_parts:
-            return df.head(0)
-    
-        sel = pd.concat(selected_parts, ignore_index=True)
-    
-        # ---------- global top-up (ADD ONLY) to n_dis: children-first, then parents ----------
-        if len(sel) < n_dis:
-            remaining_pool = df.merge(sel[["unit_id","label_id"]], on=["unit_id","label_id"], how="left", indicator=True)
-            remaining_pool = remaining_pool[remaining_pool["_merge"] == "left_only"].drop(columns=["_merge"])
-    
-            need = n_dis - len(sel)
-    
-            # children first
-            if need > 0:
-                child_rem = remaining_pool[~remaining_pool["is_root_parent"]]
-                if not child_rem.empty:
-                    fill = merge_with_global_kcenter(
-                        sel, child_rem, self.pooler, self.rag, rules_map,
-                        target_n=len(sel) + min(need, len(child_rem))
-                    )
-                    added = fill.merge(sel[["unit_id","label_id"]], on=["unit_id","label_id"], how="left", indicator=True)
-                    added = added[added["_merge"] == "left_only"].drop(columns=["_merge"])
-                    if not added.empty:
-                        added = added.copy()
-                        added["selection_reason"] = "disagreement_child_topup"
-                        sel = pd.concat([sel, added], ignore_index=True)
-                        need = n_dis - len(sel)
-    
-            # then parents
-            if need > 0:
-                par_rem = remaining_pool[remaining_pool["is_root_parent"]]
-                if not par_rem.empty:
-                    fill = merge_with_global_kcenter(
-                        sel, par_rem, self.pooler, self.rag, rules_map,
-                        target_n=len(sel) + min(need, len(par_rem))
-                    )
-                    added = fill.merge(sel[["unit_id","label_id"]], on=["unit_id","label_id"], how="left", indicator=True)
-                    added = added[added["_merge"] == "left_only"].drop(columns=["_merge"])
-                    if not added.empty:
-                        added = added.copy()
-                        added["selection_reason"] = "disagreement_parent_topup"
-                        sel = pd.concat([sel, added], ignore_index=True)
-    
-        sel["label_type"] = sel["label_id"].map(lambda x: label_types.get(x, "text"))
-        return sel
+        scorer = DisagreementScorer(
+            self.repo,
+            self.cfg.disagree,
+            self.cfg.select,
+            self.pooler,
+            self.rag,
+            expander,
+            context_builder=self.context_builder,
+            kcenter_select_fn=kcenter_select,
+        )
+        return scorer.compute_disagreement(seen_pairs, rules_map, label_types)
 
     def build_llm_uncertain_bucket(self, label_types: Dict[str,str], rules_map: Dict[str,str], exclude_units: Optional[set[str]]=None) -> pd.DataFrame:
         fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
