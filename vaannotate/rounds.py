@@ -709,13 +709,10 @@ class RoundBuilder:
         except ImportError as exc:  # pragma: no cover - runtime guard
             raise RuntimeError("pandas is required for assisted chart review") from exc
         try:
-            from vaannotate.vaannotate_ai_backend.engine import (
-                ActiveLearningLLMFirst,
-                FamilyLabeler,
-                OrchestratorConfig,
-                Paths,
-                _contexts_for_unit_label,
-            )
+            from vaannotate.vaannotate_ai_backend.config import OrchestratorConfig, Paths
+            from vaannotate.vaannotate_ai_backend.engine import ActiveLearningLLMFirst
+            from vaannotate.vaannotate_ai_backend.services.contexts import _contexts_for_unit_label
+            from vaannotate.vaannotate_ai_backend.services.family_labeler import FamilyLabeler
         except ImportError as exc:  # pragma: no cover - runtime guard
             raise RuntimeError("AI backend components are required for assisted chart review") from exc
 

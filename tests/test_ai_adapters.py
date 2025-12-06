@@ -39,7 +39,8 @@ if "langchain" not in sys.modules:
 from vaannotate.project import add_phenotype, get_connection, init_project
 from vaannotate.schema import initialize_assignment_db, initialize_corpus_db
 from vaannotate.vaannotate_ai_backend.adapters import export_inputs_from_repo
-from vaannotate.vaannotate_ai_backend.engine import DataRepository, _contexts_for_unit_label
+from vaannotate.vaannotate_ai_backend.engine import DataRepository
+from vaannotate.vaannotate_ai_backend.services.contexts import _contexts_for_unit_label
 
 
 def test_export_inputs_uses_storage_path(tmp_path: Path) -> None:

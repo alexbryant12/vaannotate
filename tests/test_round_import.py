@@ -650,6 +650,8 @@ def test_random_assisted_review_generates_snippets(monkeypatch: pytest.MonkeyPat
 
 def test_assisted_review_respects_local_backend_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from vaannotate.vaannotate_ai_backend import engine as backend_engine
+    from vaannotate.vaannotate_ai_backend.services import contexts as backend_contexts
+    from vaannotate.vaannotate_ai_backend.services import family_labeler as backend_family_labeler
 
     project_root = tmp_path / "Project"
     project_root.mkdir()
@@ -706,8 +708,8 @@ def test_assisted_review_respects_local_backend_env(monkeypatch: pytest.MonkeyPa
         ]
 
     monkeypatch.setattr(backend_engine, "ActiveLearningLLMFirst", DummyOrchestrator)
-    monkeypatch.setattr(backend_engine, "FamilyLabeler", DummyFamilyLabeler)
-    monkeypatch.setattr(backend_engine, "_contexts_for_unit_label", dummy_contexts)
+    monkeypatch.setattr(backend_family_labeler, "FamilyLabeler", DummyFamilyLabeler)
+    monkeypatch.setattr(backend_contexts, "_contexts_for_unit_label", dummy_contexts)
 
     assignments = {
         "rev_one": [
