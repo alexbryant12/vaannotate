@@ -19,17 +19,11 @@ What’s in this file (high level):
       - Uncertainty U = w1·z(entropy) + w2·z(1 − agreement) when FC available; else fallback to prior method
   • Dependencies among labels (e.g., HTN_PRESENT → {DATE, SEVERITY}) to avoid probing inapplicable children
   • Safe Parquet writing (JSON-encode nested cols)
-  
-  
-  To do - 
+
+
+  To do -
   - Multi-categorical selection support
   - Local LLM with exllamav2 and LMFE forced JSON schemas
- - pure inference branch with query builder: default (zero shot, family-tree traversal, label exemplars). Knobs:
-      - zero vs. few shot
-      - family-tree traversal vs. single prompt
-      - label exemplars for RAG vs. hand-written exemplars
-      - Prompt stems - use rules as-is from most recent round, or hand-write
-      - checkpointing on inference runs + seamless resume
 """
 
 from __future__ import annotations
