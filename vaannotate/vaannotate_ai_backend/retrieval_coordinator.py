@@ -7,6 +7,7 @@ from typing import Callable, Dict, Iterable, List, Tuple
 
 @dataclass
 class SemanticQuery:
+    """A semantic retrieval request containing text and a precomputed embedding."""
     text: str
     embedding: object
     source: str = "semantic"

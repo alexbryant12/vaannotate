@@ -11,9 +11,10 @@ if str(ROOT) not in sys.path:
 
 from vaannotate.vaannotate_ai_backend import engine
 from vaannotate.vaannotate_ai_backend.llm_backends import JSONCallResult
+from vaannotate.vaannotate_ai_backend.services.llm_labeler import LLMLabeler
 
 
-def test_llm_annotator_omits_reasoning_when_disabled(monkeypatch, tmp_path):
+def test_llm_annotator_omits_reasoning_when_disabled(tmp_path):
     calls: dict[str, object] = {}
 
     class DummyBackend:
@@ -31,11 +32,15 @@ def test_llm_annotator_omits_reasoning_when_disabled(monkeypatch, tmp_path):
                 logprobs=None,
             )
 
-    monkeypatch.setattr(engine, "build_llm_backend", lambda cfg: DummyBackend(cfg))
-
     llm_cfg = engine.LLMConfig()
     llm_cfg.include_reasoning = False
-    annotator = engine.LLMAnnotator(llm_cfg, engine.SCJitterConfig(), cache_dir=str(tmp_path))
+    annotator = LLMLabeler(
+        DummyBackend(llm_cfg),
+        engine.LabelConfigBundle(),
+        llm_cfg,
+        sc_cfg=engine.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
 
     result = annotator.annotate(
         unit_id="unit-1",
@@ -52,10 +57,10 @@ def test_llm_annotator_omits_reasoning_when_disabled(monkeypatch, tmp_path):
     assert "reasoning" not in system_message
 
     run = result["runs"][0]
-    assert "reasoning" not in run["raw"]
+    assert run.get("reasoning") in (None, "")
 
 
-def test_llm_annotator_multicategorical_inline_keys(monkeypatch, tmp_path):
+def test_llm_annotator_multicategorical_inline_keys(tmp_path):
     calls: dict[str, object] = {}
 
     class DummyBackend:
@@ -77,11 +82,15 @@ def test_llm_annotator_multicategorical_inline_keys(monkeypatch, tmp_path):
                 logprobs=None,
             )
 
-    monkeypatch.setattr(engine, "build_llm_backend", lambda cfg: DummyBackend(cfg))
-
     llm_cfg = engine.LLMConfig()
     llm_cfg.include_reasoning = True
-    annotator = engine.LLMAnnotator(llm_cfg, engine.SCJitterConfig(), cache_dir=str(tmp_path))
+    annotator = LLMLabeler(
+        DummyBackend(llm_cfg),
+        engine.LabelConfigBundle(),
+        llm_cfg,
+        sc_cfg=engine.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
     annotator.label_config = {"Flag": {"options": ["Option A", "Option B"]}}
 
     result = annotator.annotate(
@@ -96,4 +105,4 @@ def test_llm_annotator_multicategorical_inline_keys(monkeypatch, tmp_path):
 
     run = result["runs"][0]
     assert run["prediction"] == "Option A"
-    assert run["raw"].get("canonical_prediction") == "Option A"
+    assert run.get("raw_prediction") == "Option A"
