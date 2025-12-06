@@ -33,7 +33,9 @@ if "langchain" not in sys.modules:
     sys.modules["langchain.text_splitter"] = text_splitter_stub
 
 
-from vaannotate.vaannotate_ai_backend.engine import ActiveLearningLLMFirst, DataRepository
+from vaannotate.vaannotate_ai_backend.core.data import DataRepository
+from vaannotate.vaannotate_ai_backend.pipelines.active_learning import ActiveLearningPipeline
+from vaannotate.vaannotate_ai_backend.services.selection import ActiveLearningSelector
 from vaannotate.vaannotate_ai_backend.label_configs import LabelConfigBundle
 
 
@@ -65,12 +67,12 @@ def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -
         "new_label": {"label_id": "new_label", "type": "boolean", "rules": "fresh rule"},
     }
 
-    orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
-    orchestrator.repo = repo
-    orchestrator.label_config = label_config
-    orchestrator.label_config_bundle = LabelConfigBundle(current=label_config)
+    pipeline = ActiveLearningPipeline.__new__(ActiveLearningPipeline)
+    pipeline.repo = repo
+    pipeline.label_config = label_config
+    pipeline.label_config_bundle = LabelConfigBundle(current=label_config)
 
-    legacy_rules, legacy_types, current_rules, current_types = orchestrator._label_maps()
+    legacy_rules, legacy_types, current_rules, current_types = pipeline._label_maps()
 
     assert "legacy_label" in legacy_rules
     assert "new_label" not in legacy_rules  # legacy annotations exclude the new label
@@ -82,16 +84,16 @@ def test_label_config_overlays_new_labels_for_non_disagreement(tmp_path: Path) -
     assert current_rules["new_label"] == "fresh rule"
     assert current_types["new_label"] == "binary"
 
-    unseen_pairs = orchestrator.build_unseen_pairs()
+    unseen_pairs = pipeline._build_unseen_pairs()
     assert ("p1", "new_label") in set(unseen_pairs)
 
     empty_sel = pd.DataFrame(columns=["unit_id", "label_id", "label_type", "selection_reason"])
-    topoff = orchestrator.top_off_random(
-        current_sel=empty_sel,
-        unseen_pairs=[("p1", "new_label")],
+    selector = ActiveLearningSelector(
+        select_config=types.SimpleNamespace(batch_size=1),
         label_types=current_types,
-        target_n=1,
+        unseen_pairs=[("p1", "new_label")],
     )
+    topoff = selector.top_off_random(current_sel=empty_sel, target_n=1)
     assert list(topoff["label_id"]) == ["new_label"]
     assert topoff.loc[topoff.index[0], "label_type"] == "binary"
 
@@ -123,19 +125,19 @@ def test_current_round_rules_ignore_legacy_when_not_selected() -> None:
         "new_label": {"label_id": "new_label", "type": "boolean", "rules": "fresh rule"},
     }
 
-    orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
-    orchestrator.repo = repo
-    orchestrator.label_config = label_config
-    orchestrator.label_config_bundle = LabelConfigBundle(current=label_config)
+    pipeline = ActiveLearningPipeline.__new__(ActiveLearningPipeline)
+    pipeline.repo = repo
+    pipeline.label_config = label_config
+    pipeline.label_config_bundle = LabelConfigBundle(current=label_config)
 
-    legacy_rules, _, current_rules, current_types = orchestrator._label_maps()
+    legacy_rules, _, current_rules, current_types = pipeline._label_maps()
 
     assert "legacy_label" in legacy_rules
     assert "legacy_label" not in current_rules
     assert current_types == {"new_label": "binary"}
 
     current_label_ids = set(current_rules.keys())
-    unseen_pairs = orchestrator.build_unseen_pairs(label_ids=current_label_ids)
+    unseen_pairs = pipeline._build_unseen_pairs(label_ids=current_label_ids)
     assert unseen_pairs == [("p1", "new_label")]
 
 
@@ -180,13 +182,12 @@ def test_attach_metadata_for_multi_doc_units() -> None:
     )
 
     repo = DataRepository(notes_df, ann_df, phenotype_level="multi_doc")
-    orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
-    orchestrator.repo = repo
 
     selection = pd.DataFrame(
         [{"unit_id": "p1", "label_id": "legacy_label", "selection_reason": "bucket"}]
     )
-    augmented = orchestrator._attach_unit_metadata(selection)
+    meta = repo.unit_metadata()
+    augmented = selection.merge(meta, on="unit_id", how="left")
 
     assert list(augmented.columns).count("patient_icn") == 1
     assert "doc_id" not in augmented.columns
@@ -214,13 +215,12 @@ def test_attach_metadata_for_single_doc_units() -> None:
     )
 
     repo = DataRepository(notes_df, ann_df, phenotype_level="single_doc")
-    orchestrator = ActiveLearningLLMFirst.__new__(ActiveLearningLLMFirst)
-    orchestrator.repo = repo
 
     selection = pd.DataFrame(
         [{"unit_id": "d1", "label_id": "legacy_label", "selection_reason": "bucket"}]
     )
-    augmented = orchestrator._attach_unit_metadata(selection)
+    meta = repo.unit_metadata()
+    augmented = selection.merge(meta, on="unit_id", how="left")
 
     assert "patient_icn" in augmented.columns
     assert "doc_id" in augmented.columns

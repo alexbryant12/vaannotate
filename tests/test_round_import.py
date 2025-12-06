@@ -649,7 +649,6 @@ def test_random_assisted_review_generates_snippets(monkeypatch: pytest.MonkeyPat
 
 
 def test_assisted_review_respects_local_backend_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    from vaannotate.vaannotate_ai_backend import engine as backend_engine
     from vaannotate.vaannotate_ai_backend.services import contexts as backend_contexts
     from vaannotate.vaannotate_ai_backend.services import family_labeler as backend_family_labeler
 
@@ -707,7 +706,6 @@ def test_assisted_review_respects_local_backend_env(monkeypatch: pytest.MonkeyPa
             }
         ]
 
-    monkeypatch.setattr(backend_engine, "ActiveLearningLLMFirst", DummyOrchestrator)
     monkeypatch.setattr(backend_family_labeler, "FamilyLabeler", DummyFamilyLabeler)
     monkeypatch.setattr(backend_contexts, "_contexts_for_unit_label", dummy_contexts)
 
@@ -1534,9 +1532,9 @@ def test_run_final_llm_labeling_forwards_logs(
     messages: list[str] = []
 
     def _fake_apply(self, **kwargs):  # type: ignore[no-untyped-def]
-        from vaannotate.vaannotate_ai_backend import engine
+        from vaannotate.vaannotate_ai_backend.utils.runtime import LOGGER
 
-        engine.LOGGER.info("[FinalLLM] 1/1 complete")
+        LOGGER.info("[FinalLLM] 1/1 complete")
         return {"final_llm_labels": "dummy"}
 
     monkeypatch.setattr(RoundBuilder, "_apply_final_llm_labeling", _fake_apply)

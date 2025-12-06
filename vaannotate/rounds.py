@@ -710,7 +710,8 @@ class RoundBuilder:
             raise RuntimeError("pandas is required for assisted chart review") from exc
         try:
             from vaannotate.vaannotate_ai_backend.config import OrchestratorConfig, Paths
-            from vaannotate.vaannotate_ai_backend.engine import ActiveLearningLLMFirst
+            from vaannotate.vaannotate_ai_backend.label_configs import LabelConfigBundle
+            from vaannotate.vaannotate_ai_backend.orchestration import build_active_learning_runner
             from vaannotate.vaannotate_ai_backend.services.contexts import _contexts_for_unit_label
             from vaannotate.vaannotate_ai_backend.services.family_labeler import FamilyLabeler
         except ImportError as exc:  # pragma: no cover - runtime guard
@@ -838,27 +839,27 @@ class RoundBuilder:
             os.environ[key] = value
 
         try:
-            orchestrator = ActiveLearningLLMFirst(
-                paths=paths,
-                cfg=cfg,
-                label_config=label_config_payload,
-                phenotype_level=phenotype_level,
-            )
-            orchestrator.store.build_chunk_index(
-                orchestrator.repo.notes,
-                orchestrator.cfg.rag,
-                orchestrator.cfg.index,
-            )
-            orchestrator.ensure_llm_backend()
-            _, _, current_rules_map, current_label_types = orchestrator._label_maps()
-            family_labeler = FamilyLabeler(
-                orchestrator.llm,
-                orchestrator.rag,
-                orchestrator.repo,
-                orchestrator.label_config,
-                orchestrator.cfg.scjitter,
-                orchestrator.cfg.llmfirst,
-            )
+        label_bundle = LabelConfigBundle(current=label_config_payload, current_labelset_id=labelset.get("labelset_id"))
+        pipeline = build_active_learning_runner(
+            paths=paths,
+            cfg=cfg,
+            label_config_bundle=label_bundle,
+            phenotype_level=phenotype_level,
+        )
+        pipeline.store.build_chunk_index(
+            pipeline.repo.notes,
+            pipeline.cfg.rag,
+            pipeline.cfg.index,
+        )
+        _, _, current_rules_map, current_label_types = pipeline._label_maps()
+        family_labeler = FamilyLabeler(
+            pipeline.llm,
+            pipeline.retriever,
+            pipeline.repo,
+            pipeline.label_config,
+            pipeline.cfg.scjitter,
+            pipeline.cfg.llmfirst,
+        )
             try:
                 family_labeler.ensure_label_exemplars(current_rules_map, K=max(1, top_n))
             except Exception:  # noqa: BLE001 - exemplar generation best effort
@@ -870,14 +871,14 @@ class RoundBuilder:
                 for label_id in sorted(current_label_types.keys()):
                     rules_text = current_rules_map.get(label_id, "")
                     contexts = _contexts_for_unit_label(
-                        orchestrator.rag,
-                        orchestrator.repo,
+                        pipeline.retriever,
+                        pipeline.repo,
                         unit_id,
                         label_id,
                         rules_text,
                         topk_override=top_n,
-                        single_doc_context_mode=getattr(orchestrator.cfg.llmfirst, "single_doc_context", "rag"),
-                        full_doc_char_limit=getattr(orchestrator.cfg.llmfirst, "single_doc_full_context_max_chars", None),
+                        single_doc_context_mode=getattr(pipeline.cfg.llmfirst, "single_doc_context", "rag"),
+                        full_doc_char_limit=getattr(pipeline.cfg.llmfirst, "single_doc_full_context_max_chars", None),
                     )
                     if not contexts:
                         continue
@@ -1288,14 +1289,12 @@ class RoundBuilder:
         except ImportError as exc:  # pragma: no cover - runtime guard
             raise RuntimeError("pandas is required for final LLM labeling") from exc
         try:
-            from vaannotate.vaannotate_ai_backend.engine import (
-                ActiveLearningLLMFirst,
-                FamilyLabeler,
-                OrchestratorConfig,
-                Paths,
-                _jsonify_cols,
-            )
             from vaannotate.vaannotate_ai_backend import orchestrator as orchestrator_module
+            from vaannotate.vaannotate_ai_backend.config import OrchestratorConfig, Paths
+            from vaannotate.vaannotate_ai_backend.label_configs import LabelConfigBundle
+            from vaannotate.vaannotate_ai_backend.orchestration import build_active_learning_runner
+            from vaannotate.vaannotate_ai_backend.services.family_labeler import FamilyLabeler
+            from vaannotate.vaannotate_ai_backend.utils.jsonish import _jsonify_cols
         except ImportError as exc:  # pragma: no cover - runtime guard
             raise RuntimeError("AI backend components are required for final LLM labeling") from exc
 
@@ -1396,10 +1395,11 @@ class RoundBuilder:
         if label_queries:
             label_config_payload = self._apply_label_queries(label_config_payload, label_queries)
         paths = Paths(str(notes_path), str(ann_path), str(work_dir / "engine_outputs"))
-        orchestrator = ActiveLearningLLMFirst(
+        label_bundle = LabelConfigBundle(current=label_config_payload, current_labelset_id=labelset.get("labelset_id"))
+        pipeline = build_active_learning_runner(
             paths=paths,
             cfg=cfg,
-            label_config=label_config_payload,
+            label_config_bundle=label_bundle,
             phenotype_level=phenotype_level,
         )
 
@@ -1408,20 +1408,20 @@ class RoundBuilder:
         # call has patient-level context with reranking. The random sampling
         # pathway skips the orchestrator run loop, so we need to explicitly build
         # the embeddings/index here as well.
-        orchestrator.store.build_chunk_index(
-            orchestrator.repo.notes,
-            orchestrator.cfg.rag,
-            orchestrator.cfg.index,
+        pipeline.store.build_chunk_index(
+            pipeline.repo.notes,
+            pipeline.cfg.rag,
+            pipeline.cfg.index,
         )
 
-        _, _, current_rules_map, current_label_types = orchestrator._label_maps()
+        _, _, current_rules_map, current_label_types = pipeline._label_maps()
         family_labeler = FamilyLabeler(
-            orchestrator.llm,
-            orchestrator.rag,
-            orchestrator.repo,
-            orchestrator.label_config,
-            orchestrator.cfg.scjitter,
-            orchestrator.cfg.llmfirst,
+            pipeline.llm,
+            pipeline.retriever,
+            pipeline.repo,
+            pipeline.label_config,
+            pipeline.cfg.scjitter,
+            pipeline.cfg.llmfirst,
         )
 
         fam_rows: list[dict[str, Any]] = []

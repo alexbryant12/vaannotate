@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vaannotate.vaannotate_ai_backend import config as ai_config, engine
+from vaannotate.vaannotate_ai_backend import config as ai_config
+from vaannotate.vaannotate_ai_backend.core import embeddings as embeddings_mod
+from vaannotate.vaannotate_ai_backend.core.data import DataRepository
 
 
 class _StubEmbedder:
@@ -69,7 +71,7 @@ _FAISS_STUB = types.SimpleNamespace(
 
 @pytest.fixture(autouse=True)
 def _patch_faiss(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(engine, "faiss", _FAISS_STUB)
+    monkeypatch.setattr(embeddings_mod, "faiss", _FAISS_STUB)
     yield
 
 
@@ -92,14 +94,14 @@ def _build_repo_notes(level: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             }
         ]
     )
-    repo = engine.DataRepository(notes, ann, phenotype_level=level)
+    repo = DataRepository(notes, ann, phenotype_level=level)
     return repo.notes.copy(), repo.ann.copy()
 
 
-def _make_store(cache_dir: Path, embedder_name: str) -> tuple[engine.EmbeddingStore, _StubEmbedder]:
+def _make_store(cache_dir: Path, embedder_name: str) -> tuple[embeddings_mod.EmbeddingStore, _StubEmbedder]:
     embedder = _StubEmbedder(embedder_name)
-    models = engine.Models(embedder=embedder, reranker=_StubCrossEncoder())
-    store = engine.EmbeddingStore(models, cache_dir=str(cache_dir))
+    models = embeddings_mod.Models(embedder=embedder, reranker=_StubCrossEncoder())
+    store = embeddings_mod.EmbeddingStore(models, cache_dir=str(cache_dir))
     return store, embedder
 
 

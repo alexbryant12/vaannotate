@@ -6,6 +6,13 @@ from .orchestrator import build_next_batch
 from .adapters import BackendResult, export_inputs_from_repo, run_ai_backend_and_collect
 from .utils.runtime import CancelledError
 
+# Layering overview:
+# - core.*: primitives such as DataRepository, EmbeddingStore, and RetrievalCoordinator
+# - config: configuration dataclasses for pipelines and orchestration
+# - services.*: retrieval, context building, LLM labelers, disagreement/diversity, and family/gating helpers
+# - pipelines.*: active learning and inference workflows composed from services
+# - orchestrator.py: external entrypoints used by the app and round builder
+
 __all__ = [
     "__version__",
     "BackendResult",
