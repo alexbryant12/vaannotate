@@ -838,34 +838,39 @@ class RoundBuilder:
             previous_env[key] = os.environ.get(key)
             os.environ[key] = value
 
+        unit_snippets: Dict[str, Dict[str, list[dict[str, Any]]]] = {}
+
         try:
-        label_bundle = LabelConfigBundle(current=label_config_payload, current_labelset_id=labelset.get("labelset_id"))
-        pipeline = build_active_learning_runner(
-            paths=paths,
-            cfg=cfg,
-            label_config_bundle=label_bundle,
-            phenotype_level=phenotype_level,
-        )
-        pipeline.store.build_chunk_index(
-            pipeline.repo.notes,
-            pipeline.cfg.rag,
-            pipeline.cfg.index,
-        )
-        _, _, current_rules_map, current_label_types = pipeline._label_maps()
-        family_labeler = FamilyLabeler(
-            pipeline.llm,
-            pipeline.retriever,
-            pipeline.repo,
-            pipeline.label_config,
-            pipeline.cfg.scjitter,
-            pipeline.cfg.llmfirst,
-        )
+            label_bundle = LabelConfigBundle(
+                current=label_config_payload, current_labelset_id=labelset.get("labelset_id")
+            )
+            pipeline = build_active_learning_runner(
+                paths=paths,
+                cfg=cfg,
+                label_config_bundle=label_bundle,
+                phenotype_level=phenotype_level,
+            )
+            pipeline.store.build_chunk_index(
+                pipeline.repo.notes,
+                pipeline.cfg.rag,
+                pipeline.cfg.index,
+            )
+            _, _, current_rules_map, current_label_types = pipeline._label_maps()
+            family_labeler = FamilyLabeler(
+                pipeline.llm,
+                pipeline.retriever,
+                pipeline.repo,
+                pipeline.label_config,
+                pipeline.cfg.scjitter,
+                pipeline.cfg.llmfirst,
+            )
             try:
                 family_labeler.ensure_label_exemplars(current_rules_map, K=max(1, top_n))
             except Exception:  # noqa: BLE001 - exemplar generation best effort
-                logging.getLogger(__name__).info("Assisted review falling back to label rules for exemplars")
+                logging.getLogger(__name__).info(
+                    "Assisted review falling back to label rules for exemplars"
+                )
 
-            unit_snippets: Dict[str, Dict[str, list[dict[str, Any]]]] = {}
             for unit_id in sorted(units_by_id.keys()):
                 unit_map: Dict[str, list[dict[str, Any]]] = {}
                 for label_id in sorted(current_label_types.keys()):
@@ -877,14 +882,20 @@ class RoundBuilder:
                         label_id,
                         rules_text,
                         topk_override=top_n,
-                        single_doc_context_mode=getattr(pipeline.cfg.llmfirst, "single_doc_context", "rag"),
-                        full_doc_char_limit=getattr(pipeline.cfg.llmfirst, "single_doc_full_context_max_chars", None),
+                        single_doc_context_mode=getattr(
+                            pipeline.cfg.llmfirst, "single_doc_context", "rag"
+                        ),
+                        full_doc_char_limit=getattr(
+                            pipeline.cfg.llmfirst, "single_doc_full_context_max_chars", None
+                        ),
                     )
                     if not contexts:
                         continue
                     entries: list[dict[str, Any]] = []
                     for ctx_entry in contexts[:top_n]:
-                        metadata_value = ctx_entry.get("metadata") if isinstance(ctx_entry, Mapping) else {}
+                        metadata_value = (
+                            ctx_entry.get("metadata") if isinstance(ctx_entry, Mapping) else {}
+                        )
                         metadata: Dict[str, Any]
                         if isinstance(metadata_value, Mapping):
                             metadata = {
