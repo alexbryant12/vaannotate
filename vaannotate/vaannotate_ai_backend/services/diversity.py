@@ -43,7 +43,6 @@ class DiversitySelector:
         relax_steps=(0.20, 0.10, 0.05),
         pool_factor: float = 4.0,
         use_proto: bool = False,
-        *,
         family_labeler=None,
         ensure_exemplars: bool = True,
         exclude_units: set[str] | None = None,

@@ -47,12 +47,8 @@ from vaannotate.project import (
 )
 from vaannotate.utils import copy_sqlite_database, ensure_dir
 from vaannotate.rounds import AssignmentUnit as RoundAssignmentUnit, RoundBuilder
-from vaannotate.vaannotate_ai_backend import (
-    CancelledError,
-    BackendResult,
-    engine,
-    run_ai_backend_and_collect,
-)
+from vaannotate.vaannotate_ai_backend import CancelledError, BackendResult, run_ai_backend_and_collect
+from vaannotate.vaannotate_ai_backend import config as ai_config
 
 PROJECT_MODELS = [
     models.Project,
@@ -651,7 +647,7 @@ class LabelFewShotExamplesEditor(QtWidgets.QWidget):
 
 
 class AIAdvancedConfigDialog(QtWidgets.QDialog):
-    """Dialog that surfaces all engine.py configuration options."""
+    """Dialog that surfaces all AI backend configuration options."""
 
     def __init__(
         self,
@@ -3072,7 +3068,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _build_ai_config_snapshot(self) -> Dict[str, Any]:
         try:
-            base_cfg: Dict[str, Any] = asdict(engine.OrchestratorConfig())
+            base_cfg: Dict[str, Any] = asdict(ai_config.OrchestratorConfig())
         except Exception:  # noqa: BLE001
             base_cfg = {}
         _deep_update_dict(base_cfg, self._ai_engine_overrides or {})
@@ -3123,7 +3119,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if "final_llm_labeling_n_consistency" not in base_cfg:
             try:
                 base_cfg["final_llm_labeling_n_consistency"] = int(
-                    engine.OrchestratorConfig().final_llm_labeling_n_consistency
+                    ai_config.OrchestratorConfig().final_llm_labeling_n_consistency
                 )
             except Exception:  # noqa: BLE001
                 base_cfg["final_llm_labeling_n_consistency"] = 1
@@ -4986,7 +4982,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if "final_llm_labeling_n_consistency" not in overrides:
             try:
                 overrides["final_llm_labeling_n_consistency"] = int(
-                    engine.OrchestratorConfig().final_llm_labeling_n_consistency
+                    ai_config.OrchestratorConfig().final_llm_labeling_n_consistency
                 )
             except Exception:  # noqa: BLE001
                 overrides["final_llm_labeling_n_consistency"] = 1

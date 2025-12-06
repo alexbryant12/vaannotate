@@ -9,11 +9,10 @@ import logging
 import sys
 import pandas as pd
 
-from . import engine
 from .config import OrchestratorConfig, Paths
-from .utils.runtime import CancelledError, cancellation_scope
+from .orchestration import build_active_learning_runner, build_inference_runner
+from .utils.runtime import cancellation_scope
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
-from .pipelines import InferencePipeline
 
 
 def _default_paths(outdir: Path, cache_dir: Path | None = None) -> Paths:
@@ -274,13 +273,13 @@ def build_next_batch(
 
     with _capture_logs(log_callback):
         with cancellation_scope(cancel_callback):
-            orch = engine.ActiveLearningLLMFirst(
+            pipeline = build_active_learning_runner(
                 paths=paths,
                 cfg=cfg,
                 label_config_bundle=bundle,
                 phenotype_level=phenotype_level,
             )
-            final_df = orch.run()  # engine returns DataFrame
+            final_df = pipeline.run()
 
     normalized = final_df.copy()
     rename_map = {}
@@ -374,21 +373,11 @@ def run_inference(
 
     with _capture_logs(log_callback):
         with cancellation_scope(cancel_callback):
-            runner = engine.ActiveLearningLLMFirst(
+            pipeline = build_inference_runner(
                 paths=paths,
                 cfg=cfg,
                 label_config_bundle=bundle,
                 phenotype_level=phenotype_level,
-            )
-            runner.ensure_llm_backend()
-
-            pipeline = InferencePipeline(
-                data_repo=runner.repo,
-                emb_store=runner.store,
-                ctx_builder=runner.context_builder,
-                llm_labeler=runner.llm,
-                config=runner.cfg,
-                paths=runner.paths,
             )
             result_df = pipeline.run(unit_ids=unit_ids)
 

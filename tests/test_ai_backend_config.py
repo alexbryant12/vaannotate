@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import types
-import importlib.util
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -44,42 +43,12 @@ def _install_stub_modules() -> None:
 
 
 _install_stub_modules()
-
-
-def _load_engine_module():
-    module_path = ROOT / "vaannotate" / "vaannotate_ai_backend" / "engine.py"
-    spec = importlib.util.spec_from_file_location(
-        "vaannotate.vaannotate_ai_backend.engine", module_path
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load engine module for testing")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-ENGINE_MODULE = _load_engine_module()
-
-
-def _load_config_module():
-    module_path = ROOT / "vaannotate" / "vaannotate_ai_backend" / "config.py"
-    spec = importlib.util.spec_from_file_location(
-        "vaannotate.vaannotate_ai_backend.config", module_path
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load config module for testing")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-CONFIG_MODULE = _load_config_module()
+from vaannotate.vaannotate_ai_backend.config import LLMConfig
+from vaannotate.vaannotate_ai_backend.core.embeddings import _ensure_default_ce_max_length
 
 
 def test_llm_config_respects_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """LLMConfig should read environment variables at instantiation time."""
-
-    LLMConfig = CONFIG_MODULE.LLMConfig
 
     local_dir = tmp_path / "LocalModel"
     local_dir.mkdir()
@@ -105,7 +74,7 @@ def test_llm_config_respects_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_pa
 def test_cross_encoder_default_max_length_applied() -> None:
     reranker = type("_StubRerankerNoMax", (), {})()
 
-    ENGINE_MODULE._ensure_default_ce_max_length(reranker, default=777)
+    _ensure_default_ce_max_length(reranker, default=777)
 
     assert hasattr(reranker, "max_length")
     assert reranker.max_length == 777
@@ -114,6 +83,6 @@ def test_cross_encoder_default_max_length_applied() -> None:
 def test_cross_encoder_existing_max_length_preserved() -> None:
     reranker = type("_StubRerankerWithMax", (), {"max_length": 1024})()
 
-    ENGINE_MODULE._ensure_default_ce_max_length(reranker, default=777)
+    _ensure_default_ce_max_length(reranker, default=777)
 
     assert reranker.max_length == 1024

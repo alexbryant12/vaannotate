@@ -12,6 +12,7 @@ from ..config import LLMFirstConfig, SCJitterConfig
 from ..core.data import DataRepository
 from ..services import ContextBuilder, LLMLabeler, LLM_RECORDER
 from ..services.label_dependencies import build_label_dependencies, evaluate_gating
+from ..services.pooling import LabelAwarePooler, kcenter_select
 from ..services.rag_retriever import RAGRetriever
 from ..utils.runtime import iter_with_bar
 

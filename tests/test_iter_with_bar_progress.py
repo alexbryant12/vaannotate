@@ -37,7 +37,7 @@ _install_placeholder_module("langchain_text_splitters", classes=["RecursiveChara
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vaannotate.vaannotate_ai_backend import engine
+from vaannotate.vaannotate_ai_backend.utils import runtime
 
 
 class SimpleLogCollector:
@@ -132,10 +132,10 @@ def split_stream_chunks(data: str) -> List[str]:
 
 def test_iter_with_bar_tty_emits_without_escape_sequences(monkeypatch):
     fake = FakeTTY()
-    monkeypatch.setattr(engine._sys, "stderr", fake)
+    monkeypatch.setattr(runtime._sys, "stderr", fake)
 
     list(
-        engine.iter_with_bar(
+        runtime.iter_with_bar(
             "Testing",
             range(3),
             total=3,
@@ -155,13 +155,13 @@ def test_iter_with_bar_tty_emits_without_escape_sequences(monkeypatch):
 def test_iter_with_bar_progress_keeps_logs(monkeypatch):
     collector = SimpleLogCollector()
     fake_tty = FakeTTY(collector)
-    monkeypatch.setattr(engine._sys, "stderr", fake_tty)
+    monkeypatch.setattr(runtime._sys, "stderr", fake_tty)
 
     collector.append("Log before 1")
     collector.append("Log before 2")
 
     list(
-        engine.iter_with_bar(
+        runtime.iter_with_bar(
             "Embedding",
             range(3),
             total=3,
@@ -181,10 +181,10 @@ def test_iter_with_bar_progress_keeps_logs(monkeypatch):
 
 def test_iter_with_bar_non_tty_prints_lines(monkeypatch):
     fake = FakeNonTTY()
-    monkeypatch.setattr(engine._sys, "stderr", fake)
+    monkeypatch.setattr(runtime._sys, "stderr", fake)
 
     list(
-        engine.iter_with_bar(
+        runtime.iter_with_bar(
             "Batch",
             range(4),
             total=4,
