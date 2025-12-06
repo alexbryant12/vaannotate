@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - avoid runtime circular import
-    from .engine import LLMConfig
+    from .config import LLMConfig
 
 try:  # pragma: no cover - optional dependency
     from openai import AzureOpenAI  # type: ignore

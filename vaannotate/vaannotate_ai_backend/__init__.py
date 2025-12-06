@@ -4,7 +4,7 @@ __version__ = "0.1.0"
 
 from .orchestrator import build_next_batch
 from .adapters import BackendResult, export_inputs_from_repo, run_ai_backend_and_collect
-from .engine import CancelledError
+from .utils.runtime import CancelledError
 
 __all__ = [
     "__version__",
