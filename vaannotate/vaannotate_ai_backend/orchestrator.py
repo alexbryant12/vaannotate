@@ -11,6 +11,7 @@ import pandas as pd
 
 from . import engine
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
+from .pipelines import InferencePipeline
 
 
 def _default_paths(outdir: Path, cache_dir: Path | None = None) -> engine.Paths:
@@ -327,3 +328,71 @@ def build_next_batch(
         else None,
     }
     return normalized, artifacts
+
+
+def run_inference(
+    notes_df: pd.DataFrame,
+    ann_df: pd.DataFrame,
+    outdir: Path,
+    label_config_bundle: LabelConfigBundle | None = None,
+    *,
+    label_config: Optional[dict] = None,
+    cfg_overrides: Optional[Dict[str, Any]] = None,
+    unit_ids: Optional[list[str]] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+    cache_dir: Path | None = None,
+) -> Tuple[pd.DataFrame, dict]:
+    """Run inference-only labeling across the corpus or a provided subset."""
+
+    outdir = Path(outdir)
+    _ensure_dir(outdir)
+    cache_dir_path = Path(cache_dir) if cache_dir else None
+    paths = _default_paths(outdir, cache_dir=cache_dir_path)
+
+    notes_path = Path(paths.notes_path)
+    ann_path = Path(paths.annotations_path)
+    notes_df.to_parquet(notes_path, index=False)
+    ann_df.to_parquet(ann_path, index=False)
+
+    cfg = engine.OrchestratorConfig()
+    overrides = dict(cfg_overrides or {})
+    phenotype_level = overrides.pop("phenotype_level", None)
+    rag_overrides = overrides.get("rag") if isinstance(overrides.get("rag"), Mapping) else {}
+    label_queries_override = None
+    if isinstance(rag_overrides, Mapping):
+        candidate = rag_overrides.get("label_queries")
+        if isinstance(candidate, Mapping):
+            label_queries_override = candidate
+    if overrides:
+        _apply_overrides(cfg, overrides)
+
+    bundle = (label_config_bundle or EMPTY_BUNDLE).with_current_fallback(label_config)
+    bundle = _apply_label_queries(bundle, label_queries_override)
+
+    with _capture_logs(log_callback):
+        with engine.cancellation_scope(cancel_callback):
+            runner = engine.ActiveLearningLLMFirst(
+                paths=paths,
+                cfg=cfg,
+                label_config_bundle=bundle,
+                phenotype_level=phenotype_level,
+            )
+            runner.ensure_llm_backend()
+
+            pipeline = InferencePipeline(
+                data_repo=runner.repo,
+                emb_store=runner.store,
+                ctx_builder=runner.context_builder,
+                llm_labeler=runner.llm,
+                config=runner.cfg,
+                paths=runner.paths,
+            )
+            result_df = pipeline.run(unit_ids=unit_ids)
+
+    artifacts = {
+        "predictions": str(outdir / "inference_predictions.parquet"),
+        "predictions_json": str(outdir / "inference_predictions.json"),
+    }
+
+    return result_df, artifacts

@@ -44,8 +44,16 @@ from .core.embeddings import (
     Models,
     build_models_from_env,
 )
-from .services import ContextBuilder, LLMLabeler, LLM_RECORDER
-from .services.disagreement import DisagreementScorer
+from .services import (
+    ActiveLearningSelector,
+    ContextBuilder,
+    DiversitySelector,
+    DisagreementScorer,
+    LLMLabeler,
+    LLMUncertaintyScorer,
+    LLM_RECORDER,
+)
+from .pipelines.active_learning import ActiveLearningPipeline
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
 from .llm_backends import build_llm_backend
 from .core.retrieval import RetrievalCoordinator, SemanticQuery
@@ -2366,18 +2374,6 @@ class FamilyLabeler:
             rows.extend(self.label_family_for_unit(uid, label_types, per_label_rules))
 
         df = pd.DataFrame(rows)
-        # Compute U column if using FC or JSON: ensure presence
-        if "U" not in df.columns:
-            df["U"] = np.nan
-        # Harmonize U like LLMProber.probe_unseen does: FC entropy preferred, else 1-consistency
-        if "fc_entropy" in df.columns:
-            # keep U as already set; ensure fallback for rows lacking fc
-            idx = df["U"].isna()
-            if "consistency" in df.columns:
-                df.loc[idx, "U"] = 1.0 - pd.to_numeric(df.loc[idx, "consistency"], errors="coerce").fillna(0.0)
-        elif "consistency" in df.columns:
-            df["U"] = 1.0 - pd.to_numeric(df["consistency"], errors="coerce").fillna(0.0)
-        # Return aligned columns
         return df
 
 # ------------------------------
@@ -2463,289 +2459,6 @@ def merge_with_global_kcenter(per_label_selected: pd.DataFrame, pool_df: pd.Data
     if not chosen_rows: return selected
     chosen_df = pd.DataFrame([r._asdict() if hasattr(r,"_asdict") else dict(r) for r in chosen_rows])
     return pd.concat([selected, chosen_df], ignore_index=True)
-
-
-def _mmr_select_simple(vecs, rel_scores, k, lam=0.7, preselected=None):
-    """Greedy MMR: argmax lam*rel – (1–lam)*max_sim_to_selected (no label caps)."""
-    if k <= 0 or vecs is None or len(vecs) == 0:
-        return []
-    V = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
-    rel = np.asarray(rel_scores, dtype="float32")
-    N = V.shape[0]
-    selected = []
-    if preselected is not None and getattr(preselected, "size", 0):
-        P = preselected / (np.linalg.norm(preselected, axis=1, keepdims=True) + 1e-12)
-        sim_pre = (V @ P.T).max(axis=1)
-    else:
-        sim_pre = np.zeros(N, dtype="float32")
-    used = np.zeros(N, dtype=bool)
-    for _ in range(min(k, N)):
-        if selected:
-            S = V[selected, :]
-            sim_sel = (V @ S.T).max(axis=1)
-            sim = np.maximum(sim_pre, sim_sel)
-        else:
-            sim = sim_pre
-        score = lam * rel - (1.0 - lam) * sim
-        score[used] = -1e9
-        i = int(np.argmax(score))
-        if score[i] <= -1e8:
-            break
-        selected.append(i)
-        used[i] = True
-    return selected
-
-def build_diversity_bucket(
-    unseen_pairs,
-    already_selected,
-    n_div,
-    pooler,
-    retriever,
-    rules_map,
-    label_types,
-    label_config=None,
-    rag_k=4,
-    min_rel_quantile=0.30,
-    mmr_lambda=0.7,
-    sample_cap=2000,
-    adaptive_relax=True,
-    relax_steps=(0.20, 0.10, 0.05),
-    pool_factor=4.0,
-    use_proto=False,                      # if True, pooler prototype beats exemplars
-    *,
-    family_labeler=None,                  # NEW: for ensure_label_exemplars
-    ensure_exemplars: bool = True,        # NEW: call ensure_label_exemplars first
-    exclude_units: set[str] | None = None # (keep if you already added this earlier)
-):
-    """
-    Diversity bucket without CE gating:
-      label-aware MMR using rel-to-anchor where anchor is:
-        (1) pooler prototype (if use_proto=True),
-        (2) else exemplar centroid (preferred fallback),
-        (3) else rule-text query embedding.
-      Then pooled candidates -> unit-level k-center.
-    """
-    import numpy as np
-    import pandas as pd
-
-    # --- ensure exemplars once (cheap if already cached) ---
-    if ensure_exemplars and family_labeler is not None:
-        try:
-            K_use = int(getattr(getattr(family_labeler, "cfg", None), "exemplar_K", 6) or 6)
-            family_labeler.ensure_label_exemplars(rules_map, K=K_use)
-        except Exception:
-            pass
-
-    def _l2(v):
-        v = np.asarray(v, dtype="float32")
-        n = np.linalg.norm(v) + 1e-12
-        return v / n
-
-    def _cos(a, b): return float(np.dot(_l2(a), _l2(b)))
-
-    def _kcenter_greedy(U: np.ndarray, k: int, seed_indices=None) -> list[int]:
-        if U.size == 0 or k <= 0: return []
-        Un = U / (np.linalg.norm(U, axis=1, keepdims=True) + 1e-12)
-        n = Un.shape[0]
-        sel, dmin = [], np.ones(n) * np.inf
-        if seed_indices:
-            seeds = [s for s in seed_indices if 0 <= s < n]
-            if seeds:
-                sel.extend(seeds)
-                sims = Un @ Un[seeds].T
-                dmin = 1 - sims.max(axis=1); dmin[seeds] = 0.0
-        if not sel:
-            s0 = int(np.random.randint(0, n))
-            sel.append(s0); dmin = 1 - (Un @ Un[s0])
-        while len(sel) < min(k, n):
-            i = int(np.argmax(dmin))
-            sel.append(i)
-            dmin = np.minimum(dmin, 1 - (Un @ Un[i]))
-        return sel
-
-    def _equal_quota(group_sizes: dict[str, int], total: int) -> dict[str, int]:
-        labs = list(group_sizes.keys())
-        if not labs or total <= 0: return {lab: 0 for lab in labs}
-        base, rem = total // len(labs), total % len(labs)
-        q = {lab: min(group_sizes[lab], base) for lab in labs}
-        order = sorted(labs, key=lambda x: group_sizes[x] - q[x], reverse=True)
-        for lab in order:
-            if rem <= 0: break
-            if q[lab] < group_sizes[lab]: q[lab] += 1; rem -= 1
-        while rem > 0:
-            progressed = False
-            for lab in order:
-                if q[lab] < group_sizes[lab]:
-                    q[lab] += 1; rem -= 1; progressed = True
-                    if rem == 0: break
-            if not progressed: break
-        return q
-
-    # --- early exits & candidate sampling ---
-    if n_div <= 0:
-        return pd.DataFrame(columns=["unit_id","label_id","label_type","selection_reason"])
-
-    rem_all = [(u,l) for (u,l) in unseen_pairs if (u,l) not in set(already_selected)]
-    if exclude_units:
-        rem_all = [(u,l) for (u,l) in rem_all if u not in exclude_units]
-    np.random.shuffle(rem_all)
-    rem_all = rem_all[: max(n_div*8, min(sample_cap, len(rem_all)))]
-    if not rem_all:
-        return pd.DataFrame(columns=["unit_id","label_id","label_type","selection_reason"])
-
-    rem_df = pd.DataFrame([{"unit_id": u, "label_id": str(l), "label_type": label_types.get(l,"text")}
-                           for (u,l) in rem_all])
-
-    # --- anchor cache (label -> vector) ---
-    proto_cache: dict[str, np.ndarray] = {}
-
-    def _label_anchor(lid: str) -> np.ndarray:
-        """
-        (1) pooler prototype (if use_proto),
-        (2) exemplar centroid if cached,
-        (3) rule-text query embedding fallback.
-        """
-        if lid in proto_cache:
-            return proto_cache[lid]
-
-        proto = None
-
-        # 1) pooler prototype (explicit opt-in)
-        if hasattr(pooler, "label_prototype") and use_proto:
-            try:
-                proto = pooler.label_prototype(lid, retriever, rules_map.get(lid, ""))
-            except Exception:
-                proto = None
-
-        # 2) exemplar centroid (preferred fallback)
-        if proto is None:
-            Q = None
-            try:
-                base_k = getattr(getattr(retriever, "cfg", None), "exemplar_K", None)
-                K_use = int(base_k if base_k is not None else 6)
-                if K_use <= 0:
-                    K_use = 6
-                opts = _options_for_label(
-                    lid,
-                    label_types.get(str(lid), "categorical"),
-                    getattr(retriever, "label_configs", {}),
-                ) or []
-                if opts:
-                    K_use = max(K_use, len(opts))
-                getQ = getattr(retriever, "_get_label_query_embs", None)
-                if callable(getQ):
-                    Q = getQ(lid, rules_map.get(lid, ""), K_use)
-            except Exception:
-                Q = None
-            if Q is not None and getattr(Q, "ndim", 1) == 2 and Q.shape[0] > 0:
-                proto = Q.mean(axis=0)
-
-        # 3) rule-text embedding fallback
-        if proto is None:
-            q = retriever._build_query(lid, rules_map.get(lid, ""))
-            proto = retriever.store._embed([q])[0]
-
-        proto_cache[lid] = np.asarray(proto, dtype="float32")
-        return proto_cache[lid]
-
-    # --- build label-aware vectors & rel-to-anchor ---
-    vecs, rels = [], []
-    _progress_every = float(family_labeler.cfg.progress_min_interval_s or 1)
-    for r in iter_with_bar(
-            step="Diversity: pooling vectors",
-            iterable=rem_df.itertuples(index=False),
-            total=len(rem_df),
-            min_interval_s=_progress_every):
-        v = pooler.pooled_vector(r.unit_id, r.label_id, retriever, rules_map.get(r.label_id, ""))
-        vecs.append(v)
-        rels.append(_cos(v, _label_anchor(r.label_id)))
-    rem_df["vec"] = vecs
-    rem_df["rel"] = np.array(rels, dtype="float32")
-
-    # --- per-label quantile keep (with relax) ---
-    def _keep_by_q(df, q):
-        kept = []
-        for lid, g in df.groupby("label_id", sort=False):
-            if g.empty: continue
-            thr = float(np.quantile(g["rel"].to_numpy(), q)) if len(g) > 1 else g["rel"].min()
-            kept.append(g[g["rel"] >= thr])
-        return pd.concat(kept, ignore_index=True) if kept else df.head(0)
-
-    if min_rel_quantile is not None:
-        gated = _keep_by_q(rem_df, float(min_rel_quantile))
-        if adaptive_relax and len(gated) < n_div:
-            for q in relax_steps:
-                gated = _keep_by_q(rem_df, float(q))
-                if len(gated) >= n_div:
-                    break
-    else:
-        gated = rem_df
-    if gated.empty:
-        return gated
-
-    # --- per-label MMR → pooled candidates ---
-    pool_total = int(min(len(gated), max(n_div, int(n_div * pool_factor))))
-    sizes = {lid: len(g) for lid, g in gated.groupby("label_id", sort=False)}
-    quotas = _equal_quota(sizes, pool_total)
-
-    pools, sel_pairs = [], set()
-    preV_by_label: dict[str, np.ndarray] = {}  # keep empty unless you add warm-start vectors
-
-    for lid, g in gated.groupby("label_id", sort=False):
-        k_lab = quotas.get(lid, 0)
-        if k_lab <= 0 or g.empty: continue
-        V   = np.stack(g["vec"].to_list()).astype("float32")
-        rel = g["rel"].to_numpy().astype("float32")
-        preV = preV_by_label.get(lid)
-        order = _mmr_select_simple(V, rel, k=k_lab, lam=mmr_lambda, preselected=preV)
-        choice = g.iloc[order].head(k_lab) if order else g.sort_values("rel", ascending=False).head(k_lab)
-        for r in choice.itertuples(index=False):
-            key = (r.unit_id, r.label_id)
-            if key in sel_pairs: continue
-            sel_pairs.add(key); pools.append(r)
-
-    if not pools:
-        add_df = gated.sort_values("rel", ascending=False).head(n_div).copy()
-        add_df["selection_reason"] = "diversity_toprel_fallback"
-        return add_df[["unit_id","label_id","label_type","selection_reason"]]
-
-    pool_df = pd.DataFrame(pools)
-    if len(pool_df) > pool_total:
-        pool_df = pool_df.sample(pool_total).reset_index(drop=True)
-
-    # --- unit-level k-center over averaged vectors ---
-    by_unit = {}
-    for r in pool_df.itertuples(index=False):
-        by_unit.setdefault(r.unit_id, {"labels": [], "vecs": [], "best_label": None, "best_rel": -1.0})
-        by_unit[r.unit_id]["labels"].append(r.label_id)
-        by_unit[r.unit_id]["vecs"].append(np.asarray(r.vec, dtype="float32"))
-        if float(r.rel) > by_unit[r.unit_id]["best_rel"]:
-            by_unit[r.unit_id]["best_rel"] = float(r.rel)
-            by_unit[r.unit_id]["best_label"] = r.label_id
-
-    units = list(by_unit.keys())
-    if not units:
-        return pd.DataFrame(columns=["unit_id","label_id","label_type","selection_reason"])
-
-    U = np.stack([np.mean(np.stack(v["vecs"], axis=0), axis=0) for v in by_unit.values()], axis=0)
-    idx_map = {u: i for i, u in enumerate(units)}
-    seed_units = {u for (u, _l) in already_selected}
-    seeds = [idx_map[u] for u in seed_units if u in idx_map]
-
-    picks = _kcenter_greedy(U, k=n_div, seed_indices=seeds)
-
-    rows = []
-    for i in picks:
-        u = units[i]
-        lab = by_unit[u]["best_label"]
-        rows.append({
-            "unit_id": u,
-            "label_id": lab,
-            "label_type": label_types.get(lab, "text"),
-            "selection_reason": "diversity_mmr_kcenter"
-        })
-    return pd.DataFrame(rows)
-
 
 
 def direct_uncertainty_selection(
@@ -3079,123 +2792,6 @@ class ActiveLearningLLMFirst:
 
         return legacy_rules_map, legacy_label_types, current_rules_map, current_label_types
 
-    def build_unseen_pairs(self, label_ids: Optional[set[str]] = None) -> List[Tuple[str,str]]:
-        seen = set(zip(self.repo.ann["unit_id"], self.repo.ann["label_id"]))
-        all_units = sorted(self.repo.notes["unit_id"].unique().tolist())
-
-        if label_ids is None:
-            legacy_labels = {str(l) for l in self.repo.ann["label_id"].unique().tolist()}
-            config_labels: set[str] = set()
-            for key, entry in (self.label_config or {}).items():
-                if str(key) == "_meta":
-                    continue
-                if isinstance(entry, dict):
-                    lid = str(entry.get("label_id") or key).strip()
-                else:
-                    lid = str(key).strip()
-                if lid:
-                    config_labels.add(lid)
-            use_labels = legacy_labels | config_labels
-        else:
-            use_labels = {str(l) for l in label_ids if str(l)}
-
-        all_labels = sorted(use_labels)
-        pairs = [(u,l) for u in all_units for l in all_labels if (u,l) not in seen]
-        return pairs
-
-     # ---- Buckets ----
-    def build_disagreement_bucket(self, seen_pairs: set, rules_map: Dict[str,str], label_types: Dict[str,str]) -> pd.DataFrame:
-        """
-        Disagreement bucket where apportionment targets come from LAST-ROUND VALID DISAGREEMENTS:
-          • parents: all parent labels with last-round disagreement >= threshold
-          • children: last-round disagreement >= threshold AND parent's aggregated label passes gating by consensus
-        Then parent-first per label, fill with children for that label, and top-up (children-first).
-        """
-        expander = DisagreementExpander(
-            self.cfg.disagree,
-            self.repo,
-            self.rag,
-            label_config_bundle=self.label_config_bundle,
-            llmfirst_cfg=self.cfg.llmfirst,
-            context_builder=self.context_builder,
-        )
-        scorer = DisagreementScorer(
-            self.repo,
-            self.cfg.disagree,
-            self.cfg.select,
-            self.pooler,
-            self.rag,
-            expander,
-            context_builder=self.context_builder,
-            kcenter_select_fn=kcenter_select,
-        )
-        return scorer.compute_disagreement(seen_pairs, rules_map, label_types)
-
-    def build_llm_uncertain_bucket(self, label_types: Dict[str,str], rules_map: Dict[str,str], exclude_units: Optional[set[str]]=None) -> pd.DataFrame:
-        fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
-        probe_df = fam.probe_units_label_tree(self.cfg.llmfirst.enrich, label_types, rules_map, exclude_units = exclude_units)
-        # Save the raw probe for inspection / later reuse
-        safe_cols = [c for c in ["fc_probs","rag_context","why","runs"] if c in probe_df.columns]
-        _jsonify_cols(probe_df, safe_cols).to_parquet(os.path.join(self.paths.outdir, "llm_probe.parquet"), index=False)
-        # select most uncertain
-        n_unc = int(self.cfg.select.batch_size * self.cfg.select.pct_uncertain)
-        unc_df = direct_uncertainty_selection(probe_df, n_unc, select_most_certain=False)
-        return unc_df
-
-    def build_llm_certain_bucket(self, label_types: Dict[str,str], rules_map: Dict[str,str], exclude_units: Optional[set[str]] = None) -> pd.DataFrame:
-        p = os.path.join(self.paths.outdir, "llm_probe.parquet")
-        if os.path.exists(p):
-            probe_df = pd.read_parquet(p)
-        else:
-            fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
-            probe_df = fam.probe_units_label_tree(self.cfg.llmfirst.enrich, label_types, rules_map, exclude_units = exclude_units)
-        n_cer = int(self.cfg.select.batch_size * self.cfg.select.pct_easy_qc)
-        cer_df = direct_uncertainty_selection(probe_df, n_cer,select_most_certain=True)
-        return cer_df
-    
-    def top_off_random(
-        self,
-        current_sel: pd.DataFrame,
-        unseen_pairs: list[tuple[str, str]],
-        label_types: dict[str, str],
-        target_n: int,
-    ) -> pd.DataFrame:
-        """
-        Add-only random top-off from unseen_pairs to reach target_n.
-        Returns an updated DataFrame with new rows labeled 'random_topoff'.
-        """
-        import random
-        import pandas as pd
-    
-        sel = current_sel.copy()
-        need = int(target_n) - len(sel)
-        if need <= 0:
-            return sel
-    
-        # Exclude already-selected (unit,label) pairs
-        taken = set(zip(sel["unit_id"].astype(str), sel["label_id"].astype(str)))
-        cand = [(str(u), str(l)) for (u, l) in unseen_pairs if (str(u), str(l)) not in taken]
-        if not cand:
-            return sel
-    
-        rng = random.Random()
-        rng.shuffle(cand)
-    
-        take = cand[:need]
-        if not take:
-            return sel
-    
-        add = pd.DataFrame(
-            [{
-                "unit_id": u,
-                "label_id": l,
-                "label_type": label_types.get(l, "text"),
-                "selection_reason": "random_topoff",
-            } for (u, l) in take]
-        )
-
-        return pd.concat([sel, add], ignore_index=True)
-
 
     def _apply_excluded_units(self) -> int:
         removed = self.repo.exclude_units(self.excluded_unit_ids)
@@ -3205,327 +2801,56 @@ class ActiveLearningLLMFirst:
 
 
     def run(self):
-        import time, os, pandas as pd
-
-        t0 = time.time()
-        
-        run_id = time.strftime("%Y%m%d-%H%M%S")
-        LLM_RECORDER.start(
-            outdir=self.paths.outdir,
-            run_id=run_id,
-            meta={
-                "model": getattr(self.cfg.llm, "model_name", None),
-                "project": os.path.basename(self.paths.outdir.rstrip(os.sep)),
-            },
-        )
-
-        print("Indexing chunks ...")
-        check_cancelled()
-        self.store.build_chunk_index(self.repo.notes, self.cfg.rag, self.cfg.index)
-        removed = self._apply_excluded_units()
-        if removed:
-            print(f"Excluded {removed} previously reviewed units from candidate pool")
-        if self.repo.notes.empty:
-            raise RuntimeError("No candidate units remain after excluding previously reviewed units.")
-        print("Building label prototypes ...")
-        check_cancelled()
-        self.pooler.build_prototypes()
-        # Load the LLM backend only after embeddings/cross-encoders have been loaded and
-        # used, so GPU memory can be allocated to them before the ExLlamaV2 model.
+        # Ensure the LLM backend is available after embeddings are loaded.
         self.ensure_llm_backend()
 
-        (
-            legacy_rules_map,
-            legacy_label_types,
-            current_rules_map,
-            current_label_types,
-        ) = self._label_maps()
+        diversity_selector = DiversitySelector(self.repo, self.store, self.cfg.diversity)
+        expander = DisagreementExpander(
+            self.cfg.disagree,
+            self.repo,
+            self.rag,
+            label_config_bundle=self.label_config_bundle,
+            llmfirst_cfg=self.cfg.llmfirst,
+            context_builder=self.context_builder,
+        )
+        disagreement_scorer = DisagreementScorer(
+            self.repo,
+            self.cfg.disagree,
+            self.cfg.select,
+            self.pooler,
+            self.rag,
+            expander,
+            context_builder=self.context_builder,
+            kcenter_select_fn=kcenter_select,
+        )
+        uncertainty_scorer = LLMUncertaintyScorer(self.cfg.llmfirst)
+        selector = ActiveLearningSelector(self.cfg.select)
 
-        legacy_label_ids = {str(l) for l in self.repo.ann["label_id"].unique().tolist()}
-        if not legacy_label_ids:
-            legacy_label_ids = set(legacy_rules_map.keys())
-        current_label_ids = set(current_rules_map.keys())
-        if not current_label_ids:
-            current_label_ids = set(legacy_label_ids)
-
-        # Build concise rule overrides for reranker-only queries to preserve context
-        # budget without altering retrieval embeddings.
-        overrides = self._build_rerank_rule_overrides(current_rules_map)
-        self.rag.rerank_rule_overrides = overrides or {}
-    
-        # ---------- small helpers ----------
-        def _empty_unit_frame() -> "pd.DataFrame":
-            return pd.DataFrame(
-                {
-                    "unit_id": pd.Series(dtype="string"),
-                    "label_id": pd.Series(dtype="string"),
-                    "label_type": pd.Series(dtype="string"),
-                    "selection_reason": pd.Series(dtype="string"),
-                }
-            )
-
-        def _ensure_unit_schema(df: "pd.DataFrame" | None) -> "pd.DataFrame":
-            base = _empty_unit_frame()
-            if df is None:
-                return base
-            result = df.copy()
-            for col in base.columns:
-                if col not in result.columns:
-                    result[col] = pd.Series(dtype=base[col].dtype)
-            return result[base.columns.tolist()]
-
-        def _to_unit_only(df: "pd.DataFrame") -> "pd.DataFrame":
-            if df is None:
-                return _empty_unit_frame()
-            cols = [c for c in ["unit_id","label_id","label_type","selection_reason"] if c in df.columns]
-            if not cols:
-                return _empty_unit_frame()
-            subset = df[cols].drop_duplicates(subset=["unit_id"], keep="first")
-            return _ensure_unit_schema(subset)
-    
-        def _filter_units(df: "pd.DataFrame", excluded: set[str]) -> "pd.DataFrame":
-            if df is None or df.empty or not excluded:
-                return df if df is not None else pd.DataFrame(columns=["unit_id"])
-            return df[~df["unit_id"].isin(excluded)].copy()
-    
-        def _head_units(df: "pd.DataFrame", k: int) -> "pd.DataFrame":
-            ensured = _ensure_unit_schema(df)
-            if ensured.empty or k <= 0:
-                return ensured.iloc[0:0].copy()
-            return ensured.head(k).copy()
-
-    
-        # ---------- seen/unseen and quotas ----------
-        seen_units = set(self.repo.ann["unit_id"].unique().tolist())
-        seen_pairs = set(zip(self.repo.ann["unit_id"], self.repo.ann["label_id"]))
-        unseen_pairs_current = self.build_unseen_pairs(label_ids=current_label_ids)
-    
-        total = int(self.cfg.select.batch_size)
-        n_dis = int(total * self.cfg.select.pct_disagreement)
-        n_div = int(total * self.cfg.select.pct_diversity)
-        n_unc = int(total * self.cfg.select.pct_uncertain)
-        n_cer = int(total * self.cfg.select.pct_easy_qc)
-    
-        selected_rows: list[pd.DataFrame] = []
-        selected_units: set[str] = set()
-
-        run_id = time.strftime("%Y%m%d-%H%M%S")
-        LLM_RECORDER.start(outdir=self.paths.outdir, run_id=run_id)
-    
-        # progressively exclude units
-        selected_units: set[str] = set()
-        selected_rows: list[pd.DataFrame] = []
-    
-        # 1) Disagreement (unit-level, excluding seen + already-picked)
-        dis_units = _empty_unit_frame()
-        dis_path = os.path.join(self.paths.outdir, "bucket_disagreement.parquet")
-        if self.repo.ann.empty:
-            print("[1/4] Skipping disagreement bucket (no prior rounds or quota is zero)")
-        else:
-            if n_dis > 0:
-                print("[1/4] Expanded disagreement ...")
-            else:
-                print("[1/4] Disagreement quota is zero; refreshing schema only ...")
-            check_cancelled()
-            dis_pairs = self.build_disagreement_bucket(seen_pairs, legacy_rules_map, legacy_label_types)
-            # Keep prior-round units eligible for disagreement reviews while still
-            # preventing duplicates within the current batch.
-            dis_pairs = _filter_units(dis_pairs, selected_units)
-            dis_units = _head_units(_to_unit_only(dis_pairs), n_dis)
-        dis_units.to_parquet(dis_path, index=False)
-        selected_rows.append(dis_units)
-        selected_units |= set(dis_units["unit_id"])
-
-        # 2) Diversity (exclude seen + already-picked via both unseen_pairs filter and seed set)
-        print("[2/4] Diversity ...")
-        check_cancelled()
-        want_div = min(n_div, max(0, total - len(selected_units)))
-        fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
-        sel_div_pairs = build_diversity_bucket(
-            unseen_pairs=unseen_pairs_current,
-            already_selected=[(r.unit_id, getattr(r, "label_id", "")) for r in dis_units.itertuples(index=False)],
-            n_div=want_div,
+        pipeline = ActiveLearningPipeline(
+            data_repo=self.repo,
+            emb_store=self.store,
+            ctx_builder=self.context_builder,
+            llm_labeler=self.llm,
+            disagreement_scorer=disagreement_scorer,
+            uncertainty_scorer=uncertainty_scorer,
+            diversity_selector=diversity_selector,
+            selector=selector,
+            config=self.cfg,
+            paths=self.paths,
             pooler=self.pooler,
             retriever=self.rag,
-            rules_map=current_rules_map,
-            label_types=current_label_types,
             label_config=self.label_config,
-            rag_k=getattr(self.cfg.diversity, "rag_topk", 4),
-            min_rel_quantile=getattr(self.cfg.diversity, "min_rel_quantile", 0.30),
-            mmr_lambda=getattr(self.cfg.diversity, "mmr_lambda", 0.7),
-            sample_cap=getattr(self.cfg.diversity, "sample_cap", 2000),
-            adaptive_relax=getattr(self.cfg.diversity, "adaptive_relax", True),
-            relax_steps=getattr(self.cfg.diversity, "relax_steps", (0.20, 0.10, 0.05)),
-            pool_factor=getattr(self.cfg.diversity, "pool_factor", 4.0),
-            use_proto=getattr(self.cfg.diversity, "use_proto", False),
-            family_labeler=fam,
-            ensure_exemplars=True,
-            exclude_units=seen_units | selected_units,
+            label_config_bundle=self.label_config_bundle,
+            excluded_unit_ids=self.excluded_unit_ids,
+            check_cancelled_fn=check_cancelled,
+            iter_with_bar_fn=iter_with_bar,
+            jsonify_cols_fn=_jsonify_cols,
+            attach_metadata_fn=self._attach_unit_metadata,
+            label_maps_fn=self._label_maps,
+            rerank_override_fn=self._build_rerank_rule_overrides,
         )
-        sel_div_pairs = _filter_units(sel_div_pairs, seen_units | selected_units)
-        sel_div_units = _head_units(_to_unit_only(sel_div_pairs), want_div)
-        sel_div_units.to_parquet(os.path.join(self.paths.outdir, "bucket_diversity.parquet"), index=False)
-        selected_rows.append(sel_div_units)
-        selected_units |= set(sel_div_units["unit_id"])
-    
-        # 3) LLM-uncertain (gated); exclude seen + prior-picked
-        if n_unc > 0:
-            print("[3/4] LLM-uncertain ...")
-            check_cancelled()
-            want_unc = min(n_unc, max(0, total - len(selected_units)))
-            if want_unc > 0:
-                sel_unc_pairs = self.build_llm_uncertain_bucket(
-                    current_label_types, current_rules_map,
-                    exclude_units=seen_units | selected_units,   # <- sampler-level exclusion
-                )
-                sel_unc_pairs = _filter_units(sel_unc_pairs, seen_units | selected_units)
-                sel_unc_units = _head_units(_to_unit_only(sel_unc_pairs), want_unc)
-                sel_unc_units.to_parquet(os.path.join(self.paths.outdir, "bucket_llm_uncertain.parquet"), index=False)
-                selected_rows.append(sel_unc_units)
-                selected_units |= set(sel_unc_units["unit_id"])
-            else:
-                print("Uncertain bucket skipped: no remaining quota.")
-    
-        # 4) LLM-certain (gated); exclude seen + prior-picked
-        if n_cer > 0:
-            print("[4/4] LLM-certain ...")
-            check_cancelled()
-            want_cer = min(n_cer, max(0, total - len(selected_units)))
-            if want_cer > 0:
-                sel_cer_pairs = self.build_llm_certain_bucket(
-                    current_label_types, current_rules_map,
-                    exclude_units=seen_units | selected_units,   # <- sampler-level exclusion
-                )
-                sel_cer_pairs = _filter_units(sel_cer_pairs, seen_units | selected_units)
-                sel_cer_units = _head_units(_to_unit_only(sel_cer_pairs), want_cer)
-                sel_cer_units.to_parquet(os.path.join(self.paths.outdir, "bucket_llm_certain.parquet"), index=False)
-                selected_rows.append(sel_cer_units)
-                selected_units |= set(sel_cer_units["unit_id"])
-            else:
-                print("Certain bucket skipped: no remaining quota.")
 
-        # ---------- Compose final (units only) + top-off ----------
-        final = pd.concat(selected_rows, ignore_index=True) if selected_rows else pd.DataFrame(columns=["unit_id","label_id","label_type","selection_reason"])
-        final = final.drop_duplicates(subset=["unit_id"], keep="first").copy()
-
-        if len(final) < total:
-            print("Topping off to target batch_size ...")
-            excluded = seen_units | set(final["unit_id"])
-            unseen_pairs_topoff = [
-                (u, l) for (u, l) in self.build_unseen_pairs(label_ids=current_label_ids) if u not in excluded
-            ]
-            final = self.top_off_random(
-                current_sel=final,
-                unseen_pairs=unseen_pairs_topoff,
-                label_types=current_label_types,
-                target_n=total,
-            ).drop_duplicates(subset=["unit_id"], keep="first")
-    
-        final.to_parquet(os.path.join(self.paths.outdir, "final_selection.parquet"), index=False)
-        result_df = final
-
-        # (Optional) run family labeling on the final units for transparency/audit
-        final_out = None
-        if self.cfg.final_llm_labeling:
-            fam_rows = []
-            fam = FamilyLabeler(self.llm, self.rag, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
-            unit_ids = final["unit_id"].tolist()
-            rules_map = current_rules_map
-            types = current_label_types
-            _progress_every = float(fam.cfg.progress_min_interval_s or 1)
-            for uid in iter_with_bar(
-                    step="Final family labeling",
-                    iterable=unit_ids,
-                    total=len(unit_ids),
-                    min_interval_s=_progress_every):
-                fam_rows.extend(
-                    fam.label_family_for_unit(uid, types, rules_map,
-                                              json_only=True,
-                                              json_n_consistency=getattr(self.cfg.llmfirst, "final_llm_label_consistency", 1),
-                                              json_jitter=False)
-                )
-            fam_df = pd.DataFrame(fam_rows)
-            if not fam_df.empty:
-                if "runs" in fam_df.columns: fam_df.rename(columns={"runs":"llm_runs"}, inplace=True)
-                if "consistency" in fam_df.columns: fam_df.rename(columns={"consistency":"llm_consistency"}, inplace=True)
-                if "prediction" in fam_df.columns: fam_df.rename(columns={"prediction":"llm_prediction"}, inplace=True)
-                if "llm_runs" in fam_df.columns:
-                    fam_df["llm_reasoning"] = fam_df["llm_runs"].map(
-                        lambda rs: (rs[0].get("raw", {}).get("reasoning") if isinstance(rs, list) and rs else None)
-                    )
-                fam_df = _jsonify_cols(fam_df, [c for c in ["rag_context","llm_runs","fc_probs"] if c in fam_df.columns])
-            fam_df.to_parquet(os.path.join(self.paths.outdir, "final_llm_family_probe.parquet"), index=False)
-    
-            # Build wide convenience view & save merged
-            if not fam_df.empty:
-                pv = fam_df[["unit_id","label_id","llm_prediction"]].copy()
-                pv["col"] = pv["label_id"].astype(str) + "_llm"
-                fam_wide = (
-                    pv.pivot_table(index="unit_id", columns="col", values="llm_prediction", aggfunc="first")
-                      .reset_index()
-                )
-                if "llm_reasoning" in fam_df.columns:
-                    rv = fam_df[["unit_id","label_id","llm_reasoning"]].copy()
-                    rv["colr"] = rv["label_id"].astype(str) + "_llm_reason"
-                    fam_reason_wide = (
-                        rv.pivot_table(index="unit_id", columns="colr", values="llm_reasoning", aggfunc="first")
-                          .reset_index()
-                    )
-                    fam_wide = fam_wide.merge(fam_reason_wide, on="unit_id", how="left")
-                final_units = final[["unit_id", "label_id", "label_type", "selection_reason"]].drop_duplicates()
-                final_out = final_units.merge(fam_wide, on="unit_id", how="left")
-                final_out.to_parquet(os.path.join(self.paths.outdir, "final_selection_with_llm.parquet"), index=False)
-
-                labels_path = Path(self.paths.outdir) / "final_llm_labels.parquet"
-                try:
-                    fam_wide.to_parquet(labels_path, index=False)
-                except Exception:
-                    pass
-                else:
-                    try:
-                        labels_path.with_suffix(".json").write_text(
-                            fam_wide.to_json(orient="records", indent=2, force_ascii=False),
-                            encoding="utf-8",
-                        )
-                    except TypeError:
-                        labels_path.with_suffix(".json").write_text(
-                            fam_wide.to_json(orient="records"),
-                            encoding="utf-8",
-                        )
-
-            try:
-                probe_json_path = Path(self.paths.outdir) / "final_llm_family_probe.json"
-                fam_df.to_json(probe_json_path, orient="records", indent=2, force_ascii=False)
-            except TypeError:
-                fam_df.to_json(probe_json_path, orient="records")
-        if final_out is not None:
-            result_df = final_out
-        
-        diagnostics = {
-            "total_selected": int(len(final)),
-            "bucket_sizes": {
-                "disagreement": int(len(dis_units) if 'dis_bucket_units' in locals() else 0),
-                "diversity":    int(len(sel_div_units)   if 'sel_div_units' in locals() else 0),
-                "uncertain":    int(len(sel_unc_units)   if 'sel_unc_units' in locals() else 0),
-                "certain":      int(len(sel_cer_units)   if 'sel_cer_units' in locals() else 0),
-            },
-            "unique_units": int(len(final["unit_id"].unique())),
-        }
-        
-        try:
-            rec_path = LLM_RECORDER.flush()
-            if rec_path:
-                LOGGER.info("llm_run_log_written", extra={"path": rec_path, "n_calls": len(LLM_RECORDER.calls)})
-        except Exception as e:
-            LOGGER.warning("llm_run_log_write_failed", extra={"error": str(e)})
-
-        total_seconds = time.time() - t0
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        print(f"Done. Total elapsed: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
-
-        result_df = self._attach_unit_metadata(result_df)
-        return result_df
+        return pipeline.run()
         
         
 # ------------------------------
