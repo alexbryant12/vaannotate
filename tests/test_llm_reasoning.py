@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vaannotate.vaannotate_ai_backend import engine
+from vaannotate.vaannotate_ai_backend import config as ai_config, engine
 from vaannotate.vaannotate_ai_backend.llm_backends import JSONCallResult
 from vaannotate.vaannotate_ai_backend.services.llm_labeler import LLMLabeler
 
@@ -32,13 +32,13 @@ def test_llm_annotator_omits_reasoning_when_disabled(tmp_path):
                 logprobs=None,
             )
 
-    llm_cfg = engine.LLMConfig()
+    llm_cfg = ai_config.LLMConfig()
     llm_cfg.include_reasoning = False
     annotator = LLMLabeler(
         DummyBackend(llm_cfg),
         engine.LabelConfigBundle(),
         llm_cfg,
-        sc_cfg=engine.SCJitterConfig(),
+        sc_cfg=ai_config.SCJitterConfig(),
         cache_dir=str(tmp_path),
     )
 
@@ -82,13 +82,13 @@ def test_llm_annotator_multicategorical_inline_keys(tmp_path):
                 logprobs=None,
             )
 
-    llm_cfg = engine.LLMConfig()
+    llm_cfg = ai_config.LLMConfig()
     llm_cfg.include_reasoning = True
     annotator = LLMLabeler(
         DummyBackend(llm_cfg),
         engine.LabelConfigBundle(),
         llm_cfg,
-        sc_cfg=engine.SCJitterConfig(),
+        sc_cfg=ai_config.SCJitterConfig(),
         cache_dir=str(tmp_path),
     )
     annotator.label_config = {"Flag": {"options": ["Option A", "Option B"]}}

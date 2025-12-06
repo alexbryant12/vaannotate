@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 from sentence_transformers import CrossEncoder, SentenceTransformer
+from ..utils.runtime import iter_with_bar as _iter_with_bar
 
 try:
     import faiss  # type: ignore
@@ -30,13 +31,6 @@ except Exception:
         from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
     except Exception:
         raise ImportError("Please install langchain-text-splitters or langchain to use RecursiveCharacterTextSplitter.")
-
-
-def _iter_with_bar(*args, **kwargs):
-    from .. import engine as engine_mod
-    return engine_mod.iter_with_bar(*args, **kwargs)
-
-
 @dataclass
 class IndexConfig:
     type: str = "flat"    # flat | hnsw | ivf

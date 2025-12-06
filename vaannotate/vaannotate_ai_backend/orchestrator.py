@@ -10,14 +10,16 @@ import sys
 import pandas as pd
 
 from . import engine
+from .config import OrchestratorConfig, Paths
+from .utils.runtime import CancelledError, cancellation_scope
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
 from .pipelines import InferencePipeline
 
 
-def _default_paths(outdir: Path, cache_dir: Path | None = None) -> engine.Paths:
+def _default_paths(outdir: Path, cache_dir: Path | None = None) -> Paths:
     notes_path = outdir / "notes.parquet"
     annotations_path = outdir / "annotations.parquet"
-    return engine.Paths(
+    return Paths(
         notes_path=str(notes_path),
         annotations_path=str(annotations_path),
         outdir=str(outdir),
@@ -255,7 +257,7 @@ def build_next_batch(
     ann_df.to_parquet(ann_path, index=False)
 
     # Build config
-    cfg = engine.OrchestratorConfig()
+    cfg = OrchestratorConfig()
     overrides = dict(cfg_overrides or {})
     phenotype_level = overrides.pop("phenotype_level", None)
     rag_overrides = overrides.get("rag") if isinstance(overrides.get("rag"), Mapping) else {}
@@ -271,7 +273,7 @@ def build_next_batch(
     bundle = _apply_label_queries(bundle, label_queries_override)
 
     with _capture_logs(log_callback):
-        with engine.cancellation_scope(cancel_callback):
+        with cancellation_scope(cancel_callback):
             orch = engine.ActiveLearningLLMFirst(
                 paths=paths,
                 cfg=cfg,
@@ -355,7 +357,7 @@ def run_inference(
     notes_df.to_parquet(notes_path, index=False)
     ann_df.to_parquet(ann_path, index=False)
 
-    cfg = engine.OrchestratorConfig()
+    cfg = OrchestratorConfig()
     overrides = dict(cfg_overrides or {})
     phenotype_level = overrides.pop("phenotype_level", None)
     rag_overrides = overrides.get("rag") if isinstance(overrides.get("rag"), Mapping) else {}
@@ -371,7 +373,7 @@ def run_inference(
     bundle = _apply_label_queries(bundle, label_queries_override)
 
     with _capture_logs(log_callback):
-        with engine.cancellation_scope(cancel_callback):
+        with cancellation_scope(cancel_callback):
             runner = engine.ActiveLearningLLMFirst(
                 paths=paths,
                 cfg=cfg,

@@ -28,14 +28,11 @@ What’s in this file (high level):
 
 from __future__ import annotations
 import gzip
-import os, re, json, math, time, random, hashlib, unicodedata
-from dataclasses import dataclass, field
+import os, re, json, math, time, random, unicodedata
 from collections import defaultdict, Counter
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Dict, Tuple, Optional, Any, Mapping
 import numpy as np
-import logging
 import pandas as pd
 from .core.data import DataRepository
 from .core.embeddings import (
@@ -43,6 +40,17 @@ from .core.embeddings import (
     IndexConfig,
     Models,
     build_models_from_env,
+)
+from .config import (
+    DiversityConfig,
+    DisagreementConfig,
+    LLMConfig,
+    LLMFirstConfig,
+    OrchestratorConfig,
+    Paths,
+    RAGConfig,
+    SCJitterConfig,
+    SelectionConfig,
 )
 from .services import (
     ActiveLearningSelector,
@@ -57,6 +65,16 @@ from .pipelines.active_learning import ActiveLearningPipeline
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
 from .llm_backends import build_llm_backend
 from .core.retrieval import RetrievalCoordinator, SemanticQuery
+from .utils.hashing import _stable_rules_hash, stable_hash_pair, stable_hash_str
+from .utils.io import atomic_write_bytes, normalize01, read_table, write_table
+from .utils.jsonish import _jsonify_cols, _maybe_parse_jsonish
+from .utils.runtime import (
+    CancelledError,
+    LOGGER,
+    cancellation_scope,
+    check_cancelled,
+    iter_with_bar,
+)
 
 try:
     from cachetools import LRUCache
@@ -80,429 +98,6 @@ except Exception:
 Note: Embedding/index primitives (IndexConfig, Models, EmbeddingStore) now live
 in ``core.embeddings``.
 """
-
-# ------------------------------
-# Config
-# ------------------------------
-
-@dataclass
-class RAGConfig:
-    chunk_size: int = 1500
-    chunk_overlap: int = 150
-    normalize_embeddings: bool = True
-    per_label_topk: int = 6
-    top_k_final: int = 6
-    use_mmr: bool = True
-    mmr_lambda: float = 0.7
-    mmr_candidates: int = 200
-    use_keywords: bool = True
-    keyword_topk: int = 20
-    keyword_fraction: float = 0.3
-    keywords: List[str] = field(default_factory=list)
-    label_keywords: dict[str, list[str]] = field(default_factory=dict)
-    min_context_chunks: int = 3
-    mmr_multiplier: int = 3
-    neighbor_hops: int = 1
-    pool_factor: int = 3
-    pool_oversample: float = 1.5
-        
-def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
-    val = os.getenv(name)
-    if val is None or val == "":
-        return default
-    try:
-        return int(val)
-    except ValueError:
-        return default
-
-
-@dataclass
-class LLMConfig:
-    model_name: str = field(
-        default_factory=lambda: os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-    )
-    backend: str = field(default_factory=lambda: os.getenv("LLM_BACKEND", "azure"))
-    temperature: float = 0.2
-    n_consistency: int = 3
-    logprobs: bool = True
-    top_logprobs: int = 5
-    few_shot_examples: dict[str, list[dict[str, str]]] = field(default_factory=dict)
-    prediction_field: str = "prediction"
-    timeout: float = 60.0
-    retry_max: int = 3
-    retry_backoff: float = 2.0
-    max_context_chars: int = 1200000
-    rpm_limit: Optional[int] = 30
-    include_reasoning: bool = False
-    # Azure OpenAI specific knobs
-    azure_api_key: Optional[str] = field(
-        default_factory=lambda: os.getenv("AZURE_OPENAI_API_KEY")
-    )
-    azure_api_version: str = field(
-        default_factory=lambda: os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
-    )
-    azure_endpoint: Optional[str] = field(
-        default_factory=lambda: os.getenv("AZURE_OPENAI_ENDPOINT")
-    )
-    # Local ExLlamaV2 specific knobs
-    local_model_dir: Optional[str] = field(
-        default_factory=lambda: os.getenv("LOCAL_LLM_MODEL_DIR")
-    )
-    local_max_seq_len: Optional[int] = field(
-        default_factory=lambda: _env_int("LOCAL_LLM_MAX_SEQ_LEN")
-    )
-    local_max_new_tokens: Optional[int] = field(
-        default_factory=lambda: _env_int("LOCAL_LLM_MAX_NEW_TOKENS")
-    )
-    # Context ordering for snippets
-    context_order: str = "relevance"  # relevance | chronological
-    
-@dataclass
-class SelectionConfig:
-    batch_size: int = 10
-    pct_disagreement: float = 0.3
-    pct_uncertain: float = 0.3    # LLM-uncertain
-    pct_easy_qc: float = 0.1      # LLM-certain
-    pct_diversity: float = 0.3
-
-@dataclass
-class LLMFirstConfig:
-    n_probe_units: int = 10
-    topk: int = 6
-    json_trace_policy: str = 'fallback'
-    progress_min_interval_s: float = 10.0
-    exemplar_K: int = 1
-    exemplar_generate: bool = True
-    exemplar_temperature: float = 0.9
-    # forced-choice micro-probe
-    fc_enable: bool = True
-    #label enrichment for probe
-    enrich: bool = True
-    probe_enrichment_mix: float = 1.00          # fraction of enriched vs uniform
-    probe_enrichment_equalize: bool = True      # equal per parent; else proportional
-    probe_ce_unit_sample: int = 75
-    probe_ce_search_topk_per_unit: int = 15
-    probe_ce_rerank_m: int = 3        # aggregate top-3 CE
-    probe_ce_unit_agg: str = "max"    # or "mean"
-    single_doc_context: str = "rag"
-    single_doc_full_context_max_chars: int = 12000
-    context_order: str = "relevance"  # relevance | chronological
-    
-
-@dataclass
-class DisagreementConfig:
-    round_policy: str = 'last'       # 'last' | 'all' | 'decay'
-    decay_half_life: float = 2.0     # if round_policy='decay'
-    high_entropy_threshold: float = 0.0001 #very low = any disagreements included
-    seeds_per_label: int = 5
-    snippets_per_seed: int = 3
-    similar_chunks_per_seed: int = 50
-    expanded_per_label: int = 10
-    # Hard-disagreement thresholds
-    date_disagree_days: int = 5
-    numeric_disagree_abs: float = 1.0
-    numeric_disagree_rel: float = 0.20
-    
-@dataclass
-class DiversityConfig:
-    rag_k: int = 4
-    min_rel_quantile: float = 0.30
-    mmr_lambda: float = 0.7
-    sample_cap: int = 50
-    adaptive_relax: bool = True
-    use_proto: bool = False
-
-@dataclass
-class SCJitterConfig:
-    enable: bool = True
-    rag_topk_range: Tuple[int, int] = (4, 10)
-    rag_dropout_p: float = 0.20
-    temperature_range: Tuple[float, float] = (0.5, 0.9)
-    shuffle_context: bool = True 
-
-@dataclass
-class Paths:
-    notes_path: str
-    annotations_path: str
-    outdir: str
-    cache_dir_override: str | None = None
-    cache_dir: str = field(init=False)
-
-    def __post_init__(self):
-        outdir_path = Path(self.outdir)
-        outdir_path.mkdir(parents=True, exist_ok=True)
-        if self.cache_dir_override:
-            cache_dir_path = Path(self.cache_dir_override)
-        else:
-            cache_dir_path = outdir_path / "cache"
-        cache_dir_path.mkdir(parents=True, exist_ok=True)
-        self.cache_dir = str(cache_dir_path)
-
-@dataclass
-class OrchestratorConfig:
-    index: IndexConfig = field(default_factory=IndexConfig)
-    rag: RAGConfig = field(default_factory=RAGConfig)
-    llm: LLMConfig = field(default_factory=LLMConfig)
-    select: SelectionConfig = field(default_factory=SelectionConfig)
-    llmfirst: LLMFirstConfig = field(default_factory=LLMFirstConfig)
-    disagree: DisagreementConfig = field(default_factory=DisagreementConfig)
-    diversity: DiversityConfig = field(default_factory=DiversityConfig)
-    scjitter: SCJitterConfig = field(default_factory=SCJitterConfig)
-    final_llm_labeling: bool = True
-    final_llm_labeling_n_consistency: int = 1
-    excluded_unit_ids: set[str] = field(default_factory=set)
-
-
-# ------------------------------
-# Logging (JSON) and Telemetry
-# ------------------------------
-logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        base = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
-            "level": record.levelname,
-            "msg": record.getMessage(),
-            "logger": record.name,
-        }
-        for k, v in getattr(record, "__dict__", {}).items():
-            if k in ("args","msg","levelname","levelno","pathname","filename","module","exc_info","exc_text","stack_info","lineno","funcName","created","msecs","relativeCreated","thread","threadName","processName","process"): 
-                continue
-            if k.startswith("_"): 
-                continue
-            if k in base: 
-                continue
-            try:
-                json.dumps({k: v}); base[k] = v
-            except Exception:
-                base[k] = str(v)
-        if record.exc_info:
-            base["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(base, ensure_ascii=False)
-
-def setup_logging(level=logging.INFO):
-    logger = logging.getLogger()
-    if logger.handlers:
-        return logger
-    logger.setLevel(level)
-    ch = logging.StreamHandler()
-    ch.setFormatter(JsonFormatter())
-    logger.addHandler(ch)
-    return logger
-
-class CancelledError(RuntimeError):
-    """Raised when a cancellation request is received."""
-
-
-_cancel_check: Optional[Callable[[], bool]] = None
-
-
-@contextmanager
-def cancellation_scope(callback: Optional[Callable[[], bool]]):
-    """Temporarily install a cancellation callback for long-running loops."""
-    global _cancel_check
-    previous = _cancel_check
-    _cancel_check = callback
-    try:
-        yield
-    finally:
-        _cancel_check = previous
-
-
-def check_cancelled() -> None:
-    if _cancel_check and _cancel_check():
-        raise CancelledError("AI backend run cancelled")
-
-
-LOGGER = setup_logging()
-
-# ---- Pretty progress logging (ETA) -------------------------------------------
-import time as _time
-import sys as _sys
-
-def _fmt_hms(_secs: float) -> str:
-    if not _secs or _secs == float("inf") or _secs != _secs:  # NaN
-        return "--:--:--"
-    secs = int(max(0, _secs))
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-def _bar_str(fraction: float, width: int = 32, ascii_only: bool = False) -> str:
-    fraction = max(0.0, min(1.0, float(fraction)))
-    filled = int(round(fraction * width))
-    if ascii_only:
-        mid = ">" if 0 < filled < width else ""
-        return "[" + "#" * max(0, filled-1) + mid + "." * (width - filled) + "]"
-    # Unicode blocks
-    full = "█"; empty = "·"
-    return "[" + full * filled + empty * (width - filled) + "]"
-
-def iter_with_bar(step: str, iterable, *, total: int | None = None,
-                  bar_width: int = 32, min_interval_s: float = 10,
-                  ascii_only: bool | None = None):
-    """
-    Wrap an iterable and render a live progress bar if stderr is a TTY.
-    Falls back to periodic log lines otherwise.
-    """
-    try: 
-        if total is None: total = len(iterable)  # may fail for generators
-    except Exception:
-        total = None
-
-    t0 = _time.time(); last = t0
-    tty = hasattr(_sys.stderr, "isatty") and _sys.stderr.isatty()
-    if ascii_only is None: ascii_only = not tty  # default: Unicode in TTY
-
-    wrote_progress = False
-    last_render_len = 0
-    last_tty_msg = ""
-    for i, item in enumerate(iterable, 1):
-        check_cancelled()
-        now = _time.time()
-        if tty and (i == 1 or now - last >= min_interval_s or (total and i == total)):
-            last = now
-            elapsed = now - t0
-            rate = (i / elapsed) if elapsed > 0 else 0.0
-            if total:
-                frac = i / total
-                eta = ((total - i) / rate) if rate > 0 else float("inf")
-                bar = _bar_str(frac, width=bar_width, ascii_only=ascii_only)
-                msg = f"{step:<14} {bar}  {int(frac*100):3d}%  {i}/{total} • {rate:.2f}/s • ETA {_fmt_hms(eta)}"
-            else:
-                spinner = "-\\|/"[int((now - t0) * 8) % 4]
-                msg = f"{step:<14} [{spinner}]  {i} done • {rate:.2f}/s • elapsed {_fmt_hms(now - t0)}"
-            if wrote_progress and last_render_len:
-                _sys.stderr.write("\r" + " " * last_render_len)
-            _sys.stderr.write("\r" + msg)
-            last_render_len = len(msg)
-            last_tty_msg = msg
-            wrote_progress = True
-            _sys.stderr.flush()
-        elif not tty and (i == 1 or now - last >= min_interval_s or (total and i == total)):
-            last = now
-            elapsed = now - t0
-            rate = (i / elapsed) if elapsed > 0 else 0.0
-            if total:
-                eta = ((total - i) / rate) if rate > 0 else float("inf")
-                msg = f"[{step}] {i}/{total} • {rate:.2f}/s • ETA {_fmt_hms(eta)}"
-            else:
-                msg = f"[{step}] {i} done • {rate:.2f}/s • elapsed {_fmt_hms(elapsed)}"
-            _sys.stderr.write(msg + "\n")
-            _sys.stderr.flush()
-        yield item
-
-    # finish line
-    if tty:
-        if total:
-            elapsed = _time.time() - t0
-            rate = (total / elapsed) if elapsed > 0 else 0.0
-            bar = _bar_str(1.0, width=bar_width, ascii_only=ascii_only)
-            if wrote_progress and last_render_len:
-                _sys.stderr.write("\r" + " " * last_render_len)
-            final = f"{step:<14} {bar}  100%  {total}/{total} • {rate:.2f}/s • elapsed {_fmt_hms(elapsed)}"
-            _sys.stderr.write("\r" + final + "\n")
-            last_tty_msg = final
-        else:
-            if wrote_progress and last_render_len:
-                _sys.stderr.write("\r" + " " * last_render_len)
-            if wrote_progress and last_tty_msg:
-                _sys.stderr.write("\r" + last_tty_msg)
-            _sys.stderr.write("\n")
-        _sys.stderr.flush()
-# ------------------------------------------------------------------------------
-
-
-
-
-# ------------------------------
-# Small utilities
-
-# ---------- Stable hashing (reproducible across runs) ----------
-def stable_hash_str(s: str, digest_size: int = 8) -> str:
-    import hashlib
-    if s is None: s = ""
-    return hashlib.blake2b(str(s).encode('utf-8'), digest_size=digest_size).hexdigest()
-
-def stable_hash_pair(a: str, b: str, digest_size: int = 12) -> str:
-    import hashlib
-    a = "" if a is None else str(a)
-    b = "" if b is None else str(b)
-    return hashlib.blake2b((a + "\x1f" + b).encode('utf-8'), digest_size=digest_size).hexdigest()
-
-def _stable_rules_hash(label_id: str, rules: str, K: int, model_sig: str=""):
-    s = json.dumps({"label": label_id, "rules": rules or "", "K": int(K), "model": model_sig}, sort_keys=True)
-    return hashlib.blake2b(s.encode("utf-8"), digest_size=12).hexdigest()
-
-# ------------------------------
-
-def read_table(path: str) -> pd.DataFrame:
-    ext = path.lower().split(".")[-1]
-    if ext == "csv":
-        return pd.read_csv(path)
-    if ext == "tsv":
-        return pd.read_csv(path, sep="\t")
-    if ext in ("parquet","pq"):
-        return pd.read_parquet(path)
-    if ext == "jsonl":
-        return pd.read_json(path, lines=True)
-    raise ValueError(f"Unsupported table extension: {path}")
-
-
-def atomic_write_bytes(path: str, data: bytes):
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
-
-def write_table(df: pd.DataFrame, path: str):
-
-    ext = path.lower().split(".")[-1]
-    if ext == "csv":
-        df.to_csv(path, index=False)
-    elif ext in ("parquet","pq"):
-        df.to_parquet(path, index=False)
-    elif ext == "jsonl":
-        df.to_json(path, lines=True, orient="records", force_ascii=False)
-    else:
-        raise ValueError(f"Unsupported table extension: {path}")
-
-def normalize01(a: np.ndarray) -> np.ndarray:
-    if a.size == 0: return a
-    mn, mx = a.min(), a.max()
-    if mx <= mn: return np.zeros_like(a)
-    return (a - mn) / (mx - mn)
-
-def _jsonify_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    if df.empty: return df
-    out = df.copy()
-    for c in cols:
-        if c in out.columns:
-            out[c] = out[c].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else x)
-    return out
-
-
-def _maybe_parse_jsonish(value):
-    """Best-effort JSON (or literal) parser that tolerates legacy metadata strings."""
-    if isinstance(value, (dict, list)):
-        return value
-    if isinstance(value, str):
-        txt = value.strip()
-        if not txt:
-            return None
-        try:
-            return json.loads(txt)
-        except Exception:  # noqa: BLE001
-            try:
-                import ast
-
-                return ast.literal_eval(txt)
-            except Exception:  # noqa: BLE001
-                return None
-    return None
-
 
 class DisagreementExpander:
     def __init__(

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vaannotate.vaannotate_ai_backend import engine
+from vaannotate.vaannotate_ai_backend import config as ai_config, engine
 
 
 class _StubEmbedder:
@@ -103,9 +103,9 @@ def _make_store(cache_dir: Path, embedder_name: str) -> tuple[engine.EmbeddingSt
     return store, embedder
 
 
-def _rag_index_cfg() -> tuple[engine.RAGConfig, engine.IndexConfig]:
-    rag_cfg = engine.RAGConfig(chunk_size=32, chunk_overlap=0)
-    index_cfg = engine.IndexConfig(type="flat")
+def _rag_index_cfg() -> tuple[ai_config.RAGConfig, ai_config.IndexConfig]:
+    rag_cfg = ai_config.RAGConfig(chunk_size=32, chunk_overlap=0)
+    index_cfg = ai_config.IndexConfig(type="flat")
     return rag_cfg, index_cfg
 
 

@@ -8,6 +8,8 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import pandas as pd
 
 from ..services import LLM_RECORDER
+from ..utils.runtime import check_cancelled as default_check_cancelled
+from ..utils.runtime import iter_with_bar as default_iter_with_bar
 
 
 class ActiveLearningPipeline:
@@ -160,8 +162,8 @@ class ActiveLearningPipeline:
         import pandas as pd
 
         t0 = time.time()
-        check_cancelled = self.check_cancelled or (lambda: None)
-        iter_with_bar = self.iter_with_bar or (lambda **kwargs: kwargs.get("iterable", []))
+        check_cancelled = self.check_cancelled or default_check_cancelled
+        iter_with_bar = self.iter_with_bar or default_iter_with_bar
 
         run_id = time.strftime("%Y%m%d-%H%M%S")
         LLM_RECORDER.start(

@@ -33,6 +33,7 @@ from .utils import (
     ensure_dir,
     stable_hash,
 )
+from vaannotate.vaannotate_ai_backend.utils.jsonish import _jsonify_cols
 
 
 def _date_sort_value(value: object) -> tuple:
@@ -956,7 +957,7 @@ class RoundBuilder:
         original_level: int | None = None
         if log_callback:
             try:
-                from vaannotate.vaannotate_ai_backend import engine
+                from vaannotate.vaannotate_ai_backend.utils.runtime import LOGGER
             except ImportError:  # pragma: no cover - runtime guard
                 handler = None
             else:
@@ -977,7 +978,7 @@ class RoundBuilder:
                         except Exception:  # noqa: BLE001
                             pass
 
-                logger = engine.LOGGER
+                logger = LOGGER
                 original_level = logger.level
                 if original_level is None or original_level > logging.INFO:
                     logger.setLevel(logging.INFO)

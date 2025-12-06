@@ -61,10 +61,25 @@ def _load_engine_module():
 ENGINE_MODULE = _load_engine_module()
 
 
+def _load_config_module():
+    module_path = ROOT / "vaannotate" / "vaannotate_ai_backend" / "config.py"
+    spec = importlib.util.spec_from_file_location(
+        "vaannotate.vaannotate_ai_backend.config", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load config module for testing")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CONFIG_MODULE = _load_config_module()
+
+
 def test_llm_config_respects_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """LLMConfig should read environment variables at instantiation time."""
 
-    LLMConfig = ENGINE_MODULE.LLMConfig
+    LLMConfig = CONFIG_MODULE.LLMConfig
 
     local_dir = tmp_path / "LocalModel"
     local_dir.mkdir()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import time
 from typing import Iterable, List, Mapping, Optional, Tuple
@@ -8,18 +7,7 @@ from typing import Iterable, List, Mapping, Optional, Tuple
 import pandas as pd
 
 from ..services import LLM_RECORDER
-
-
-def _jsonify_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    for col in cols:
-        if col in out.columns:
-            out[col] = out[col].apply(
-                lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else x
-            )
-    return out
+from ..utils.jsonish import _jsonify_cols
 
 
 class InferencePipeline:
