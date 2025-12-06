@@ -216,9 +216,6 @@ class ActiveLearningPipeline:
         n_unc = int(total * self.cfg.select.pct_uncertain)
         n_cer = int(total * self.cfg.select.pct_easy_qc)
 
-        run_id = time.strftime("%Y%m%d-%H%M%S")
-        LLM_RECORDER.start(outdir=self.paths.outdir, run_id=run_id)
-
         selected_units: set[str] = set()
         dis_units = selector._empty_unit_frame()
         dis_path = os.path.join(self.paths.outdir, "bucket_disagreement.parquet")
