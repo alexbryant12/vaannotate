@@ -24,6 +24,42 @@ def _options_for_label(label_id: str, label_type: str, label_cfgs: dict) -> Opti
         return [str(o) for o in opts]
     return None
 
+
+def build_family_labeler(
+    llm: LLMLabeler,
+    retriever: RAGRetriever,
+    repo: DataRepository,
+    label_config: dict | None,
+    sc_cfg: SCJitterConfig,
+    llmfirst_cfg: LLMFirstConfig,
+) -> "FamilyLabeler":
+    """
+    Construct a FamilyLabeler-like object.
+
+    - If `llm` exposes `.family_labeler_cls`, instantiate that with the
+      standard (llm, retriever, repo, label_config, sc_cfg, llmfirst_cfg)
+      signature.
+    - Otherwise, fall back to the local FamilyLabeler class.
+
+    The return value should always be an instance, never a class.
+    """
+    label_config = label_config or {}
+    fam_cls = getattr(llm, "family_labeler_cls", None)
+    if fam_cls is not None:
+        try:
+            return fam_cls(llm, retriever, repo, label_config, sc_cfg, llmfirst_cfg)
+        except TypeError:
+            # If a backend provides an unexpected signature, just fall back.
+            pass
+    return FamilyLabeler(
+        llm,
+        retriever,
+        repo,
+        label_config,
+        sc_cfg,
+        llmfirst_cfg,
+    )
+
 class FamilyLabeler:
     """Label entire family tree per unit, honoring parent-child gating."""
     def __init__(self, llm: LLMLabeler, retriever: RAGRetriever, repo: DataRepository, label_config: dict, scCfg: SCJitterConfig, llmfirst_cfg: LLMFirstConfig):
