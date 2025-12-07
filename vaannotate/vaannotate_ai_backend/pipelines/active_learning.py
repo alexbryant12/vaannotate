@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from dataclasses import replace
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
@@ -75,12 +76,56 @@ class ActiveLearningPipeline:
         return removed
 
     def _label_maps(self) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
-        if self.label_maps_fn:
-            return self.label_maps_fn()
-        legacy_rules_map = getattr(self.label_config_bundle, "legacy_rules_map", lambda: {})()
-        legacy_label_types = getattr(self.label_config_bundle, "legacy_label_types", lambda: {})()
-        current_rules_map = getattr(self.label_config_bundle, "current_rules_map", lambda: {})()
-        current_label_types = getattr(self.label_config_bundle, "current_label_types", lambda: {})()
+        label_maps_fn = getattr(self, "label_maps_fn", None)
+        if callable(label_maps_fn):
+            return label_maps_fn()
+
+        bundle = getattr(self, "label_config_bundle", None)
+        if bundle is None:
+            return {}, {}, {}, {}
+
+        legacy_rules_map = bundle.legacy_rules_map()
+        legacy_label_types = bundle.legacy_label_types()
+
+        if not legacy_rules_map:
+            legacy_config: Dict[str, Dict[str, object]] = {}
+            ann_df = getattr(getattr(self, "repo", None), "ann", None)
+            if ann_df is not None and hasattr(ann_df, "__iter__"):
+                try:
+                    label_ids = {str(lid) for lid in ann_df.get("label_id", []) if str(lid)}
+                except Exception:
+                    label_ids = set()
+
+                for label_id in sorted(label_ids):
+                    rule_text: Optional[str] = None
+                    try:
+                        rules_col = ann_df.loc[ann_df["label_id"] == label_id, "label_rules"]
+                        for raw_rule in reversed(getattr(rules_col, "tolist", lambda: [])()):
+                            if isinstance(raw_rule, str) and raw_rule.strip():
+                                rule_text = raw_rule.strip()
+                                break
+                    except Exception:
+                        rule_text = None
+
+                    entry: Dict[str, object] = {"label_id": label_id, "type": "boolean"}
+                    if rule_text is not None:
+                        entry["rules"] = rule_text
+                    legacy_config[label_id] = entry
+
+            if legacy_config:
+                fallback_bundle = replace(bundle, legacy={"_annotations": legacy_config})
+                legacy_rules_map = fallback_bundle.legacy_rules_map()
+                legacy_label_types = fallback_bundle.legacy_label_types()
+
+        try:
+            current_rules_map = bundle.current_rules_map(getattr(self, "label_config", None))
+        except TypeError:
+            current_rules_map = bundle.current_rules_map()
+
+        try:
+            current_label_types = bundle.current_label_types(getattr(self, "label_config", None))
+        except TypeError:
+            current_label_types = bundle.current_label_types()
 
         if not current_rules_map and legacy_rules_map:
             current_rules_map = dict(legacy_rules_map)
@@ -95,8 +140,9 @@ class ActiveLearningPipeline:
         return self.disagreement_scorer.compute_disagreement(seen_pairs, rules_map, label_types)
 
     def _build_unseen_pairs(self, label_ids: Optional[Set[str]] = None) -> List[Tuple[str, str]]:
-        if self.unseen_pairs_fn:
-            return self.unseen_pairs_fn(label_ids)
+        unseen_pairs_fn = getattr(self, "unseen_pairs_fn", None)
+        if unseen_pairs_fn:
+            return unseen_pairs_fn(label_ids)
         seen = set(zip(self.repo.ann["unit_id"], self.repo.ann["label_id"]))
         all_units = sorted(self.repo.notes["unit_id"].unique().tolist())
 
