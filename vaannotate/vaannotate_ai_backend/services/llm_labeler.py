@@ -205,13 +205,14 @@ class LLMLabeler:
         cat_types = categorical_types or LLMLabeler.CATEGORICAL_TYPES
         if lt_norm == "categorical_multi":
             if opts:
+                yn_values = ["yes", "no", "unknown", "Yes", "No", "Unknown"]
                 return {
                     "anyOf": [
                         {"type": "array", "items": {"type": "string", "enum": opts}},
                         {
                             "type": "object",
                             "properties": {
-                                opt: {"type": "string", "enum": ["yes", "no", "unknown"]}
+                                opt: {"type": "string", "enum": yn_values}
                                 for opt in opts
                             },
                             "additionalProperties": False,
