@@ -7,11 +7,8 @@ from typing import Dict, List, Mapping, Tuple
 import pandas as pd
 
 from .adapters import export_inputs_from_repo
-from .config import OrchestratorConfig, Paths
 from .experiments import InferenceExperimentResult, run_inference_experiments
 from .label_configs import LabelConfigBundle
-from .orchestration import BackendSession
-from .orchestrator import _apply_overrides
 
 
 def _infer_unit_id_column(notes_df: pd.DataFrame, phenotype_level: str) -> pd.Series:
@@ -169,18 +166,6 @@ def run_project_inference_experiments(
 
     bundle = LabelConfigBundle(current_labelset_id=labelset_id)
 
-    base_cfg = OrchestratorConfig()
-    if cfg_overrides_base:
-        _apply_overrides(base_cfg, dict(cfg_overrides_base))
-
-    session_paths = Paths(
-        notes_path=str(base_outdir / "_session_notes.parquet"),
-        annotations_path=str(base_outdir / "_session_annotations.parquet"),
-        outdir=str(base_outdir / "_session"),
-        cache_dir_override=str(base_outdir / "cache"),
-    )
-    session = BackendSession.from_env(session_paths, base_cfg)
-
     base_overrides = dict(cfg_overrides_base or {})
     sweeps_with_base = {
         name: {**base_overrides, **dict(overrides)} for name, overrides in sweeps.items()
@@ -193,7 +178,6 @@ def run_project_inference_experiments(
         sweeps=sweeps_with_base,
         unit_ids=eval_unit_ids,
         label_config_bundle=bundle,
-        session=session,
     )
 
     for name, result in results.items():
