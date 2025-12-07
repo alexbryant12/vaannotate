@@ -38,6 +38,15 @@ except Exception:
                 old, _ = self._order.popitem(last=False)
                 super().pop(old, None)
 
+
+def _options_for_label(label_id: str, label_type: str, label_config: dict) -> list[str]:
+    cfg = label_config.get(label_id, {}) if isinstance(label_config, dict) else {}
+    if label_type == "categorical":
+        return cfg.get("options", []) or []
+    if label_type == "binary":
+        return ["yes", "no"]
+    return []
+
         def get(self, k, default=None):
             if k in self._order:
                 self._order.move_to_end(k)
