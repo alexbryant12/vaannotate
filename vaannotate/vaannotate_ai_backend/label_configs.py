@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 def sanitize_label_config(config: Mapping[str, Any] | None) -> Dict[str, Any]:
@@ -233,6 +233,84 @@ class LabelConfigBundle:
                 label_types[label_id] = "categorical"
 
         return label_types
+
+
+    def label_maps(
+        self,
+        label_config: Mapping[str, object] | None = None,
+        ann_df: Any | None = None,
+    ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
+        """Return (legacy_rules, legacy_types, current_rules, current_types).
+
+        This centralizes the logic for:
+        - deriving legacy rules/types from the bundle's ``legacy`` configs
+        - optionally inferring a synthetic legacy config from annotations
+        - deriving current rules/types from ``current`` (or an override)
+        - falling back to legacy maps when current maps are empty
+        """
+
+        bundle = self
+
+        # Start from any explicit legacy configs.
+        legacy_rules_map = bundle.legacy_rules_map()
+        legacy_label_types = bundle.legacy_label_types()
+
+        # Optional annotation-based fallback when there is no legacy config.
+        if not legacy_rules_map and ann_df is not None and hasattr(ann_df, "__iter__"):
+            legacy_config: Dict[str, Dict[str, object]] = {}
+
+            try:
+                label_ids = {str(lid) for lid in ann_df.get("label_id", []) if str(lid)}
+            except Exception:  # noqa: BLE001
+                label_ids = set()
+
+            for label_id in sorted(label_ids):
+                rule_text: Optional[str] = None
+                try:
+                    # Mirror the existing ActiveLearningPipeline._label_maps logic:
+                    # look at label_rules for this label and take the last non-empty string.
+                    rules_col = ann_df.loc[ann_df["label_id"] == label_id, "label_rules"]
+                    to_list = getattr(rules_col, "tolist", None)
+                    if callable(to_list):
+                        for raw_rule in reversed(to_list()):
+                            if isinstance(raw_rule, str):
+                                text = raw_rule.strip()
+                                if text:
+                                    rule_text = text
+                                    break
+                except Exception:  # noqa: BLE001
+                    rule_text = None
+
+                entry: Dict[str, object] = {"label_id": label_id, "type": "boolean"}
+                if rule_text is not None:
+                    entry["rules"] = rule_text
+                legacy_config[label_id] = entry
+
+            if legacy_config:
+                # Materialise a synthetic legacy labelset based on annotations.
+                fallback_bundle = replace(bundle, legacy={"_annotations": legacy_config})
+                legacy_rules_map = fallback_bundle.legacy_rules_map()
+                legacy_label_types = fallback_bundle.legacy_label_types()
+
+        # Current rules/types, optionally overridden by a specific label_config.
+        try:
+            current_rules_map = bundle.current_rules_map(label_config)
+        except TypeError:
+            # Backwards-compatibility if the signature is used positionally.
+            current_rules_map = bundle.current_rules_map()
+
+        try:
+            current_label_types = bundle.current_label_types(label_config)
+        except TypeError:
+            current_label_types = bundle.current_label_types()
+
+        # If there is no explicit current config, fall back to legacy maps.
+        if not current_rules_map and legacy_rules_map:
+            current_rules_map = dict(legacy_rules_map)
+        if not current_label_types and legacy_label_types:
+            current_label_types = dict(legacy_label_types)
+
+        return legacy_rules_map, legacy_label_types, current_rules_map, current_label_types
 
 
 EMPTY_BUNDLE = LabelConfigBundle()
