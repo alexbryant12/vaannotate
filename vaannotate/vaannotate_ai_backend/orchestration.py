@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from typing import Mapping
 
@@ -91,6 +92,7 @@ def _build_shared_components(
     return {
         "repo": repo,
         "store": store,
+        "models": models,
         "rag": rag,
         "context_builder": context_builder,
         "llm_labeler": llm_labeler,
@@ -143,6 +145,9 @@ def build_active_learning_runner(
     cfg: OrchestratorConfig,
     label_config_bundle: LabelConfigBundle,
     phenotype_level: str | None = None,
+    *,
+    models: Models | None = None,
+    store: EmbeddingStore | None = None,
 ) -> ActiveLearningPipeline:
     components = _build_shared_components(
         paths,
@@ -150,6 +155,8 @@ def build_active_learning_runner(
         label_config_bundle,
         phenotype_level=phenotype_level,
         include_pooler=True,  # active learning uses pooler
+        models=models,
+        store=store,
     )
 
     repo = components["repo"]
@@ -212,6 +219,9 @@ def build_inference_runner(
     cfg: OrchestratorConfig,
     label_config_bundle: LabelConfigBundle,
     phenotype_level: str | None = None,
+    *,
+    models: Models | None = None,
+    store: EmbeddingStore | None = None,
 ) -> InferencePipeline:
     components = _build_shared_components(
         paths,
@@ -219,6 +229,8 @@ def build_inference_runner(
         label_config_bundle,
         phenotype_level=phenotype_level,
         include_pooler=False,  # inference does not use pooler
+        models=models,
+        store=store,
     )
 
     return InferencePipeline(
@@ -231,7 +243,71 @@ def build_inference_runner(
     )
 
 
+@dataclass
+class BackendSession:
+    """Lightweight holder for shared embedding models and stores.
+
+    This is useful for parameter sweeps or sharded inference runs where you
+    want to reuse the same Models and EmbeddingStore across multiple
+    ActiveLearning or Inference pipelines.
+    """
+
+    models: Models
+    store: EmbeddingStore
+
+    @classmethod
+    def from_env(cls, paths: Paths, cfg: OrchestratorConfig) -> "BackendSession":
+        """Build a session by loading models from the current environment.
+
+        This mirrors the logic used in _build_shared_components for
+        constructing the EmbeddingStore, but does not instantiate any
+        downstream components (retriever, labeler, etc.).
+        """
+        models = build_models_from_env()
+        store = EmbeddingStore(
+            models,
+            cache_dir=paths.cache_dir,
+            normalize=cfg.rag.normalize_embeddings,
+        )
+        return cls(models=models, store=store)
+
+    def build_active_learning_pipeline(
+        self,
+        paths: Paths,
+        cfg: OrchestratorConfig,
+        label_config_bundle: LabelConfigBundle,
+        phenotype_level: str | None = None,
+    ) -> ActiveLearningPipeline:
+        """Construct an ActiveLearningPipeline reusing this session's models."""
+        return build_active_learning_runner(
+            paths=paths,
+            cfg=cfg,
+            label_config_bundle=label_config_bundle,
+            phenotype_level=phenotype_level,
+            models=self.models,
+            store=self.store,
+        )
+
+    def build_inference_pipeline(
+        self,
+        paths: Paths,
+        cfg: OrchestratorConfig,
+        label_config_bundle: LabelConfigBundle,
+        phenotype_level: str | None = None,
+    ) -> InferencePipeline:
+        """Construct an InferencePipeline reusing this session's models."""
+        return build_inference_runner(
+            paths=paths,
+            cfg=cfg,
+            label_config_bundle=label_config_bundle,
+            phenotype_level=phenotype_level,
+            models=self.models,
+            store=self.store,
+        )
+
+
 __all__ = [
     "build_active_learning_runner",
     "build_inference_runner",
+    "BackendSession",
 ]
