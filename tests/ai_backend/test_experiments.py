@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -53,6 +54,10 @@ def test_run_inference_experiments_smoke(
     notes_df, ann_df = _load_inputs()
     captured_backends: list[str | None] = []
 
+    class _StubSession:
+        models: None = None
+        store: None = None
+
     class _StubInference:
         def __init__(self, paths, cfg=None, **_kwargs):
             self.paths = paths
@@ -100,6 +105,7 @@ def test_run_inference_experiments_smoke(
         base_outdir=tmp_path,
         sweeps=sweeps,
         label_config_bundle=bundle,
+        session=_StubSession(),
     )
 
     # One result per experiment
@@ -128,3 +134,66 @@ def test_run_inference_experiments_smoke(
     assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert set(manifest.keys()) == set(sweeps.keys())
+
+
+def test_run_inference_experiments_scopes_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unit_ids = ["u1", "u2"]
+    notes_df = pd.DataFrame(
+        {
+            "unit_id": ["u1", "u2", "u3"],
+            "note_id": [1, 2, 3],
+            "text": ["a", "b", "c"],
+        }
+    )
+    ann_df = pd.DataFrame(
+        {
+            "unit_id": ["u1", "u2", "u3"],
+            "annotation": ["x", "y", "z"],
+        }
+    )
+
+    class _StubSession:
+        def __init__(self) -> None:
+            self.models = None
+            self.store = None
+
+    stub_session = _StubSession()
+    captured_calls: list[dict[str, Any]] = []
+
+    def _stub_run_inference(**kwargs):
+        captured_calls.append(
+            {
+                "notes_units": set(kwargs["notes_df"]["unit_id"].astype(str).unique()),
+                "ann_units": set(kwargs["ann_df"]["unit_id"].astype(str).unique()),
+                "unit_ids": kwargs.get("unit_ids"),
+                "session": kwargs.get("session"),
+            }
+        )
+        df = kwargs["notes_df"].copy()
+        return df, {"predictions": "pred.parquet", "predictions_json": "pred.json"}
+
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.experiments.run_inference",
+        _stub_run_inference,
+    )
+
+    sweeps = {"exp_a": {}, "exp_b": {}}
+
+    results = run_inference_experiments(
+        notes_df=notes_df,
+        ann_df=ann_df,
+        base_outdir=tmp_path,
+        sweeps=sweeps,
+        unit_ids=unit_ids,
+        session=stub_session,
+    )
+
+    assert set(results.keys()) == set(sweeps.keys())
+    assert len(captured_calls) == len(sweeps)
+    for call in captured_calls:
+        assert call["notes_units"] == set(unit_ids)
+        assert call["ann_units"] == set(unit_ids)
+        assert call["unit_ids"] == unit_ids
+        assert call["session"] is stub_session

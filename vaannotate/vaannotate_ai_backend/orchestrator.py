@@ -11,7 +11,7 @@ import sys
 import pandas as pd
 
 from .config import OrchestratorConfig, Paths
-from .orchestration import build_active_learning_runner, build_inference_runner
+from .orchestration import build_active_learning_runner, build_inference_runner, BackendSession
 from .utils.runtime import cancellation_scope
 from .label_configs import EMPTY_BUNDLE, LabelConfigBundle
 
@@ -404,8 +404,14 @@ def run_inference(
     cancel_callback: Optional[Callable[[], bool]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     cache_dir: Path | None = None,
+    session: BackendSession | None = None,
 ) -> Tuple[pd.DataFrame, dict]:
-    """Run inference-only labeling across the corpus or a provided subset."""
+    """Run inference-only labeling across the corpus or a provided subset.
+
+    If ``session`` is provided, its models and ``EmbeddingStore`` are reused when
+    building the inference pipeline. If ``session`` is ``None``, models and
+    stores are constructed for this call as before.
+    """
 
     outdir = Path(outdir)
     _ensure_dir(outdir)
@@ -437,11 +443,15 @@ def run_inference(
             if os.getenv("VAANNOTATE_TEST_STUB_INFERENCE_RUNNER") == "1":
                 pipeline = _build_test_stub_inference_runner(paths)
             else:
+                models = session.models if session is not None else None
+                store = session.store if session is not None else None
                 pipeline = build_inference_runner(
                     paths=paths,
                     cfg=cfg,
                     label_config_bundle=bundle,
                     phenotype_level=phenotype_level,
+                    models=models,
+                    store=store,
                 )
             result_df = pipeline.run(unit_ids=unit_ids)
 
