@@ -1,0 +1,21 @@
+{
+  "_meta": {
+    "labelset_id": "pneumo_labels",
+    "labelset_name": "Pneumonitis",
+    "notes": "Golden test labelset for AI backend",
+    "created_by": "tests"
+  },
+  "pneumonitis": {
+    "label_id": "pneumonitis",
+    "name": "Pneumonitis",
+    "type": "categorical",
+    "required": true,
+    "na_allowed": false,
+    "options": ["pneumonitis_yes", "pneumonitis_no", "pneumonitis_uncertain"],
+    "option_details": [
+      {"value": "pneumonitis_yes", "display": "Yes"},
+      {"value": "pneumonitis_no", "display": "No"},
+      {"value": "pneumonitis_uncertain", "display": "Uncertain"}
+    ]
+  }
+}

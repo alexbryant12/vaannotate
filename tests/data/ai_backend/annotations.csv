@@ -1,0 +1,4 @@
+round_id,unit_id,doc_id,label_id,reviewer_id,label_value,labelset_id
+r1,1001,n1,pneumonitis,gold,pneumonitis_yes,pneumo_labels
+r1,1002,n2,pneumonitis,gold,pneumonitis_no,pneumo_labels
+r1,1003,n3,pneumonitis,gold,pneumonitis_uncertain,pneumo_labels
