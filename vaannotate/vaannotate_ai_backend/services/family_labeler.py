@@ -4,7 +4,7 @@ import math
 import random
 from collections import Counter
 from datetime import date, datetime
-from typing import Any, List, Optional, Iterable, Callable, Dict
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 import numpy as np
 import pandas as pd
