@@ -168,19 +168,21 @@ class ActiveLearningPipeline:
     def _build_llm_uncertain_bucket(self, label_types: Dict[str, str], rules_map: Dict[str, str], exclude_units: Optional[Set[str]] = None) -> pd.DataFrame:
         if self.uncertain_builder_fn:
             return self.uncertain_builder_fn(label_types, rules_map, exclude_units)
-        fam_cls = getattr(self.llm, "family_labeler_cls", None)
-        fam = fam_cls(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst) if fam_cls else None
-        if fam is None:
-            from ..services.family_labeler import FamilyLabeler
+        from ..services.family_labeler import build_family_labeler, direct_uncertainty_selection
 
-            fam = FamilyLabeler(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
+        fam = build_family_labeler(
+            self.llm,
+            self.retriever,
+            self.repo,
+            self.label_config,
+            self.cfg.scjitter,
+            self.cfg.llmfirst,
+        )
         probe_df = fam.probe_units_label_tree(self.cfg.llmfirst.enrich, label_types, rules_map, exclude_units=exclude_units)
         probe_df = self.uncertainty_scorer.score_probe_results(probe_df)
         if self.jsonify_cols:
             safe_cols = [c for c in ["fc_probs", "rag_context", "why", "runs"] if c in probe_df.columns]
             self.jsonify_cols(probe_df, safe_cols).to_parquet(os.path.join(self.paths.outdir, "llm_probe.parquet"), index=False)
-        from ..services.family_labeler import direct_uncertainty_selection
-
         n_unc = int(self.cfg.select.batch_size * self.cfg.select.pct_uncertain)
         return direct_uncertainty_selection(probe_df, n_unc, select_most_certain=False)
 
@@ -191,21 +193,24 @@ class ActiveLearningPipeline:
         if os.path.exists(p):
             probe_df = pd.read_parquet(p)
         else:
-            fam_cls = getattr(self.llm, "family_labeler_cls", None)
-            fam = fam_cls(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst) if fam_cls else None
-            if fam is None:
-                from ..services.family_labeler import FamilyLabeler
+            from ..services.family_labeler import build_family_labeler, direct_uncertainty_selection
 
-                fam = FamilyLabeler(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
+            fam = build_family_labeler(
+                self.llm,
+                self.retriever,
+                self.repo,
+                self.label_config,
+                self.cfg.scjitter,
+                self.cfg.llmfirst,
+            )
             probe_df = fam.probe_units_label_tree(self.cfg.llmfirst.enrich, label_types, rules_map, exclude_units=exclude_units)
         probe_df = self.uncertainty_scorer.score_probe_results(probe_df)
-        from ..services.family_labeler import direct_uncertainty_selection
-
         n_cer = int(self.cfg.select.batch_size * self.cfg.select.pct_easy_qc)
         return direct_uncertainty_selection(probe_df, n_cer, select_most_certain=True)
 
     def run(self) -> pd.DataFrame:
         import pandas as pd
+        from ..services.family_labeler import build_family_labeler
 
         t0 = time.time()
         check_cancelled = self.check_cancelled or default_check_cancelled
@@ -281,12 +286,14 @@ class ActiveLearningPipeline:
         print("[2/4] Diversity ...")
         check_cancelled()
         want_div = min(n_div, max(0, total - len(selected_units)))
-        fam_cls = getattr(self.llm, "family_labeler_cls", None)
-        fam = fam_cls(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst) if fam_cls else None
-        if fam is None:
-            from ..services.family_labeler import FamilyLabeler
-
-            fam = FamilyLabeler(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
+        fam = build_family_labeler(
+            self.llm,
+            self.retriever,
+            self.repo,
+            self.label_config,
+            self.cfg.scjitter,
+            self.cfg.llmfirst,
+        )
         div_candidates = pd.DataFrame(unseen_pairs_current, columns=["unit_id", "label_id"])
         sel_div_pairs = self.diversity_selector.select_diverse_units(
             div_candidates,
@@ -362,12 +369,14 @@ class ActiveLearningPipeline:
 
         final_out = None
         if getattr(self.cfg, "final_llm_labeling", False):
-            fam_cls = getattr(self.llm, "family_labeler_cls", None)
-            fam = fam_cls(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst) if fam_cls else None
-            if fam is None:
-                from ..services.family_labeler import FamilyLabeler
-
-                fam = FamilyLabeler(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
+            fam = build_family_labeler(
+                self.llm,
+                self.retriever,
+                self.repo,
+                self.label_config,
+                self.cfg.scjitter,
+                self.cfg.llmfirst,
+            )
             unit_ids = final["unit_id"].tolist()
             rules_map = current_rules_map
             types = current_label_types

@@ -44,12 +44,16 @@ class InferencePipeline:
         return current_rules_map, current_label_types
 
     def _label_units(self, unit_ids: Iterable[str], label_types: dict[str, str], rules_map: dict[str, str]) -> pd.DataFrame:
-        fam_cls = getattr(self.llm, "family_labeler_cls", None)
-        fam = fam_cls(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst) if fam_cls else None
-        if fam is None:
-            from ..services.family_labeler import FamilyLabeler
+        from ..services.family_labeler import build_family_labeler
 
-            fam = FamilyLabeler(self.llm, self.retriever, self.repo, self.label_config, self.cfg.scjitter, self.cfg.llmfirst)
+        fam = build_family_labeler(
+            self.llm,
+            self.retriever,
+            self.repo,
+            self.label_config,
+            self.cfg.scjitter,
+            self.cfg.llmfirst,
+        )
 
         rows: List[dict] = []
         for uid in unit_ids:
