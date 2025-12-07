@@ -7,6 +7,7 @@ workflows via :func:`build_next_batch` and :func:`run_inference`.
 __version__ = "0.1.0"
 
 from .orchestrator import build_next_batch, run_inference
+from .orchestration import BackendSession
 from .adapters import BackendResult, export_inputs_from_repo, run_ai_backend_and_collect
 from .utils.runtime import CancelledError
 
@@ -25,4 +26,5 @@ __all__ = [
     "export_inputs_from_repo",
     "run_ai_backend_and_collect",
     "CancelledError",
+    "BackendSession",
 ]
