@@ -9,6 +9,7 @@ __version__ = "0.1.0"
 from .orchestrator import build_next_batch, run_inference
 from .orchestration import BackendSession
 from .adapters import BackendResult, export_inputs_from_repo, run_ai_backend_and_collect
+from .experiments import InferenceExperimentResult, run_inference_experiments
 from .utils.runtime import CancelledError
 
 # Layering overview:
@@ -27,4 +28,6 @@ __all__ = [
     "run_ai_backend_and_collect",
     "CancelledError",
     "BackendSession",
+    "InferenceExperimentResult",
+    "run_inference_experiments",
 ]
