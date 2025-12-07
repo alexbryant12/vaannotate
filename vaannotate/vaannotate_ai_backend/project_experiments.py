@@ -162,7 +162,10 @@ def run_project_inference_experiments(
     semantics) so sweeps can specify only the deltas from a tuned baseline.
     Label configurations are loaded via ``_load_label_config_bundle`` just like
     the main AI backend path, so label rules/types/gating and prior-round gold
-    construction remain aligned for experiment metrics.
+    construction remain aligned for experiment metrics; only a
+    ``cfg_overrides_base['label_config']`` payload is treated as a label
+    configuration override to avoid stomping production labelsets with
+    unrelated sweep parameters.
     Sweeps that alter ``models.embed_model_name`` or ``models.rerank_model_name``
     should avoid reusing a shared :class:`BackendSession`, because the
     embedding store is specific to the embedder; sweeps that only tweak
@@ -186,12 +189,16 @@ def run_project_inference_experiments(
         {str(uid) for uid in gold_df["unit_id"].unique() if pd.notna(uid) and str(uid)}
     )
 
+    label_config_override = None
+    if cfg_overrides_base and isinstance(cfg_overrides_base.get("label_config"), Mapping):
+        label_config_override = cfg_overrides_base["label_config"]
+
     label_config_bundle = _load_label_config_bundle(
         project_root,
         pheno_id,
         labelset_id,
         prior_rounds,
-        overrides=cfg_overrides_base,
+        overrides=label_config_override,
     )
 
     base_cfg = OrchestratorConfig()
