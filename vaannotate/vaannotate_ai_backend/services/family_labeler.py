@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 from collections import Counter
+from datetime import date, datetime
 from typing import Any, List, Optional, Iterable, Callable, Dict
 
 import numpy as np
@@ -138,6 +139,11 @@ def run_family_labeling_for_units(
                 if isinstance(rs, list) and rs
                 else None
             )
+        )
+
+    if "llm_prediction" in df.columns:
+        df["llm_prediction"] = df["llm_prediction"].map(
+            lambda value: value.isoformat() if isinstance(value, (date, datetime)) else value
         )
 
     return df
