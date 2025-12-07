@@ -163,6 +163,7 @@ class LLMBackend:
         logprobs: bool,
         top_logprobs: Optional[int],
         response_format: Optional[Mapping[str, Any]] = None,
+        **_: Any,
     ) -> JSONCallResult:
         raise NotImplementedError
 
@@ -209,6 +210,7 @@ class AzureOpenAIBackend(LLMBackend):
         logprobs: bool,
         top_logprobs: Optional[int],
         response_format: Optional[Mapping[str, Any]] = None,
+        **_: Any,
     ) -> JSONCallResult:
         self._respect_rpm_limit()
         kwargs: Dict[str, Any] = {
@@ -612,6 +614,7 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         logprobs: bool,
         top_logprobs: Optional[int],
         response_format: Optional[Mapping[str, Any]] = None,
+        **_: Any,
     ) -> JSONCallResult:
         prompt = self._format_messages(messages)
         max_new = int(self.cfg.local_max_new_tokens or 1024)
