@@ -32,7 +32,29 @@ def safe_json_loads(x):
 
 
 class DataRepository:
-    """Canonical interface to notes, annotations, and labeling metadata."""
+    """Canonical interface to notes, annotations, and labeling metadata.
+
+    unit_id semantics
+    -----------------
+    The repository normalizes the "unit" of labeling differently depending on
+    the phenotype_level:
+
+    - phenotype_level == "single_doc":
+      * Each unit corresponds to a single document.
+      * notes["unit_id"] is the same as notes["doc_id"].
+      * Annotations are still stored per (unit_id, label_id), but helper
+        methods like doc_id_for_unit(...) can recover the underlying doc_id
+        even if the original notes had their own unit_id column.
+
+    - phenotype_level == "multi_doc" (default):
+      * Each unit corresponds to a patient across all documents.
+      * notes["unit_id"] is the same as notes["patient_icn"].
+      * doc_id is still available for per-document contexts, but the primary
+        selection/labeling grain is the unit_id (patient).
+
+    Callers should treat unit_id as the canonical key for selecting candidate
+    units, and rely on patient_icn/doc_id as metadata attributes.
+    """
 
     def __init__(
         self,
@@ -122,6 +144,13 @@ class DataRepository:
         self._round_labelset_map = self._collect_round_labelsets()
 
     def unit_metadata(self) -> pd.DataFrame:
+        """Return per-unit metadata for joining onto selection/label outputs.
+
+        The returned DataFrame always has a "unit_id" column. For multi_doc
+        phenotypes it also includes "patient_icn"; for single_doc phenotypes it
+        includes both "patient_icn" and "doc_id" so downstream code can recover
+        the document identifier for each unit.
+        """
         columns = ["unit_id", "patient_icn"]
         if self.phenotype_level == "single_doc":
             columns.append("doc_id")

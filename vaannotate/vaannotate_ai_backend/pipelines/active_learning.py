@@ -188,7 +188,7 @@ class ActiveLearningPipeline:
 
     def run(self) -> pd.DataFrame:
         import pandas as pd
-        from ..services.family_labeler import build_family_labeler
+        from ..services.family_labeler import build_family_labeler, run_family_labeling_for_units
 
         t0 = time.time()
         check_cancelled = self.check_cancelled or default_check_cancelled
@@ -358,38 +358,28 @@ class ActiveLearningPipeline:
             unit_ids = final["unit_id"].tolist()
             rules_map = current_rules_map
             types = current_label_types
-            _progress_every = float(getattr(fam.cfg, "progress_min_interval_s", 1) or 1)
-            fam_rows = []
-            for uid in iter_with_bar(
-                step="Final family labeling",
-                iterable=unit_ids,
-                total=len(unit_ids),
-                min_interval_s=_progress_every,
-            ):
-                fam_rows.extend(
-                    fam.label_family_for_unit(
-                        uid,
-                        types,
-                        rules_map,
-                        json_only=True,
-                        json_n_consistency=getattr(self.cfg.llmfirst, "final_llm_label_consistency", 1),
-                        json_jitter=False,
-                    )
+
+            json_n_consistency = int(
+                getattr(self.cfg.llmfirst, "final_llm_label_consistency", 1) or 1
+            )
+
+            fam_df = run_family_labeling_for_units(
+                fam,
+                unit_ids=unit_ids,
+                label_types=types,
+                per_label_rules=rules_map,
+                json_n_consistency=json_n_consistency,
+                json_jitter=False,
+                iter_with_bar_fn=iter_with_bar,
+                progress_step="Final family labeling",
+            )
+
+            # Apply JSON-safe conversion for wide probe traces if configured
+            if not fam_df.empty and self.jsonify_cols:
+                fam_df = self.jsonify_cols(
+                    fam_df,
+                    [c for c in ["rag_context", "llm_runs", "fc_probs"] if c in fam_df.columns],
                 )
-            fam_df = pd.DataFrame(fam_rows)
-            if not fam_df.empty:
-                if "runs" in fam_df.columns:
-                    fam_df.rename(columns={"runs": "llm_runs"}, inplace=True)
-                if "consistency" in fam_df.columns:
-                    fam_df.rename(columns={"consistency": "llm_consistency"}, inplace=True)
-                if "prediction" in fam_df.columns:
-                    fam_df.rename(columns={"prediction": "llm_prediction"}, inplace=True)
-                if "llm_runs" in fam_df.columns:
-                    fam_df["llm_reasoning"] = fam_df["llm_runs"].map(
-                        lambda rs: (rs[0].get("raw", {}).get("reasoning") if isinstance(rs, list) and rs else None)
-                    )
-                if self.jsonify_cols:
-                    fam_df = self.jsonify_cols(fam_df, [c for c in ["rag_context", "llm_runs", "fc_probs"] if c in fam_df.columns])
             fam_df.to_parquet(os.path.join(self.paths.outdir, "final_llm_family_probe.parquet"), index=False)
 
             if not fam_df.empty:
