@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Mapping, Optional
+from typing import Mapping
 
 from .config import OrchestratorConfig, Paths
 from .core.data import DataRepository
@@ -131,99 +131,21 @@ def _attach_unit_metadata(repo: DataRepository, df):
 
 
 def _label_maps(bundle: LabelConfigBundle, label_config: Mapping[str, object]):
-    def _normalize_type(raw: Optional[object]) -> Optional[str]:
-        if raw is None:
-            return None
-        text = str(raw).strip().lower()
-        if not text:
-            return None
-        mapping = {
-            "boolean": "binary",
-            "bool": "binary",
-            "yes/no": "binary",
-            "yesno": "binary",
-            "y/n": "binary",
-            "yn": "binary",
-            "binary": "binary",
-            "categorical": "categorical",
-            "category": "categorical",
-            "multiclass": "categorical",
-            "multi": "categorical",
-            "options": "categorical",
-            "option": "categorical",
-            "text": "categorical",
-            "string": "categorical",
-            "free_text": "categorical",
-            "numeric": "numeric",
-            "number": "numeric",
-            "int": "numeric",
-            "integer": "numeric",
-            "float": "numeric",
-            "double": "numeric",
-            "decimal": "numeric",
-            "ordinal": "ordinal",
-            "rank": "ordinal",
-            "ranking": "ordinal",
-            "date": "date",
-            "datetime": "date",
-            "timestamp": "date",
-        }
-        return mapping.get(text, "categorical")
-
-    def _extract_rule_text(entry: Mapping[str, object] | None) -> Optional[str]:
-        if not isinstance(entry, Mapping):
-            return None
-        for key in ("rule", "rules", "why", "query", "text"):
-            val = entry.get(key)
-            if isinstance(val, str):
-                text = val.strip()
-                if text:
-                    return text
-            elif isinstance(val, list):
-                for item in reversed(val):
-                    if isinstance(item, str):
-                        text = item.strip()
-                        if text:
-                            return text
-                    elif isinstance(item, Mapping):
-                        text = str(item.get("text") or item.get("rule") or "").strip()
-                        if text:
-                            return text
-            elif isinstance(val, Mapping):
-                text = str(val.get("text") or val.get("rule") or "").strip()
-                if text:
-                    return text
-        return None
-
     legacy_rules_map = bundle.legacy_rules_map()
     legacy_label_types = bundle.legacy_label_types()
-    current_rules_map: Dict[str, str] = {}
-    current_label_types: Dict[str, str] = {}
+    try:
+        current_rules_map = bundle.current_rules_map(label_config)
+    except TypeError:
+        current_rules_map = bundle.current_rules_map()
 
-    for key, entry in (label_config or {}).items():
-        if str(key) == "_meta":
-            continue
-        label_entry = entry if isinstance(entry, Mapping) else {}
-        raw_id = label_entry.get("label_id") if isinstance(label_entry, Mapping) else None
-        label_id = str(raw_id or key).strip()
-        if not label_id:
-            continue
+    try:
+        current_label_types = bundle.current_label_types(label_config)
+    except TypeError:
+        current_label_types = bundle.current_label_types()
 
-        rule_text = _extract_rule_text(label_entry) if isinstance(label_entry, Mapping) else None
-        if rule_text is not None:
-            current_rules_map[label_id] = rule_text
-        elif label_id not in current_rules_map:
-            current_rules_map[label_id] = ""
-
-        normalized_type = _normalize_type(label_entry.get("type") if isinstance(label_entry, Mapping) else None)
-        if normalized_type:
-            current_label_types[label_id] = normalized_type
-        elif label_id not in current_label_types:
-            current_label_types[label_id] = "categorical"
-
-    if not current_rules_map:
+    if not current_rules_map and legacy_rules_map:
         current_rules_map = dict(legacy_rules_map)
-    if not current_label_types:
+    if not current_label_types and legacy_label_types:
         current_label_types = dict(legacy_label_types)
 
     return legacy_rules_map, legacy_label_types, current_rules_map, current_label_types

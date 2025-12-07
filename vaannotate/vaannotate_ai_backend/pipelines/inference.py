@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Iterable, List, Mapping, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -23,75 +23,24 @@ class InferencePipeline:
         self.label_config_bundle = getattr(ctx_builder, "label_config_bundle", None)
 
     def _label_maps(self) -> Tuple[dict[str, str], dict[str, str]]:
-        def _normalize_type(raw_type: object) -> str:
-            if raw_type is None:
-                return ""
-            t = str(raw_type).strip().lower()
-            if not t:
-                return ""
-            if t in {"binary", "categorical", "categorical_single", "categorical_multi", "ordinal", "date", "numeric"}:
-                return t
-            return "categorical"
+        bundle = getattr(self, "label_config_bundle", None)
+        if bundle is None:
+            return {}, {}
 
-        def _extract_rule_text(entry: Mapping[str, object] | None) -> str:
-            if not isinstance(entry, Mapping):
-                return ""
-            for key in ("rule", "rules", "why", "query", "text"):
-                val = entry.get(key)
-                if isinstance(val, str):
-                    val = val.strip()
-                    if val:
-                        return val
-                elif isinstance(val, list):
-                    for item in reversed(val):
-                        if isinstance(item, str):
-                            text = item.strip()
-                            if text:
-                                return text
-                        elif isinstance(item, Mapping):
-                            text = str(item.get("text") or item.get("rule") or "").strip()
-                            if text:
-                                return text
-                elif isinstance(val, Mapping):
-                    text = str(val.get("text") or val.get("rule") or "").strip()
-                    if text:
-                        return text
-            return ""
+        try:
+            current_rules_map = bundle.current_rules_map(self.label_config)
+        except TypeError:
+            current_rules_map = bundle.current_rules_map()
 
-        legacy_rules_map = (
-            getattr(self.label_config_bundle, "legacy_rules_map", lambda: {})() if self.label_config_bundle else {}
-        )
-        legacy_label_types = (
-            getattr(self.label_config_bundle, "legacy_label_types", lambda: {})() if self.label_config_bundle else {}
-        )
-
-        current_rules_map: dict[str, str] = {}
-        current_label_types: dict[str, str] = {}
-
-        for key, entry in (self.label_config or {}).items():
-            if str(key) == "_meta":
-                continue
-            label_entry = entry if isinstance(entry, Mapping) else {}
-            raw_id = label_entry.get("label_id") if isinstance(label_entry, Mapping) else None
-            label_id = str(raw_id or key).strip()
-            if not label_id:
-                continue
-
-            rule_text = _extract_rule_text(label_entry) if isinstance(label_entry, Mapping) else ""
-            if label_id not in current_rules_map:
-                current_rules_map[label_id] = rule_text
-
-            normalized_type = _normalize_type(label_entry.get("type") if isinstance(label_entry, Mapping) else None)
-            if normalized_type:
-                current_label_types[label_id] = normalized_type
-            elif label_id not in current_label_types:
-                current_label_types[label_id] = "categorical"
+        try:
+            current_label_types = bundle.current_label_types(self.label_config)
+        except TypeError:
+            current_label_types = bundle.current_label_types()
 
         if not current_rules_map:
-            current_rules_map = dict(legacy_rules_map)
+            current_rules_map = {}
         if not current_label_types:
-            current_label_types = dict(legacy_label_types)
-
+            current_label_types = {}
         return current_rules_map, current_label_types
 
     def _label_units(self, unit_ids: Iterable[str], label_types: dict[str, str], rules_map: dict[str, str]) -> pd.DataFrame:
