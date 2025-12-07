@@ -13,9 +13,37 @@ def _jsonify_cols(df, cols: List[str]):
     for c in cols:
         if c in out.columns:
             out[c] = out[c].apply(
-                lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else x
+                lambda x: _jsonify_value(x)
             )
     return out
+
+
+def _jsonify_value(value):
+    """Normalize structured values to JSON strings.
+
+    PyArrow/parquet writes will fail when a column mixes structured objects
+    (lists, dicts, tuples, sets) with plain scalars. Converting the structured
+    values to JSON strings keeps the column homogenous and avoids the
+    "cannot mix struct and non-struct" error.
+    """
+
+    # Preserve common scalars and null-ish values unchanged
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    # Normalize common container types into JSON strings
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, tuple):
+        return json.dumps(list(value), ensure_ascii=False)
+    if isinstance(value, set):
+        return json.dumps(sorted(value), ensure_ascii=False)
+
+    # Fallback: stringify any other object to avoid struct/scalar mixing
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        return json.dumps(str(value), ensure_ascii=False)
 
 
 def _maybe_parse_jsonish(value):
