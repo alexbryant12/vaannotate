@@ -1,17 +1,25 @@
 """Helpers for project-level inference experiments."""
 
+import copy
 import json
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple
 
 import pandas as pd
 
-from .adapters import export_inputs_from_repo
+from .adapters import _load_label_config_bundle, export_inputs_from_repo
 from .config import OrchestratorConfig, Paths
 from .experiments import InferenceExperimentResult, run_inference_experiments
-from .label_configs import LabelConfigBundle
 from .orchestration import BackendSession
 from .orchestrator import _apply_overrides
+
+
+def merge_cfg_overrides(base: dict | None, overrides: dict | None) -> dict:
+    """Deep-merge overrides onto a baseline using ``_apply_overrides`` semantics."""
+
+    combined = copy.deepcopy(base) if base is not None else {}
+    _apply_overrides(combined, overrides or {})
+    return combined
 
 
 def _infer_unit_id_column(notes_df: pd.DataFrame, phenotype_level: str) -> pd.Series:
@@ -148,6 +156,17 @@ def run_project_inference_experiments(
     """
     Use prior rounds to build a gold-standard set and run a sweep of
     inference experiments. Returns (results_dict, gold_df).
+
+    The ``cfg_overrides_base`` configuration is deep-merged with each sweep's
+    overrides (via :func:`merge_cfg_overrides` and ``_apply_overrides``
+    semantics) so sweeps can specify only the deltas from a tuned baseline.
+    Label configurations are loaded via ``_load_label_config_bundle`` just like
+    the main AI backend path, so label rules/types/gating and prior-round gold
+    construction remain aligned for experiment metrics.
+    Sweeps that alter ``models.embed_model_name`` or ``models.rerank_model_name``
+    should avoid reusing a shared :class:`BackendSession`, because the
+    embedding store is specific to the embedder; sweeps that only tweak
+    RAG/LLM knobs can safely share the session for speed.
     """
 
     notes_df, ann_df = export_inputs_from_repo(
@@ -167,7 +186,13 @@ def run_project_inference_experiments(
         {str(uid) for uid in gold_df["unit_id"].unique() if pd.notna(uid) and str(uid)}
     )
 
-    bundle = LabelConfigBundle(current_labelset_id=labelset_id)
+    label_config_bundle = _load_label_config_bundle(
+        project_root,
+        pheno_id,
+        labelset_id,
+        prior_rounds,
+        overrides=cfg_overrides_base,
+    )
 
     base_cfg = OrchestratorConfig()
     if cfg_overrides_base:
@@ -181,9 +206,10 @@ def run_project_inference_experiments(
     )
     session = BackendSession.from_env(session_paths, base_cfg)
 
-    base_overrides = dict(cfg_overrides_base or {})
+    base_overrides = cfg_overrides_base or {}
     sweeps_with_base = {
-        name: {**base_overrides, **dict(overrides)} for name, overrides in sweeps.items()
+        name: merge_cfg_overrides(base_overrides, dict(overrides))
+        for name, overrides in sweeps.items()
     }
 
     results = run_inference_experiments(
@@ -192,7 +218,7 @@ def run_project_inference_experiments(
         base_outdir=base_outdir,
         sweeps=sweeps_with_base,
         unit_ids=eval_unit_ids,
-        label_config_bundle=bundle,
+        label_config_bundle=label_config_bundle,
         session=session,
     )
 

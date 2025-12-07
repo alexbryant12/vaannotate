@@ -152,6 +152,12 @@ class SCJitterConfig:
 
 
 @dataclass
+class ModelConfig:
+    embed_model_name: str | None = None
+    rerank_model_name: str | None = None
+
+
+@dataclass
 class Paths:
     notes_path: str
     annotations_path: str
@@ -180,6 +186,7 @@ class OrchestratorConfig:
     disagree: DisagreementConfig = field(default_factory=DisagreementConfig)
     diversity: DiversityConfig = field(default_factory=DiversityConfig)
     scjitter: SCJitterConfig = field(default_factory=SCJitterConfig)
+    models: ModelConfig = field(default_factory=ModelConfig)
     final_llm_labeling: bool = True
     final_llm_labeling_n_consistency: int = 1
     excluded_unit_ids: set[str] = field(default_factory=set)
