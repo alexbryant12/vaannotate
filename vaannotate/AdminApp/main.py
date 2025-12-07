@@ -135,6 +135,296 @@ class LabelDefinition:
 
 
 @dataclass
+class InferenceExperimentConfig:
+    pheno_id: str
+    pheno_level: str
+    prior_rounds: List[int]
+    labelset_id: str
+    corpus_id: str | None
+    corpus_path: str | None
+    sweeps: Dict[str, dict]
+    cfg_overrides_base: dict
+    outdir: Path
+
+
+class InferenceExperimentDialog(QtWidgets.QDialog):
+    def __init__(self, parent, ctx: "ProjectContext", pheno_row, labelsets, rounds):
+        super().__init__(parent)
+        self.ctx = ctx
+        self.pheno_row = pheno_row
+        self.labelsets = labelsets
+        self.rounds = rounds
+        self._cfg_overrides_base: dict = {}
+        self._corpus_path: str | None = None
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        self.setWindowTitle("Inference experiments")
+        layout = QtWidgets.QVBoxLayout(self)
+
+        rounds_group = QtWidgets.QGroupBox("Prior rounds")
+        rounds_layout = QtWidgets.QVBoxLayout(rounds_group)
+        self.rounds_list = QtWidgets.QListWidget()
+        for entry in self.rounds:
+            round_number = entry.get("round_number") if isinstance(entry, Mapping) else entry
+            round_id = None
+            if isinstance(entry, Mapping):
+                round_id = entry.get("round_id")
+            if round_number is None:
+                continue
+            display = f"Round {round_number}"
+            if round_id:
+                display = f"{display} ({round_id})"
+            item = QtWidgets.QListWidgetItem(display)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, int(round_number))
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            self.rounds_list.addItem(item)
+        rounds_layout.addWidget(self.rounds_list)
+        layout.addWidget(rounds_group)
+
+        labelset_group = QtWidgets.QGroupBox("Labelset")
+        labelset_layout = QtWidgets.QFormLayout(labelset_group)
+        self.labelset_combo = QtWidgets.QComboBox()
+        for labelset in self.labelsets:
+            if not isinstance(labelset, Mapping):
+                continue
+            labelset_id = str(labelset.get("labelset_id") or "")
+            if not labelset_id:
+                continue
+            display = str(labelset.get("name") or labelset_id)
+            self.labelset_combo.addItem(display, labelset_id)
+        labelset_layout.addRow("Labelset", self.labelset_combo)
+        layout.addWidget(labelset_group)
+
+        corpus_group = QtWidgets.QGroupBox("Corpus")
+        corpus_layout = QtWidgets.QHBoxLayout(corpus_group)
+        self.corpus_combo = QtWidgets.QComboBox()
+        self._populate_corpus_combo()
+        corpus_layout.addWidget(self.corpus_combo)
+        self.corpus_browse_btn = QtWidgets.QPushButton("Browse…")
+        self.corpus_browse_btn.clicked.connect(self._browse_corpus_path)
+        corpus_layout.addWidget(self.corpus_browse_btn)
+        layout.addWidget(corpus_group)
+
+        sweeps_group = QtWidgets.QGroupBox("Sweeps")
+        sweeps_layout = QtWidgets.QVBoxLayout(sweeps_group)
+        self.sweeps_table = QtWidgets.QTableWidget(0, 4)
+        self.sweeps_table.setHorizontalHeaderLabels(
+            ["Name", "Chunk size", "Top k", "Backend"]
+        )
+        self.sweeps_table.horizontalHeader().setStretchLastSection(True)
+        sweeps_layout.addWidget(self.sweeps_table)
+        sweeps_buttons = QtWidgets.QHBoxLayout()
+        self.add_sweep_btn = QtWidgets.QPushButton("Add row")
+        self.add_sweep_btn.clicked.connect(self._add_sweep_row)
+        sweeps_buttons.addWidget(self.add_sweep_btn)
+        self.remove_sweep_btn = QtWidgets.QPushButton("Remove row")
+        self.remove_sweep_btn.clicked.connect(self._remove_sweep_row)
+        sweeps_buttons.addWidget(self.remove_sweep_btn)
+        sweeps_buttons.addStretch()
+        sweeps_layout.addLayout(sweeps_buttons)
+        layout.addWidget(sweeps_group)
+
+        baseline_group = QtWidgets.QGroupBox("Baseline AI config")
+        baseline_layout = QtWidgets.QVBoxLayout(baseline_group)
+        self.baseline_label = QtWidgets.QLabel("No baseline loaded")
+        baseline_layout.addWidget(self.baseline_label)
+        baseline_buttons = QtWidgets.QHBoxLayout()
+        self.load_latest_btn = QtWidgets.QPushButton("Load from latest round")
+        self.load_latest_btn.clicked.connect(self._load_latest_round_config)
+        baseline_buttons.addWidget(self.load_latest_btn)
+        self.advanced_btn = QtWidgets.QPushButton("Advanced…")
+        self.advanced_btn.clicked.connect(self._open_advanced_config)
+        baseline_buttons.addWidget(self.advanced_btn)
+        baseline_buttons.addStretch()
+        baseline_layout.addLayout(baseline_buttons)
+        layout.addWidget(baseline_group)
+
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _populate_corpus_combo(self) -> None:
+        self.corpus_combo.clear()
+        corpora = self.ctx.list_corpora()
+        if not corpora:
+            self.corpus_combo.addItem("Select corpus…", None)
+            self.corpus_combo.setEnabled(False)
+            return
+        self.corpus_combo.setEnabled(True)
+        for corpus in corpora:
+            corpus_id = str(corpus.get("corpus_id") or "")
+            name = str(corpus.get("name") or corpus_id)
+            self.corpus_combo.addItem(f"{name} ({corpus_id})", corpus_id)
+        self.corpus_combo.setCurrentIndex(0)
+
+    def _browse_corpus_path(self) -> None:
+        start_dir = str(self.ctx.project_root or Path.home())
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select corpus database",
+            start_dir,
+            "SQLite databases (*.db *.sqlite *.sqlite3);;All files (*)",
+        )
+        if path_str:
+            self._corpus_path = path_str
+
+    def _add_sweep_row(self) -> None:
+        row = self.sweeps_table.rowCount()
+        self.sweeps_table.insertRow(row)
+        self.sweeps_table.setItem(row, 0, QtWidgets.QTableWidgetItem(""))
+        self.sweeps_table.setItem(row, 1, QtWidgets.QTableWidgetItem(""))
+        self.sweeps_table.setItem(row, 2, QtWidgets.QTableWidgetItem(""))
+        self.sweeps_table.setItem(row, 3, QtWidgets.QTableWidgetItem(""))
+
+    def _remove_sweep_row(self) -> None:
+        row = self.sweeps_table.currentRow()
+        if row >= 0:
+            self.sweeps_table.removeRow(row)
+
+    def _load_latest_round_config(self) -> None:
+        latest_round = None
+        latest_number = -1
+        for entry in self.rounds:
+            if not isinstance(entry, Mapping):
+                number = int(entry)
+                round_id = None
+            else:
+                number = int(entry.get("round_number") or 0)
+                round_id = entry.get("round_id")
+            if number > latest_number:
+                latest_number = number
+                latest_round = round_id or entry
+        if latest_round is None or latest_number < 0:
+            QtWidgets.QMessageBox.warning(self, "Baseline", "No prior rounds available.")
+            return
+        round_id_value = None
+        if isinstance(latest_round, Mapping):
+            round_id_value = latest_round.get("round_id")
+        elif isinstance(latest_round, str):
+            round_id_value = latest_round
+        config: dict | None = None
+        if round_id_value:
+            config = self.ctx.get_round_config(str(round_id_value))
+        if not isinstance(config, Mapping):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Baseline",
+                "Could not load AI config from the latest round.",
+            )
+            return
+        ai_cfg = config.get("ai_backend") if isinstance(config, Mapping) else None
+        if isinstance(ai_cfg, Mapping):
+            self._cfg_overrides_base = dict(ai_cfg)
+            self.baseline_label.setText(f"Loaded from round {latest_number}")
+        else:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Baseline",
+                "Latest round is missing AI configuration.",
+            )
+
+    def _open_advanced_config(self) -> None:
+        dialog = AIAdvancedConfigDialog(self, self._cfg_overrides_base)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._cfg_overrides_base = dialog.result_config or {}
+
+    def accept(self) -> None:  # type: ignore[override]
+        prior_rounds = [
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for item in self._checked_round_items()
+        ]
+        if not prior_rounds:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation", "Select at least one prior round."
+            )
+            return
+        if self.labelset_combo.currentIndex() < 0:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation", "Select a labelset for evaluation."
+            )
+            return
+        if not self._collect_sweeps():
+            QtWidgets.QMessageBox.warning(
+                self, "Validation", "Add at least one sweep configuration."
+            )
+            return
+        super().accept()
+
+    def _checked_round_items(self) -> List[QtWidgets.QListWidgetItem]:
+        items: List[QtWidgets.QListWidgetItem] = []
+        for idx in range(self.rounds_list.count()):
+            item = self.rounds_list.item(idx)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                items.append(item)
+        return items
+
+    def _collect_sweeps(self) -> Dict[str, dict]:
+        sweeps: Dict[str, dict] = {}
+        for row in range(self.sweeps_table.rowCount()):
+            name_item = self.sweeps_table.item(row, 0)
+            if not name_item:
+                continue
+            name = name_item.text().strip()
+            if not name:
+                continue
+            chunk_item = self.sweeps_table.item(row, 1)
+            topk_item = self.sweeps_table.item(row, 2)
+            backend_item = self.sweeps_table.item(row, 3)
+            rag_cfg: dict = {}
+            try:
+                chunk_size = int(chunk_item.text()) if chunk_item and chunk_item.text() else None
+            except ValueError:
+                chunk_size = None
+            if chunk_size is not None:
+                rag_cfg["chunk_size"] = chunk_size
+            try:
+                top_k = int(topk_item.text()) if topk_item and topk_item.text() else None
+            except ValueError:
+                top_k = None
+            if top_k is not None:
+                rag_cfg["top_k_final"] = top_k
+            llm_cfg: dict = {}
+            backend = backend_item.text().strip() if backend_item else ""
+            if backend:
+                llm_cfg["backend"] = backend
+            sweep_cfg: dict = {}
+            if rag_cfg:
+                sweep_cfg["rag"] = rag_cfg
+            if llm_cfg:
+                sweep_cfg["llm"] = llm_cfg
+            sweeps[name] = sweep_cfg
+        return sweeps
+
+    def to_config(self) -> InferenceExperimentConfig:
+        pheno_id = str(self.pheno_row.get("pheno_id") if isinstance(self.pheno_row, Mapping) else "")
+        pheno_level = str(self.pheno_row.get("level") if isinstance(self.pheno_row, Mapping) else "")
+        prior_rounds = [int(item.data(QtCore.Qt.ItemDataRole.UserRole)) for item in self._checked_round_items()]
+        labelset_id = self.labelset_combo.currentData()
+        corpus_id = self.corpus_combo.currentData()
+        sweeps = self._collect_sweeps()
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        project_root = self.ctx.project_root or Path.cwd()
+        outdir = project_root / "phenotypes" / pheno_id / "experiments" / timestamp
+        return InferenceExperimentConfig(
+            pheno_id=pheno_id,
+            pheno_level=pheno_level,
+            prior_rounds=prior_rounds,
+            labelset_id=str(labelset_id) if labelset_id is not None else "",
+            corpus_id=corpus_id if isinstance(corpus_id, str) else None,
+            corpus_path=self._corpus_path,
+            sweeps=sweeps,
+            cfg_overrides_base=self._cfg_overrides_base,
+            outdir=outdir,
+        )
+
+
+@dataclass
 class RoundCreationContext:
     pheno_id: str
     pheno_level: str
@@ -6232,6 +6522,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
 class ProjectTreeWidget(QtWidgets.QTreeWidget):
     node_selected = QtCore.Signal(dict)
+    run_inference_experiments_requested = QtCore.Signal(QtWidgets.QTreeWidgetItem)
 
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -6351,6 +6642,12 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             view_labelsets_action.triggered.connect(lambda: self._view_labelsets(item))
             action = menu.addAction("Add round…")
             action.triggered.connect(lambda: self._add_round(item))
+            experiment_action = menu.addAction("Run inference experiments…")
+            experiment_action.triggered.connect(
+                lambda _checked=False, item=item: self.run_inference_experiments_requested.emit(
+                    item
+                )
+            )
             delete_action = menu.addAction("Delete phenotype…")
             delete_action.triggered.connect(lambda: self._delete_phenotype(item))
         elif node_type == "round":
@@ -9820,6 +10117,8 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         self.ctx = ProjectContext()
         self.setWindowTitle("VAAnnotate Admin")
         self.resize(1280, 860)
+        self._inference_log_dialog: Optional[AIRoundLogDialog] = None
+        self._inference_log_output: Optional[QtWidgets.QPlainTextEdit] = None
         self._setup_menu()
         self._setup_central()
         self.ctx.dirty_changed.connect(self._on_dirty_changed)
@@ -9843,6 +10142,9 @@ class AdminMainWindow(QtWidgets.QMainWindow):
     def _setup_central(self) -> None:
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.tree = ProjectTreeWidget(self.ctx)
+        self.tree.run_inference_experiments_requested.connect(
+            self._on_run_inference_experiments
+        )
         splitter.addWidget(self.tree)
 
         self.stack = QtWidgets.QStackedWidget()
@@ -9918,6 +10220,133 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         else:
             self.project_view.set_project(self.ctx.project_row)
             self._show_view("project")
+
+    def _open_inference_log_dialog(self) -> None:
+        dialog = self._inference_log_dialog
+        if dialog is None:
+            dialog = AIRoundLogDialog(self)
+            dialog.setWindowTitle("Inference experiments")
+            dialog.finished.connect(self._on_inference_log_dialog_closed)
+            self._inference_log_dialog = dialog
+        dialog.reset_for_run()
+        self._inference_log_output = dialog.log_output
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _append_inference_log(self, message: str) -> None:
+        if not self._inference_log_output:
+            return
+        stamp = datetime.utcnow().strftime("%H:%M:%S")
+        self._inference_log_output.appendPlainText(f"[{stamp}] {message.strip()}")
+
+    def _mark_inference_log_complete(self) -> None:
+        if not self._inference_log_dialog:
+            return
+        self._inference_log_dialog.mark_complete()
+
+    def _close_inference_log_dialog(self) -> None:
+        if not self._inference_log_dialog:
+            return
+        dialog = self._inference_log_dialog
+        self._inference_log_dialog = None
+        self._inference_log_output = None
+        dialog.close()
+        dialog.deleteLater()
+
+    def _on_inference_log_dialog_closed(self) -> None:
+        self._inference_log_dialog = None
+        self._inference_log_output = None
+
+    def _run_inference_experiments_in_background(
+        self,
+        config: InferenceExperimentConfig,
+    ) -> None:
+        """
+        Start a background job to run inference experiments.
+        """
+
+        class _InferenceExperimentSignals(QtCore.QObject):
+            log = QtCore.Signal(str)
+            finished = QtCore.Signal()
+            failed = QtCore.Signal(str)
+
+        signals = _InferenceExperimentSignals()
+        signals.log.connect(self._append_inference_log)
+        signals.finished.connect(self._on_inference_experiments_finished)
+        signals.failed.connect(self._on_inference_experiments_failed)
+
+        self._open_inference_log_dialog()
+        self._append_inference_log("Preparing inference experiments…")
+
+        def worker() -> None:
+            try:
+                from vaannotate.vaannotate_ai_backend.project_experiments import (
+                    run_project_inference_experiments,
+                )
+
+                signals.log.emit("Starting inference sweeps…")
+                try:
+                    ensure_dir(config.outdir)
+                except Exception as exc:  # noqa: BLE001
+                    signals.log.emit(f"Error preparing output directory: {exc}")
+                    signals.failed.emit(str(exc))
+                    return
+                run_project_inference_experiments(
+                    project_root=self.ctx.project_root,
+                    pheno_id=config.pheno_id,
+                    prior_rounds=config.prior_rounds,
+                    labelset_id=config.labelset_id or None,
+                    phenotype_level=config.pheno_level,
+                    sweeps=config.sweeps,
+                    base_outdir=config.outdir,
+                    corpus_id=config.corpus_id,
+                    corpus_path=config.corpus_path,
+                    cfg_overrides_base=config.cfg_overrides_base,
+                )
+            except Exception as exc:  # noqa: BLE001
+                signals.log.emit(f"Error: {exc}")
+                signals.failed.emit(str(exc))
+            else:
+                signals.log.emit("Inference experiments completed.")
+                signals.finished.emit()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def _on_inference_experiments_finished(self) -> None:
+        self._append_inference_log("Inference experiments finished.")
+        self._mark_inference_log_complete()
+
+    def _on_inference_experiments_failed(self, message: str) -> None:
+        self._append_inference_log("Inference experiments failed.")
+        self._append_inference_log(message)
+        self._mark_inference_log_complete()
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Inference experiments",
+            f"Inference experiments failed: {message}",
+        )
+
+    def _on_run_inference_experiments(
+        self, pheno_item: QtWidgets.QTreeWidgetItem
+    ) -> None:
+        data = pheno_item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        pheno_row = None
+        if isinstance(data, Mapping):
+            pheno_row = data.get("pheno") or data
+        if not isinstance(pheno_row, Mapping):
+            return
+        pheno_id = pheno_row.get("pheno_id")
+        if not pheno_id:
+            return
+        labelsets = self.ctx.list_label_sets()
+        rounds = self.ctx.list_rounds(pheno_id)
+        dialog = InferenceExperimentDialog(self, self.ctx, pheno_row, labelsets, rounds)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        cfg = dialog.to_config()
+        self._run_inference_experiments_in_background(cfg)
 
     def _create_project(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(self, "Create project", "Project name:")
