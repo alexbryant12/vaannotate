@@ -652,7 +652,7 @@ class RAGRetriever:
             oversample=pool_oversample,
         )
 
-        diagnostics["retrieval_coordinator"] = pool_diag
+        diagnostics["retrieval"] = pool_diag
         diagnostics["keyword_search"] = {
             "keywords": uniq_keywords,
             "hit_count": pool_diag.get("keyword_hits", 0),
