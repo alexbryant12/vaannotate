@@ -159,7 +159,7 @@ class ActiveLearningPipeline:
         probe_df = fam.probe_units_label_tree(self.cfg.llmfirst.enrich, label_types, rules_map, exclude_units=exclude_units)
         probe_df = self.uncertainty_scorer.score_probe_results(probe_df)
         if self.jsonify_cols:
-            safe_cols = [c for c in ["fc_probs", "rag_context", "why", "runs"] if c in probe_df.columns]
+            safe_cols = [c for c in ["fc_probs", "rag_context", "why", "runs", "llm_runs"] if c in probe_df.columns]
             self.jsonify_cols(probe_df, safe_cols).to_parquet(os.path.join(self.paths.outdir, "llm_probe.parquet"), index=False)
         n_unc = int(self.cfg.select.batch_size * self.cfg.select.pct_uncertain)
         return direct_uncertainty_selection(probe_df, n_unc, select_most_certain=False)
