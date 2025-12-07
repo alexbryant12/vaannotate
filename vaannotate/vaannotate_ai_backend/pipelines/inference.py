@@ -44,7 +44,7 @@ class InferencePipeline:
         return current_rules_map, current_label_types
 
     def _label_units(self, unit_ids: Iterable[str], label_types: dict[str, str], rules_map: dict[str, str]) -> pd.DataFrame:
-        from ..services.family_labeler import build_family_labeler
+        from ..services.family_labeler import build_family_labeler, run_family_labeling_for_units
 
         fam = build_family_labeler(
             self.llm,
@@ -55,32 +55,23 @@ class InferencePipeline:
             self.cfg.llmfirst,
         )
 
-        rows: List[dict] = []
-        for uid in unit_ids:
-            rows.extend(
-                fam.label_family_for_unit(
-                    uid,
-                    label_types,
-                    rules_map,
-                    json_only=True,
-                    json_n_consistency=getattr(self.cfg.llmfirst, "final_llm_label_consistency", 1),
-                    json_jitter=False,
-                )
-            )
+        json_n_consistency = int(
+            getattr(self.cfg.llmfirst, "final_llm_label_consistency", 1) or 1
+        )
 
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        if "runs" in df.columns:
-            df.rename(columns={"runs": "llm_runs"}, inplace=True)
-        if "consistency" in df.columns:
-            df.rename(columns={"consistency": "llm_consistency"}, inplace=True)
-        if "prediction" in df.columns:
-            df.rename(columns={"prediction": "llm_prediction"}, inplace=True)
-        if "llm_runs" in df.columns:
-            df["llm_reasoning"] = df["llm_runs"].map(
-                lambda rs: (rs[0].get("raw", {}).get("reasoning") if isinstance(rs, list) and rs else None)
-            )
+        df = run_family_labeling_for_units(
+            fam,
+            unit_ids=unit_ids,
+            label_types=label_types,
+            per_label_rules=rules_map,
+            json_n_consistency=json_n_consistency,
+            json_jitter=False,
+            iter_with_bar_fn=None,
+            progress_step="Inference family labeling",
+        )
+
+        # The JSON-safe view is still handled by _jsonify_cols in run(), so we
+        # simply return the tall DataFrame here.
         return df
 
     def run(self, unit_ids: Optional[List[str]] = None) -> pd.DataFrame:

@@ -172,85 +172,57 @@ class RAGRetriever:
         cached = self._bm25_cache.get(uid)
         if cached is not None:
             return cached
+
+        idx: Optional[dict] = None
         if hasattr(self.store, "bm25_index_for_unit"):
-            idx = self.store.bm25_index_for_unit(uid)
-            if idx is not None:
-                self._bm25_cache[uid] = idx
-                return idx
-        idxs = self.store.get_patient_chunk_indices(uid)
-        if not idxs:
-            return None
-        docs, metas = [], []
-        for ix in idxs:
-            meta = self.store.chunk_meta[ix]
-            tokens = self._tokenize_for_bm25(meta.get("text", ""))
-            if not tokens:
-                continue
-            docs.append(tokens)
-            metas.append(meta)
-        if not docs:
-            return None
-        avgdl = sum(len(toks) for toks in docs) / float(len(docs))
-        index = {"docs": docs, "metas": metas, "avgdl": avgdl}
-        self._bm25_cache[uid] = index
-        if hasattr(self.store, "bm25_indices"):
             try:
-                existing_indices = getattr(self.store, "bm25_indices", {})
-                if not isinstance(existing_indices, dict):
-                    existing_indices = {}
-                units = existing_indices.get("units") if "units" in existing_indices else existing_indices
-                if not isinstance(units, dict):
-                    units = {}
-                units = dict(units)
-                units[uid] = index
-                if "units" in existing_indices or not existing_indices:
-                    existing_indices = dict(existing_indices)
-                    existing_indices["units"] = units
-                else:
-                    existing_indices = units
-                self.store.bm25_indices = existing_indices
-                if hasattr(self.store, "_chunk_cache_dir_path"):
-                    self.store._save_bm25_indices(self.store._chunk_cache_dir_path, self.store.bm25_indices)
+                idx = self.store.bm25_index_for_unit(uid)
             except Exception:
-                pass
-        return index
+                idx = None
+
+        if idx is None:
+            return None
+
+        self._bm25_cache[uid] = idx
+        return idx
 
     def _bm25_hits_for_patient(self, unit_id: str, keywords: List[str]) -> List[dict]:
         if not keywords:
             return []
+
         index = self._bm25_index_for_patient(unit_id)
         if not index:
             return []
-        query_tokens = []
+
+        query_tokens: List[str] = []
         for kw in keywords:
             if isinstance(kw, str):
                 query_tokens.extend(self._tokenize_for_bm25(kw))
         if not query_tokens:
             return []
-        docs = index["docs"]
+
+        docs = index.get("docs") or []
+        metas = index.get("metas") or []
+        if not docs or not metas:
+            return []
+
+        # Global IDF statistics are maintained by the EmbeddingStore.
         idf = getattr(self.store, "idf_global", {}) or {}
         if not idf and isinstance(getattr(self.store, "bm25_indices", None), dict):
             indices_dict = getattr(self.store, "bm25_indices", {})
-            idf = indices_dict.get("idf_global", {}) if isinstance(indices_dict, dict) else {}
-        if not idf and hasattr(self.store, "_build_bm25_indices"):
-            built = self.store._build_bm25_indices()
-            if isinstance(built, dict):
-                self.store.bm25_indices = built
-                idf = built.get("idf_global", {})
-                if hasattr(self.store, "_chunk_cache_dir_path"):
-                    try:
-                        self.store._save_bm25_indices(self.store._chunk_cache_dir_path, built)
-                    except Exception:
-                        pass
+            if isinstance(indices_dict, dict):
+                idf = indices_dict.get("idf_global", {}) or {}
+
         if not idf:
             return []
-        avgdl = index["avgdl"] or 1.0
-        metas = index["metas"]
+
+        avgdl = float(index.get("avgdl") or 1.0)
         k1, b = 1.5, 0.75
         scores: List[tuple[float, dict]] = []
+
         for toks, meta in zip(docs, metas):
             tf = Counter(toks)
-            dl = len(toks)
+            dl = len(toks) or 1
             score = 0.0
             for term in query_tokens:
                 if term not in tf or term not in idf:
@@ -258,20 +230,24 @@ class RAGRetriever:
                 freq = tf[term]
                 denom = freq + k1 * (1 - b + b * dl / avgdl)
                 score += idf[term] * (freq * (k1 + 1)) / (denom + 1e-12)
-            if score <= 0:
+            if score <= 0.0:
                 continue
             scores.append((score, meta))
+
         scores.sort(key=lambda pair: pair[0], reverse=True)
-        out = []
+
+        out: List[dict] = []
         for score, meta in scores[: self.cfg.keyword_topk]:
-            out.append({
-                "doc_id": meta.get("doc_id"),
-                "chunk_id": meta.get("chunk_id"),
-                "metadata": self._extract_meta(meta),
-                "text": meta.get("text", ""),
-                "score": float(score),
-                "source": "bm25",
-            })
+            out.append(
+                {
+                    "doc_id": meta.get("doc_id"),
+                    "chunk_id": meta.get("chunk_id"),
+                    "metadata": self._extract_meta(meta),
+                    "text": meta.get("text", ""),
+                    "score": float(score),
+                    "source": "bm25",
+                }
+            )
         return out
 
     def _reciprocal_rank_fusion(self, runs: List[List[dict]], constant: int = 60) -> List[dict]:

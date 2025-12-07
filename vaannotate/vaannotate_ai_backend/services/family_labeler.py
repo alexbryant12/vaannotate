@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 from collections import Counter
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Iterable, Callable, Dict
 
 import numpy as np
 import pandas as pd
@@ -59,6 +59,89 @@ def build_family_labeler(
         sc_cfg,
         llmfirst_cfg,
     )
+
+
+def run_family_labeling_for_units(
+    fam: "FamilyLabeler",
+    unit_ids: Iterable[str],
+    label_types: Dict[str, str],
+    per_label_rules: Dict[str, str],
+    *,
+    json_n_consistency: int = 1,
+    json_jitter: bool = False,
+    iter_with_bar_fn: Optional[Callable[..., object]] = None,
+    progress_step: str = "Family labeling",
+) -> pd.DataFrame:
+    """Label a collection of units with a FamilyLabeler and return a normalized DataFrame.
+
+    This helper centralizes the 'family pass' logic that was previously
+    duplicated between the active-learning final LLM labeling pass and the
+    inference pipeline:
+
+    * iterates over each unit_id
+    * calls fam.label_family_for_unit(..., json_only=True, ...)
+    * flattens into a tall DataFrame
+    * normalizes column names (runs->llm_runs, consistency->llm_consistency,
+      prediction->llm_prediction)
+    * extracts a best-effort llm_reasoning column from the first run, when
+      available.
+    """
+    # Normalize and filter unit IDs
+    unit_list = [str(u) for u in unit_ids if str(u)]
+    if not unit_list:
+        return pd.DataFrame()
+
+    rows: List[dict] = []
+
+    # Optional progress wrapper for long runs
+    iterable = unit_list
+    if iter_with_bar_fn is not None:
+        min_interval = float(
+            getattr(getattr(fam, "cfg", None), "progress_min_interval_s", 1.0) or 1.0
+        )
+        iterable = iter_with_bar_fn(
+            step=progress_step,
+            iterable=unit_list,
+            total=len(unit_list),
+            min_interval_s=min_interval,
+        )
+
+    for uid in iterable:
+        rows.extend(
+            fam.label_family_for_unit(
+                uid,
+                label_types,
+                per_label_rules,
+                json_only=True,
+                json_n_consistency=int(json_n_consistency),
+                json_jitter=bool(json_jitter),
+            )
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # Normalize column names
+    if "runs" in df.columns:
+        df.rename(columns={"runs": "llm_runs"}, inplace=True)
+    if "consistency" in df.columns:
+        df.rename(columns={"consistency": "llm_consistency"}, inplace=True)
+    if "prediction" in df.columns:
+        df.rename(columns={"prediction": "llm_prediction"}, inplace=True)
+
+    # Extract a single reasoning field from the first run when present
+    if "llm_runs" in df.columns and "llm_reasoning" not in df.columns:
+        df["llm_reasoning"] = df["llm_runs"].map(
+            lambda rs: (
+                rs[0].get("raw", {}).get("reasoning")
+                if isinstance(rs, list) and rs
+                else None
+            )
+        )
+
+    return df
+
 
 class FamilyLabeler:
     """Label entire family tree per unit, honoring parent-child gating."""
