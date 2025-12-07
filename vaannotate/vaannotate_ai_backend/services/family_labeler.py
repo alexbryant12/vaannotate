@@ -123,6 +123,23 @@ def run_family_labeling_for_units(
     if df.empty:
         return df
 
+    return _normalize_family_predictions_df(df)
+
+
+def _normalize_family_predictions_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize LLM family-label outputs for downstream storage.
+
+    Ensures column names match the ``llm_*`` conventions, extracts a best-effort
+    reasoning string, and converts any date/datetime predictions to
+    ISO-formatted strings to avoid serialization errors (e.g., parquet write
+    failures when predictions are Python ``date`` objects).
+    """
+
+    if df.empty:
+        return df
+
+    df = df.copy()
+
     # Normalize column names
     if "runs" in df.columns:
         df.rename(columns={"runs": "llm_runs"}, inplace=True)
@@ -661,7 +678,7 @@ class FamilyLabeler:
             rows.extend(self.label_family_for_unit(uid, label_types, per_label_rules))
 
         df = pd.DataFrame(rows)
-        return df
+        return _normalize_family_predictions_df(df)
 
 # ------------------------------
 def per_label_kcenter(pool_df: pd.DataFrame, pooler: LabelAwarePooler, retriever: RAGRetriever, rules_map: Dict[str,str],
