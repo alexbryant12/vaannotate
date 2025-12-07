@@ -91,11 +91,20 @@ def test_active_learning_run_preserves_recorder_meta(tmp_path: Path, monkeypatch
         def legacy_label_types(self):  # pragma: no cover - trivial
             return {}
 
-        def current_rules_map(self):  # pragma: no cover - trivial
+        def current_rules_map(self, *_, **__):  # pragma: no cover - trivial
             return {"label_a": "rule"}
 
-        def current_label_types(self):  # pragma: no cover - trivial
+        def current_label_types(self, *_, **__):  # pragma: no cover - trivial
             return {"label_a": "binary"}
+
+        def label_maps(self, label_config=None, ann_df=None):  # pragma: no cover - trivial
+            """Minimal shim to match LabelConfigBundle.label_maps signature."""
+            return (
+                self.legacy_rules_map(),
+                self.legacy_label_types(),
+                self.current_rules_map(label_config),
+                self.current_label_types(label_config),
+            )
 
     select_cfg = types.SimpleNamespace(
         batch_size=1,

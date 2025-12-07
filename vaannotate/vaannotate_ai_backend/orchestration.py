@@ -138,27 +138,6 @@ def _attach_unit_metadata(repo: DataRepository, df):
     return df.merge(meta, on="unit_id", how="left")
 
 
-def _label_maps(bundle: LabelConfigBundle, label_config: Mapping[str, object]):
-    legacy_rules_map = bundle.legacy_rules_map()
-    legacy_label_types = bundle.legacy_label_types()
-    try:
-        current_rules_map = bundle.current_rules_map(label_config)
-    except TypeError:
-        current_rules_map = bundle.current_rules_map()
-
-    try:
-        current_label_types = bundle.current_label_types(label_config)
-    except TypeError:
-        current_label_types = bundle.current_label_types()
-
-    if not current_rules_map and legacy_rules_map:
-        current_rules_map = dict(legacy_rules_map)
-    if not current_label_types and legacy_label_types:
-        current_label_types = dict(legacy_label_types)
-
-    return legacy_rules_map, legacy_label_types, current_rules_map, current_label_types
-
-
 def build_active_learning_runner(
     paths: Paths,
     cfg: OrchestratorConfig,
@@ -224,7 +203,6 @@ def build_active_learning_runner(
         iter_with_bar_fn=iter_with_bar,
         jsonify_cols_fn=_jsonify_cols,
         attach_metadata_fn=lambda df: _attach_unit_metadata(repo, df),
-        label_maps_fn=lambda: _label_maps(label_config_bundle, label_config),
         rerank_override_fn=lambda rules_map: _build_rerank_rule_overrides(llm_labeler, rules_map),
     )
 

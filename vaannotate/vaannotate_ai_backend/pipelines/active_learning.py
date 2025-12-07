@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from dataclasses import replace
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
@@ -76,6 +75,7 @@ class ActiveLearningPipeline:
         return removed
 
     def _label_maps(self) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
+        # If a custom label_maps_fn was injected, honor that first (for tests or overrides).
         label_maps_fn = getattr(self, "label_maps_fn", None)
         if callable(label_maps_fn):
             return label_maps_fn()
@@ -84,46 +84,24 @@ class ActiveLearningPipeline:
         if bundle is None:
             return {}, {}, {}, {}
 
+        # Prefer the centralized helper on LabelConfigBundle when available.
+        ann_df = getattr(getattr(self, "repo", None), "ann", None)
+        label_config = getattr(self, "label_config", None)
+        label_maps = getattr(bundle, "label_maps", None)
+        if callable(label_maps):
+            return label_maps(label_config=label_config, ann_df=ann_df)
+
+        # Fallback path for older or stub bundles that don't implement ``label_maps``.
         legacy_rules_map = bundle.legacy_rules_map()
         legacy_label_types = bundle.legacy_label_types()
 
-        if not legacy_rules_map:
-            legacy_config: Dict[str, Dict[str, object]] = {}
-            ann_df = getattr(getattr(self, "repo", None), "ann", None)
-            if ann_df is not None and hasattr(ann_df, "__iter__"):
-                try:
-                    label_ids = {str(lid) for lid in ann_df.get("label_id", []) if str(lid)}
-                except Exception:
-                    label_ids = set()
-
-                for label_id in sorted(label_ids):
-                    rule_text: Optional[str] = None
-                    try:
-                        rules_col = ann_df.loc[ann_df["label_id"] == label_id, "label_rules"]
-                        for raw_rule in reversed(getattr(rules_col, "tolist", lambda: [])()):
-                            if isinstance(raw_rule, str) and raw_rule.strip():
-                                rule_text = raw_rule.strip()
-                                break
-                    except Exception:
-                        rule_text = None
-
-                    entry: Dict[str, object] = {"label_id": label_id, "type": "boolean"}
-                    if rule_text is not None:
-                        entry["rules"] = rule_text
-                    legacy_config[label_id] = entry
-
-            if legacy_config:
-                fallback_bundle = replace(bundle, legacy={"_annotations": legacy_config})
-                legacy_rules_map = fallback_bundle.legacy_rules_map()
-                legacy_label_types = fallback_bundle.legacy_label_types()
-
         try:
-            current_rules_map = bundle.current_rules_map(getattr(self, "label_config", None))
+            current_rules_map = bundle.current_rules_map(label_config)
         except TypeError:
             current_rules_map = bundle.current_rules_map()
 
         try:
-            current_label_types = bundle.current_label_types(getattr(self, "label_config", None))
+            current_label_types = bundle.current_label_types(label_config)
         except TypeError:
             current_label_types = bundle.current_label_types()
 
