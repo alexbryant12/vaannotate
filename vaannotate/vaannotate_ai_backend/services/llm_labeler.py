@@ -83,6 +83,15 @@ def _options_for_label(label_id: str, label_type: str, label_cfgs: dict) -> Opti
 class LLMLabeler:
     """Builds prompts, calls the backend, and normalizes LLM label outputs."""
 
+    CATEGORICAL_TYPES = {
+        "binary",
+        "boolean",
+        "categorical",
+        "categorical_single",
+        "categorical_multi",
+        "ordinal",
+    }
+
     def __init__(
         self,
         llm_backend,
@@ -186,6 +195,50 @@ class LLMLabeler:
             _add_if_selected(prediction)
 
         return ",".join(selected) if selected else None
+
+    @staticmethod
+    def _prediction_schema(
+        ltype: str, option_values: list[str] | None, categorical_types: set[str] | None = None
+    ) -> dict:
+        lt_norm = (ltype or "").strip().lower()
+        opts = [str(o) for o in (option_values or [])]
+        cat_types = categorical_types or LLMLabeler.CATEGORICAL_TYPES
+        if lt_norm == "categorical_multi":
+            if opts:
+                return {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string", "enum": opts}},
+                        {
+                            "type": "object",
+                            "properties": {
+                                opt: {"type": "string", "enum": ["yes", "no", "unknown"]}
+                                for opt in opts
+                            },
+                            "additionalProperties": False,
+                        },
+                    ]
+                }
+            return {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "object"}]}
+        if opts and lt_norm in cat_types:
+            return {"type": "string", "enum": opts}
+        if lt_norm in {"binary", "boolean"}:
+            return {"type": "string", "enum": ["yes", "no", "unknown"]}
+        if lt_norm in {"numeric", "number", "int", "integer", "float", "double"}:
+            return {
+                "anyOf": [
+                    {"type": "number"},
+                    {
+                        "type": "string",
+                        "description": "Numeric value or 'unknown' when evidence is absent.",
+                    },
+                ]
+            }
+        if lt_norm in {"date", "datetime", "timestamp"}:
+            return {
+                "type": "string",
+                "description": "ISO 8601 date (YYYY-MM-DD) when known, otherwise 'unknown'.",
+            }
+        return {"type": "string"}
 
     @staticmethod
     def _parse_float(value):
@@ -380,14 +433,7 @@ class LLMLabeler:
 
             opts = _options_for_label(label_id, label_type, self.label_config)
             lt_norm = (label_type or "").strip().lower()
-            categorical_types = {
-                "binary",
-                "boolean",
-                "categorical",
-                "categorical_single",
-                "categorical_multi",
-                "ordinal",
-            }
+            categorical_types = self.CATEGORICAL_TYPES
             use_options = bool(opts) and lt_norm in categorical_types
             option_values = [str(opt) for opt in (opts or [])]
             is_multi_select = lt_norm == "categorical_multi"
@@ -432,7 +478,13 @@ class LLMLabeler:
 
             few_shot_msgs = self._few_shot_messages(label_id)
             messages = ([{"role": "system", "content": system}] + few_shot_msgs + [{"role": "user", "content": ctx_text}])
-            schema = {"type": "object", "properties": {"prediction": {"type": "string"}}, "required": ["prediction"], "additionalProperties": include_reasoning}
+            prediction_schema = self._prediction_schema(label_type, option_values, categorical_types)
+            schema = {
+                "type": "object",
+                "properties": {"prediction": prediction_schema},
+                "required": ["prediction"],
+                "additionalProperties": include_reasoning,
+            }
             if include_reasoning:
                 schema["properties"]["reasoning"] = {"type": "string"}
             try:
@@ -564,55 +616,7 @@ class LLMLabeler:
         include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
         ordered_snippets = self._ordered_snippets(ctx_snippets)
         ctx_text = self._build_context_text(ordered_snippets)
-
-        categorical_types = {
-            "binary",
-            "boolean",
-            "categorical",
-            "categorical_single",
-            "categorical_multi",
-            "ordinal",
-        }
-
-        def _prediction_schema(ltype: str, option_values: list[str] | None) -> dict:
-            lt_norm = (ltype or "").strip().lower()
-            opts = [str(o) for o in (option_values or [])]
-            if lt_norm == "categorical_multi":
-                if opts:
-                    return {
-                        "anyOf": [
-                            {"type": "array", "items": {"type": "string", "enum": opts}},
-                            {
-                                "type": "object",
-                                "properties": {
-                                    opt: {"type": "string", "enum": ["yes", "no", "unknown"]}
-                                    for opt in opts
-                                },
-                                "additionalProperties": False,
-                            },
-                        ]
-                    }
-                return {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "object"}]}
-            if opts and lt_norm in categorical_types:
-                return {"type": "string", "enum": opts}
-            if lt_norm in {"binary", "boolean"}:
-                return {"type": "string", "enum": ["yes", "no", "unknown"]}
-            if lt_norm in {"numeric", "number", "int", "integer", "float", "double"}:
-                return {
-                    "anyOf": [
-                        {"type": "number"},
-                        {
-                            "type": "string",
-                            "description": "Numeric value or 'unknown' when evidence is absent.",
-                        },
-                    ]
-                }
-            if lt_norm in {"date", "datetime", "timestamp"}:
-                return {
-                    "type": "string",
-                    "description": "ISO 8601 date (YYYY-MM-DD) when known, otherwise 'unknown'.",
-                }
-            return {"type": "string"}
+        categorical_types = self.CATEGORICAL_TYPES
 
         label_summaries: list[str] = []
         schema = {"type": "object", "properties": {}, "additionalProperties": False, "required": []}
@@ -631,12 +635,19 @@ class LLMLabeler:
                 label_lines.append(f"Guidelines:\n{rules}")
             label_lines.append("If no evidence, respond with 'no' or 'unknown'.")
             if is_multi:
-                label_lines.append("Select all supported options; omit unsupported ones.")
+                label_lines.append(
+                    "Select all supported options; omit unsupported ones."
+                )
+                label_lines.append(
+                    "Set prediction to a JSON object with each selected option key set to 'Yes' (omit or set to 'No' when unsupported)."
+                )
             label_summaries.append("\n".join(label_lines))
 
             label_schema = {
                 "type": "object",
-                "properties": {"prediction": _prediction_schema(ltype, option_values)},
+                "properties": {
+                    "prediction": self._prediction_schema(ltype, option_values, self.CATEGORICAL_TYPES)
+                },
                 "required": ["prediction"],
                 "additionalProperties": include_reasoning,
             }

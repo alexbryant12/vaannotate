@@ -71,6 +71,7 @@ def test_llm_annotator_multicategorical_inline_keys(tmp_path):
 
         def json_call(self, messages, **kwargs):  # noqa: D401
             calls["messages"] = list(messages)
+            calls["response_format"] = kwargs.get("response_format")
             payload = {
                 "reasoning": "evidence",
                 "Option A": "Yes",
@@ -108,6 +109,11 @@ def test_llm_annotator_multicategorical_inline_keys(tmp_path):
     run = result["runs"][0]
     assert run["prediction"] == "Option A"
     assert run.get("raw_prediction") == "Option A"
+
+    response_format = calls.get("response_format") or {}
+    schema = (response_format.get("json_schema") if isinstance(response_format, dict) else {}) or {}
+    pred_schema = (schema.get("properties") or {}).get("prediction", {})
+    assert "anyOf" in pred_schema
 
 
 def test_multicategorical_probe_uses_json_consistency(tmp_path):
@@ -171,3 +177,59 @@ def test_multicategorical_probe_uses_json_consistency(tmp_path):
     assert calls["fc"] == 0
     assert calls["json"] == 1
     assert rows[0]["prediction"] == "Option A"
+
+
+def test_multilabel_prompt_switches_to_multi_select(tmp_path):
+    calls: dict[str, object] = {}
+
+    class DummyBackend:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def json_call(self, messages, **kwargs):  # noqa: D401
+            calls["messages"] = list(messages)
+            calls["response_format"] = kwargs.get("response_format")
+            payload = {
+                "Multi": {"prediction": {"Option A": "Yes", "Option B": "No"}},
+                "Single": {"prediction": "Option B"},
+            }
+            return JSONCallResult(
+                data=payload,
+                content=json.dumps(payload),
+                raw_response=None,
+                latency_s=0.01,
+                logprobs=None,
+            )
+
+    llm_cfg = ai_config.LLMConfig()
+    annotator = LLMLabeler(
+        DummyBackend(llm_cfg),
+        LabelConfigBundle(),
+        llm_cfg,
+        sc_cfg=ai_config.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
+    annotator.label_config = {
+        "Multi": {"options": ["Option A", "Option B"]},
+        "Single": {"options": ["Option A", "Option B"]},
+    }
+
+    result = annotator.annotate_multi(
+        unit_id="unit-4",
+        label_ids=["Multi", "Single"],
+        label_types={"Multi": "categorical_multi", "Single": "categorical"},
+        rules_map={"Multi": "", "Single": ""},
+        ctx_snippets=[{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}],
+    )
+
+    system_message = next(msg["content"] for msg in calls["messages"] if msg["role"] == "system")
+    assert "Select all supported options" in system_message
+    assert "selected option key" in system_message
+
+    response_format = calls.get("response_format") or {}
+    schema = (response_format.get("json_schema") if isinstance(response_format, dict) else {}) or {}
+    multi_schema = (((schema.get("properties") or {}).get("Multi", {}) or {}).get("properties") or {}).get("prediction", {})
+    assert "anyOf" in multi_schema
+
+    assert result["predictions"]["Multi"]["prediction"] == "Option A"
+    assert result["predictions"]["Single"]["prediction"] == "Option B"
