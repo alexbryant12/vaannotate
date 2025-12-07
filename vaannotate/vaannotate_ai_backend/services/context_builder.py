@@ -123,6 +123,91 @@ class ContextBuilder:
             original_unit_id=str(unit_id),
         )
 
+    def build_context_for_family(
+        self,
+        unit_id: str,
+        label_ids: list[str],
+        rules_map: Mapping[str, str],
+        *,
+        topk_per_label: int | None = None,
+        max_snippets: int | None = None,
+        max_chars: int | None = None,
+    ) -> list[dict]:
+        """
+        Build a single merged context for a unit across many labels.
+
+        - For each label_id in label_ids:
+            - Look up rules_text = rules_map.get(label_id, "")
+            - Call build_context_for_label(unit_id, label_id, rules_text, ...)
+            - Take up to topk_per_label snippets (if provided), otherwise keep all.
+        - Deduplicate snippets across labels (e.g. by (doc_id, chunk_id) or another stable key in the snippet dict).
+        - Sort snippets in a stable way (e.g. by descending score, then by chronological metadata if available).
+        - Apply max_snippets to truncate the list if provided.
+        - Apply a character budget if max_chars is not None, by walking the sorted snippets and stopping when the cumulative length of snippet["text"] (or their rendered form) exceeds max_chars.
+        - Return the final list of snippet dicts, retaining the same shape as build_context_for_label.
+        """
+
+        collected: list[dict] = []
+        topk: int | None = None
+        if topk_per_label is not None:
+            try:
+                topk = max(0, int(topk_per_label))
+            except Exception:
+                topk = None
+
+        for label_id in label_ids:
+            snippets = self.build_context_for_label(unit_id, label_id, rules_map.get(label_id, ""))
+            if topk is not None:
+                snippets = snippets[:topk]
+            collected.extend(snippets)
+
+        seen: dict[tuple[object, object], dict] = {}
+        ordered: list[dict] = []
+        for snip in collected:
+            key = (snip.get("doc_id"), snip.get("chunk_id"))
+            if key in seen:
+                continue
+            seen[key] = snip
+            ordered.append(snip)
+
+        def _score_key(item: dict, idx: int) -> tuple:
+            raw_score = item.get("score")
+            try:
+                score = float(raw_score)
+            except Exception:
+                score = 0.0
+            return (-score, idx)
+
+        scored = sorted(enumerate(ordered), key=lambda t: _score_key(t[1], t[0]))
+        sorted_snippets = [ordered[idx] for idx, _ in scored]
+
+        if max_snippets is not None:
+            try:
+                limit = int(max_snippets)
+            except Exception:
+                limit = None
+            if limit is not None and limit >= 0:
+                sorted_snippets = sorted_snippets[:limit]
+
+        if max_chars is not None:
+            try:
+                char_budget = int(max_chars)
+            except Exception:
+                char_budget = None
+            if char_budget is not None and char_budget > 0:
+                total = 0
+                budgeted: list[dict] = []
+                for snip in sorted_snippets:
+                    text = snip.get("text", "")
+                    length = len(text) if isinstance(text, str) else len(str(text))
+                    if total + length > char_budget:
+                        break
+                    budgeted.append(snip)
+                    total += length
+                sorted_snippets = budgeted
+
+        return sorted_snippets
+
     def _retrieve_rag_context(
         self,
         unit_id: str,

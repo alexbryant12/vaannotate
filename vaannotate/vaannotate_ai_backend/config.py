@@ -95,6 +95,18 @@ class SelectionConfig:
 
 @dataclass
 class LLMFirstConfig:
+    """Knobs for the LLM-first labeling pipeline.
+
+    Attributes:
+        inference_labeling_mode: how to label units during inference; "family"
+            uses the existing FamilyLabeler, "single_prompt" will use a single
+            multi-label LLM call per unit.
+        single_prompt_max_labels: safety clamp on how many labels can be included
+            in a single-prompt call.
+        single_prompt_max_chars: approximate cap on total characters of the
+            merged context passed to the LLM in single-prompt mode.
+    """
+
     n_probe_units: int = 10
     topk: int = 6
     json_trace_policy: str = 'fallback'
@@ -102,6 +114,9 @@ class LLMFirstConfig:
     exemplar_K: int = 1
     exemplar_generate: bool = True
     exemplar_temperature: float = 0.9
+    inference_labeling_mode: str = "family"  # "family" | "single_prompt"
+    single_prompt_max_labels: int = 64
+    single_prompt_max_chars: int = 16000
     # forced-choice micro-probe
     fc_enable: bool = True
     #label enrichment for probe

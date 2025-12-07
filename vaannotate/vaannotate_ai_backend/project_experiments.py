@@ -170,6 +170,8 @@ def run_project_inference_experiments(
     should avoid reusing a shared :class:`BackendSession`, because the
     embedding store is specific to the embedder; sweeps that only tweak
     RAG/LLM knobs can safely share the session for speed.
+    Sweeps or inference experiments can switch to single-prompt label inference
+    with a cfg override like ``{"llmfirst": {"inference_labeling_mode": "single_prompt"}}``.
     """
 
     notes_df, ann_df = export_inputs_from_repo(
