@@ -46,7 +46,7 @@ except Exception:
 
 def _options_for_label(label_id: str, label_type: str, label_config: dict) -> list[str]:
     cfg = label_config.get(label_id, {}) if isinstance(label_config, dict) else {}
-    if label_type == "categorical":
+    if label_type in {"categorical", "categorical_multi"}:
         return cfg.get("options", []) or []
     if label_type == "binary":
         return ["yes", "no"]
