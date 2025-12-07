@@ -7,7 +7,7 @@ from typing import Mapping
 
 from .config import OrchestratorConfig, Paths
 from .core.data import DataRepository
-from .core.embeddings import EmbeddingStore, build_models_from_env
+from .core.embeddings import EmbeddingStore, Models, build_models_from_env
 from .label_configs import LabelConfigBundle
 from .llm_backends import build_llm_backend
 from .pipelines.active_learning import ActiveLearningPipeline
@@ -35,13 +35,21 @@ def _build_shared_components(
     phenotype_level: str | None = None,
     *,
     include_pooler: bool = False,
+    models: Models | None = None,
+    store: EmbeddingStore | None = None,
 ):
     notes_df = read_table(paths.notes_path)
     ann_df = read_table(paths.annotations_path)
     repo = DataRepository(notes_df, ann_df, phenotype_level=phenotype_level)
 
-    models = build_models_from_env()
-    store = EmbeddingStore(models, cache_dir=paths.cache_dir, normalize=cfg.rag.normalize_embeddings)
+    if models is None:
+        models = build_models_from_env()
+    if store is None:
+        store = EmbeddingStore(
+            models,
+            cache_dir=paths.cache_dir,
+            normalize=cfg.rag.normalize_embeddings,
+        )
     rag = RAGRetriever(
         store,
         models,
@@ -162,7 +170,7 @@ def build_active_learning_runner(
         cfg,
         label_config_bundle,
         phenotype_level=phenotype_level,
-        include_pooler=True,
+        include_pooler=True,  # active learning uses pooler
     )
 
     repo = components["repo"]
@@ -232,7 +240,7 @@ def build_inference_runner(
         cfg,
         label_config_bundle,
         phenotype_level=phenotype_level,
-        include_pooler=False,
+        include_pooler=False,  # inference does not use pooler
     )
 
     return InferencePipeline(
