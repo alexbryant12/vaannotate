@@ -80,6 +80,14 @@ def _load_label_config_bundle(
     *,
     overrides: Optional[Dict[str, Any]] = None,
 ) -> LabelConfigBundle:
+    """Load the current and historical label configs for a phenotype.
+
+    ``overrides`` can supply a pre-parsed label_config (for example from
+    ``label_config.json`` or experiment baseline overrides). When provided, the
+    overrides are used as the current config payload and can optionally carry a
+    ``_meta.labelset_id``/``labelset_name`` hint to set ``current_labelset_id``
+    when one is not passed explicitly.
+    """
     project_db = Path(project_root) / "project.db"
     legacy_configs: Dict[str, Dict[str, Any]] = {}
     round_labelsets: Dict[str, str] = {}

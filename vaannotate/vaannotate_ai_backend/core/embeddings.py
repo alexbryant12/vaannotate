@@ -12,12 +12,15 @@ import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from ..utils.runtime import iter_with_bar as _iter_with_bar
+
+if TYPE_CHECKING:
+    from ..config import ModelConfig
 
 try:
     import faiss  # type: ignore
@@ -74,11 +77,15 @@ def _ensure_default_ce_max_length(reranker: CrossEncoder, *, default: int = 512)
             pass
 
 
-def build_models_from_env() -> "Models":
+def build_models_from_env(model_cfg: "ModelConfig | None" = None) -> "Models":
     import os
 
-    embed_name = os.getenv("MED_EMBED_MODEL_NAME")
-    rerank_name = os.getenv("RERANKER_MODEL_NAME")
+    embed_name = (model_cfg.embed_model_name if model_cfg else None) or os.getenv(
+        "MED_EMBED_MODEL_NAME"
+    )
+    rerank_name = (model_cfg.rerank_model_name if model_cfg else None) or os.getenv(
+        "RERANKER_MODEL_NAME"
+    )
     device = _detect_device()
     embedder = SentenceTransformer(embed_name, device=device)
     reranker = CrossEncoder(rerank_name, device=device)

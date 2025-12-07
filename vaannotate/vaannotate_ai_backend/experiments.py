@@ -96,7 +96,10 @@ def run_inference_experiments(
     session:
         Optional BackendSession to reuse a single set of models + EmbeddingStore
         across all sweeps. If ``None``, a fresh session is created using the
-        shared cache directory.
+        shared cache directory. Sweeps that vary ``models.embed_model_name`` or
+        ``models.rerank_model_name`` should avoid reusing a shared session
+        because the embedding store is tied to the embedder choice; sweeps that
+        only adjust RAG/LLM knobs can safely share the session for speed.
 
     Returns
     -------

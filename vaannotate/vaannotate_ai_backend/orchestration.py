@@ -44,7 +44,7 @@ def _build_shared_components(
     repo = DataRepository(notes_df, ann_df, phenotype_level=phenotype_level)
 
     if models is None:
-        models = build_models_from_env()
+        models = build_models_from_env(cfg.models)
     if store is None:
         store = EmbeddingStore(
             models,
@@ -263,7 +263,7 @@ class BackendSession:
         constructing the EmbeddingStore, but does not instantiate any
         downstream components (retriever, labeler, etc.).
         """
-        models = build_models_from_env()
+        models = build_models_from_env(cfg.models)
         store = EmbeddingStore(
             models,
             cache_dir=paths.cache_dir,
