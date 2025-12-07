@@ -10340,8 +10340,8 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         pheno_id = pheno_row.get("pheno_id")
         if not pheno_id:
             return
-        labelsets = self.ctx.list_labelsets_for_pheno(pheno_id)
-        rounds = self.ctx.list_rounds_for_pheno(pheno_id)
+        labelsets = self.ctx.list_label_sets()
+        rounds = self.ctx.list_rounds(pheno_id)
         dialog = InferenceExperimentDialog(self, self.ctx, pheno_row, labelsets, rounds)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
