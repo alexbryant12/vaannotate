@@ -105,6 +105,40 @@ class LLMLabeler:
         except Exception:
             pass
 
+    def _ordered_snippets(self, items: List[dict]) -> List[dict]:
+        context_order = getattr(self.cfg, "context_order", "relevance") or "relevance"
+        if str(context_order).lower() != "chronological":
+            return list(items)
+        sortable: list[tuple[str, int, dict]] = []
+        for idx, snip in enumerate(items):
+            meta = snip.get("metadata") if isinstance(snip, Mapping) else {}
+            date_val = ""
+            if isinstance(meta, Mapping):
+                date_val = str(meta.get("date") or "")
+            sortable.append((date_val, idx, snip))
+        sortable.sort(key=lambda t: (t[0], t[1]))
+        return [entry[2] for entry in sortable]
+
+    def _build_context_text(self, snippets: List[dict]) -> str:
+        ctx, used = [], 0
+        budget = max(1000, getattr(self.cfg, "max_context_chars", 4000))
+        for s in snippets:
+            md = s.get("metadata") or {}
+            hdr_bits = [f"doc_id={s.get('doc_id')}", f"chunk_id={s.get('chunk_id')}"]
+            if md.get("date"):
+                hdr_bits.append(f"date={md['date']}")
+            note_type = md.get("note_type") or md.get("notetype")
+            if note_type:
+                hdr_bits.append(f"type={note_type}")
+            header = "[" + ", ".join(hdr_bits) + "] "
+            text_body = (s.get("text", "") or "")
+            frag = header + text_body
+            if used + len(frag) > budget:
+                break
+            ctx.append(frag)
+            used += len(frag)
+        return "\n\n".join(ctx)
+
     @staticmethod
     def _norm_token(x) -> str:
         if x is None:
@@ -313,45 +347,10 @@ class LLMLabeler:
         rag_dropout_p = getattr(self.scCfg, "rag_dropout_p", 0.0)
         temp_range = getattr(self.scCfg, "temperature_range", (self.cfg.temperature, self.cfg.temperature))
         shuffle_context = getattr(self.scCfg, "shuffle_context", False)
-        context_order = getattr(self.cfg, "context_order", "relevance") or "relevance"
-
-        def _ordered_snippets(items: List[dict]) -> List[dict]:
-            if str(context_order).lower() != "chronological":
-                return list(items)
-            sortable: list[tuple[str, int, dict]] = []
-            for idx, snip in enumerate(items):
-                meta = snip.get("metadata") if isinstance(snip, Mapping) else {}
-                date_val = ""
-                if isinstance(meta, Mapping):
-                    date_val = str(meta.get("date") or "")
-                sortable.append((date_val, idx, snip))
-            sortable.sort(key=lambda t: (t[0], t[1]))
-            return [entry[2] for entry in sortable]
-
-        snippets = _ordered_snippets(snippets)
+        snippets = self._ordered_snippets(snippets)
 
         rng = random.Random()
         include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
-
-        def _build_context_text(_snips: List[dict]) -> str:
-            ctx, used = [], 0
-            budget = max(1000, getattr(self.cfg, "max_context_chars", 4000))
-            for s in _snips:
-                md = s.get("metadata") or {}
-                hdr_bits = [f"doc_id={s.get('doc_id')}", f"chunk_id={s.get('chunk_id')}"]
-                if md.get("date"):
-                    hdr_bits.append(f"date={md['date']}")
-                note_type = md.get("note_type") or md.get("notetype")
-                if note_type:
-                    hdr_bits.append(f"type={note_type}")
-                header = "[" + ", ".join(hdr_bits) + "] "
-                text_body = (s.get("text", "") or "")
-                frag = header + text_body
-                if used + len(frag) > budget:
-                    break
-                ctx.append(frag)
-                used += len(frag)
-            return "\n\n".join(ctx)
 
         preds, runs = [], []
         system_intro = "You are a meticulous clinical annotator for EHR data."
@@ -372,11 +371,11 @@ class LLMLabeler:
                 t_lo, t_hi = temp_range
                 t = rng.uniform(float(t_lo), float(t_hi))
                 sc_meta = f"<!-- sc:vote={i};k={k};drop={drop_p:.2f};shuf={int(shuffle_context)};temp={t:.2f} -->"
-                ctx_text = _build_context_text(cand)
+                ctx_text = self._build_context_text(cand)
                 temperature_this_vote = t
             else:
                 sc_meta = ""
-                ctx_text = _build_context_text(snippets)
+                ctx_text = self._build_context_text(snippets)
                 temperature_this_vote = self.cfg.temperature
 
             opts = _options_for_label(label_id, label_type, self.label_config)
@@ -537,6 +536,206 @@ class LLMLabeler:
             "runs": runs,
         }
         return out
+
+    def annotate_multi(
+        self,
+        unit_id: str,
+        label_ids: list[str],
+        label_types: Mapping[str, str],
+        rules_map: Mapping[str, str],
+        ctx_snippets: list[dict],
+    ) -> dict:
+        """
+        Run a single JSON-mode LLM call to predict values for many labels at once.
+
+        Returns a dict with:
+            {
+                "runs": [ ... raw call metadata ... ],
+                "predictions": {
+                    "<label_id>": {
+                        "prediction": <value>,
+                        "reasoning": <optional reasoning string or None>,
+                    },
+                    ...
+                }
+            }
+        """
+
+        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
+        ordered_snippets = self._ordered_snippets(ctx_snippets)
+        ctx_text = self._build_context_text(ordered_snippets)
+
+        categorical_types = {
+            "binary",
+            "boolean",
+            "categorical",
+            "categorical_single",
+            "categorical_multi",
+            "ordinal",
+        }
+
+        def _prediction_schema(ltype: str, option_values: list[str] | None) -> dict:
+            lt_norm = (ltype or "").strip().lower()
+            opts = [str(o) for o in (option_values or [])]
+            if lt_norm == "categorical_multi":
+                if opts:
+                    return {
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "string", "enum": opts}},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    opt: {"type": "string", "enum": ["yes", "no", "unknown"]}
+                                    for opt in opts
+                                },
+                                "additionalProperties": False,
+                            },
+                        ]
+                    }
+                return {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "object"}]}
+            if opts and lt_norm in categorical_types:
+                return {"type": "string", "enum": opts}
+            if lt_norm in {"binary", "boolean"}:
+                return {"type": "string", "enum": ["yes", "no", "unknown"]}
+            if lt_norm in {"numeric", "number", "int", "integer", "float", "double"}:
+                return {
+                    "anyOf": [
+                        {"type": "number"},
+                        {
+                            "type": "string",
+                            "description": "Numeric value or 'unknown' when evidence is absent.",
+                        },
+                    ]
+                }
+            if lt_norm in {"date", "datetime", "timestamp"}:
+                return {
+                    "type": "string",
+                    "description": "ISO 8601 date (YYYY-MM-DD) when known, otherwise 'unknown'.",
+                }
+            return {"type": "string"}
+
+        label_summaries: list[str] = []
+        schema = {"type": "object", "properties": {}, "additionalProperties": False, "required": []}
+        for lid in label_ids:
+            ltype = label_types.get(lid, "categorical") if isinstance(label_types, Mapping) else "categorical"
+            rules = rules_map.get(lid, "") if isinstance(rules_map, Mapping) else ""
+            opts = _options_for_label(lid, ltype, self.label_config)
+            option_values = [str(o) for o in (opts or [])]
+            is_multi = (ltype or "").strip().lower() == "categorical_multi"
+
+            label_lines = [f"Label '{lid}' (type: {ltype})"]
+            if option_values:
+                label_lines.append("Options:")
+                label_lines.extend(f"- {opt}" for opt in option_values)
+            if rules:
+                label_lines.append(f"Guidelines:\n{rules}")
+            label_lines.append("If no evidence, respond with 'no' or 'unknown'.")
+            if is_multi:
+                label_lines.append("Select all supported options; omit unsupported ones.")
+            label_summaries.append("\n".join(label_lines))
+
+            label_schema = {
+                "type": "object",
+                "properties": {"prediction": _prediction_schema(ltype, option_values)},
+                "required": ["prediction"],
+                "additionalProperties": include_reasoning,
+            }
+            if include_reasoning:
+                label_schema["properties"]["reasoning"] = {"type": "string"}
+            schema["properties"][lid] = label_schema
+            schema["required"].append(lid)
+
+        system_segments = [
+            "You are a meticulous clinical annotator for EHR data.",
+            "Given the patient context, extract all requested labels in one pass.",
+            "Use 'no' or 'unknown' when evidence is missing or insufficient.",
+            "Each label must return JSON with keys: prediction (required) and reasoning (optional).",
+            "Label details:",
+            "\n\n".join(label_summaries),
+        ]
+        system_prompt = "\n\n".join(system_segments)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": ctx_text},
+        ]
+
+        try:
+            result = self.backend.json_call(
+                messages,
+                temperature=self.cfg.temperature,
+                logprobs=bool(self.cfg.logprobs),
+                top_logprobs=int(self.cfg.top_logprobs) if int(self.cfg.top_logprobs) > 0 else None,
+                response_format={"type": "json_object", "json_schema": schema},
+                timeout=self.cfg.timeout,
+                retry_max=self.cfg.retry_max,
+                retry_backoff=self.cfg.retry_backoff,
+            )
+            content = result.content
+            LLM_RECORDER.record(
+                "json_multi",
+                {
+                    "unit_id": unit_id,
+                    "label_ids": label_ids,
+                    "prompt": {"system": system_prompt, "user": ctx_text},
+                    "output": content,
+                },
+            )
+        except Exception:
+            LLM_RECORDER.record("json_multi_error", {"unit_id": unit_id, "label_ids": label_ids})
+            return {"runs": [], "predictions": {}}
+
+        if isinstance(content, str):
+            try:
+                obj = json.loads(content)
+            except Exception:
+                obj = None
+        else:
+            obj = content if isinstance(content, Mapping) else None
+
+        runs = [
+            {
+                "raw_output": content,
+                "logprobs": getattr(result, "logprobs", None),
+                "latency_s": getattr(result, "latency_s", None),
+            }
+        ]
+
+        predictions: dict[str, dict] = {}
+        for lid in label_ids:
+            ltype = label_types.get(lid, "categorical") if isinstance(label_types, Mapping) else "categorical"
+            lt_norm = (ltype or "").strip().lower()
+            opts = _options_for_label(lid, ltype, self.label_config)
+            option_values = [str(o) for o in (opts or [])]
+            use_options = bool(option_values) and lt_norm in categorical_types
+            is_multi_select = lt_norm == "categorical_multi"
+
+            raw_entry = (obj or {}).get(lid) if isinstance(obj, Mapping) else None
+            reasoning = raw_entry.get("reasoning") if include_reasoning and isinstance(raw_entry, Mapping) else None
+            raw_prediction = None
+            if isinstance(raw_entry, Mapping):
+                raw_prediction = raw_entry.get("prediction")
+                if raw_prediction is None and "prediction" not in raw_entry:
+                    raw_prediction = raw_entry
+            else:
+                raw_prediction = raw_entry
+
+            pred_norm = None
+            option_values = [str(opt) for opt in option_values]
+            if use_options:
+                if is_multi_select:
+                    pred_norm = self._canon_multi_selection(raw_prediction, option_values)
+                    if pred_norm is None and isinstance(raw_entry, Mapping):
+                        pred_norm = self._canon_multi_selection(raw_entry, option_values)
+                else:
+                    lut = {_canon_str(o).lower(): o for o in option_values}
+                    pred_norm = lut.get(_canon_str(raw_prediction).lower())
+            if pred_norm is None:
+                pred_norm = self._norm_token(raw_prediction)
+
+            predictions[lid] = {"prediction": pred_norm, "reasoning": reasoning}
+
+        return {"runs": runs, "predictions": predictions}
 
     def forced_choice_probe(
         self,
