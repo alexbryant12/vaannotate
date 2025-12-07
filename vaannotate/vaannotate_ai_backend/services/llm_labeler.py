@@ -839,6 +839,7 @@ class LLMLabeler:
         results: list[dict] = []
         for lid in label_ids:
             ltype = label_types.get(lid, "categorical") if isinstance(label_types, Mapping) else "categorical"
+            lt_norm = (ltype or "").strip().lower()
             rules = per_label_rules.get(lid, "") if isinstance(per_label_rules, Mapping) else ""
             opts = _options_for_label(lid, ltype, getattr(retriever, "label_configs", {}))
             row = {"unit_id": unit_id, "label_id": lid, "label_type": ltype}
@@ -873,7 +874,11 @@ class LLMLabeler:
                 row["U"] = (1.0 - float(row["consistency"])) if row.get("consistency") is not None else None
             else:
                 used_fc = False
-                if ltype in ("categorical", "binary") or (opts is not None and getattr(llmfirst_cfg, "fc_enable", False)):
+                is_multi_select = lt_norm == "categorical_multi"
+                if (not is_multi_select) and (
+                    ltype in ("categorical", "binary")
+                    or (opts is not None and getattr(llmfirst_cfg, "fc_enable", False))
+                ):
                     if opts is not None:
                         try:
                             fc = self.forced_choice_probe(
