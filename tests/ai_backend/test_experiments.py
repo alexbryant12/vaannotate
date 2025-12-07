@@ -197,3 +197,51 @@ def test_run_inference_experiments_scopes_corpus(
         assert call["ann_units"] == set(unit_ids)
         assert call["unit_ids"] == unit_ids
         assert call["session"] is stub_session
+
+
+def test_run_inference_experiments_applies_rag_overrides_to_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notes_df = pd.DataFrame({"unit_id": ["a"], "note_id": [1], "text": ["t"]})
+    ann_df = pd.DataFrame({"unit_id": ["a"], "annotation": ["z"]})
+
+    created_normalize_flags: list[bool] = []
+
+    class _StubSession:
+        def __init__(self, normalize: bool) -> None:
+            self.normalize = normalize
+            self.models = None
+            self.store = None
+
+    def _stub_from_env(_paths, cfg):
+        session = _StubSession(cfg.rag.normalize_embeddings)
+        created_normalize_flags.append(session.normalize)
+        return session
+
+    def _stub_run_inference(**kwargs: Any):
+        df = kwargs["notes_df"].copy()
+        return df, {"predictions": "pred.parquet", "predictions_json": "pred.json"}
+
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.experiments.BackendSession.from_env",
+        _stub_from_env,
+    )
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.experiments.run_inference",
+        _stub_run_inference,
+    )
+
+    sweeps = {
+        "normalized": {},
+        "unnormalized": {"rag": {"normalize_embeddings": False}},
+    }
+
+    results = run_inference_experiments(
+        notes_df=notes_df,
+        ann_df=ann_df,
+        base_outdir=tmp_path,
+        sweeps=sweeps,
+    )
+
+    assert set(results.keys()) == set(sweeps.keys())
+    assert created_normalize_flags == [True, False]

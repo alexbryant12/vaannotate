@@ -10,7 +10,7 @@ import pandas as pd
 from .config import OrchestratorConfig, Paths
 from .label_configs import LabelConfigBundle, EMPTY_BUNDLE
 from .orchestration import BackendSession
-from .orchestrator import run_inference
+from .orchestrator import _apply_overrides, run_inference
 
 
 @dataclass
@@ -131,18 +131,23 @@ def run_inference_experiments(
                 index_ann_df["unit_id"].astype(str).isin(unit_set)
             ].copy()
 
-    # Build a shared BackendSession if one was not provided.
-    if session is None:
-        # Use a dedicated outdir under base_outdir for the session; only the
-        # cache_dir matters for model/index reuse.
+    def _build_session_for_overrides(
+        name: str, overrides: Mapping[str, Any]
+    ) -> BackendSession:
+        """Construct a BackendSession that respects experiment overrides."""
+
+        sweep_cfg = OrchestratorConfig()
+        if overrides:
+            _apply_overrides(sweep_cfg, dict(overrides))
+
         session_paths = Paths(
-            notes_path=str(base_outdir / "_session_notes.parquet"),
-            annotations_path=str(base_outdir / "_session_annotations.parquet"),
-            outdir=str(base_outdir / "_session"),
+            notes_path=str(base_outdir / f"_{name}_session_notes.parquet"),
+            annotations_path=str(base_outdir / f"_{name}_session_annotations.parquet"),
+            outdir=str(base_outdir / f"_{name}_session"),
             cache_dir_override=str(shared_cache_dir),
         )
-        base_cfg = OrchestratorConfig()
-        session = BackendSession.from_env(session_paths, base_cfg)
+
+        return BackendSession.from_env(session_paths, sweep_cfg)
 
     def _make_log_callback(name: str) -> Optional[Callable[[str], None]]:
         if log_callback is None:
@@ -157,6 +162,8 @@ def run_inference_experiments(
         exp_outdir = base_outdir / name
         exp_log_cb = _make_log_callback(name)
 
+        exp_session = session or _build_session_for_overrides(name, overrides)
+
         df, artifacts = run_inference(
             notes_df=index_notes_df,
             ann_df=index_ann_df,
@@ -168,7 +175,7 @@ def run_inference_experiments(
             cancel_callback=cancel_callback,
             log_callback=exp_log_cb,
             cache_dir=shared_cache_dir,
-            session=session,
+            session=exp_session,
         )
 
         results[name] = InferenceExperimentResult(
