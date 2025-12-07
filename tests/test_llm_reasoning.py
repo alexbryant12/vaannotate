@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import types
 
 from pathlib import Path
 import sys
@@ -107,3 +108,66 @@ def test_llm_annotator_multicategorical_inline_keys(tmp_path):
     run = result["runs"][0]
     assert run["prediction"] == "Option A"
     assert run.get("raw_prediction") == "Option A"
+
+
+def test_multicategorical_probe_uses_json_consistency(tmp_path):
+    calls: dict[str, int] = {"json": 0, "fc": 0}
+
+    class DummyBackend:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def json_call(self, messages, **kwargs):  # noqa: D401
+            calls["json"] += 1
+            payload = {"prediction": ["Option A"]}
+            return JSONCallResult(
+                data=payload,
+                content=json.dumps(payload),
+                raw_response=None,
+                latency_s=0.01,
+                logprobs=None,
+            )
+
+        def forced_choice(self, *_, **__):  # noqa: D401
+            calls["fc"] += 1
+            raise AssertionError("forced_choice should not run for multi-categorical labels")
+
+    llm_cfg = ai_config.LLMConfig()
+    llm_cfg.n_consistency = 1
+    annotator = LLMLabeler(
+        DummyBackend(llm_cfg),
+        LabelConfigBundle(),
+        llm_cfg,
+        sc_cfg=ai_config.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
+    annotator.label_config = {"Flag": {"options": ["Option A", "Option B"]}}
+
+    class DummyContextBuilder:
+        def build_context_for_label(self, *_, **__):  # noqa: D401
+            return [{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}]
+
+    class DummyRetriever:
+        def get_last_diagnostics(self, *_, **__):  # noqa: D401
+            return {}
+
+    cfg = types.SimpleNamespace(
+        topk=1,
+        single_doc_context="rag",
+        single_doc_full_context_max_chars=None,
+        fc_enable=True,
+    )
+
+    rows = annotator.label_unit(
+        unit_id="unit-3",
+        label_ids=["Flag"],
+        label_types={"Flag": "categorical_multi"},
+        per_label_rules={"Flag": ""},
+        context_builder=DummyContextBuilder(),
+        retriever=DummyRetriever(),
+        llmfirst_cfg=cfg,
+    )
+
+    assert calls["fc"] == 0
+    assert calls["json"] == 1
+    assert rows[0]["prediction"] == "Option A"
