@@ -7,7 +7,9 @@ from typing import Any, Callable, Dict, Mapping, Optional
 import json
 import pandas as pd
 
+from .config import OrchestratorConfig, Paths
 from .label_configs import LabelConfigBundle, EMPTY_BUNDLE
+from .orchestration import BackendSession
 from .orchestrator import run_inference
 
 
@@ -49,6 +51,7 @@ def run_inference_experiments(
     cache_dir: Optional[Path] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    session: Optional[BackendSession] = None,
 ) -> Dict[str, InferenceExperimentResult]:
     """Run multiple inference configurations (sweeps) and collect their outputs.
 
@@ -90,6 +93,10 @@ def run_inference_experiments(
     log_callback:
         Optional logging callback; if provided, messages are prefixed with the
         experiment name.
+    session:
+        Optional BackendSession to reuse a single set of models + EmbeddingStore
+        across all sweeps. If ``None``, a fresh session is created using the
+        shared cache directory.
 
     Returns
     -------
@@ -106,6 +113,37 @@ def run_inference_experiments(
     bundle = label_config_bundle or EMPTY_BUNDLE
     results: Dict[str, InferenceExperimentResult] = {}
 
+    # Optionally scope the corpus to the evaluation units for indexing.
+    # When unit_ids is provided, we restrict the notes/annotations that will be
+    # written to parquet and indexed, so experiment sweeps do not embed the
+    # entire base corpus if we only care about a gold-standard subset.
+    index_notes_df = notes_df
+    index_ann_df = ann_df
+
+    if unit_ids is not None:
+        unit_set = {str(u) for u in unit_ids if str(u)}
+        if "unit_id" in index_notes_df.columns:
+            index_notes_df = index_notes_df[
+                index_notes_df["unit_id"].astype(str).isin(unit_set)
+            ].copy()
+        if "unit_id" in index_ann_df.columns:
+            index_ann_df = index_ann_df[
+                index_ann_df["unit_id"].astype(str).isin(unit_set)
+            ].copy()
+
+    # Build a shared BackendSession if one was not provided.
+    if session is None:
+        # Use a dedicated outdir under base_outdir for the session; only the
+        # cache_dir matters for model/index reuse.
+        session_paths = Paths(
+            notes_path=str(base_outdir / "_session_notes.parquet"),
+            annotations_path=str(base_outdir / "_session_annotations.parquet"),
+            outdir=str(base_outdir / "_session"),
+            cache_dir_override=str(shared_cache_dir),
+        )
+        base_cfg = OrchestratorConfig()
+        session = BackendSession.from_env(session_paths, base_cfg)
+
     def _make_log_callback(name: str) -> Optional[Callable[[str], None]]:
         if log_callback is None:
             return None
@@ -120,8 +158,8 @@ def run_inference_experiments(
         exp_log_cb = _make_log_callback(name)
 
         df, artifacts = run_inference(
-            notes_df=notes_df,
-            ann_df=ann_df,
+            notes_df=index_notes_df,
+            ann_df=index_ann_df,
             outdir=exp_outdir,
             label_config_bundle=bundle,
             label_config=label_config,
@@ -130,6 +168,7 @@ def run_inference_experiments(
             cancel_callback=cancel_callback,
             log_callback=exp_log_cb,
             cache_dir=shared_cache_dir,
+            session=session,
         )
 
         results[name] = InferenceExperimentResult(
