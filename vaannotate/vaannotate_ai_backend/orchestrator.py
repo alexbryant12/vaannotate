@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections.abc import Mapping
+import os
 from pathlib import Path
 from typing import Callable, Optional, Dict, Any, Tuple
 from dataclasses import replace
@@ -90,6 +91,63 @@ def _apply_label_queries(
         bundle,
         current=current_config,
     )
+
+
+def _build_test_stub_active_runner(paths: Paths):
+    class _StubPipeline:
+        def __init__(self, paths: Paths):
+            self.paths = paths
+
+        def run(self):
+            parquet_notes = pd.read_parquet(self.paths.notes_path)
+            outdir = Path(self.paths.outdir)
+
+            buckets = {
+                "bucket_disagreement.parquet": pd.DataFrame({"unit_id": [], "label_id": []}),
+                "bucket_llm_uncertain.parquet": pd.DataFrame({"unit_id": [], "label_id": []}),
+                "bucket_llm_certain.parquet": pd.DataFrame({"unit_id": [], "label_id": []}),
+                "bucket_diversity.parquet": pd.DataFrame({"unit_id": [], "label_id": []}),
+            }
+            for name, df in buckets.items():
+                df.to_parquet(outdir / name, index=False)
+
+            return pd.DataFrame(
+                {
+                    "unit_id": parquet_notes["unit_id"].astype(str),
+                    "doc_id": parquet_notes.get("doc_id", parquet_notes.get("note_id")),
+                    "label_id": "pneumonitis",
+                    "selection_reason": "dummy",
+                }
+            )
+
+    return _StubPipeline(paths)
+
+
+def _build_test_stub_inference_runner(paths: Paths):
+    class _StubInference:
+        def __init__(self, paths: Paths):
+            self.paths = paths
+
+        def run(self, unit_ids=None):  # noqa: ANN001 - match real signature
+            parquet_notes = pd.read_parquet(self.paths.notes_path)
+            if unit_ids:
+                unit_set = {str(u) for u in unit_ids}
+                parquet_notes = parquet_notes[parquet_notes["unit_id"].astype(str).isin(unit_set)]
+
+            outdir = Path(self.paths.outdir)
+            df = pd.DataFrame(
+                {
+                    "unit_id": parquet_notes["unit_id"].astype(str),
+                    "doc_id": parquet_notes.get("doc_id", parquet_notes.get("note_id")),
+                    "label_id": "pneumonitis",
+                    "label_option_id": "yes",
+                }
+            )
+            df.to_parquet(outdir / "inference_predictions.parquet", index=False)
+            df.to_json(outdir / "inference_predictions.json", orient="records", lines=True)
+            return df
+
+    return _StubInference(paths)
 
 class _CallbackTee(io.TextIOBase):
     """Write to the original stream and emit complete lines to a callback."""
@@ -273,12 +331,15 @@ def build_next_batch(
 
     with _capture_logs(log_callback):
         with cancellation_scope(cancel_callback):
-            pipeline = build_active_learning_runner(
-                paths=paths,
-                cfg=cfg,
-                label_config_bundle=bundle,
-                phenotype_level=phenotype_level,
-            )
+            if os.getenv("VAANNOTATE_TEST_STUB_ACTIVE_RUNNER") == "1":
+                pipeline = _build_test_stub_active_runner(paths)
+            else:
+                pipeline = build_active_learning_runner(
+                    paths=paths,
+                    cfg=cfg,
+                    label_config_bundle=bundle,
+                    phenotype_level=phenotype_level,
+                )
             final_df = pipeline.run()
 
     normalized = final_df.copy()
@@ -373,12 +434,15 @@ def run_inference(
 
     with _capture_logs(log_callback):
         with cancellation_scope(cancel_callback):
-            pipeline = build_inference_runner(
-                paths=paths,
-                cfg=cfg,
-                label_config_bundle=bundle,
-                phenotype_level=phenotype_level,
-            )
+            if os.getenv("VAANNOTATE_TEST_STUB_INFERENCE_RUNNER") == "1":
+                pipeline = _build_test_stub_inference_runner(paths)
+            else:
+                pipeline = build_inference_runner(
+                    paths=paths,
+                    cfg=cfg,
+                    label_config_bundle=bundle,
+                    phenotype_level=phenotype_level,
+                )
             result_df = pipeline.run(unit_ids=unit_ids)
 
     artifacts = {

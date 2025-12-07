@@ -1,0 +1,4 @@
+unit_id,note_id,patient_icn,doc_id,text
+1001,n1,1001,n1,"Patient started high-dose prednisone for immune-related pneumonitis after checkpoint therapy; breathing improving."
+1002,n2,1002,n2,"Follow-up visit notes clear lungs and no signs of pneumonitis; patient off steroids."
+1003,n3,1003,n3,"Mild cough and fatigue noted; unclear if early pneumonitis or seasonal allergy."
