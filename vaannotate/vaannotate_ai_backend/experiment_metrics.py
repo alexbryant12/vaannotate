@@ -8,6 +8,8 @@ from typing import Dict, Mapping, Optional, Tuple
 
 import pandas as pd
 
+from vaannotate.shared.metadata import normalize_date_value
+
 from vaannotate.vaannotate_ai_backend.label_configs import LabelConfigBundle
 from vaannotate.vaannotate_ai_backend.services.label_dependencies import build_label_dependencies
 
@@ -64,9 +66,15 @@ def _parse_date(value: object) -> Optional[pd.Timestamp]:
     if value is None:
         return None
 
-    parsed = pd.to_datetime(value, errors="coerce")
+    if isinstance(value, pd.Timestamp):
+        return value if not pd.isna(value) else None
+
+    normalized = normalize_date_value(str(value))
+    parsed = pd.to_datetime(normalized or value, errors="coerce")
+
     if pd.isna(parsed):
         return None
+
     if isinstance(parsed, pd.Timestamp):
         return parsed
 

@@ -999,6 +999,8 @@ class InferenceMetricsDialog(QtWidgets.QDialog):
             name = str(exp.get("name", row))
             metrics = exp.get("metrics") or {}
             global_metrics = metrics.get("global") if isinstance(metrics, Mapping) else {}
+            if not isinstance(global_metrics, Mapping):
+                global_metrics = {}
 
             summary_table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
             summary_table.setItem(
