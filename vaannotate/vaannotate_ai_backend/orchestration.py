@@ -57,7 +57,8 @@ def _build_shared_components(
     # prompting layer aligned with label-set metadata for both active learning
     # and inference pipelines.
     few_shot_cfg = getattr(cfg.llm, "few_shot_examples", {}) or {}
-    if not few_shot_cfg:
+    few_shot_explicit = getattr(cfg.llm, "_few_shot_examples_overridden", False)
+    if not few_shot_cfg and not few_shot_explicit:
         label_config = label_config_bundle.current or {}
         extracted: dict[str, list[dict[str, str]]] = {}
         for label_id, entry in label_config.items():
