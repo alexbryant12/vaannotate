@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
@@ -140,6 +142,26 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
     assert captured["run_kwargs"]["unit_ids"] == ["1", "2"]
     metrics_path = tmp_path / "out" / "baseline" / "metrics.json"
     assert metrics_path.exists()
+
+    base_out = tmp_path / "out"
+    gold_path = base_out / "gold_labels.parquet"
+    collated_path = base_out / "experiments_predictions.parquet"
+    summary_path = base_out / "experiments_metrics.json"
+
+    assert gold_path.exists()
+    assert collated_path.exists()
+    assert summary_path.exists()
+
+    data = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert "global" in data
+    assert "labels" in data
+    assert isinstance(data["labels"], dict)
+    assert "l1" in data["labels"]
+    assert 0.0 <= data["global"].get("overall_accuracy", 0.0) <= 1.0
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert "sweeps" in summary
+    assert "baseline" in summary["sweeps"]
 
 
 def test_run_project_inference_experiments_passes_prior_annotations(monkeypatch, tmp_path):

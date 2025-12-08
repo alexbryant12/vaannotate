@@ -9,6 +9,7 @@ import pandas as pd
 
 from .adapters import _load_label_config_bundle, export_inputs_from_repo
 from .config import OrchestratorConfig, Paths
+from .experiment_metrics import compute_experiment_metrics
 from .experiments import (
     InferenceExperimentResult,
     _normalize_local_model_overrides,
@@ -142,6 +143,146 @@ def compute_classification_metrics(
         }
 
     return metrics
+
+
+def _collate_experiment_predictions(
+    results: Dict[str, InferenceExperimentResult],
+) -> pd.DataFrame:
+    """
+    Return a tall DataFrame with predictions from all sweeps.
+
+    Columns:
+      - experiment_name
+      - unit_id
+      - label_id
+      - prediction_value (best-effort normalized)
+      - plus any other prediction/metadata columns preserved from the
+        per-experiment inference_predictions.* files.
+    """
+
+    rows: list[pd.DataFrame] = []
+
+    for name, result in (results or {}).items():
+        df = getattr(result, "dataframe", None)
+        if df is None or df.empty:
+            # Fallback to inference_predictions.parquet / .csv in result.outdir
+            exp_outdir = Path(result.outdir)
+            parquet_path = exp_outdir / "inference_predictions.parquet"
+            csv_path = exp_outdir / "inference_predictions.csv"
+            artifact_path: Path | None = None
+            if parquet_path.exists():
+                artifact_path = parquet_path
+            elif csv_path.exists():
+                artifact_path = csv_path
+            if artifact_path is not None and artifact_path.exists():
+                if artifact_path.suffix == ".parquet":
+                    df = pd.read_parquet(artifact_path)
+                else:
+                    df = pd.read_csv(artifact_path)
+            else:
+                df = pd.DataFrame()
+
+        if df is None or df.empty:
+            continue
+
+        df = df.copy()
+        # Ensure unit_id / label_id exist and are strings.
+        if "unit_id" in df.columns:
+            df["unit_id"] = df["unit_id"].astype(str)
+        if "label_id" in df.columns:
+            df["label_id"] = df["label_id"].astype(str)
+
+        # Best-effort detection of the main prediction column.
+        if "prediction_value" not in df.columns:
+            for candidate in ("llm_prediction", "label_value", "label_option_id", "prediction"):
+                if candidate in df.columns:
+                    df["prediction_value"] = df[candidate].astype(str)
+                    break
+
+        # Skip experiments that somehow still do not have the basics.
+        if not {"unit_id", "label_id", "prediction_value"} <= set(df.columns):
+            continue
+
+        df["experiment_name"] = str(name)
+
+        # Keep cfg_overrides as a JSON blob for downstream inspection.
+        overrides = getattr(result, "cfg_overrides", {}) or {}
+        try:
+            df["cfg_overrides_json"] = json.dumps(overrides)
+        except Exception:  # noqa: BLE001
+            df["cfg_overrides_json"] = None
+
+        rows.append(df)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "experiment_name",
+                "unit_id",
+                "label_id",
+                "prediction_value",
+            ]
+        )
+
+    collated = pd.concat(rows, ignore_index=True)
+    # Ensure key columns are strings
+    for col in ("experiment_name", "unit_id", "label_id", "prediction_value"):
+        if col in collated.columns:
+            collated[col] = collated[col].astype(str)
+    return collated
+
+
+def _compute_metrics_for_all_sweeps(
+    gold_df: pd.DataFrame,
+    collated_preds: pd.DataFrame,
+    *,
+    label_config_bundle,
+    labelset_id: str | None,
+    ann_df: pd.DataFrame | None,
+) -> dict[str, dict[str, object]]:
+    """
+    Compute experiment_metrics for each sweep.
+
+    Returns:
+      { experiment_name: metrics_dict_from_compute_experiment_metrics, ... }
+    """
+
+    metrics_by_sweep: dict[str, dict[str, object]] = {}
+
+    if gold_df is None or gold_df.empty:
+        return metrics_by_sweep
+    if collated_preds is None or collated_preds.empty:
+        return metrics_by_sweep
+    if "experiment_name" not in collated_preds.columns:
+        return metrics_by_sweep
+
+    # Ensure canonical columns
+    base_cols = {"unit_id", "label_id", "prediction_value"}
+    missing = [c for c in base_cols if c not in collated_preds.columns]
+    if missing:
+        return metrics_by_sweep
+
+    for name, group in collated_preds.groupby("experiment_name"):
+        # Only the minimal columns are needed for metrics; everything else
+        # is kept in the collated parquet for inspection.
+        pred_df = group[list(base_cols)].copy()
+        for col in base_cols:
+            pred_df[col] = pred_df[col].astype(str)
+
+        try:
+            sweep_metrics = compute_experiment_metrics(
+                gold_df,
+                pred_df,
+                label_config_bundle=label_config_bundle,
+                labelset_id=labelset_id,
+                ann_df=ann_df,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Fail-soft: record the error instead of blowing up the entire sweep.
+            sweep_metrics = {"error": f"{type(exc).__name__}: {exc}"}
+        metrics_by_sweep[str(name)] = sweep_metrics
+
+    return metrics_by_sweep
 
 
 def run_project_inference_experiments(
@@ -287,7 +428,13 @@ def run_project_inference_experiments(
             for col in ["unit_id", "label_id", "prediction_value"]:
                 pred_df[col] = pred_df[col].astype(str)
 
-        metrics = compute_classification_metrics(gold_df, pred_df)
+        metrics = compute_experiment_metrics(
+            gold_df,
+            pred_df,
+            label_config_bundle=label_config_bundle,
+            labelset_id=labelset_id,
+            ann_df=ann_df,
+        )
 
         exp_outdir = result.outdir or (base_outdir / name)
         exp_outdir = Path(exp_outdir)
@@ -295,5 +442,31 @@ def run_project_inference_experiments(
 
         metrics_path = exp_outdir / "metrics.json"
         metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    base_outdir.mkdir(parents=True, exist_ok=True)
+
+    gold_out_path = base_outdir / "gold_labels.parquet"
+    try:
+        gold_df.to_parquet(gold_out_path, index=False)
+    except Exception:  # noqa: BLE001
+        gold_df.to_csv(gold_out_path, index=False)
+
+    collated_preds = _collate_experiment_predictions(results)
+    collated_path = base_outdir / "experiments_predictions.parquet"
+    try:
+        collated_preds.to_parquet(collated_path, index=False)
+    except Exception:  # noqa: BLE001
+        collated_preds.to_csv(collated_path, index=False)
+
+    summary_metrics = _compute_metrics_for_all_sweeps(
+        gold_df,
+        collated_preds,
+        label_config_bundle=label_config_bundle,
+        labelset_id=labelset_id,
+        ann_df=ann_df,
+    )
+    summary = {"sweeps": summary_metrics}
+    summary_path = base_outdir / "experiments_metrics.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     return results, gold_df
