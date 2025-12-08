@@ -7,6 +7,8 @@ from typing import Dict, List, Mapping, Tuple
 
 import pandas as pd
 
+from vaannotate.shared.metadata import normalize_date_value
+
 from .adapters import _load_label_config_bundle, export_inputs_from_repo
 from .config import OrchestratorConfig, Paths
 from .experiment_metrics import compute_experiment_metrics
@@ -77,7 +79,37 @@ def build_gold_from_ann(
     if "label_value" not in ann_df.columns:
         raise KeyError("Expected column 'label_value' in annotations")
 
-    ann_df = ann_df[ann_df["label_value"].notna()]
+    if "label_value_date" in ann_df.columns:
+        has_value = ann_df["label_value"].notna() | ann_df["label_value_date"].notna()
+        ann_df = ann_df[has_value]
+    else:
+        ann_df = ann_df[ann_df["label_value"].notna()]
+
+    date_labels: set[str] = set()
+    if "label_value_date" in ann_df.columns:
+        date_mask = ann_df["label_value_date"].notna()
+        date_labels.update(ann_df.loc[date_mask, "label_id"].astype(str).unique())
+
+    if "label_config" in ann_df.columns:
+        for lid, cfg in zip(ann_df["label_id"], ann_df["label_config"]):
+            if isinstance(cfg, Mapping) and str(cfg.get("type") or cfg.get("label_type")) == "date":
+                date_labels.add(str(lid))
+
+    def _normalize_date(value: object) -> str | None:
+        if value is None or pd.isna(value):
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        normalized = normalize_date_value(str(value))
+        parsed = pd.to_datetime(normalized or value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        if isinstance(parsed, pd.Timestamp):
+            return parsed.isoformat()
+        try:
+            return pd.Timestamp(parsed).isoformat()
+        except (TypeError, ValueError):
+            return None
 
     records: List[Mapping[str, str]] = []
 
@@ -85,7 +117,21 @@ def build_gold_from_ann(
         if len(group) < min_reviewers:
             continue
 
-        gold_value = group["label_value"].value_counts().idxmax()
+        gold_value: object
+        if str(label_id) in date_labels:
+            date_series = group.get("label_value_date")
+            normalized_dates = (
+                date_series.apply(_normalize_date).dropna() if date_series is not None else pd.Series(dtype=str)
+            )
+            if normalized_dates.empty:
+                normalized_dates = group["label_value"].apply(_normalize_date).dropna()
+
+            if not normalized_dates.empty:
+                gold_value = normalized_dates.value_counts().idxmax()
+            else:
+                gold_value = group["label_value"].value_counts().idxmax()
+        else:
+            gold_value = group["label_value"].value_counts().idxmax()
         records.append(
             {
                 "unit_id": str(unit_id),
