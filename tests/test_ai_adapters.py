@@ -193,6 +193,89 @@ def test_export_inputs_cold_start_uses_selected_corpus(tmp_path: Path) -> None:
     assert ann_df.empty
 
 
+def test_export_inputs_collates_prior_round_annotations(tmp_path: Path) -> None:
+    project_root = tmp_path / "Project"
+    paths = init_project(project_root, "proj", "Project", "tester")
+
+    pheno_id = "ph_multi"
+    storage_relative = Path("phenotypes") / "multi_round"
+    phenotype_dir = project_root / storage_relative
+    (phenotype_dir / "rounds").mkdir(parents=True, exist_ok=True)
+
+    with get_connection(paths.project_db) as conn:
+        add_phenotype(
+            conn,
+            pheno_id=pheno_id,
+            project_id="proj",
+            name="Multi-round phenotype",
+            level="single_doc",
+            storage_path=str(storage_relative.as_posix()),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO rounds(round_id, pheno_id, round_number, labelset_id, config_hash, rng_seed, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            ("ph_multi_r1", pheno_id, 1, "ls_round1", "hash", 0, "finalized", "2020-01-01T00:00:00"),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO rounds(round_id, pheno_id, round_number, labelset_id, config_hash, rng_seed, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            ("ph_multi_r2", pheno_id, 2, "ls_round2", "hash", 0, "finalized", "2020-01-02T00:00:00"),
+        )
+        conn.commit()
+
+    corpus_dir = project_root / "corpora" / pheno_id
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    corpus_db = corpus_dir / "corpus.db"
+    with initialize_corpus_db(corpus_db) as conn:
+        conn.execute("INSERT INTO patients(patient_icn) VALUES (?)", ("p1",))
+        conn.execute(
+            """
+            INSERT INTO documents(doc_id, patient_icn, date_note, hash, text, metadata_json)
+            VALUES (?,?,?,?,?,?)
+            """,
+            ("doc_a", "p1", "2020-01-01", "hash1", "Doc A", "{}"),
+        )
+        conn.execute("ALTER TABLE documents ADD COLUMN patienticn TEXT")
+        conn.execute("UPDATE documents SET patienticn = patient_icn")
+        conn.execute("ALTER TABLE documents ADD COLUMN notetype TEXT")
+        conn.execute("UPDATE documents SET notetype = ''")
+        conn.commit()
+
+    for round_number, labelset_id, unit_id, label_value in [
+        (1, "ls_round1", "unit_a", "yes"),
+        (2, "ls_round2", "unit_b", "no"),
+    ]:
+        round_dir = phenotype_dir / "rounds" / f"round_{round_number}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        assignment_db = round_dir / "imports" / f"rev{round_number}_assignment.db"
+        assignment_db.parent.mkdir(parents=True, exist_ok=True)
+        with initialize_assignment_db(assignment_db) as conn:
+            conn.execute(
+                "INSERT INTO units(unit_id, display_rank, patient_icn, doc_id, note_count) VALUES (?,?,?,?,?)",
+                (unit_id, 1, "p1", "doc_a", 1),
+            )
+            conn.execute(
+                "INSERT INTO documents(doc_id, hash, text, metadata_json) VALUES (?,?,?,?)",
+                ("doc_a", "hash1", "Doc A", "{}"),
+            )
+            conn.execute(
+                "INSERT INTO unit_notes(unit_id, doc_id, order_index) VALUES (?,?,?)",
+                (unit_id, "doc_a", 0),
+            )
+            conn.execute(
+                "INSERT INTO annotations(unit_id, label_id, value, value_num, na, notes) VALUES (?,?,?,?,?,?)",
+                (unit_id, "LabelA", label_value, None, 0, "note"),
+            )
+            conn.commit()
+
+    notes_df, ann_df = export_inputs_from_repo(project_root, pheno_id, [1, 2])
+
+    assert len(ann_df) == 2
+    assert set(ann_df["unit_id"]) == {"unit_a", "unit_b"}
+    assert set(ann_df["round_id"]) == {"ph_multi_r1", "ph_multi_r2"}
+    assert set(ann_df["labelset_id"]) == {"ls_round1", "ls_round2"}
+    assert set(ann_df["label_value"]) == {"yes", "no"}
+    assert {"doc_id", "patient_icn", "text"}.issubset(notes_df.columns)
+
+
 def test_contexts_for_unit_label_full_mode() -> None:
     notes_df = pd.DataFrame(
         [
