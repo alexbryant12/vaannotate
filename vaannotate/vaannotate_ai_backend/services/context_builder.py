@@ -331,8 +331,14 @@ class ContextBuilder:
             return dedup
 
         cfg_rag = getattr(self, "cfg", None) or self.cfg
+
+        # top_k_final is canonical; any legacy per_label_topk has been normalized
+        # into this already. Do not consult per_label_topk here.
         cfg_final_k = getattr(cfg_rag, "top_k_final", None)
-        final_k_raw = topk_override or cfg_final_k or getattr(cfg_rag, "per_label_topk", 6)
+        if cfg_final_k is None:
+            cfg_final_k = 6
+
+        final_k_raw = topk_override or cfg_final_k
         try:
             final_k = max(1, int(final_k_raw))
         except Exception:

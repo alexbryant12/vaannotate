@@ -41,6 +41,28 @@ class RAGConfig:
     pool_factor: int = 3
     pool_oversample: float = 1.5
 
+    def __post_init__(self):
+        # Treat top_k_final as canonical; per_label_topk is a compatibility alias.
+        # If only per_label_topk is custom, promote it into top_k_final, then mirror.
+        default_top_final = 6
+        default_per_label = 8
+
+        has_custom_final = self.top_k_final != default_top_final
+        has_custom_per_label = self.per_label_topk != default_per_label
+
+        # Legacy override: per_label_topk set, top_k_final left at default
+        if not has_custom_final and has_custom_per_label:
+            try:
+                self.top_k_final = int(self.per_label_topk)
+            except Exception:
+                self.top_k_final = self.per_label_topk
+
+        # Always mirror the canonical value back into per_label_topk
+        try:
+            self.per_label_topk = int(self.top_k_final)
+        except Exception:
+            self.per_label_topk = self.top_k_final
+
 
 @dataclass
 class LLMConfig:
