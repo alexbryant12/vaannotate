@@ -58,6 +58,8 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
             "backend": config.llm.backend,
             "llm_temperature": config.llm.temperature,
             "rag_chunk_size": config.rag.chunk_size,
+            "embed_model_name": getattr(config.models, "embed_model_name", None),
+            "rerank_model_name": getattr(config.models, "rerank_model_name", None),
         }
         captured["session_paths"] = paths
         return "session"
@@ -89,6 +91,8 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
         "llm": {"backend": "azure", "temperature": 0.9},
         "rag": {"chunk_size": 321},
         "label_config": {"prompt": "custom"},
+        "embedding_model_dir": "/models/embed",
+        "reranker_model_dir": "/models/rerank",
     }
     sweeps = {"baseline": {"llm": {"temperature": 0.2}}}
 
@@ -121,6 +125,8 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
         "backend": "azure",
         "llm_temperature": 0.9,
         "rag_chunk_size": 321,
+        "embed_model_name": "/models/embed",
+        "rerank_model_name": "/models/rerank",
     }
 
     merged_sweep = captured["run_kwargs"]["sweeps"]["baseline"]
@@ -128,6 +134,8 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
     assert merged_sweep["llm"]["backend"] == "azure"
     assert merged_sweep["rag"]["chunk_size"] == 321
     assert merged_sweep["label_config"] == {"prompt": "custom"}
+    assert merged_sweep["models"]["embed_model_name"] == "/models/embed"
+    assert merged_sweep["models"]["rerank_model_name"] == "/models/rerank"
 
     assert captured["run_kwargs"]["unit_ids"] == ["1", "2"]
     metrics_path = tmp_path / "out" / "baseline" / "metrics.json"
