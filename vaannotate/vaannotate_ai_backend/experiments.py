@@ -79,6 +79,30 @@ def _normalize_local_model_overrides(
     return normalized
 
 
+def _overrides_affect_backend(overrides: Mapping[str, Any] | None) -> bool:
+    """Return ``True`` when overrides change embedder, reranker, or RAG knobs."""
+
+    if overrides is None:
+        return False
+
+    models_cfg = overrides.get("models") if isinstance(overrides, Mapping) else None
+    if isinstance(models_cfg, Mapping) and any(
+        key in models_cfg for key in ("embed_model_name", "rerank_model_name")
+    ):
+        return True
+
+    if isinstance(overrides, Mapping) and any(
+        key in overrides for key in ("embedding_model_dir", "reranker_model_dir")
+    ):
+        return True
+
+    rag_cfg = overrides.get("rag") if isinstance(overrides, Mapping) else None
+    if isinstance(rag_cfg, Mapping) and rag_cfg:
+        return True
+
+    return False
+
+
 @dataclass
 class InferenceExperimentResult:
     """Container for the outputs of a single inference experiment.
@@ -111,6 +135,8 @@ def run_inference_experiments(
     base_outdir: Path,
     sweeps: Mapping[str, Mapping[str, Any]],
     *,
+    sweep_cfgs: Optional[Mapping[str, OrchestratorConfig]] = None,
+    normalized_sweeps: Optional[Mapping[str, Mapping[str, Any]]] = None,
     label_config_bundle: LabelConfigBundle | None = None,
     label_config: Optional[Dict[str, Any]] = None,
     unit_ids: Optional[list[str]] = None,
@@ -144,6 +170,14 @@ def run_inference_experiments(
         Directory under which per-experiment subdirectories will be created.
     sweeps:
         Mapping from experiment name to ``cfg_overrides`` dictionaries.
+    sweep_cfgs:
+        Optional mapping of experiment name to fully prepared
+        :class:`OrchestratorConfig` objects. When provided, these configs are
+        deep-copied per sweep instead of being reconstructed from the overrides.
+    normalized_sweeps:
+        Optional mapping of experiment name to pre-normalized overrides. When
+        supplied, these overrides are forwarded to :func:`run_inference` without
+        additional normalization.
     label_config_bundle:
         Optional pre-materialised :class:`LabelConfigBundle`. If not provided,
         :func:`run_inference` will fall back to an empty bundle.
@@ -201,12 +235,14 @@ def run_inference_experiments(
             ].copy()
 
     def _build_cfg_for_overrides(
-        overrides: Mapping[str, Any]
+        overrides: Mapping[str, Any], *, normalize: bool = True
     ) -> tuple[OrchestratorConfig, Dict[str, Any]]:
-        """Prepare a config + normalized overrides for a sweep."""
+        """Prepare a config + overrides for a sweep."""
 
         sweep_cfg = OrchestratorConfig()
-        normalized_overrides = _normalize_local_model_overrides(dict(overrides))
+        normalized_overrides = (
+            _normalize_local_model_overrides(dict(overrides)) if normalize else dict(overrides)
+        )
         if normalized_overrides:
             _apply_overrides(sweep_cfg, normalized_overrides)
 
@@ -234,12 +270,27 @@ def run_inference_experiments(
         return _wrapped
 
     for name, overrides in sweeps.items():
-        sweep_cfg, normalized_overrides = _build_cfg_for_overrides(overrides)
+        normalized_overrides = (
+            copy.deepcopy(normalized_sweeps[name])
+            if normalized_sweeps is not None and name in normalized_sweeps
+            else _normalize_local_model_overrides(dict(overrides))
+        )
+        if sweep_cfgs is not None and name in sweep_cfgs:
+            sweep_cfg = copy.deepcopy(sweep_cfgs[name])
+        else:
+            sweep_cfg, normalized_overrides = _build_cfg_for_overrides(
+                normalized_overrides, normalize=False
+            )
 
         exp_outdir = base_outdir / name
         exp_log_cb = _make_log_callback(name)
 
-        exp_session = session or _build_session_for_cfg(name, sweep_cfg)
+        backend_overrides = _overrides_affect_backend(normalized_overrides)
+
+        if session is not None and backend_overrides:
+            exp_session = _build_session_for_cfg(name, sweep_cfg)
+        else:
+            exp_session = session or _build_session_for_cfg(name, sweep_cfg)
 
         df, artifacts = run_inference(
             notes_df=index_notes_df,

@@ -245,3 +245,46 @@ def test_run_inference_experiments_applies_rag_overrides_to_session(
 
     assert set(results.keys()) == set(sweeps.keys())
     assert created_normalize_flags == [True, False]
+
+
+def test_run_inference_experiments_rebuilds_session_for_backend_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notes_df = pd.DataFrame({"unit_id": ["a"], "note_id": [1], "text": ["t"]})
+    ann_df = pd.DataFrame({"unit_id": ["a"], "annotation": ["z"]})
+
+    built_configs: list[int] = []
+    sessions_seen: list[object] = []
+
+    def _stub_from_env(_paths, cfg):
+        built_configs.append(cfg.rag.chunk_size)
+        return f"session_{cfg.rag.chunk_size}"
+
+    def _stub_run_inference(**kwargs: Any):
+        sessions_seen.append(kwargs.get("session"))
+        df = kwargs["notes_df"].copy()
+        return df, {}
+
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.experiments.BackendSession.from_env",
+        _stub_from_env,
+    )
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.experiments.run_inference",
+        _stub_run_inference,
+    )
+
+    sweeps = {"raggy": {"rag": {"chunk_size": 7}}}
+    shared_session = object()
+
+    results = run_inference_experiments(
+        notes_df=notes_df,
+        ann_df=ann_df,
+        base_outdir=tmp_path,
+        sweeps=sweeps,
+        session=shared_session,
+    )
+
+    assert set(results.keys()) == set(sweeps.keys())
+    assert built_configs == [7]
+    assert sessions_seen == ["session_7"]
