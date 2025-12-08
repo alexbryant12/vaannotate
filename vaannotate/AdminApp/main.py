@@ -217,6 +217,44 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         corpus_layout.addWidget(self.corpus_browse_btn)
         layout.addWidget(corpus_group)
 
+        models_group = QtWidgets.QGroupBox("Model directories")
+        models_layout = QtWidgets.QFormLayout(models_group)
+
+        embed_row = QtWidgets.QHBoxLayout()
+        self.embedding_path_edit = QtWidgets.QLineEdit()
+        self.embedding_path_edit.setPlaceholderText("Select embedding model directory")
+        embed_row.addWidget(self.embedding_path_edit)
+        self.embedding_browse_btn = QtWidgets.QPushButton("Choose…")
+        self.embedding_browse_btn.clicked.connect(self._browse_embedding_dir)
+        embed_row.addWidget(self.embedding_browse_btn)
+        embed_row.setStretch(0, 1)
+        embed_row.setStretch(1, 0)
+        models_layout.addRow("Embedding model", embed_row)
+
+        rerank_row = QtWidgets.QHBoxLayout()
+        self.reranker_path_edit = QtWidgets.QLineEdit()
+        self.reranker_path_edit.setPlaceholderText("Select re-ranker model directory")
+        rerank_row.addWidget(self.reranker_path_edit)
+        self.reranker_browse_btn = QtWidgets.QPushButton("Choose…")
+        self.reranker_browse_btn.clicked.connect(self._browse_reranker_dir)
+        rerank_row.addWidget(self.reranker_browse_btn)
+        rerank_row.setStretch(0, 1)
+        rerank_row.setStretch(1, 0)
+        models_layout.addRow("Re-ranker model", rerank_row)
+
+        llm_row = QtWidgets.QHBoxLayout()
+        self.llm_model_path_edit = QtWidgets.QLineEdit()
+        self.llm_model_path_edit.setPlaceholderText("Select local LLM directory")
+        llm_row.addWidget(self.llm_model_path_edit)
+        self.llm_model_browse_btn = QtWidgets.QPushButton("Choose…")
+        self.llm_model_browse_btn.clicked.connect(self._browse_llm_dir)
+        llm_row.addWidget(self.llm_model_browse_btn)
+        llm_row.setStretch(0, 1)
+        llm_row.setStretch(1, 0)
+        models_layout.addRow("Local LLM model", llm_row)
+
+        layout.addWidget(models_group)
+
         sweeps_group = QtWidgets.QGroupBox("Sweeps")
         sweeps_layout = QtWidgets.QFormLayout(sweeps_group)
 
@@ -305,6 +343,29 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         if path_str:
             self._corpus_path = path_str
 
+    def _browse_for_directory(self, title: str, current: str | None = None) -> str:
+        start_dir = current or str(self.ctx.project_root or Path.home())
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, title, start_dir)
+        return directory or ""
+
+    def _browse_embedding_dir(self) -> None:
+        current = self.embedding_path_edit.text().strip() if hasattr(self, "embedding_path_edit") else ""
+        directory = self._browse_for_directory("Select embedding model directory", current)
+        if directory and hasattr(self, "embedding_path_edit"):
+            self.embedding_path_edit.setText(directory)
+
+    def _browse_reranker_dir(self) -> None:
+        current = self.reranker_path_edit.text().strip() if hasattr(self, "reranker_path_edit") else ""
+        directory = self._browse_for_directory("Select re-ranker model directory", current)
+        if directory and hasattr(self, "reranker_path_edit"):
+            self.reranker_path_edit.setText(directory)
+
+    def _browse_llm_dir(self) -> None:
+        current = self.llm_model_path_edit.text().strip() if hasattr(self, "llm_model_path_edit") else ""
+        directory = self._browse_for_directory("Select local LLM directory", current)
+        if directory and hasattr(self, "llm_model_path_edit"):
+            self.llm_model_path_edit.setText(directory)
+
     def _load_latest_round_config(self) -> None:
         latest_round = None
         latest_number = -1
@@ -345,6 +406,7 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
                 overrides_payload.pop("config_overrides", None)
             self._cfg_overrides_base = overrides_payload
             self.baseline_label.setText(f"Loaded from round {latest_number}")
+            self._apply_base_overrides_to_model_fields()
         else:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -354,10 +416,13 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
 
     def _open_advanced_config(self) -> None:
         dialog = AIAdvancedConfigDialog(
-            self, self._cfg_overrides_base, label_schema=self._labelset_schema
+            self,
+            self._build_cfg_overrides(),
+            label_schema=self._labelset_schema,
         )
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self._cfg_overrides_base = dialog.result_config or {}
+            self._apply_base_overrides_to_model_fields()
 
     def accept(self) -> None:  # type: ignore[override]
         prior_rounds = [
@@ -695,9 +760,78 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             corpus_id=corpus_id if isinstance(corpus_id, str) else None,
             corpus_path=self._corpus_path,
             sweeps=sweeps,
-            cfg_overrides_base=self._cfg_overrides_base,
+            cfg_overrides_base=self._build_cfg_overrides(),
             outdir=outdir,
         )
+
+    def _apply_base_overrides_to_model_fields(self) -> None:
+        config = self._cfg_overrides_base if isinstance(self._cfg_overrides_base, Mapping) else {}
+        models_cfg = config.get("models") if isinstance(config.get("models"), Mapping) else {}
+        llm_cfg = config.get("llm") if isinstance(config.get("llm"), Mapping) else {}
+
+        embed_dir = None
+        for candidate in (
+            config.get("embedding_model_dir"),
+            models_cfg.get("embed_model_name") if isinstance(models_cfg, Mapping) else None,
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                embed_dir = candidate.strip()
+                break
+
+        rerank_dir = None
+        for candidate in (
+            config.get("reranker_model_dir"),
+            models_cfg.get("rerank_model_name") if isinstance(models_cfg, Mapping) else None,
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                rerank_dir = candidate.strip()
+                break
+
+        llm_dir = None
+        for candidate in (
+            config.get("local_model_dir"),
+            llm_cfg.get("local_model_dir") if isinstance(llm_cfg, Mapping) else None,
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                llm_dir = candidate.strip()
+                break
+
+        if hasattr(self, "embedding_path_edit") and isinstance(self.embedding_path_edit, QtWidgets.QLineEdit):
+            if embed_dir:
+                self.embedding_path_edit.setText(embed_dir)
+        if hasattr(self, "reranker_path_edit") and isinstance(self.reranker_path_edit, QtWidgets.QLineEdit):
+            if rerank_dir:
+                self.reranker_path_edit.setText(rerank_dir)
+        if hasattr(self, "llm_model_path_edit") and isinstance(self.llm_model_path_edit, QtWidgets.QLineEdit):
+            if llm_dir:
+                self.llm_model_path_edit.setText(llm_dir)
+
+    def _build_cfg_overrides(self) -> dict:
+        overrides = copy.deepcopy(self._cfg_overrides_base) if isinstance(self._cfg_overrides_base, Mapping) else {}
+
+        embed_dir = self.embedding_path_edit.text().strip() if hasattr(self, "embedding_path_edit") else ""
+        rerank_dir = self.reranker_path_edit.text().strip() if hasattr(self, "reranker_path_edit") else ""
+        llm_dir = self.llm_model_path_edit.text().strip() if hasattr(self, "llm_model_path_edit") else ""
+
+        models_cfg = dict(overrides.get("models")) if isinstance(overrides.get("models"), Mapping) else {}
+        llm_cfg = dict(overrides.get("llm")) if isinstance(overrides.get("llm"), Mapping) else {}
+
+        if embed_dir:
+            overrides["embedding_model_dir"] = embed_dir
+            models_cfg["embed_model_name"] = embed_dir
+        if rerank_dir:
+            overrides["reranker_model_dir"] = rerank_dir
+            models_cfg["rerank_model_name"] = rerank_dir
+        if llm_dir:
+            overrides["local_model_dir"] = llm_dir
+            llm_cfg["local_model_dir"] = llm_dir
+
+        if models_cfg:
+            overrides["models"] = models_cfg
+        if llm_cfg:
+            overrides["llm"] = llm_cfg
+
+        return overrides
 
 
 @dataclass
