@@ -25,6 +25,7 @@ class RAGConfig:
     chunk_size: int = 1500
     chunk_overlap: int = 150
     normalize_embeddings: bool = True
+    per_label_topk: int = 8
     top_k_final: int = 6
     use_mmr: bool = True
     mmr_lambda: float = 0.7
