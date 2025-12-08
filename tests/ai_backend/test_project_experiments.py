@@ -312,6 +312,180 @@ def test_run_project_inference_experiments_rebuilds_sessions_for_backend_overrid
     assert captured.get("session") is None
 
 
+def test_inference_experiments_rag_overrides_disable_shared_session(
+    monkeypatch, tmp_path
+):
+    notes_df = pd.DataFrame(
+        [
+            {"doc_id": "1", "patient_icn": "p1", "text": "Note A"},
+            {"doc_id": "2", "patient_icn": "p2", "text": "Note B"},
+        ]
+    )
+    ann_df = pd.DataFrame(
+        [
+            {"unit_id": "1", "label_id": "l1", "label_value": "yes"},
+            {"unit_id": "2", "label_id": "l1", "label_value": "no"},
+        ]
+    )
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", lambda *_, **__: (notes_df, ann_df)
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", lambda *_, **__: {"bundle": True}
+    )
+
+    def _fail_shared_session(*_args, **_kwargs):
+        raise AssertionError("Shared session should not be created")
+
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(_fail_shared_session)
+    )
+
+    captured: dict[str, object] = {}
+
+    def _stub_run_inference_experiments(**kwargs):
+        captured.update(kwargs)
+        df = pd.DataFrame(
+            [
+                {"unit_id": "1", "label_id": "l1", "prediction_value": "yes"},
+                {"unit_id": "2", "label_id": "l1", "prediction_value": "no"},
+            ]
+        )
+        return {
+            "baseline": _DummyResult(df),
+            "rag_small": _DummyResult(df),
+        }
+
+    monkeypatch.setattr(
+        project_experiments, "run_inference_experiments", _stub_run_inference_experiments
+    )
+
+    base_overrides = {"rag": {"chunk_size": 256}}
+    sweeps = {
+        "baseline": {},
+        "rag_small": {"rag": {"chunk_size": 64}},
+    }
+
+    results, gold_df = project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="pheno1",
+        prior_rounds=[1],
+        labelset_id="ls1",
+        phenotype_level="single_doc",
+        sweeps=sweeps,
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base=base_overrides,
+    )
+
+    assert isinstance(results.get("baseline"), _DummyResult)
+    assert isinstance(results.get("rag_small"), _DummyResult)
+    assert gold_df.shape == (2, 3)
+
+    assert captured.get("session") is None
+
+    forwarded_sweeps = captured["sweeps"]
+    assert forwarded_sweeps["baseline"]["rag"]["chunk_size"] == 256
+    assert forwarded_sweeps["rag_small"]["rag"]["chunk_size"] == 64
+
+    sweep_cfgs = captured["sweep_cfgs"]
+    assert sweep_cfgs["baseline"].rag.chunk_size == 256
+    assert sweep_cfgs["rag_small"].rag.chunk_size == 64
+
+
+def test_inference_experiments_merge_baseline_and_delta_configs(monkeypatch, tmp_path):
+    notes_df = pd.DataFrame(
+        [
+            {"doc_id": "1", "patient_icn": "p1", "text": "Note A"},
+        ]
+    )
+    ann_df = pd.DataFrame(
+        [
+            {"unit_id": "1", "label_id": "l1", "label_value": "yes"},
+        ]
+    )
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", lambda *_, **__: (notes_df, ann_df)
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", lambda *_, **__: {"bundle": True}
+    )
+
+    captured: dict[str, object] = {"sessions": []}
+
+    def _record_session(paths, config):
+        captured["sessions"].append({
+            "paths": paths,
+            "backend": config.llm.backend,
+            "chunk_size": config.rag.chunk_size,
+            "temperature": config.llm.temperature,
+        })
+        return "session"
+
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(_record_session)
+    )
+
+    def _stub_run_inference_experiments(**kwargs):
+        captured.update(kwargs)
+        df = pd.DataFrame(
+            [
+                {"unit_id": "1", "label_id": "l1", "prediction_value": "yes"},
+            ]
+        )
+        return {
+            "cool": _DummyResult(df),
+            "warm": _DummyResult(df),
+        }
+
+    monkeypatch.setattr(
+        project_experiments, "run_inference_experiments", _stub_run_inference_experiments
+    )
+
+    base_overrides = {
+        "llm": {"backend": "azure", "temperature": 0.4},
+        "rag": {"chunk_size": 128},
+    }
+    sweeps = {
+        "cool": {"llm": {"temperature": 0.1}},
+        "warm": {"llm": {"temperature": 0.9}},
+    }
+
+    results, gold_df = project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="pheno1",
+        prior_rounds=[1],
+        labelset_id="ls1",
+        phenotype_level="single_doc",
+        sweeps=sweeps,
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base=base_overrides,
+    )
+
+    assert isinstance(results.get("cool"), _DummyResult)
+    assert isinstance(results.get("warm"), _DummyResult)
+    assert gold_df.shape == (1, 3)
+
+    assert len(captured.get("sessions", [])) == 1
+
+    sweeps_with_base = captured["sweeps"]
+    assert sweeps_with_base["cool"]["llm"]["temperature"] == 0.1
+    assert sweeps_with_base["cool"]["rag"]["chunk_size"] == 128
+    assert sweeps_with_base["warm"]["llm"]["temperature"] == 0.9
+    assert sweeps_with_base["warm"]["rag"]["chunk_size"] == 128
+
+    sweep_cfgs = captured["sweep_cfgs"]
+    assert sweep_cfgs["cool"].llm.backend == "azure"
+    assert sweep_cfgs["cool"].llm.temperature == 0.1
+    assert sweep_cfgs["cool"].rag.chunk_size == 128
+    assert sweep_cfgs["warm"].llm.backend == "azure"
+    assert sweep_cfgs["warm"].llm.temperature == 0.9
+    assert sweep_cfgs["warm"].rag.chunk_size == 128
 def test_inference_sweeps_forward_final_topk(monkeypatch, tmp_path):
     def _fake_export_inputs_from_repo(*args, **kwargs):
         notes_df = pd.DataFrame(

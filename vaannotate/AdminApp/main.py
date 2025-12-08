@@ -50,6 +50,7 @@ from vaannotate.utils import copy_sqlite_database, ensure_dir
 from vaannotate.rounds import AssignmentUnit as RoundAssignmentUnit, RoundBuilder
 from vaannotate.vaannotate_ai_backend import CancelledError, BackendResult, run_ai_backend_and_collect
 from vaannotate.vaannotate_ai_backend import config as ai_config
+from vaannotate.vaannotate_ai_backend import project_experiments
 
 PROJECT_MODELS = [
     models.Project,
@@ -155,6 +156,10 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         self.pheno_row = pheno_row
         self.labelsets = labelsets
         self.rounds = rounds
+        # Holds the experiment-wide AI backend baseline overrides (e.g., loaded from the
+        # latest round or edited via the Advanced dialog). Per-sweep tweaks such as RAG
+        # chunk size, top_k, MMR, few-shot, etc. are collected separately by
+        # _collect_sweeps() as per-experiment deltas.
         self._cfg_overrides_base: dict = {}
         self._corpus_path: str | None = None
         self._labelset_schema: Mapping[str, object] | None = None
@@ -455,6 +460,7 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         return items
 
     def _collect_sweeps(self) -> Dict[str, dict]:
+        """Parse sweep text fields into a mapping of experiment name to per-sweep cfg_overrides deltas (merged onto cfg_overrides_base in the AI backend)."""
         chunk_sizes, chunk_invalid = self._parse_int_list(self.chunk_sizes_edit.text())
         top_k_values, topk_invalid = self._parse_int_list(self.topk_edit.text())
         mmr_values, mmr_invalid = self._parse_bool_list(self.mmr_edit.text())
@@ -491,6 +497,7 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         for chunk_size, top_k, use_mmr, use_few_shot in itertools.product(
             chunk_options, topk_options, mmr_options, few_shot_options
         ):
+            # Each sweep override is a delta-only config applied on top of the baseline.
             rag_cfg: dict = {}
             llm_cfg: dict = {}
             name_parts: list[str] = []
@@ -807,6 +814,8 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
                 self.llm_model_path_edit.setText(llm_dir)
 
     def _build_cfg_overrides(self) -> dict:
+        # Build only the experiment-wide baseline cfg_overrides. Per-sweep deltas are
+        # returned by _collect_sweeps() and merged elsewhere.
         overrides = copy.deepcopy(self._cfg_overrides_base) if isinstance(self._cfg_overrides_base, Mapping) else {}
 
         embed_dir = self.embedding_path_edit.text().strip() if hasattr(self, "embedding_path_edit") else ""
@@ -831,6 +840,8 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         if llm_cfg:
             overrides["llm"] = llm_cfg
 
+        # This is the experiment-wide baseline cfg_overrides; individual sweeps will
+        # provide only the per-experiment deltas that get merged onto this baseline.
         return overrides
 
 
@@ -2594,6 +2605,38 @@ class ProjectContext(QtCore.QObject):
             )
 
         return results
+
+    def run_inference_experiments(
+        self,
+        cfg: InferenceExperimentConfig,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        """
+        Run a sweep of inference experiments for a phenotype using the AI backend.
+
+        - cfg.cfg_overrides_base is the experiment-wide baseline config.
+        - cfg.sweeps must contain only per-experiment deltas relative to that baseline.
+        """
+
+        project_root = self.project_root or Path.cwd()
+        results, gold_df = project_experiments.run_project_inference_experiments(
+            project_root=project_root,
+            pheno_id=cfg.pheno_id,
+            prior_rounds=cfg.prior_rounds,
+            labelset_id=cfg.labelset_id or None,
+            phenotype_level=cfg.pheno_level,
+            sweeps=cfg.sweeps,
+            base_outdir=cfg.outdir,
+            corpus_record=None,
+            corpus_id=cfg.corpus_id,
+            corpus_path=cfg.corpus_path,
+            cfg_overrides_base=cfg.cfg_overrides_base,
+        )
+
+        # Optionally: store cfg.outdir or results somewhere on the context for the UI
+        # (e.g. to display links to experiments_predictions.parquet and
+        # experiments_metrics.json).
+        _ = results, gold_df
 
     def list_label_sets(self) -> List[sqlite3.Row]:
         db = self.require_db()
@@ -10947,10 +10990,6 @@ class AdminMainWindow(QtWidgets.QMainWindow):
 
         def worker() -> None:
             try:
-                from vaannotate.vaannotate_ai_backend.project_experiments import (
-                    run_project_inference_experiments,
-                )
-
                 signals.log.emit("Starting inference sweeps…")
                 try:
                     ensure_dir(config.outdir)
@@ -10958,18 +10997,7 @@ class AdminMainWindow(QtWidgets.QMainWindow):
                     signals.log.emit(f"Error preparing output directory: {exc}")
                     signals.failed.emit(str(exc))
                     return
-                run_project_inference_experiments(
-                    project_root=self.ctx.project_root,
-                    pheno_id=config.pheno_id,
-                    prior_rounds=config.prior_rounds,
-                    labelset_id=config.labelset_id or None,
-                    phenotype_level=config.pheno_level,
-                    sweeps=config.sweeps,
-                    base_outdir=config.outdir,
-                    corpus_id=config.corpus_id,
-                    corpus_path=config.corpus_path,
-                    cfg_overrides_base=config.cfg_overrides_base,
-                )
+                self.ctx.run_inference_experiments(config)
             except Exception as exc:  # noqa: BLE001
                 signals.log.emit(f"Error: {exc}")
                 signals.failed.emit(str(exc))
