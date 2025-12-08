@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import uuid
 import tempfile
+import itertools
 from collections.abc import Mapping as ABCMapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -156,6 +157,9 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         self.rounds = rounds
         self._cfg_overrides_base: dict = {}
         self._corpus_path: str | None = None
+        self._labelset_schema: Mapping[str, object] | None = None
+        self._few_shot_examples: Dict[str, List[Dict[str, str]]] = {}
+        self._few_shot_source: str = ""
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -187,13 +191,19 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         labelset_layout = QtWidgets.QFormLayout(labelset_group)
         self.labelset_combo = QtWidgets.QComboBox()
         for labelset in self.labelsets:
-            if not isinstance(labelset, Mapping):
-                continue
-            labelset_id = str(labelset.get("labelset_id") or "")
+            if isinstance(labelset, Mapping):
+                labelset_data = labelset
+            else:
+                try:
+                    labelset_data = dict(labelset)
+                except Exception:  # noqa: BLE001
+                    continue
+            labelset_id = str(labelset_data.get("labelset_id") or "")
             if not labelset_id:
                 continue
-            display = str(labelset.get("name") or labelset_id)
+            display = str(labelset_data.get("name") or labelset_id)
             self.labelset_combo.addItem(display, labelset_id)
+        self.labelset_combo.currentIndexChanged.connect(self._on_labelset_changed)
         labelset_layout.addRow("Labelset", self.labelset_combo)
         layout.addWidget(labelset_group)
 
@@ -208,22 +218,41 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         layout.addWidget(corpus_group)
 
         sweeps_group = QtWidgets.QGroupBox("Sweeps")
-        sweeps_layout = QtWidgets.QVBoxLayout(sweeps_group)
-        self.sweeps_table = QtWidgets.QTableWidget(0, 4)
-        self.sweeps_table.setHorizontalHeaderLabels(
-            ["Name", "Chunk size", "Top k", "Backend"]
+        sweeps_layout = QtWidgets.QFormLayout(sweeps_group)
+
+        self.chunk_sizes_edit = QtWidgets.QLineEdit()
+        self.chunk_sizes_edit.setPlaceholderText("e.g. 256, 512")
+        sweeps_layout.addRow("Chunk sizes", self.chunk_sizes_edit)
+
+        self.topk_edit = QtWidgets.QLineEdit()
+        self.topk_edit.setPlaceholderText("e.g. 10, 25")
+        sweeps_layout.addRow("Top k", self.topk_edit)
+
+        self.mmr_edit = QtWidgets.QLineEdit()
+        self.mmr_edit.setPlaceholderText("on, off")
+        sweeps_layout.addRow("MMR (on/off)", self.mmr_edit)
+
+        self.few_shot_edit = QtWidgets.QLineEdit()
+        self.few_shot_edit.setPlaceholderText("few-shot, zero-shot")
+        sweeps_layout.addRow("Few-shot (on/off)", self.few_shot_edit)
+
+        few_shot_row = QtWidgets.QHBoxLayout()
+        self.few_shot_status = QtWidgets.QLabel("Few-shot examples not loaded")
+        self.few_shot_status.setWordWrap(True)
+        few_shot_row.addWidget(self.few_shot_status)
+        self.few_shot_edit_btn = QtWidgets.QPushButton("Edit few-shot examples…")
+        self.few_shot_edit_btn.clicked.connect(self._open_few_shot_editor)
+        few_shot_row.addWidget(self.few_shot_edit_btn)
+        few_shot_row.addStretch()
+        sweeps_layout.addRow("", few_shot_row)
+
+        sweeps_help = QtWidgets.QLabel(
+            "Enter comma-separated values for each parameter. The dialog will "
+            "run all combinations of the provided values."
         )
-        self.sweeps_table.horizontalHeader().setStretchLastSection(True)
-        sweeps_layout.addWidget(self.sweeps_table)
-        sweeps_buttons = QtWidgets.QHBoxLayout()
-        self.add_sweep_btn = QtWidgets.QPushButton("Add row")
-        self.add_sweep_btn.clicked.connect(self._add_sweep_row)
-        sweeps_buttons.addWidget(self.add_sweep_btn)
-        self.remove_sweep_btn = QtWidgets.QPushButton("Remove row")
-        self.remove_sweep_btn.clicked.connect(self._remove_sweep_row)
-        sweeps_buttons.addWidget(self.remove_sweep_btn)
-        sweeps_buttons.addStretch()
-        sweeps_layout.addLayout(sweeps_buttons)
+        sweeps_help.setWordWrap(True)
+        sweeps_layout.addRow("", sweeps_help)
+
         layout.addWidget(sweeps_group)
 
         baseline_group = QtWidgets.QGroupBox("Baseline AI config")
@@ -249,6 +278,8 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
+        self._on_labelset_changed()
+
     def _populate_corpus_combo(self) -> None:
         self.corpus_combo.clear()
         corpora = self.ctx.list_corpora()
@@ -273,19 +304,6 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         )
         if path_str:
             self._corpus_path = path_str
-
-    def _add_sweep_row(self) -> None:
-        row = self.sweeps_table.rowCount()
-        self.sweeps_table.insertRow(row)
-        self.sweeps_table.setItem(row, 0, QtWidgets.QTableWidgetItem(""))
-        self.sweeps_table.setItem(row, 1, QtWidgets.QTableWidgetItem(""))
-        self.sweeps_table.setItem(row, 2, QtWidgets.QTableWidgetItem(""))
-        self.sweeps_table.setItem(row, 3, QtWidgets.QTableWidgetItem(""))
-
-    def _remove_sweep_row(self) -> None:
-        row = self.sweeps_table.currentRow()
-        if row >= 0:
-            self.sweeps_table.removeRow(row)
 
     def _load_latest_round_config(self) -> None:
         latest_round = None
@@ -365,41 +383,292 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         return items
 
     def _collect_sweeps(self) -> Dict[str, dict]:
+        chunk_sizes, chunk_invalid = self._parse_int_list(self.chunk_sizes_edit.text())
+        top_k_values, topk_invalid = self._parse_int_list(self.topk_edit.text())
+        mmr_values, mmr_invalid = self._parse_bool_list(self.mmr_edit.text())
+        few_shot_values, few_shot_invalid = self._parse_bool_list(
+            self.few_shot_edit.text(), allow_few_shot_tokens=True
+        )
+
+        errors = []
+        if chunk_invalid:
+            errors.append(f"Chunk sizes: {', '.join(chunk_invalid)}")
+        if topk_invalid:
+            errors.append(f"Top k: {', '.join(topk_invalid)}")
+        if mmr_invalid:
+            errors.append(f"MMR: {', '.join(mmr_invalid)}")
+        if few_shot_invalid:
+            errors.append(f"Few-shot: {', '.join(few_shot_invalid)}")
+
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Validation",
+                "Invalid sweep values:\n" + "\n".join(errors),
+            )
+            return {}
+
+        chunk_options = chunk_sizes or [None]
+        topk_options = top_k_values or [None]
+        mmr_options = mmr_values or [None]
+        few_shot_options = few_shot_values or [None]
+
+        missing_few_shot = any(val is True for val in few_shot_options) and not self._few_shot_examples
+
         sweeps: Dict[str, dict] = {}
-        for row in range(self.sweeps_table.rowCount()):
-            name_item = self.sweeps_table.item(row, 0)
-            if not name_item:
-                continue
-            name = name_item.text().strip()
-            if not name:
-                continue
-            chunk_item = self.sweeps_table.item(row, 1)
-            topk_item = self.sweeps_table.item(row, 2)
-            backend_item = self.sweeps_table.item(row, 3)
+        for chunk_size, top_k, use_mmr, use_few_shot in itertools.product(
+            chunk_options, topk_options, mmr_options, few_shot_options
+        ):
             rag_cfg: dict = {}
-            try:
-                chunk_size = int(chunk_item.text()) if chunk_item and chunk_item.text() else None
-            except ValueError:
-                chunk_size = None
+            llm_cfg: dict = {}
+            name_parts: list[str] = []
+
             if chunk_size is not None:
                 rag_cfg["chunk_size"] = chunk_size
-            try:
-                top_k = int(topk_item.text()) if topk_item and topk_item.text() else None
-            except ValueError:
-                top_k = None
+                name_parts.append(f"chunk{chunk_size}")
             if top_k is not None:
                 rag_cfg["top_k_final"] = top_k
-            llm_cfg: dict = {}
-            backend = backend_item.text().strip() if backend_item else ""
-            if backend:
-                llm_cfg["backend"] = backend
+                name_parts.append(f"topk{top_k}")
+            if use_mmr is not None:
+                rag_cfg["use_mmr"] = use_mmr
+                name_parts.append("mmr_on" if use_mmr else "mmr_off")
+
+            if use_few_shot is not None:
+                llm_cfg["few_shot_examples"] = (
+                    copy.deepcopy(self._few_shot_examples) if use_few_shot else {}
+                )
+                name_parts.append("few_shot" if use_few_shot else "zero_shot")
+
+            if not name_parts:
+                continue
+
+            name = "-".join(name_parts)
             sweep_cfg: dict = {}
             if rag_cfg:
                 sweep_cfg["rag"] = rag_cfg
             if llm_cfg:
                 sweep_cfg["llm"] = llm_cfg
             sweeps[name] = sweep_cfg
+
+        if missing_few_shot:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Validation",
+                "Few-shot sweeps requested, but no few-shot examples are loaded. "
+                "Edit or load examples before running.",
+            )
+            return {}
+
         return sweeps
+
+    @staticmethod
+    def _parse_int_list(text: str) -> tuple[list[int], list[str]]:
+        values: list[int] = []
+        invalid: list[str] = []
+        for raw in re.split(r"[,\s]+", text or ""):
+            if not raw:
+                continue
+            try:
+                values.append(int(raw))
+            except ValueError:
+                invalid.append(raw)
+        return values, invalid
+
+    @staticmethod
+    def _parse_bool_list(
+        text: str, *, allow_few_shot_tokens: bool = False
+    ) -> tuple[list[bool], list[str]]:
+        truthy = {"true", "yes", "on", "1"}
+        falsy = {"false", "no", "off", "0"}
+        if allow_few_shot_tokens:
+            truthy.update({"few-shot", "few_shot", "fewshot"})
+            falsy.update({"zero-shot", "zero_shot", "zeroshot", "zero"})
+        values: list[bool] = []
+        invalid: list[str] = []
+        for raw in re.split(r"[,\s]+", text or ""):
+            if not raw:
+                continue
+            token = raw.strip().lower()
+            if token in truthy:
+                values.append(True)
+            elif token in falsy:
+                values.append(False)
+            else:
+                invalid.append(raw)
+        return values, invalid
+
+    @staticmethod
+    def _extract_few_shot_examples(
+        config: Mapping[str, Any], labelset: Mapping[str, Any] | None = None
+    ) -> Dict[str, list[dict[str, str]]]:
+        ai_backend_cfg = (
+            config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        )
+        llm_cfg = (
+            ai_backend_cfg.get("llm")
+            if isinstance(ai_backend_cfg, Mapping)
+            and isinstance(ai_backend_cfg.get("llm"), Mapping)
+            else {}
+        )
+        top_llm_cfg = config.get("llm") if isinstance(config.get("llm"), Mapping) else {}
+
+        candidates: list[object] = []
+        if isinstance(ai_backend_cfg, Mapping):
+            candidates.append(ai_backend_cfg.get("few_shot_examples"))
+        if isinstance(llm_cfg, Mapping):
+            candidates.append(llm_cfg.get("few_shot_examples"))
+        if isinstance(top_llm_cfg, Mapping):
+            candidates.append(top_llm_cfg.get("few_shot_examples"))
+
+        few_shot_raw: Mapping[str, object] | None = None
+        for candidate in candidates:
+            if isinstance(candidate, Mapping):
+                few_shot_raw = candidate
+                break
+
+        cleaned: Dict[str, list[dict[str, str]]] = {}
+        if few_shot_raw:
+            for label_id, examples in few_shot_raw.items():
+                if not isinstance(examples, Sequence):
+                    continue
+                parsed_examples: list[dict[str, str]] = []
+                for entry in examples:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    example: dict[str, str] = {}
+                    if entry.get("context") is not None:
+                        example["context"] = str(entry.get("context"))
+                    if entry.get("answer") is not None:
+                        example["answer"] = str(entry.get("answer"))
+                    if example:
+                        parsed_examples.append(example)
+                if parsed_examples:
+                    cleaned[str(label_id)] = parsed_examples
+
+        if labelset:
+            labels = labelset.get("labels") if isinstance(labelset, Mapping) else None
+            if isinstance(labels, Sequence):
+                for label in labels:
+                    if not isinstance(label, Mapping):
+                        continue
+                    label_id = str(label.get("label_id") or "")
+                    if not label_id:
+                        continue
+                    raw_examples = label.get("few_shot_examples")
+                    if not isinstance(raw_examples, Sequence):
+                        continue
+                    parsed_examples: list[dict[str, str]] = []
+                    for entry in raw_examples:
+                        if not isinstance(entry, Mapping):
+                            continue
+                        example: dict[str, str] = {}
+                        if entry.get("context") is not None:
+                            example["context"] = str(entry.get("context"))
+                        if entry.get("answer") is not None:
+                            example["answer"] = str(entry.get("answer"))
+                        if example:
+                            parsed_examples.append(example)
+                    if parsed_examples and label_id not in cleaned:
+                        cleaned[label_id] = parsed_examples
+        return cleaned
+
+    def _on_labelset_changed(self) -> None:
+        labelset_id = self.labelset_combo.currentData()
+        if not labelset_id:
+            self._labelset_schema = None
+            self._few_shot_examples = {}
+            self._few_shot_source = ""
+            self._update_few_shot_status()
+            return
+
+        try:
+            self._labelset_schema = self.ctx.load_labelset_details(str(labelset_id))
+        except Exception:  # noqa: BLE001
+            self._labelset_schema = None
+
+        self._few_shot_examples = self._load_default_few_shot_examples(str(labelset_id))
+        self._update_few_shot_status()
+
+    def _load_default_few_shot_examples(self, labelset_id: str) -> Dict[str, list[dict[str, str]]]:
+        labelset_schema = self._labelset_schema if isinstance(self._labelset_schema, Mapping) else None
+        latest_round = None
+        latest_number = -1
+        for entry in self.rounds:
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("labelset_id") or "") != labelset_id:
+                continue
+            try:
+                number = int(entry.get("round_number") or 0)
+            except Exception:
+                continue
+            if number > latest_number:
+                latest_number = number
+                latest_round = entry
+
+        if isinstance(latest_round, Mapping):
+            round_id_val = latest_round.get("round_id")
+            if round_id_val:
+                config = self.ctx.get_round_config(str(round_id_val))
+                if isinstance(config, Mapping):
+                    examples = self._extract_few_shot_examples(config, labelset_schema)
+                    if examples:
+                        self._few_shot_source = f"Loaded few-shot examples from round {latest_number}"
+                        return examples
+
+        if labelset_schema:
+            examples = self._extract_few_shot_examples({}, labelset_schema)
+            if examples:
+                self._few_shot_source = "Using few-shot examples from label set"
+                return examples
+
+        self._few_shot_source = "No few-shot examples found"
+        return {}
+
+    def _update_few_shot_status(self) -> None:
+        details = self._few_shot_source or "Few-shot examples not loaded"
+        example_counts = sum(len(v) for v in self._few_shot_examples.values())
+        if example_counts:
+            details = f"{details} ({example_counts} example{'s' if example_counts != 1 else ''})"
+        self.few_shot_status.setText(details)
+        self.few_shot_edit_btn.setEnabled(bool(self._labelset_schema))
+
+    def _open_few_shot_editor(self) -> None:
+        if not isinstance(self._labelset_schema, Mapping):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Few-shot examples",
+                "Select a label set with labels to edit few-shot examples.",
+            )
+            return
+
+        labels = self._labelset_schema.get("labels") if isinstance(self._labelset_schema, Mapping) else None
+        if not isinstance(labels, Sequence) or not labels:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Few-shot examples",
+                "The selected label set has no labels to attach examples to.",
+            )
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Edit few-shot examples")
+        dialog.resize(760, 640)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        editor = LabelFewShotExamplesEditor(labels, self._few_shot_examples)
+        layout.addWidget(editor)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._few_shot_examples = editor.to_mapping()
+            self._few_shot_source = "Customized for inference experiments"
+            self._update_few_shot_status()
 
     def to_config(self) -> InferenceExperimentConfig:
         pheno_id = str(self.pheno_row.get("pheno_id") if isinstance(self.pheno_row, Mapping) else "")
