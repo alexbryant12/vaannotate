@@ -332,7 +332,7 @@ class ContextBuilder:
 
         cfg_rag = getattr(self, "cfg", None) or self.cfg
         cfg_final_k = getattr(cfg_rag, "top_k_final", None)
-        final_k_raw = topk_override or cfg_final_k
+        final_k_raw = topk_override or cfg_final_k or getattr(cfg_rag, "per_label_topk", 6)
         try:
             final_k = max(1, int(final_k_raw))
         except Exception:
@@ -597,14 +597,17 @@ class ContextBuilder:
                 need = min_k - len(out)
                 out.extend(rest[:need])
 
+        selected = out[:final_k]
+
         diagnostics["final_selection"] = {
-            "count": len(out),
-            "score_stats": _score_stats(out),
+            "count": len(selected),
+            "score_stats": _score_stats(selected),
+            "pre_topk_count": len(out),
         }
 
         diagnostics["stage"] = "complete"
         self.retriever.set_last_diagnostics(unit_id, label_id, diagnostics, original_unit_id=original_unit_id)
-        return out[:final_k]
+        return selected
 
 
 def _options_for_label(label_id: str, label_type: str, label_config: dict) -> list[str]:
