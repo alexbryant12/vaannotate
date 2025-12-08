@@ -44,6 +44,19 @@ def _normalize_local_model_overrides(
     if llm_cfg:
         normalized["llm"] = llm_cfg
 
+    # Mirror top-k overrides onto both the legacy ``per_label_topk`` and the
+    # newer ``top_k_final`` fields so downstream consumers that still reference
+    # the older knob (e.g., some inference contexts) see the updated value from
+    # Admin sweeps.
+    rag_cfg = (
+        dict(normalized.get("rag")) if isinstance(normalized.get("rag"), Mapping) else {}
+    )
+    top_k_final = rag_cfg.get("top_k_final")
+    if top_k_final is not None and "per_label_topk" not in rag_cfg:
+        rag_cfg["per_label_topk"] = top_k_final
+    if rag_cfg:
+        normalized["rag"] = rag_cfg
+
     return normalized
 
 

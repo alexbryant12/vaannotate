@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Iterable, List, Optional, Tuple
@@ -8,6 +9,9 @@ import pandas as pd
 
 from ..services import LLM_RECORDER
 from ..utils.jsonish import _jsonify_cols
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class InferencePipeline:
@@ -157,6 +161,17 @@ class InferencePipeline:
 
     def run(self, unit_ids: Optional[List[str]] = None) -> pd.DataFrame:
         run_id = time.strftime("%Y%m%d-%H%M%S")
+        mode = getattr(self.cfg.llmfirst, "inference_labeling_mode", "family")
+
+        LOGGER.info(
+            "inference_run_start",
+            extra={
+                "run_id": run_id,
+                "mode": mode,
+                "outdir": self.paths.outdir,
+            },
+        )
+
         LLM_RECORDER.start(
             outdir=self.paths.outdir,
             run_id=run_id,
@@ -166,22 +181,67 @@ class InferencePipeline:
         self.store.build_chunk_index(self.repo.notes, self.cfg.rag, self.cfg.index)
 
         all_units = [str(u) for u in self.repo.notes["unit_id"].unique().tolist()]
+        LOGGER.info(
+            "inference_chunk_index_built",
+            extra={"total_units": len(all_units), "outdir": self.paths.outdir},
+        )
+
         selected_units = all_units if unit_ids is None else [str(u) for u in unit_ids if str(u)]
 
+        LOGGER.info(
+            "inference_units_selected",
+            extra={
+                "requested_units": len(unit_ids) if unit_ids is not None else None,
+                "selected_units": len(selected_units),
+            },
+        )
+
+        def _flush_recorder() -> None:
+            try:
+                rec_path = LLM_RECORDER.flush()
+                if rec_path:
+                    LOGGER.info(
+                        "llm_run_log_written",
+                        extra={"path": rec_path, "n_calls": len(LLM_RECORDER.calls)},
+                    )
+            except Exception:
+                LOGGER.warning("llm_run_log_write_failed")
+
         if not selected_units:
-            LLM_RECORDER.flush()
+            LOGGER.info("inference_no_units_to_label")
+            _flush_recorder()
             return pd.DataFrame(columns=["unit_id", "label_id", "llm_prediction"])
 
         rules_map, label_types = self._label_maps()
+        LOGGER.info(
+            "inference_label_maps_ready",
+            extra={"n_rules": len(rules_map), "n_label_types": len(label_types)},
+        )
+
+        LOGGER.info(
+            "inference_labeling_start",
+            extra={"mode": mode, "n_units": len(selected_units), "n_labels": len(label_types)},
+        )
         label_df = self._label_units(selected_units, label_types, rules_map)
 
+        LOGGER.info(
+            "inference_labeling_done",
+            extra={"mode": mode, "n_rows": len(label_df)},
+        )
+
         if label_df.empty:
-            LLM_RECORDER.flush()
+            LOGGER.info("inference_no_predictions_returned")
+            _flush_recorder()
             return label_df
 
         jsonified = _jsonify_cols(label_df, [c for c in ["rag_context", "llm_runs", "fc_probs"] if c in label_df.columns])
         out_path = os.path.join(self.paths.outdir, "inference_predictions.parquet")
         jsonified.to_parquet(out_path, index=False)
+
+        LOGGER.info(
+            "inference_predictions_written",
+            extra={"path": out_path, "n_rows": len(jsonified)},
+        )
 
         json_path = os.path.join(self.paths.outdir, "inference_predictions.json")
         try:
@@ -189,7 +249,7 @@ class InferencePipeline:
         except Exception:
             pass
 
-        LLM_RECORDER.flush()
+        _flush_recorder()
         return label_df
 
 

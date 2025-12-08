@@ -211,3 +211,70 @@ def test_run_project_inference_experiments_passes_prior_annotations(monkeypatch,
     assert list(gold_df["unit_id"]) == ["1", "2"]
     assert_frame_equal(captured["run_kwargs"]["ann_df"].reset_index(drop=True), ann_df)
     assert captured["run_kwargs"]["unit_ids"] == ["1", "2"]
+
+
+def test_inference_sweeps_forward_final_topk(monkeypatch, tmp_path):
+    def _fake_export_inputs_from_repo(*args, **kwargs):
+        notes_df = pd.DataFrame(
+            {"unit_id": ["1"], "patient_icn": ["p"], "doc_id": ["d"]}
+        )
+        ann_df = pd.DataFrame({"unit_id": ["1"], "label_id": ["0"], "label_value": ["y"]})
+        return notes_df, ann_df
+
+    def _fake_load_label_config_bundle(*args, **kwargs):
+        class _DummyBundle:
+            def with_current_fallback(self, label_config):
+                return self
+
+        return _DummyBundle()
+
+    def _fake_session_from_env(*args, **kwargs):
+        class _DummySession:
+            models = None
+            store = None
+
+        return _DummySession()
+
+    captured = {}
+
+    def _fake_run_inference_experiments(**kwargs):
+        captured["sweeps"] = kwargs.get("sweeps") or {}
+
+        class _DummyResult:
+            dataframe = pd.DataFrame()
+            artifacts = {}
+            outdir = tmp_path / "out"
+            cfg_overrides = {}
+            name = "topk"
+
+        return {"topk": _DummyResult()}
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", _fake_export_inputs_from_repo
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", _fake_load_label_config_bundle
+    )
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(_fake_session_from_env)
+    )
+    monkeypatch.setattr(
+        project_experiments, "run_inference_experiments", _fake_run_inference_experiments
+    )
+
+    project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="p1",
+        prior_rounds=[1],
+        labelset_id="ls",
+        phenotype_level="single_doc",
+        sweeps={"topk": {"rag": {"top_k_final": 11}}},
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base=None,
+    )
+
+    rag_cfg = captured.get("sweeps", {}).get("topk", {}).get("rag", {})
+    assert rag_cfg.get("top_k_final") == 11
+    assert rag_cfg.get("per_label_topk") == 11
