@@ -332,7 +332,7 @@ class ContextBuilder:
 
         cfg_rag = getattr(self, "cfg", None) or self.cfg
         cfg_final_k = getattr(cfg_rag, "top_k_final", None)
-        final_k_raw = topk_override or cfg_final_k or getattr(cfg_rag, "per_label_topk", 6)
+        final_k_raw = topk_override or cfg_final_k
         try:
             final_k = max(1, int(final_k_raw))
         except Exception:
