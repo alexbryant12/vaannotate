@@ -15,7 +15,6 @@ from .experiment_metrics import compute_experiment_metrics
 from .experiments import (
     InferenceExperimentResult,
     _normalize_local_model_overrides,
-    _overrides_affect_backend,
     run_inference_experiments,
 )
 from .orchestration import BackendSession
@@ -402,17 +401,13 @@ def run_project_inference_experiments(
     if base_overrides:
         _apply_overrides(base_cfg, dict(base_overrides))
 
-    sweeps_normalized = {
-        name: _normalize_local_model_overrides(dict(overrides))
-        for name, overrides in sweeps.items()
-    }
-
-    sweep_cfgs = {}
-    for name, overrides in sweeps_normalized.items():
-        sweep_cfg = copy.deepcopy(base_cfg)
-        if overrides:
-            _apply_overrides(sweep_cfg, dict(overrides))
-        sweep_cfgs[name] = sweep_cfg
+    session_paths = Paths(
+        notes_path=str(base_outdir / "_session_notes.parquet"),
+        annotations_path=str(base_outdir / "_session_annotations.parquet"),
+        outdir=str(base_outdir / "_session"),
+        cache_dir_override=str(base_outdir / "cache"),
+    )
+    session = BackendSession.from_env(session_paths, base_cfg)
 
     sweeps_with_base = {
         name: _normalize_local_model_overrides(
@@ -421,24 +416,11 @@ def run_project_inference_experiments(
         for name, overrides in sweeps.items()
     }
 
-    share_session = not any(_overrides_affect_backend(o) for o in sweeps_normalized.values())
-    session: BackendSession | None = None
-    if share_session:
-        session_paths = Paths(
-            notes_path=str(base_outdir / "_session_notes.parquet"),
-            annotations_path=str(base_outdir / "_session_annotations.parquet"),
-            outdir=str(base_outdir / "_session"),
-            cache_dir_override=str(base_outdir / "cache"),
-        )
-        session = BackendSession.from_env(session_paths, base_cfg)
-
     results = run_inference_experiments(
         notes_df=notes_df,
         ann_df=ann_df,
         base_outdir=base_outdir,
         sweeps=sweeps_with_base,
-        sweep_cfgs=sweep_cfgs,
-        normalized_sweeps=sweeps_normalized,
         unit_ids=eval_unit_ids,
         label_config_bundle=label_config_bundle,
         session=session,
