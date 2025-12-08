@@ -1,16 +1,50 @@
 from __future__ import annotations
 
+import copy
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
-
-import json
 import pandas as pd
 
 from .config import OrchestratorConfig, Paths
 from .label_configs import LabelConfigBundle, EMPTY_BUNDLE
 from .orchestration import BackendSession
 from .orchestrator import _apply_overrides, run_inference
+
+
+def _normalize_local_model_overrides(
+    cfg_overrides: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
+    """Ensure local model directories are passed via the models/llm configs."""
+
+    normalized = copy.deepcopy(cfg_overrides or {})
+
+    models_cfg = (
+        dict(normalized.get("models"))
+        if isinstance(normalized.get("models"), Mapping)
+        else {}
+    )
+    embed_dir = normalized.get("embedding_model_dir")
+    rerank_dir = normalized.get("reranker_model_dir")
+
+    if isinstance(embed_dir, str) and embed_dir.strip():
+        models_cfg.setdefault("embed_model_name", embed_dir.strip())
+    if isinstance(rerank_dir, str) and rerank_dir.strip():
+        models_cfg.setdefault("rerank_model_name", rerank_dir.strip())
+    if models_cfg:
+        normalized["models"] = models_cfg
+
+    llm_cfg = (
+        dict(normalized.get("llm")) if isinstance(normalized.get("llm"), Mapping) else {}
+    )
+    top_level_local_llm = normalized.get("local_model_dir")
+    if isinstance(top_level_local_llm, str) and top_level_local_llm.strip():
+        llm_cfg.setdefault("local_model_dir", top_level_local_llm.strip())
+    if llm_cfg:
+        normalized["llm"] = llm_cfg
+
+    return normalized
 
 
 @dataclass
@@ -140,8 +174,9 @@ def run_inference_experiments(
         """Construct a BackendSession that respects experiment overrides."""
 
         sweep_cfg = OrchestratorConfig()
+        normalized_overrides = _normalize_local_model_overrides(dict(overrides))
         if overrides:
-            _apply_overrides(sweep_cfg, dict(overrides))
+            _apply_overrides(sweep_cfg, normalized_overrides)
 
         session_paths = Paths(
             notes_path=str(base_outdir / f"_{name}_session_notes.parquet"),
@@ -167,13 +202,15 @@ def run_inference_experiments(
 
         exp_session = session or _build_session_for_overrides(name, overrides)
 
+        normalized_overrides = _normalize_local_model_overrides(dict(overrides))
+
         df, artifacts = run_inference(
             notes_df=index_notes_df,
             ann_df=index_ann_df,
             outdir=exp_outdir,
             label_config_bundle=bundle,
             label_config=label_config,
-            cfg_overrides=dict(overrides),
+            cfg_overrides=normalized_overrides,
             unit_ids=unit_ids,
             cancel_callback=cancel_callback,
             log_callback=exp_log_cb,

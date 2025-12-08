@@ -9,7 +9,11 @@ import pandas as pd
 
 from .adapters import _load_label_config_bundle, export_inputs_from_repo
 from .config import OrchestratorConfig, Paths
-from .experiments import InferenceExperimentResult, run_inference_experiments
+from .experiments import (
+    InferenceExperimentResult,
+    _normalize_local_model_overrides,
+    run_inference_experiments,
+)
 from .orchestration import BackendSession
 from .orchestrator import _apply_overrides
 
@@ -204,9 +208,11 @@ def run_project_inference_experiments(
         overrides=label_config_override,
     )
 
+    base_overrides = _normalize_local_model_overrides(cfg_overrides_base or {})
+
     base_cfg = OrchestratorConfig()
-    if cfg_overrides_base:
-        _apply_overrides(base_cfg, dict(cfg_overrides_base))
+    if base_overrides:
+        _apply_overrides(base_cfg, dict(base_overrides))
 
     session_paths = Paths(
         notes_path=str(base_outdir / "_session_notes.parquet"),
@@ -216,9 +222,10 @@ def run_project_inference_experiments(
     )
     session = BackendSession.from_env(session_paths, base_cfg)
 
-    base_overrides = cfg_overrides_base or {}
     sweeps_with_base = {
-        name: merge_cfg_overrides(base_overrides, dict(overrides))
+        name: _normalize_local_model_overrides(
+            merge_cfg_overrides(base_overrides, dict(overrides))
+        )
         for name, overrides in sweeps.items()
     }
 
