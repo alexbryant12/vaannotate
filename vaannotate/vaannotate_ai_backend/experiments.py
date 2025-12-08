@@ -44,11 +44,13 @@ def _normalize_local_model_overrides(
     if llm_cfg:
         normalized["llm"] = llm_cfg
 
-    # Mirror top-k overrides onto both the legacy ``per_label_topk`` and the
-    # newer ``top_k_final`` fields so downstream consumers that still reference
-    # the older knob (e.g., some inference contexts) see the updated value from
-    # Admin sweeps. Keep the two fields in sync with ``top_k_final`` treated as
-    # canonical when present.
+    # RAG top-k compatibility shim:
+    # - Older configs may set rag.per_label_topk only.
+    # - New code and Admin sweeps should set rag.top_k_final.
+    # Here we canonicalize:
+    #   * If only per_label_topk is set, promote it into top_k_final.
+    #   * Then mirror top_k_final back into per_label_topk so any legacy code
+    #     inspecting that field sees the same value, but it never drives behavior.
     rag_cfg = (
         dict(normalized.get("rag")) if isinstance(normalized.get("rag"), Mapping) else {}
     )
@@ -64,8 +66,7 @@ def _normalize_local_model_overrides(
             rag_cfg["top_k_final"] = per_label_topk
         top_k_final = rag_cfg["top_k_final"]
 
-    # If top_k_final is set (from sweeps or elsewhere), treat it as canonical
-    # and keep per_label_topk in sync, overriding any stale baseline value.
+    # If top_k_final is set, treat it as canonical and keep per_label_topk in sync.
     if top_k_final is not None:
         try:
             rag_cfg["per_label_topk"] = int(top_k_final)
