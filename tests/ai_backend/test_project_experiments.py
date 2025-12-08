@@ -300,3 +300,46 @@ def test_inference_sweeps_forward_final_topk(monkeypatch, tmp_path):
     rag_cfg = captured.get("sweeps", {}).get("topk", {}).get("rag", {})
     assert rag_cfg.get("top_k_final") == 11
     assert rag_cfg.get("per_label_topk") == 11
+
+
+def test_build_gold_uses_date_values_for_consensus():
+    ann_df = pd.DataFrame(
+        [
+            {
+                "unit_id": "u1",
+                "label_id": "onset",
+                "label_value": "date provided",
+                "label_value_date": pd.Timestamp("2024-01-01"),
+            },
+            {
+                "unit_id": "u1",
+                "label_id": "onset",
+                "label_value": "date provided",
+                "label_value_date": pd.Timestamp("2024-01-01"),
+            },
+        ]
+    )
+
+    gold_df = project_experiments.build_gold_from_ann(ann_df)
+
+    assert gold_df.shape == (1, 3)
+    assert gold_df.loc[0, "gold_value"].startswith("2024-01-01")
+
+    pred_df = pd.DataFrame(
+        [
+            {"unit_id": "u1", "label_id": "onset", "prediction_value": "2024-01-03"},
+        ]
+    )
+
+    metrics = project_experiments.compute_experiment_metrics(
+        gold_df,
+        pred_df,
+        label_config_bundle=None,
+        labelset_id=None,
+        ann_df=ann_df,
+    )
+
+    onset_metrics = metrics["labels"].get("onset", {})
+    assert onset_metrics.get("n") == 1
+    assert onset_metrics.get("within_3d") == 1.0
+    assert onset_metrics.get("exact_match") == 0.0
