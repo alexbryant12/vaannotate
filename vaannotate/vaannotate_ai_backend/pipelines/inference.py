@@ -9,6 +9,7 @@ import pandas as pd
 
 from ..services import LLM_RECORDER
 from ..utils.jsonish import _jsonify_cols
+from ..utils.runtime import iter_with_bar
 
 
 LOGGER = logging.getLogger(__name__)
@@ -87,7 +88,7 @@ class InferencePipeline:
             per_label_rules=rules_map,
             json_n_consistency=json_n_consistency,
             json_jitter=False,
-            iter_with_bar_fn=None,
+            iter_with_bar_fn=iter_with_bar,
             progress_step="Inference family labeling",
         )
 
@@ -103,12 +104,20 @@ class InferencePipeline:
         label_ids = label_ids[:max_labels]
 
         rows: list[dict] = []
+        unit_list = [str(u) for u in unit_ids]
+        min_interval = float(getattr(self.cfg.llmfirst, "progress_min_interval_s", 1.0) or 1.0)
+        iterable = iter_with_bar(
+            step="Inference single prompt",
+            iterable=unit_list,
+            total=len(unit_list),
+            min_interval_s=min_interval,
+        )
 
         from ..services.label_dependencies import build_label_dependencies, evaluate_gating
 
         _parent_to_children, _child_to_parents, _roots = build_label_dependencies(self.label_config)
 
-        for uid in unit_ids:
+        for uid in iterable:
             ctx = self.ctx_builder.build_context_for_family(
                 uid,
                 label_ids=label_ids,

@@ -17,7 +17,7 @@ from collections.abc import Mapping as ABCMapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Mapping, Type, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -877,12 +877,16 @@ class AIRoundLogDialog(QtWidgets.QDialog):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("AI backend progress")
-        self.resize(640, 480)
+        self.resize(640, 520)
         self._allow_close = False
+        self._metrics_loader: Optional[Callable[[], List[dict]]] = None
+        self._metrics_button: Optional[QtWidgets.QPushButton] = None
+
         layout = QtWidgets.QVBoxLayout(self)
         self.log_output = QtWidgets.QPlainTextEdit()
         self.log_output.setReadOnly(True)
         layout.addWidget(self.log_output)
+
         self.button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Close
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -914,6 +918,7 @@ class AIRoundLogDialog(QtWidgets.QDialog):
             self._close_button.setEnabled(False)
         if self._cancel_button:
             self._cancel_button.setEnabled(True)
+        self.set_metrics_loader(None)
 
     def mark_complete(self) -> None:
         self._allow_close = True
@@ -921,6 +926,168 @@ class AIRoundLogDialog(QtWidgets.QDialog):
             self._close_button.setEnabled(True)
         if self._cancel_button:
             self._cancel_button.setEnabled(False)
+
+    def set_metrics_loader(
+        self, loader: Optional[Callable[[], List[dict]]] = None
+    ) -> None:
+        """Enable or disable the metrics viewer button.
+
+        A loader returning a list of experiment payloads will be invoked when
+        the user clicks the Metrics button.
+        """
+
+        self._metrics_loader = loader
+        if loader is None:
+            if self._metrics_button:
+                self._metrics_button.setEnabled(False)
+            return
+
+        if self._metrics_button is None:
+            metrics_button = QtWidgets.QPushButton("Metrics")
+            self.button_box.addButton(
+                metrics_button, QtWidgets.QDialogButtonBox.ButtonRole.ActionRole
+            )
+            metrics_button.clicked.connect(self._on_metrics_requested)
+            self._metrics_button = metrics_button
+        self._metrics_button.setEnabled(True)
+
+    def _on_metrics_requested(self) -> None:
+        if not self._metrics_loader:
+            return
+        try:
+            payload = self._metrics_loader() or []
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Experiment metrics",
+                f"Unable to load metrics: {exc}",
+            )
+            return
+        if not payload:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Experiment metrics",
+                "No metrics were found for this run yet.",
+            )
+            return
+        dialog = InferenceMetricsDialog(self, payload)
+        dialog.exec()
+
+
+class InferenceMetricsDialog(QtWidgets.QDialog):
+    def __init__(
+        self, parent: Optional[QtWidgets.QWidget], experiments: List[dict], *, per_label_limit: int = 10
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Inference experiment metrics")
+        self.resize(780, 560)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        summary_label = QtWidgets.QLabel(
+            "Summary metrics across experiments (overall accuracy and micro F1 for yes)."
+        )
+        layout.addWidget(summary_label)
+
+        summary_table = QtWidgets.QTableWidget(len(experiments), 4)
+        summary_table.setHorizontalHeaderLabels(
+            ["Experiment", "Overall accuracy", "Micro precision (yes)", "Micro F1 (yes)"]
+        )
+        summary_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        for row, exp in enumerate(experiments):
+            name = str(exp.get("name", row))
+            metrics = exp.get("metrics") or {}
+            global_metrics = metrics.get("global") if isinstance(metrics, Mapping) else {}
+
+            summary_table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
+            summary_table.setItem(
+                row,
+                1,
+                QtWidgets.QTableWidgetItem(
+                    _format_metric(global_metrics.get("overall_accuracy"))
+                ),
+            )
+            summary_table.setItem(
+                row,
+                2,
+                QtWidgets.QTableWidgetItem(
+                    _format_metric(global_metrics.get("micro_precision_yes"))
+                ),
+            )
+            summary_table.setItem(
+                row,
+                3,
+                QtWidgets.QTableWidgetItem(
+                    _format_metric(global_metrics.get("micro_f1_yes"))
+                ),
+            )
+
+        summary_table.horizontalHeader().setStretchLastSection(True)
+        summary_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(summary_table)
+
+        label_table_label = QtWidgets.QLabel(
+            f"Per-label accuracy/F1 (first {per_label_limit} labels per experiment)."
+        )
+        layout.addWidget(label_table_label)
+
+        per_label_rows: List[tuple[str, str, Any, Any]] = []
+        for exp in experiments:
+            name = str(exp.get("name", ""))
+            metrics = exp.get("metrics") or {}
+            labels = metrics.get("labels") if isinstance(metrics, Mapping) else {}
+            if not isinstance(labels, Mapping):
+                continue
+            for idx, (label_id, label_metrics) in enumerate(labels.items()):
+                if idx >= per_label_limit:
+                    break
+                acc = None
+                f1 = None
+                if isinstance(label_metrics, Mapping):
+                    acc = label_metrics.get("accuracy")
+                    f1 = label_metrics.get("f1")
+                    if f1 is None:
+                        f1 = label_metrics.get("macro_f1")
+                per_label_rows.append((name, str(label_id), acc, f1))
+
+        label_table = QtWidgets.QTableWidget(len(per_label_rows), 4)
+        label_table.setHorizontalHeaderLabels(["Experiment", "Label", "Accuracy", "F1"])
+        label_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        for row, (exp_name, label_id, acc, f1) in enumerate(per_label_rows):
+            label_table.setItem(row, 0, QtWidgets.QTableWidgetItem(exp_name))
+            label_table.setItem(row, 1, QtWidgets.QTableWidgetItem(label_id))
+            label_table.setItem(row, 2, QtWidgets.QTableWidgetItem(_format_metric(acc)))
+            label_table.setItem(row, 3, QtWidgets.QTableWidgetItem(_format_metric(f1)))
+
+        label_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(label_table)
+
+        metadata_label = QtWidgets.QLabel("Sweep overrides / metadata (JSON):")
+        layout.addWidget(metadata_label)
+
+        metadata_view = QtWidgets.QPlainTextEdit()
+        metadata_view.setReadOnly(True)
+        metadata_payload = {
+            str(exp.get("name", idx)): exp.get("cfg_overrides", {})
+            for idx, exp in enumerate(experiments)
+        }
+        metadata_view.setPlainText(json.dumps(metadata_payload, indent=2))
+        layout.addWidget(metadata_view)
+
+
+def _format_metric(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.3f}"
+    except Exception:
+        return str(value)
 
 
 def _deep_update_dict(target: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
@@ -2345,6 +2512,86 @@ class ProjectContext(QtCore.QObject):
                 (pheno_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def load_inference_experiment_metrics(
+        self, base_outdir: Path | str | None
+    ) -> List[Dict[str, object]]:
+        """Load metrics and sweep metadata for inference experiments."""
+
+        if not base_outdir:
+            return []
+
+        outdir = Path(base_outdir)
+        if not outdir.exists():
+            return []
+
+        manifest: Mapping[str, object] | None = None
+        manifest_path = outdir / "experiments.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                manifest = None
+
+        experiments: Dict[str, Dict[str, object]] = {}
+        if isinstance(manifest, Mapping):
+            for name, payload in manifest.items():
+                overrides = {}
+                artifacts = {}
+                outdir_override: Path | None = None
+                if isinstance(payload, Mapping):
+                    overrides = (
+                        payload.get("cfg_overrides")
+                        if isinstance(payload.get("cfg_overrides"), Mapping)
+                        else {}
+                    )
+                    artifacts = (
+                        payload.get("artifacts")
+                        if isinstance(payload.get("artifacts"), Mapping)
+                        else {}
+                    )
+                    if payload.get("outdir"):
+                        outdir_override = Path(str(payload.get("outdir")))
+                experiments[str(name)] = {
+                    "cfg_overrides": dict(overrides),
+                    "artifacts": dict(artifacts),
+                    "outdir": outdir_override or outdir / str(name),
+                }
+
+        for child in outdir.iterdir():
+            if not child.is_dir():
+                continue
+            experiments.setdefault(
+                child.name,
+                {
+                    "cfg_overrides": {},
+                    "artifacts": {},
+                    "outdir": child,
+                },
+            )
+
+        results: List[Dict[str, object]] = []
+        for name, payload in sorted(experiments.items()):
+            exp_outdir = Path(payload.get("outdir") or outdir / name)
+            metrics_path = exp_outdir / "metrics.json"
+            metrics: Dict[str, object] = {}
+            if metrics_path.exists():
+                try:
+                    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    metrics = {}
+
+            results.append(
+                {
+                    "name": name,
+                    "outdir": str(exp_outdir),
+                    "cfg_overrides": payload.get("cfg_overrides", {}),
+                    "artifacts": payload.get("artifacts", {}),
+                    "metrics": metrics,
+                }
+            )
+
+        return results
 
     def list_label_sets(self) -> List[sqlite3.Row]:
         db = self.require_db()
@@ -10529,6 +10776,8 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         self.resize(1280, 860)
         self._inference_log_dialog: Optional[AIRoundLogDialog] = None
         self._inference_log_output: Optional[QtWidgets.QPlainTextEdit] = None
+        self._inference_metrics_loader: Optional[Callable[[], List[dict]]] = None
+        self._last_inference_experiments_dir: Optional[Path] = None
         self._setup_menu()
         self._setup_central()
         self.ctx.dirty_changed.connect(self._on_dirty_changed)
@@ -10639,6 +10888,7 @@ class AdminMainWindow(QtWidgets.QMainWindow):
             dialog.finished.connect(self._on_inference_log_dialog_closed)
             self._inference_log_dialog = dialog
         dialog.reset_for_run()
+        dialog.set_metrics_loader(self._inference_metrics_loader)
         self._inference_log_output = dialog.log_output
         dialog.show()
         dialog.raise_()
@@ -10686,6 +10936,10 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         signals.finished.connect(self._on_inference_experiments_finished)
         signals.failed.connect(self._on_inference_experiments_failed)
 
+        self._last_inference_experiments_dir = config.outdir
+        self._inference_metrics_loader = lambda: self.ctx.load_inference_experiment_metrics(
+            self._last_inference_experiments_dir
+        )
         self._open_inference_log_dialog()
         self._append_inference_log("Preparing inference experiments…")
 
