@@ -358,6 +358,18 @@ class LLMLabeler:
                 messages.append({"role": "assistant", "content": str(answer)})
         return messages
 
+    def _few_shot_messages_for_labels(self, label_ids: Iterable[str]) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        for label_id in label_ids:
+            for entry in self._few_shot_messages(label_id):
+                role = entry.get("role") if isinstance(entry, Mapping) else None
+                content = entry.get("content") if isinstance(entry, Mapping) else None
+                if role not in {"user", "assistant"} or not isinstance(content, str):
+                    continue
+                prefix = f"[label {label_id}] "
+                messages.append({"role": role, "content": prefix + content})
+        return messages
+
     def summarize_label_rule_for_rerank(self, label_id: str, label_rules: str, max_sentences: int = 2) -> str:
         if not getattr(self, "backend", None):
             return ""
@@ -667,8 +679,10 @@ class LLMLabeler:
         ]
         system_prompt = "\n\n".join(system_segments)
 
+        few_shot_msgs = self._few_shot_messages_for_labels(label_ids)
         messages = [
             {"role": "system", "content": system_prompt},
+            *few_shot_msgs,
             {"role": "user", "content": ctx_text},
         ]
 
@@ -689,7 +703,7 @@ class LLMLabeler:
                 {
                     "unit_id": unit_id,
                     "label_ids": label_ids,
-                    "prompt": {"system": system_prompt, "user": ctx_text},
+                    "prompt": {"system": system_prompt, "messages": few_shot_msgs, "user": ctx_text},
                     "output": content,
                 },
             )

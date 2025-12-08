@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .config import OrchestratorConfig, Paths
 from .core.data import DataRepository
@@ -51,6 +51,42 @@ def _build_shared_components(
             cache_dir=paths.cache_dir,
             normalize=cfg.rag.normalize_embeddings,
         )
+
+    # If the LLM config does not already include few-shot examples, fall back to
+    # any examples embedded in the current label configuration. This keeps the
+    # prompting layer aligned with label-set metadata for both active learning
+    # and inference pipelines.
+    few_shot_cfg = getattr(cfg.llm, "few_shot_examples", {}) or {}
+    few_shot_explicit = getattr(cfg.llm, "_few_shot_examples_overridden", False)
+    if not few_shot_cfg and not few_shot_explicit:
+        label_config = label_config_bundle.current or {}
+        extracted: dict[str, list[dict[str, str]]] = {}
+        for label_id, entry in label_config.items():
+            if str(label_id) == "_meta" or not isinstance(entry, Mapping):
+                continue
+            raw_examples = entry.get("few_shot_examples")
+            if not isinstance(raw_examples, Sequence):
+                continue
+            parsed: list[dict[str, str]] = []
+            for example in raw_examples:
+                if not isinstance(example, Mapping):
+                    continue
+                payload: dict[str, str] = {}
+                if example.get("context") is not None:
+                    payload["context"] = str(example.get("context"))
+                if example.get("answer") is not None:
+                    payload["answer"] = str(example.get("answer"))
+                if payload:
+                    parsed.append(payload)
+            if parsed:
+                key = str(entry.get("label_id") or label_id)
+                if key:
+                    extracted[key] = parsed
+        if extracted:
+            try:
+                setattr(cfg.llm, "few_shot_examples", extracted)
+            except Exception:
+                pass
     rag = RAGRetriever(
         store,
         models,

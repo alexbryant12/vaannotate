@@ -43,6 +43,12 @@ def _apply_overrides(target: object, overrides: Mapping[str, Any]) -> None:
         return
 
     for key, value in overrides.items():
+        if key == "few_shot_examples":
+            try:
+                setattr(target, "_few_shot_examples_overridden", True)
+            except Exception:
+                pass
+
         if isinstance(value, Mapping):
             current = getattr(target, key, None)
             if current is not None and not isinstance(current, (str, bytes, int, float, bool)):
