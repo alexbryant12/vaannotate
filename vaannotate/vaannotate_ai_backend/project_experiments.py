@@ -66,7 +66,8 @@ def build_gold_from_ann(
         ann_df = ann_df[ann_df["labelset_id"].astype(str) == str(labelset_id)]
 
     if "label_na" in ann_df.columns:
-        ann_df = ann_df[~ann_df["label_na"].fillna(False)]
+        label_na_mask = ann_df["label_na"].fillna(False).astype(bool)
+        ann_df = ann_df[~label_na_mask]
 
     if "label_value" not in ann_df.columns:
         raise KeyError("Expected column 'label_value' in annotations")
