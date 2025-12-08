@@ -80,7 +80,7 @@ def _normalize_local_model_overrides(
 
 
 def _overrides_affect_backend(overrides: Mapping[str, Any] | None) -> bool:
-    """Return ``True`` when overrides change embedder, reranker, or RAG knobs."""
+    """Return True when overrides change any backend-affecting knobs (embedder, re-ranker, or RAG config)."""
 
     if overrides is None:
         return False
@@ -194,12 +194,15 @@ def run_inference_experiments(
         Optional logging callback; if provided, messages are prefixed with the
         experiment name.
     session:
-        Optional BackendSession to reuse a single set of models + EmbeddingStore
-        across all sweeps. If ``None``, a fresh session is created using the
-        shared cache directory. Sweeps that vary ``models.embed_model_name`` or
-        ``models.rerank_model_name`` should avoid reusing a shared session
-        because the embedding store is tied to the embedder choice; sweeps that
-        only adjust RAG/LLM knobs can safely share the session for speed.
+        Optional :class:`BackendSession` to reuse a single set of models and
+        EmbeddingStore across sweeps. A shared session is reused only when
+        ``_overrides_affect_backend(normalized_overrides)`` is ``False`` for a
+        given sweep; otherwise a new session is built for that sweep. Any
+        ``rag.*`` override (e.g., ``chunk_size``, ``top_k_final``,
+        ``normalize_embeddings``, ``use_mmr``, etc.) is treated as
+        backend-affecting, so those sweeps receive their own session even if the
+        embedder and re-ranker names are unchanged. If ``session`` is ``None``,
+        a fresh session is created using the shared cache directory.
 
     Returns
     -------

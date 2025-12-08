@@ -350,19 +350,29 @@ def run_project_inference_experiments(
     Use prior rounds to build a gold-standard set and run a sweep of
     inference experiments. Returns (results_dict, gold_df).
 
-    The ``cfg_overrides_base`` configuration is deep-merged with each sweep's
-    overrides (via :func:`merge_cfg_overrides` and ``_apply_overrides``
-    semantics) so sweeps can specify only the deltas from a tuned baseline.
+    Configuration layering follows three steps:
+    1. Start from ``OrchestratorConfig()`` defaults.
+    2. Apply ``cfg_overrides_base`` as the tuned, experiment-wide baseline for
+       this phenotype.
+    3. For each entry in ``sweeps``, apply only the per-experiment deltas on
+       top of the baseline; do not repeat baseline values here. The final
+       overrides sent to :func:`run_inference_experiments` are computed as
+       ``merged_overrides[name] = normalize(merge_cfg_overrides(base_overrides, sweeps[name]))``,
+       and ``sweep_cfgs[name]`` starts from a copy of the baseline cfg with
+       ``sweeps_normalized[name]`` applied.
+
     Label configurations are loaded via ``_load_label_config_bundle`` just like
     the main AI backend path, so label rules/types/gating and prior-round gold
     construction remain aligned for experiment metrics; only a
     ``cfg_overrides_base['label_config']`` payload is treated as a label
     configuration override to avoid stomping production labelsets with
     unrelated sweep parameters.
-    Sweeps that alter ``models.embed_model_name`` or ``models.rerank_model_name``
-    should avoid reusing a shared :class:`BackendSession`, because the
-    embedding store is specific to the embedder; sweeps that only tweak
-    RAG/LLM knobs can safely share the session for speed.
+    Sweeps that alter ``models.embed_model_name``, ``models.rerank_model_name``,
+    ``embedding_model_dir``, ``reranker_model_dir``, or any ``rag.*`` parameter
+    are considered backend-affecting and will not share a session. When any
+    sweep includes backend-affecting overrides, this function passes
+    ``session=None`` to :func:`run_inference_experiments` so each sweep gets its
+    own :class:`BackendSession`.
     Sweeps or inference experiments can switch to single-prompt label inference
     with a cfg override like ``{"llmfirst": {"inference_labeling_mode": "single_prompt"}}``.
     """
@@ -420,6 +430,8 @@ def run_project_inference_experiments(
         )
         for name, overrides in sweeps.items()
     }
+    # Invariant: for each experiment 'name',
+    #   final_cfg(name) ≈ OrchestratorConfig() ⊕ base_overrides ⊕ sweeps[name]
 
     share_session = not any(_overrides_affect_backend(o) for o in sweeps_normalized.values())
     session: BackendSession | None = None
