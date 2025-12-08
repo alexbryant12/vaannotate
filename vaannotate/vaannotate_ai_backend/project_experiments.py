@@ -366,6 +366,27 @@ def run_project_inference_experiments(
     with a cfg override like ``{"llmfirst": {"inference_labeling_mode": "single_prompt"}}``.
     """
 
+    def _rag_knob_values(cfg: OrchestratorConfig) -> dict:
+        return {
+            key: getattr(cfg.rag, key, None)
+            for key in (
+                "top_k_final",
+                "per_label_topk",
+                "chunk_size",
+                "normalize_embeddings",
+                "use_mmr",
+                "mmr_lambda",
+                "mmr_candidates",
+            )
+        }
+
+    def _build_cfg(overrides: Mapping[str, object] | None) -> OrchestratorConfig:
+        cfg = OrchestratorConfig()
+        normalized_overrides = _normalize_local_model_overrides(dict(overrides or {}))
+        if normalized_overrides:
+            _apply_overrides(cfg, dict(normalized_overrides))
+        return cfg
+
     notes_df, ann_df = export_inputs_from_repo(
         project_root,
         pheno_id,
@@ -397,24 +418,30 @@ def run_project_inference_experiments(
 
     base_overrides = _normalize_local_model_overrides(cfg_overrides_base or {})
 
-    base_cfg = OrchestratorConfig()
-    if base_overrides:
-        _apply_overrides(base_cfg, dict(base_overrides))
-
-    session_paths = Paths(
-        notes_path=str(base_outdir / "_session_notes.parquet"),
-        annotations_path=str(base_outdir / "_session_annotations.parquet"),
-        outdir=str(base_outdir / "_session"),
-        cache_dir_override=str(base_outdir / "cache"),
-    )
-    session = BackendSession.from_env(session_paths, base_cfg)
-
     sweeps_with_base = {
         name: _normalize_local_model_overrides(
             merge_cfg_overrides(base_overrides, dict(overrides))
         )
         for name, overrides in sweeps.items()
     }
+
+    base_cfg = _build_cfg(base_overrides)
+    base_rag_knobs = _rag_knob_values(base_cfg)
+
+    rag_overrides_present = any(
+        _rag_knob_values(_build_cfg(overrides)) != base_rag_knobs
+        for overrides in sweeps_with_base.values()
+    )
+
+    session: BackendSession | None = None
+    if not rag_overrides_present:
+        session_paths = Paths(
+            notes_path=str(base_outdir / "_session_notes.parquet"),
+            annotations_path=str(base_outdir / "_session_annotations.parquet"),
+            outdir=str(base_outdir / "_session"),
+            cache_dir_override=str(base_outdir / "cache"),
+        )
+        session = BackendSession.from_env(session_paths, base_cfg)
 
     results = run_inference_experiments(
         notes_df=notes_df,

@@ -164,6 +164,80 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
     assert "baseline" in summary["sweeps"]
 
 
+def test_run_project_inference_experiments_refreshes_session_for_rag(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    notes_df = pd.DataFrame(
+        [
+            {"doc_id": "1", "patient_icn": "p1", "text": "Note A"},
+            {"doc_id": "2", "patient_icn": "p2", "text": "Note B"},
+        ]
+    )
+    ann_df = pd.DataFrame(
+        [
+            {"unit_id": "1", "label_id": "l1", "label_value": "yes"},
+            {"unit_id": "2", "label_id": "l1", "label_value": "no"},
+        ]
+    )
+
+    def _fake_export_inputs_from_repo(*args, **kwargs):
+        return notes_df, ann_df
+
+    def _fake_load_label_config_bundle(*_args, **_kwargs):
+        return {"bundle": True}
+
+    def _fake_session_from_env(*_args, **_kwargs):
+        raise AssertionError("shared session should not be reused when rag overrides differ")
+
+    def _fake_run_inference_experiments(**kwargs):
+        captured["session"] = kwargs.get("session")
+        captured["sweeps"] = kwargs.get("sweeps")
+        df = pd.DataFrame(
+            [
+                {"unit_id": "1", "label_id": "l1", "prediction_value": "yes"},
+                {"unit_id": "2", "label_id": "l1", "prediction_value": "no"},
+            ]
+        )
+        return {"rag_tweak": _DummyResult(df)}
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", _fake_export_inputs_from_repo
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", _fake_load_label_config_bundle
+    )
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(_fake_session_from_env)
+    )
+    monkeypatch.setattr(
+        project_experiments, "run_inference_experiments", _fake_run_inference_experiments
+    )
+
+    base_overrides = {"rag": {"chunk_size": 999}}
+    sweeps = {"rag_tweak": {"rag": {"top_k_final": 3}}}
+
+    results, _ = project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="pheno1",
+        prior_rounds=[1],
+        labelset_id="ls1",
+        phenotype_level="single_doc",
+        sweeps=sweeps,
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base=base_overrides,
+    )
+
+    assert isinstance(results.get("rag_tweak"), _DummyResult)
+    assert captured.get("session") is None
+
+    rag_cfg = captured.get("sweeps", {}).get("rag_tweak", {}).get("rag", {})
+    assert rag_cfg.get("top_k_final") == 3
+    assert rag_cfg.get("per_label_topk") == 3
+    assert rag_cfg.get("chunk_size") == 999
+
+
 def test_run_project_inference_experiments_passes_prior_annotations(monkeypatch, tmp_path):
     captured: dict[str, object] = {}
 
