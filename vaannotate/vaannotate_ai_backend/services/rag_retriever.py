@@ -760,14 +760,17 @@ class RAGRetriever:
                 need = min_k - len(out)
                 out.extend(rest[:need])
 
+        selected = out[:final_k]
+
         diagnostics["final_selection"] = {
-            "count": len(out),
-            "score_stats": _score_stats(out),
+            "count": len(selected),
+            "score_stats": _score_stats(selected),
+            "pre_topk_count": len(out),
         }
 
         diagnostics["stage"] = "complete"
         self.set_last_diagnostics(unit_id, label_id, diagnostics, original_unit_id=original_unit_id)
-        return out[:final_k]
+        return selected
 
     def expand_from_snippets(self, label_id: str, snippets: List[str], seen_pairs: set, per_seed_k: int=100) -> Dict[str,float]:
         out: Dict[str,float] = {}

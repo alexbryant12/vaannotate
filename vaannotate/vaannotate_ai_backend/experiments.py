@@ -181,15 +181,20 @@ def run_inference_experiments(
                 index_ann_df["unit_id"].astype(str).isin(unit_set)
             ].copy()
 
-    def _build_session_for_overrides(
-        name: str, overrides: Mapping[str, Any]
-    ) -> BackendSession:
-        """Construct a BackendSession that respects experiment overrides."""
+    def _build_cfg_for_overrides(
+        overrides: Mapping[str, Any]
+    ) -> tuple[OrchestratorConfig, Dict[str, Any]]:
+        """Prepare a config + normalized overrides for a sweep."""
 
         sweep_cfg = OrchestratorConfig()
         normalized_overrides = _normalize_local_model_overrides(dict(overrides))
-        if overrides:
+        if normalized_overrides:
             _apply_overrides(sweep_cfg, normalized_overrides)
+
+        return sweep_cfg, normalized_overrides
+
+    def _build_session_for_cfg(name: str, sweep_cfg: OrchestratorConfig) -> BackendSession:
+        """Construct a BackendSession that respects experiment overrides."""
 
         session_paths = Paths(
             notes_path=str(base_outdir / f"_{name}_session_notes.parquet"),
@@ -210,12 +215,12 @@ def run_inference_experiments(
         return _wrapped
 
     for name, overrides in sweeps.items():
+        sweep_cfg, normalized_overrides = _build_cfg_for_overrides(overrides)
+
         exp_outdir = base_outdir / name
         exp_log_cb = _make_log_callback(name)
 
-        exp_session = session or _build_session_for_overrides(name, overrides)
-
-        normalized_overrides = _normalize_local_model_overrides(dict(overrides))
+        exp_session = session or _build_session_for_cfg(name, sweep_cfg)
 
         df, artifacts = run_inference(
             notes_df=index_notes_df,
@@ -229,6 +234,7 @@ def run_inference_experiments(
             log_callback=exp_log_cb,
             cache_dir=shared_cache_dir,
             session=exp_session,
+            cfg=sweep_cfg,
         )
 
         results[name] = InferenceExperimentResult(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections.abc import Mapping
+import copy
 import os
 from pathlib import Path
 from typing import Callable, Optional, Dict, Any, Tuple
@@ -406,6 +407,7 @@ def run_inference(
     *,
     label_config: Optional[dict] = None,
     cfg_overrides: Optional[Dict[str, Any]] = None,
+    cfg: OrchestratorConfig | None = None,
     unit_ids: Optional[list[str]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
@@ -429,7 +431,7 @@ def run_inference(
     notes_df.to_parquet(notes_path, index=False)
     ann_df.to_parquet(ann_path, index=False)
 
-    cfg = OrchestratorConfig()
+    cfg = copy.deepcopy(cfg) if cfg is not None else OrchestratorConfig()
     overrides = dict(cfg_overrides or {})
     phenotype_level = overrides.pop("phenotype_level", None)
     rag_overrides = overrides.get("rag") if isinstance(overrides.get("rag"), Mapping) else {}
