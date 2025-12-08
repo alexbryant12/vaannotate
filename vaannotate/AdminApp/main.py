@@ -338,7 +338,12 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             return
         ai_cfg = config.get("ai_backend") if isinstance(config, Mapping) else None
         if isinstance(ai_cfg, Mapping):
-            self._cfg_overrides_base = dict(ai_cfg)
+            overrides_payload = dict(ai_cfg)
+            config_overrides = ai_cfg.get("config_overrides")
+            if isinstance(config_overrides, Mapping):
+                overrides_payload = _deep_update_dict(overrides_payload, config_overrides)
+                overrides_payload.pop("config_overrides", None)
+            self._cfg_overrides_base = overrides_payload
             self.baseline_label.setText(f"Loaded from round {latest_number}")
         else:
             QtWidgets.QMessageBox.warning(
@@ -348,7 +353,9 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             )
 
     def _open_advanced_config(self) -> None:
-        dialog = AIAdvancedConfigDialog(self, self._cfg_overrides_base)
+        dialog = AIAdvancedConfigDialog(
+            self, self._cfg_overrides_base, label_schema=self._labelset_schema
+        )
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self._cfg_overrides_base = dialog.result_config or {}
 
