@@ -139,6 +139,17 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
     assert merged_sweep["models"]["embed_model_name"] == "/models/embed"
     assert merged_sweep["models"]["rerank_model_name"] == "/models/rerank"
 
+    normalized_sweep = captured["run_kwargs"]["normalized_sweeps"]["baseline"]
+    assert normalized_sweep["llm"]["temperature"] == 0.2
+    assert "rag" not in normalized_sweep
+
+    sweep_cfg = captured["run_kwargs"]["sweep_cfgs"]["baseline"]
+    assert sweep_cfg.llm.backend == "azure"
+    assert sweep_cfg.llm.temperature == 0.2
+    assert sweep_cfg.rag.chunk_size == 321
+    assert getattr(sweep_cfg.models, "embed_model_name") == "/models/embed"
+    assert getattr(sweep_cfg.models, "rerank_model_name") == "/models/rerank"
+
     assert captured["run_kwargs"]["unit_ids"] == ["1", "2"]
     metrics_path = tmp_path / "out" / "baseline" / "metrics.json"
     assert metrics_path.exists()
@@ -233,6 +244,72 @@ def test_run_project_inference_experiments_passes_prior_annotations(monkeypatch,
     assert list(gold_df["unit_id"]) == ["1", "2"]
     assert_frame_equal(captured["run_kwargs"]["ann_df"].reset_index(drop=True), ann_df)
     assert captured["run_kwargs"]["unit_ids"] == ["1", "2"]
+
+
+def test_run_project_inference_experiments_rebuilds_sessions_for_backend_overrides(
+    monkeypatch, tmp_path
+):
+    notes_df = pd.DataFrame(
+        [
+            {"doc_id": "1", "patient_icn": "p1", "text": "Note A"},
+            {"doc_id": "2", "patient_icn": "p2", "text": "Note B"},
+        ]
+    )
+    ann_df = pd.DataFrame(
+        [
+            {"unit_id": "1", "label_id": "l1", "label_value": "yes"},
+            {"unit_id": "2", "label_id": "l1", "label_value": "no"},
+        ]
+    )
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", lambda *_, **__: (notes_df, ann_df)
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", lambda *_, **__: {"bundle": True}
+    )
+
+    def _fail_shared_session(*_args, **_kwargs):
+        raise AssertionError("Shared session should not be created for backend overrides")
+
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(_fail_shared_session)
+    )
+
+    captured: dict[str, object] = {}
+
+    def _stub_run_inference_experiments(**kwargs):
+        captured.update(kwargs)
+        df = pd.DataFrame(
+            [
+                {"unit_id": "1", "label_id": "l1", "prediction_value": "yes"},
+                {"unit_id": "2", "label_id": "l1", "prediction_value": "no"},
+            ]
+        )
+        return {"raggy": _DummyResult(df)}
+
+    monkeypatch.setattr(
+        project_experiments, "run_inference_experiments", _stub_run_inference_experiments
+    )
+
+    sweeps = {"raggy": {"rag": {"chunk_size": 11}}}
+
+    results, gold_df = project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="pheno1",
+        prior_rounds=[1],
+        labelset_id="ls1",
+        phenotype_level="single_doc",
+        sweeps=sweeps,
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base=None,
+    )
+
+    assert isinstance(results.get("raggy"), _DummyResult)
+    assert gold_df.shape == (2, 3)
+    assert captured.get("session") is None
 
 
 def test_inference_sweeps_forward_final_topk(monkeypatch, tmp_path):
