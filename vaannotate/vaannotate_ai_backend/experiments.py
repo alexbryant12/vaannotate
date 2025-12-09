@@ -56,6 +56,12 @@ def _normalize_local_model_overrides(
     )
 
     top_k_final = rag_cfg.get("top_k_final")
+    if top_k_final is None:
+        for alias in ("final_topk", "final_top_k"):
+            if alias in rag_cfg:
+                top_k_final = rag_cfg.get(alias)
+                rag_cfg["top_k_final"] = top_k_final
+                break
     per_label_topk = rag_cfg.get("per_label_topk")
 
     # If only the legacy knob is set, promote it to top_k_final.
