@@ -741,9 +741,21 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             if llm_dir:
                 self.llm_model_path_edit.setText(llm_dir)
 
-    def _build_inference_backend_config(self) -> dict:
+    @staticmethod
+    def _json_safe_config(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {k: AdminApp._json_safe_config(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [AdminApp._json_safe_config(v) for v in value]
+        if isinstance(value, set):
+            return sorted(AdminApp._json_safe_config(v) for v in value)
+        return value
+
+    def _build_inference_backend_config(self, include_defaults: bool = True) -> dict:
         try:
-            base_cfg: dict = asdict(ai_config.OrchestratorConfig())
+            base_cfg: dict = (
+                asdict(ai_config.OrchestratorConfig()) if include_defaults else {}
+            )
         except Exception:  # noqa: BLE001
             base_cfg = {}
 
@@ -752,7 +764,8 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             if isinstance(self._cfg_overrides_base, Mapping)
             else {}
         )
-        _deep_update_dict(base_cfg, overrides)
+        if overrides:
+            _deep_update_dict(base_cfg, overrides)
 
         embed_dir = (
             self.embedding_path_edit.text().strip()
@@ -794,12 +807,12 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         if llm_cfg:
             base_cfg["llm"] = llm_cfg
 
-        return base_cfg
+        return AdminApp._json_safe_config(base_cfg)
 
     def _build_cfg_overrides(self) -> dict:
         # Build only the experiment-wide baseline cfg_overrides. Per-sweep deltas are
         # returned by _collect_sweeps() and merged elsewhere.
-        return self._build_inference_backend_config()
+        return self._build_inference_backend_config(include_defaults=False)
 
 
 @dataclass

@@ -137,6 +137,76 @@ def test_run_inference_experiments_smoke(
     assert set(manifest.keys()) == set(sweeps.keys())
 
 
+def test_run_inference_experiments_manifest_serializes_sets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    label_config = _load_label_config()
+    bundle = LabelConfigBundle(
+        current=label_config,
+        current_labelset_id=label_config.get("_meta", {}).get("labelset_id"),
+    )
+
+    notes_df, ann_df = _load_inputs()
+
+    class _StubSession:
+        models: None = None
+        store: None = None
+
+    class _StubInference:
+        def __init__(self, paths, cfg=None, **_kwargs):
+            self.paths = paths
+            self.cfg = cfg
+
+        def run(self, unit_ids=None):  # noqa: ANN001 - match real signature
+            parquet_notes = pd.read_parquet(self.paths.notes_path)
+            outdir = Path(self.paths.outdir)
+            df = pd.DataFrame(
+                {
+                    "unit_id": parquet_notes["unit_id"].astype(str),
+                    "doc_id": parquet_notes.get("doc_id", parquet_notes.get("note_id")),
+                    "label_id": "pneumonitis",
+                    "label_option_id": "yes",
+                }
+            )
+            df.to_parquet(outdir / "inference_predictions.parquet", index=False)
+            df.to_json(outdir / "inference_predictions.json", orient="records", lines=True)
+            return df
+
+    def _build_stub_runner(*args, **kwargs):
+        paths = kwargs.get("paths") if "paths" in kwargs else args[0]
+        cfg = kwargs.get("cfg")
+        return _StubInference(paths, cfg=cfg)
+
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.orchestrator.build_inference_runner",
+        _build_stub_runner,
+    )
+
+    sweeps = {
+        "set_overrides": {
+            "excluded_unit_ids": {"1001", "1002"},
+            "llm": {"backend": "local"},
+        }
+    }
+
+    results = run_inference_experiments(
+        notes_df=notes_df,
+        ann_df=ann_df,
+        base_outdir=tmp_path,
+        sweeps=sweeps,
+        label_config_bundle=bundle,
+        session=_StubSession(),
+    )
+
+    assert set(results.keys()) == set(sweeps.keys())
+
+    manifest_path = tmp_path / "experiments.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_overrides = manifest["set_overrides"]["cfg_overrides"]
+    assert manifest_overrides["excluded_unit_ids"] == ["1001", "1002"]
+
+
 def test_run_inference_experiments_scopes_corpus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
