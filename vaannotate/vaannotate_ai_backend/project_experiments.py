@@ -456,6 +456,17 @@ def run_project_inference_experiments(
         session=session,
     )
 
+        # DEBUG: print rag overrides per sweep
+    print("=== DEBUG project_experiments.run_project_inference_experiments ===")
+    for name, overrides in sweeps_with_base.items():
+        rag_cfg = (overrides.get("rag") or {}) if isinstance(overrides, dict) else {}
+        print(
+            f"  sweep={name} rag overrides:",
+            "top_k_final=", rag_cfg.get("top_k_final"),
+            "per_label_topk=", rag_cfg.get("per_label_topk"),
+            "chunk_size=", rag_cfg.get("chunk_size"),
+        )
+
     for name, result in results.items():
         pred_df = getattr(result, "dataframe", None)
 
