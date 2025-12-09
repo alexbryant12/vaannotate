@@ -156,10 +156,10 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         self.pheno_row = pheno_row
         self.labelsets = labelsets
         self.rounds = rounds
-        # Holds the experiment-wide AI backend baseline overrides (e.g., loaded from the
-        # latest round or edited via the Advanced dialog). Per-sweep tweaks such as RAG
-        # chunk size, top_k, MMR, few-shot, etc. are collected separately by
-        # _collect_sweeps() as per-experiment deltas.
+        # Holds the experiment-wide AI backend baseline overrides (edited via the
+        # Advanced dialog). Per-sweep tweaks such as RAG chunk size, top_k, MMR,
+        # few-shot, etc. are collected separately by _collect_sweeps() as
+        # per-experiment deltas.
         self._cfg_overrides_base: dict = {}
         self._corpus_path: str | None = None
         self._labelset_schema: Mapping[str, object] | None = None
@@ -298,14 +298,15 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
 
         layout.addWidget(sweeps_group)
 
-        baseline_group = QtWidgets.QGroupBox("Baseline AI config")
+        baseline_group = QtWidgets.QGroupBox("Inference backend settings")
         baseline_layout = QtWidgets.QVBoxLayout(baseline_group)
-        self.baseline_label = QtWidgets.QLabel("No baseline loaded")
-        baseline_layout.addWidget(self.baseline_label)
+        baseline_layout.addWidget(
+            QtWidgets.QLabel(
+                "Configure the AI backend options used as the baseline for this "
+                "inference experiment run."
+            )
+        )
         baseline_buttons = QtWidgets.QHBoxLayout()
-        self.load_latest_btn = QtWidgets.QPushButton("Load from latest round")
-        self.load_latest_btn.clicked.connect(self._load_latest_round_config)
-        baseline_buttons.addWidget(self.load_latest_btn)
         self.advanced_btn = QtWidgets.QPushButton("Advanced…")
         self.advanced_btn.clicked.connect(self._open_advanced_config)
         baseline_buttons.addWidget(self.advanced_btn)
@@ -371,58 +372,10 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         if directory and hasattr(self, "llm_model_path_edit"):
             self.llm_model_path_edit.setText(directory)
 
-    def _load_latest_round_config(self) -> None:
-        latest_round = None
-        latest_number = -1
-        for entry in self.rounds:
-            if not isinstance(entry, Mapping):
-                number = int(entry)
-                round_id = None
-            else:
-                number = int(entry.get("round_number") or 0)
-                round_id = entry.get("round_id")
-            if number > latest_number:
-                latest_number = number
-                latest_round = round_id or entry
-        if latest_round is None or latest_number < 0:
-            QtWidgets.QMessageBox.warning(self, "Baseline", "No prior rounds available.")
-            return
-        round_id_value = None
-        if isinstance(latest_round, Mapping):
-            round_id_value = latest_round.get("round_id")
-        elif isinstance(latest_round, str):
-            round_id_value = latest_round
-        config: dict | None = None
-        if round_id_value:
-            config = self.ctx.get_round_config(str(round_id_value))
-        if not isinstance(config, Mapping):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Baseline",
-                "Could not load AI config from the latest round.",
-            )
-            return
-        ai_cfg = config.get("ai_backend") if isinstance(config, Mapping) else None
-        if isinstance(ai_cfg, Mapping):
-            overrides_payload = dict(ai_cfg)
-            config_overrides = ai_cfg.get("config_overrides")
-            if isinstance(config_overrides, Mapping):
-                overrides_payload = _deep_update_dict(overrides_payload, config_overrides)
-                overrides_payload.pop("config_overrides", None)
-            self._cfg_overrides_base = overrides_payload
-            self.baseline_label.setText(f"Loaded from round {latest_number}")
-            self._apply_base_overrides_to_model_fields()
-        else:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Baseline",
-                "Latest round is missing AI configuration.",
-            )
-
     def _open_advanced_config(self) -> None:
         dialog = AIAdvancedConfigDialog(
             self,
-            self._build_cfg_overrides(),
+            self._build_inference_backend_config(),
             label_schema=self._labelset_schema,
         )
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
@@ -670,31 +623,6 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
 
     def _load_default_few_shot_examples(self, labelset_id: str) -> Dict[str, list[dict[str, str]]]:
         labelset_schema = self._labelset_schema if isinstance(self._labelset_schema, Mapping) else None
-        latest_round = None
-        latest_number = -1
-        for entry in self.rounds:
-            if not isinstance(entry, Mapping):
-                continue
-            if str(entry.get("labelset_id") or "") != labelset_id:
-                continue
-            try:
-                number = int(entry.get("round_number") or 0)
-            except Exception:
-                continue
-            if number > latest_number:
-                latest_number = number
-                latest_round = entry
-
-        if isinstance(latest_round, Mapping):
-            round_id_val = latest_round.get("round_id")
-            if round_id_val:
-                config = self.ctx.get_round_config(str(round_id_val))
-                if isinstance(config, Mapping):
-                    examples = self._extract_few_shot_examples(config, labelset_schema)
-                    if examples:
-                        self._few_shot_source = f"Loaded few-shot examples from round {latest_number}"
-                        return examples
-
         if labelset_schema:
             examples = self._extract_few_shot_examples({}, labelset_schema)
             if examples:
@@ -813,36 +741,65 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             if llm_dir:
                 self.llm_model_path_edit.setText(llm_dir)
 
-    def _build_cfg_overrides(self) -> dict:
-        # Build only the experiment-wide baseline cfg_overrides. Per-sweep deltas are
-        # returned by _collect_sweeps() and merged elsewhere.
-        overrides = copy.deepcopy(self._cfg_overrides_base) if isinstance(self._cfg_overrides_base, Mapping) else {}
+    def _build_inference_backend_config(self) -> dict:
+        try:
+            base_cfg: dict = asdict(ai_config.OrchestratorConfig())
+        except Exception:  # noqa: BLE001
+            base_cfg = {}
 
-        embed_dir = self.embedding_path_edit.text().strip() if hasattr(self, "embedding_path_edit") else ""
-        rerank_dir = self.reranker_path_edit.text().strip() if hasattr(self, "reranker_path_edit") else ""
-        llm_dir = self.llm_model_path_edit.text().strip() if hasattr(self, "llm_model_path_edit") else ""
+        overrides = (
+            copy.deepcopy(self._cfg_overrides_base)
+            if isinstance(self._cfg_overrides_base, Mapping)
+            else {}
+        )
+        _deep_update_dict(base_cfg, overrides)
 
-        models_cfg = dict(overrides.get("models")) if isinstance(overrides.get("models"), Mapping) else {}
-        llm_cfg = dict(overrides.get("llm")) if isinstance(overrides.get("llm"), Mapping) else {}
+        embed_dir = (
+            self.embedding_path_edit.text().strip()
+            if hasattr(self, "embedding_path_edit")
+            else ""
+        )
+        rerank_dir = (
+            self.reranker_path_edit.text().strip()
+            if hasattr(self, "reranker_path_edit")
+            else ""
+        )
+        llm_dir = (
+            self.llm_model_path_edit.text().strip()
+            if hasattr(self, "llm_model_path_edit")
+            else ""
+        )
+
+        models_cfg = (
+            dict(base_cfg.get("models"))
+            if isinstance(base_cfg.get("models"), Mapping)
+            else {}
+        )
+        llm_cfg = (
+            dict(base_cfg.get("llm")) if isinstance(base_cfg.get("llm"), Mapping) else {}
+        )
 
         if embed_dir:
-            overrides["embedding_model_dir"] = embed_dir
+            base_cfg["embedding_model_dir"] = embed_dir
             models_cfg["embed_model_name"] = embed_dir
         if rerank_dir:
-            overrides["reranker_model_dir"] = rerank_dir
+            base_cfg["reranker_model_dir"] = rerank_dir
             models_cfg["rerank_model_name"] = rerank_dir
         if llm_dir:
-            overrides["local_model_dir"] = llm_dir
+            base_cfg["local_model_dir"] = llm_dir
             llm_cfg["local_model_dir"] = llm_dir
 
         if models_cfg:
-            overrides["models"] = models_cfg
+            base_cfg["models"] = models_cfg
         if llm_cfg:
-            overrides["llm"] = llm_cfg
+            base_cfg["llm"] = llm_cfg
 
-        # This is the experiment-wide baseline cfg_overrides; individual sweeps will
-        # provide only the per-experiment deltas that get merged onto this baseline.
-        return overrides
+        return base_cfg
+
+    def _build_cfg_overrides(self) -> dict:
+        # Build only the experiment-wide baseline cfg_overrides. Per-sweep deltas are
+        # returned by _collect_sweeps() and merged elsewhere.
+        return self._build_inference_backend_config()
 
 
 @dataclass
