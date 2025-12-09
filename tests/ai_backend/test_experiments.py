@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from vaannotate.vaannotate_ai_backend import (
     InferenceExperimentResult,
+    experiments,
     run_inference_experiments,
 )
 from vaannotate.vaannotate_ai_backend.label_configs import LabelConfigBundle
@@ -136,6 +137,76 @@ def test_run_inference_experiments_smoke(
     assert set(manifest.keys()) == set(sweeps.keys())
 
 
+def test_run_inference_experiments_manifest_serializes_sets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    label_config = _load_label_config()
+    bundle = LabelConfigBundle(
+        current=label_config,
+        current_labelset_id=label_config.get("_meta", {}).get("labelset_id"),
+    )
+
+    notes_df, ann_df = _load_inputs()
+
+    class _StubSession:
+        models: None = None
+        store: None = None
+
+    class _StubInference:
+        def __init__(self, paths, cfg=None, **_kwargs):
+            self.paths = paths
+            self.cfg = cfg
+
+        def run(self, unit_ids=None):  # noqa: ANN001 - match real signature
+            parquet_notes = pd.read_parquet(self.paths.notes_path)
+            outdir = Path(self.paths.outdir)
+            df = pd.DataFrame(
+                {
+                    "unit_id": parquet_notes["unit_id"].astype(str),
+                    "doc_id": parquet_notes.get("doc_id", parquet_notes.get("note_id")),
+                    "label_id": "pneumonitis",
+                    "label_option_id": "yes",
+                }
+            )
+            df.to_parquet(outdir / "inference_predictions.parquet", index=False)
+            df.to_json(outdir / "inference_predictions.json", orient="records", lines=True)
+            return df
+
+    def _build_stub_runner(*args, **kwargs):
+        paths = kwargs.get("paths") if "paths" in kwargs else args[0]
+        cfg = kwargs.get("cfg")
+        return _StubInference(paths, cfg=cfg)
+
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.orchestrator.build_inference_runner",
+        _build_stub_runner,
+    )
+
+    sweeps = {
+        "set_overrides": {
+            "excluded_unit_ids": {"1001", "1002"},
+            "llm": {"backend": "local"},
+        }
+    }
+
+    results = run_inference_experiments(
+        notes_df=notes_df,
+        ann_df=ann_df,
+        base_outdir=tmp_path,
+        sweeps=sweeps,
+        label_config_bundle=bundle,
+        session=_StubSession(),
+    )
+
+    assert set(results.keys()) == set(sweeps.keys())
+
+    manifest_path = tmp_path / "experiments.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_overrides = manifest["set_overrides"]["cfg_overrides"]
+    assert manifest_overrides["excluded_unit_ids"] == ["1001", "1002"]
+
+
 def test_run_inference_experiments_scopes_corpus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -197,6 +268,85 @@ def test_run_inference_experiments_scopes_corpus(
         assert call["ann_units"] == set(unit_ids)
         assert call["unit_ids"] == unit_ids
         assert call["session"] is stub_session
+
+
+def test_run_inference_experiments_applies_normalized_sweeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notes_df = pd.DataFrame(
+        {
+            "unit_id": ["1", "2"],
+            "note_id": [1, 2],
+            "text": ["first", "second"],
+        }
+    )
+    ann_df = pd.DataFrame(
+        {
+            "unit_id": ["1", "2"],
+            "label_id": ["l1", "l1"],
+            "label_value": ["yes", "no"],
+        }
+    )
+
+    sweeps = {"delta": {"rag": {"chunk_size": 7}}}
+    normalized_sweeps = {
+        "delta": {
+            "rag": {"chunk_size": 7},
+            "models": {"embed_model_name": "/models/base"},
+            "llm": {"temperature": 0.4},
+        }
+    }
+
+    sweep_cfg = experiments.OrchestratorConfig()
+    sweep_cfg.rag.chunk_size = 7
+    sweep_cfg.models.embed_model_name = "/models/base"
+    sweep_cfg.llm.temperature = 0.4
+
+    captured: dict[str, Any] = {}
+
+    def _stub_run_inference(**kwargs):
+        captured["cfg_overrides"] = kwargs.get("cfg_overrides", {})
+        captured["cfg"] = kwargs.get("cfg")
+        df = pd.DataFrame(
+            {
+                "unit_id": ["1", "2"],
+                "label_id": ["l1", "l1"],
+                "prediction_value": ["yes", "no"],
+            }
+        )
+        return df, {"predictions": str(tmp_path / "pred.parquet")}
+
+    class _StubSession:
+        def __init__(self) -> None:
+            self.models = None
+            self.store = None
+
+    monkeypatch.setattr(
+        experiments.BackendSession, "from_env", staticmethod(lambda *_args, **_kwargs: _StubSession())
+    )
+    monkeypatch.setattr(experiments, "run_inference", _stub_run_inference)
+
+    results = experiments.run_inference_experiments(
+        notes_df=notes_df,
+        ann_df=ann_df,
+        base_outdir=tmp_path,
+        sweeps=sweeps,
+        sweep_cfgs={"delta": sweep_cfg},
+        normalized_sweeps=normalized_sweeps,
+    )
+
+    assert set(results.keys()) == {"delta"}
+    assert results["delta"].cfg_overrides == sweeps["delta"]
+
+    cfg_overrides = captured["cfg_overrides"]
+    assert cfg_overrides["rag"]["chunk_size"] == 7
+    assert cfg_overrides["models"]["embed_model_name"] == "/models/base"
+    assert cfg_overrides["llm"]["temperature"] == 0.4
+
+    cfg = captured["cfg"]
+    assert cfg.rag.chunk_size == 7
+    assert getattr(cfg.models, "embed_model_name") == "/models/base"
+    assert cfg.llm.temperature == 0.4
 
 
 def test_run_inference_experiments_applies_rag_overrides_to_session(

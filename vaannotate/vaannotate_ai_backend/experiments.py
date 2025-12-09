@@ -93,6 +93,20 @@ def _normalize_local_model_overrides(
     return normalized
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return sorted(_json_safe(v) for v in value)
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
 def _overrides_affect_backend(overrides: Mapping[str, Any] | None) -> bool:
     """Return True when overrides change any backend-affecting knobs (embedder, re-ranker, or RAG config)."""
 
@@ -335,9 +349,9 @@ def run_inference_experiments(
     try:
         manifest_payload = {
             name: {
-                "cfg_overrides": result.cfg_overrides,
+                "cfg_overrides": _json_safe(result.cfg_overrides),
                 "outdir": str(result.outdir),
-                "artifacts": result.artifacts,
+                "artifacts": _json_safe(result.artifacts),
             }
             for name, result in results.items()
         }
