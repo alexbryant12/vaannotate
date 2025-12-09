@@ -744,11 +744,16 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
     @staticmethod
     def _json_safe_config(value: object) -> object:
         if isinstance(value, Mapping):
-            return {k: AdminApp._json_safe_config(v) for k, v in value.items()}
+            return {
+                k: InferenceExperimentDialog._json_safe_config(v)
+                for k, v in value.items()
+            }
         if isinstance(value, list):
-            return [AdminApp._json_safe_config(v) for v in value]
+            return [InferenceExperimentDialog._json_safe_config(v) for v in value]
         if isinstance(value, set):
-            return sorted(AdminApp._json_safe_config(v) for v in value)
+            return sorted(
+                InferenceExperimentDialog._json_safe_config(v) for v in value
+            )
         return value
 
     def _build_inference_backend_config(self, include_defaults: bool = True) -> dict:
@@ -807,7 +812,7 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         if llm_cfg:
             base_cfg["llm"] = llm_cfg
 
-        return AdminApp._json_safe_config(base_cfg)
+        return self._json_safe_config(base_cfg)
 
     def _build_cfg_overrides(self) -> dict:
         # Build only the experiment-wide baseline cfg_overrides. Per-sweep deltas are
