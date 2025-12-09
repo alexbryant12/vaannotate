@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import copy
 import json
 
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
-from vaannotate.vaannotate_ai_backend import project_experiments
+from vaannotate.vaannotate_ai_backend import (
+    experiments,
+    orchestrator as orchestrator_module,
+    project_experiments,
+)
 
 
 class _DummyResult:
@@ -141,7 +146,9 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
 
     normalized_sweep = captured["run_kwargs"]["normalized_sweeps"]["baseline"]
     assert normalized_sweep["llm"]["temperature"] == 0.2
-    assert "rag" not in normalized_sweep
+    assert normalized_sweep["rag"]["chunk_size"] == 321
+    assert normalized_sweep["models"]["embed_model_name"] == "/models/embed"
+    assert normalized_sweep["models"]["rerank_model_name"] == "/models/rerank"
 
     sweep_cfg = captured["run_kwargs"]["sweep_cfgs"]["baseline"]
     assert sweep_cfg.llm.backend == "azure"
@@ -551,6 +558,201 @@ def test_inference_sweeps_forward_final_topk(monkeypatch, tmp_path):
     rag_cfg = captured.get("sweeps", {}).get("topk", {}).get("rag", {})
     assert rag_cfg.get("top_k_final") == 11
     assert rag_cfg.get("per_label_topk") == 11
+
+
+def test_baseline_topk_final_used_with_normalized_sweeps(monkeypatch, tmp_path):
+    def _fake_export_inputs_from_repo(*args, **kwargs):
+        notes_df = pd.DataFrame(
+            {"unit_id": ["1"], "patient_icn": ["p"], "doc_id": ["d"], "text": ["note"]}
+        )
+        ann_df = pd.DataFrame({"unit_id": ["1"], "label_id": ["0"], "label_value": ["y"]})
+        return notes_df, ann_df
+
+    def _fake_load_label_config_bundle(*args, **kwargs):
+        class _DummyBundle:
+            def with_current_fallback(self, label_config):
+                return self
+
+        return _DummyBundle()
+
+    class _DummySession:
+        models = None
+        store = None
+
+    captured: dict[str, list[dict]] = {}
+
+    def _fake_run_inference(**kwargs):
+        captured.setdefault("cfg_overrides", []).append(kwargs.get("cfg_overrides") or {})
+        df = pd.DataFrame(
+            [
+                {"unit_id": "1", "label_id": "l1", "prediction_value": "yes"},
+            ]
+        )
+        return df, {}
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", _fake_export_inputs_from_repo
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", _fake_load_label_config_bundle
+    )
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(lambda *_, **__: _DummySession())
+    )
+    monkeypatch.setattr(experiments.BackendSession, "from_env", staticmethod(lambda *_, **__: _DummySession()))
+    monkeypatch.setattr(experiments, "run_inference", _fake_run_inference)
+
+    project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="p1",
+        prior_rounds=[1],
+        labelset_id="ls",
+        phenotype_level="single_doc",
+        sweeps={"topk": {}},
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base={"rag": {"top_k_final": 15}},
+    )
+
+    assert captured.get("cfg_overrides")
+    rag_cfg = captured["cfg_overrides"][0].get("rag", {})
+    assert rag_cfg.get("top_k_final") == 15
+
+
+def test_per_label_topk_overrides_prior_top_k_final(monkeypatch, tmp_path):
+    def _fake_export_inputs_from_repo(*args, **kwargs):
+        notes_df = pd.DataFrame(
+            {"unit_id": ["1"], "patient_icn": ["p"], "doc_id": ["d"], "text": ["note"]}
+        )
+        ann_df = pd.DataFrame({"unit_id": ["1"], "label_id": ["0"], "label_value": ["y"]})
+        return notes_df, ann_df
+
+    def _fake_load_label_config_bundle(*args, **kwargs):
+        class _DummyBundle:
+            def with_current_fallback(self, label_config):
+                return self
+
+        return _DummyBundle()
+
+    class _DummySession:
+        models = None
+        store = None
+
+    captured: list[dict[str, object]] = []
+
+    def _fake_run_inference(**kwargs):
+        captured.append(kwargs.get("cfg_overrides") or {})
+        df = pd.DataFrame(
+            [
+                {"unit_id": "1", "label_id": "l1", "prediction_value": "yes"},
+            ]
+        )
+        return df, {}
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", _fake_export_inputs_from_repo
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", _fake_load_label_config_bundle
+    )
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(lambda *_, **__: _DummySession())
+    )
+    monkeypatch.setattr(experiments.BackendSession, "from_env", staticmethod(lambda *_, **__: _DummySession()))
+    monkeypatch.setattr(experiments, "run_inference", _fake_run_inference)
+
+    project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="p1",
+        prior_rounds=[1],
+        labelset_id="ls",
+        phenotype_level="single_doc",
+        sweeps={"topk": {"rag": {"per_label_topk": 3}}},
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base={"rag": {"top_k_final": 10}},
+    )
+
+    assert captured, "run_inference should be invoked"
+    rag_cfg = captured[0].get("rag", {})
+    assert rag_cfg.get("top_k_final") == 3
+    assert rag_cfg.get("per_label_topk") == 3
+
+
+def test_normalized_sweeps_reach_backend_with_prior_session(monkeypatch, tmp_path):
+    notes_df = pd.DataFrame({"unit_id": ["1"], "text": ["note"]})
+    ann_df = pd.DataFrame({"unit_id": ["1"], "label_id": ["0"], "label_value": ["y"]})
+
+    captured_cfgs = []
+    session_cfgs = []
+
+    def _fake_export_inputs_from_repo(*_, **__):
+        return notes_df, ann_df
+
+    def _fake_load_label_config_bundle(*_, **__):
+        class _Bundle:
+            def with_current_fallback(self, label_config):
+                return self
+
+        return _Bundle()
+
+    class _DummySession:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.models = object()
+            self.store = object()
+
+    def _fake_build_inference_runner(*, cfg, **kwargs):
+        captured_cfgs.append(copy.deepcopy(cfg))
+
+        class _Runner:
+            def run(self, unit_ids=None):
+                return pd.DataFrame(
+                    {"unit_id": [], "label_id": [], "prediction_value": []}
+                )
+
+        return _Runner()
+
+    def _fake_session_from_env(paths, cfg):
+        session_cfgs.append(copy.deepcopy(cfg))
+        return _DummySession(cfg)
+
+    base_session_cfg = experiments.OrchestratorConfig()
+    base_session_cfg.rag.top_k_final = 10
+    prior_session = _DummySession(base_session_cfg)
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", _fake_export_inputs_from_repo
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", _fake_load_label_config_bundle
+    )
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(_fake_session_from_env)
+    )
+    monkeypatch.setattr(
+        experiments.BackendSession, "from_env", staticmethod(_fake_session_from_env)
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "build_inference_runner", _fake_build_inference_runner
+    )
+
+    sweeps = {"topk": {"rag": {"top_k_final": 3}}}
+    experiments.run_inference_experiments(
+        notes_df=notes_df,
+        ann_df=ann_df,
+        base_outdir=tmp_path / "out",
+        sweeps=sweeps,
+        normalized_sweeps=sweeps,
+        session=prior_session,
+    )
+
+    assert captured_cfgs, "build_inference_runner should be invoked"
+    assert captured_cfgs[0].rag.top_k_final == 3
+    assert session_cfgs, "a new backend session should be built for backend overrides"
+    assert session_cfgs[0].rag.top_k_final == 3
 
 
 def test_build_gold_uses_date_values_for_consensus():
