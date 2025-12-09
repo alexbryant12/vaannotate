@@ -416,7 +416,7 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         """Parse sweep text fields into a mapping of experiment name to per-sweep cfg_overrides deltas (merged onto cfg_overrides_base in the AI backend)."""
         chunk_sizes, chunk_invalid = self._parse_int_list(self.chunk_sizes_edit.text())
         top_k_values, topk_invalid = self._parse_int_list(self.topk_edit.text())
-        mmr_values, mmr_invalid = self._parse_bool_list(self.mmr_edit.text())
+        use_mmr_values, mmr_invalid = self._parse_bool_list(self.mmr_edit.text())
         few_shot_values, few_shot_invalid = self._parse_bool_list(
             self.few_shot_edit.text(), allow_few_shot_tokens=True
         )
@@ -441,7 +441,7 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
 
         chunk_options = chunk_sizes or [None]
         topk_options = top_k_values or [None]
-        mmr_options = mmr_values or [None]
+        mmr_options = use_mmr_values or [None]
         few_shot_options = few_shot_values or [None]
 
         missing_few_shot = any(val is True for val in few_shot_options) and not self._few_shot_examples
@@ -462,7 +462,9 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
                 rag_cfg["top_k_final"] = top_k
                 name_parts.append(f"topk{top_k}")
             if use_mmr is not None:
-                rag_cfg["use_mmr"] = use_mmr
+                # The sweep toggle should drive the master RAG switch rather than
+                # tweaking legacy MMR knobs like ``mmr_lambda``.
+                rag_cfg["use_mmr"] = bool(use_mmr)
                 name_parts.append("mmr_on" if use_mmr else "mmr_off")
 
             if use_few_shot is not None:
@@ -763,6 +765,16 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             )
         except Exception:  # noqa: BLE001
             base_cfg = {}
+
+        if include_defaults:
+            rag_cfg = (
+                base_cfg.get("rag", {})
+                if isinstance(base_cfg.get("rag"), Mapping)
+                else {}
+            )
+            if "use_mmr" not in rag_cfg:
+                rag_cfg["use_mmr"] = ai_config.RAGConfig().use_mmr
+            base_cfg["rag"] = rag_cfg
 
         overrides = (
             copy.deepcopy(self._cfg_overrides_base)
@@ -4038,6 +4050,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             base_cfg: Dict[str, Any] = asdict(ai_config.OrchestratorConfig())
         except Exception:  # noqa: BLE001
             base_cfg = {}
+        rag_cfg = (
+            base_cfg.get("rag", {}) if isinstance(base_cfg.get("rag"), Mapping) else {}
+        )
+        if "use_mmr" not in rag_cfg:
+            rag_cfg["use_mmr"] = ai_config.RAGConfig().use_mmr
+        base_cfg["rag"] = rag_cfg
         _deep_update_dict(base_cfg, self._ai_engine_overrides or {})
         select_cfg = base_cfg.get("select", {}) if isinstance(base_cfg.get("select"), Mapping) else {}
         if hasattr(self, "total_n_spin"):

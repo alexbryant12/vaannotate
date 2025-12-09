@@ -556,6 +556,80 @@ def test_inference_sweeps_forward_final_topk(monkeypatch, tmp_path):
     assert rag_cfg.get("per_label_topk") == 11
 
 
+def test_inference_sweeps_toggle_mmr_master_switch(monkeypatch, tmp_path):
+    def _fake_export_inputs_from_repo(*args, **kwargs):
+        notes_df = pd.DataFrame(
+            {"unit_id": ["1"], "patient_icn": ["p"], "doc_id": ["d"]}
+        )
+        ann_df = pd.DataFrame({"unit_id": ["1"], "label_id": ["0"], "label_value": ["y"]})
+        return notes_df, ann_df
+
+    def _fake_load_label_config_bundle(*args, **kwargs):
+        class _DummyBundle:
+            def with_current_fallback(self, label_config):
+                return self
+
+        return _DummyBundle()
+
+    class _DummySession:
+        models = None
+        store = None
+
+    captured = {}
+
+    def _fake_run_inference_experiments(**kwargs):
+        captured["sweeps"] = kwargs.get("sweeps") or {}
+        captured["sweep_cfgs"] = kwargs.get("sweep_cfgs") or {}
+
+        mmr_on = _DummyResult(pd.DataFrame())
+        mmr_off = _DummyResult(pd.DataFrame())
+        mmr_on.outdir = tmp_path / "out" / "mmr_on"
+        mmr_off.outdir = tmp_path / "out" / "mmr_off"
+        return {
+            "mmr_on": mmr_on,
+            "mmr_off": mmr_off,
+        }
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", _fake_export_inputs_from_repo
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", _fake_load_label_config_bundle
+    )
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(lambda *_, **__: _DummySession())
+    )
+    monkeypatch.setattr(
+        project_experiments, "run_inference_experiments", _fake_run_inference_experiments
+    )
+
+    sweeps = {
+        "mmr_on": {"rag": {"use_mmr": True}},
+        "mmr_off": {"rag": {"use_mmr": False}},
+    }
+
+    project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="pheno1",
+        prior_rounds=[1],
+        labelset_id="ls1",
+        phenotype_level="single_doc",
+        sweeps=sweeps,
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base=None,
+    )
+
+    sweeps_with_base = captured.get("sweeps") or {}
+    assert sweeps_with_base["mmr_on"]["rag"]["use_mmr"] is True
+    assert sweeps_with_base["mmr_off"]["rag"]["use_mmr"] is False
+
+    sweep_cfgs = captured.get("sweep_cfgs") or {}
+    assert sweep_cfgs["mmr_on"].rag.use_mmr is True
+    assert sweep_cfgs["mmr_off"].rag.use_mmr is False
+
+
 def test_baseline_topk_final_used_with_normalized_sweeps(monkeypatch, tmp_path):
     def _fake_export_inputs_from_repo(*args, **kwargs):
         notes_df = pd.DataFrame(
