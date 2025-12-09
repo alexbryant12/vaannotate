@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from vaannotate.vaannotate_ai_backend import (
     InferenceExperimentResult,
+    experiments,
     run_inference_experiments,
 )
 from vaannotate.vaannotate_ai_backend.label_configs import LabelConfigBundle
@@ -197,6 +198,85 @@ def test_run_inference_experiments_scopes_corpus(
         assert call["ann_units"] == set(unit_ids)
         assert call["unit_ids"] == unit_ids
         assert call["session"] is stub_session
+
+
+def test_run_inference_experiments_applies_normalized_sweeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notes_df = pd.DataFrame(
+        {
+            "unit_id": ["1", "2"],
+            "note_id": [1, 2],
+            "text": ["first", "second"],
+        }
+    )
+    ann_df = pd.DataFrame(
+        {
+            "unit_id": ["1", "2"],
+            "label_id": ["l1", "l1"],
+            "label_value": ["yes", "no"],
+        }
+    )
+
+    sweeps = {"delta": {"rag": {"chunk_size": 7}}}
+    normalized_sweeps = {
+        "delta": {
+            "rag": {"chunk_size": 7},
+            "models": {"embed_model_name": "/models/base"},
+            "llm": {"temperature": 0.4},
+        }
+    }
+
+    sweep_cfg = experiments.OrchestratorConfig()
+    sweep_cfg.rag.chunk_size = 7
+    sweep_cfg.models.embed_model_name = "/models/base"
+    sweep_cfg.llm.temperature = 0.4
+
+    captured: dict[str, Any] = {}
+
+    def _stub_run_inference(**kwargs):
+        captured["cfg_overrides"] = kwargs.get("cfg_overrides", {})
+        captured["cfg"] = kwargs.get("cfg")
+        df = pd.DataFrame(
+            {
+                "unit_id": ["1", "2"],
+                "label_id": ["l1", "l1"],
+                "prediction_value": ["yes", "no"],
+            }
+        )
+        return df, {"predictions": str(tmp_path / "pred.parquet")}
+
+    class _StubSession:
+        def __init__(self) -> None:
+            self.models = None
+            self.store = None
+
+    monkeypatch.setattr(
+        experiments.BackendSession, "from_env", staticmethod(lambda *_args, **_kwargs: _StubSession())
+    )
+    monkeypatch.setattr(experiments, "run_inference", _stub_run_inference)
+
+    results = experiments.run_inference_experiments(
+        notes_df=notes_df,
+        ann_df=ann_df,
+        base_outdir=tmp_path,
+        sweeps=sweeps,
+        sweep_cfgs={"delta": sweep_cfg},
+        normalized_sweeps=normalized_sweeps,
+    )
+
+    assert set(results.keys()) == {"delta"}
+    assert results["delta"].cfg_overrides == sweeps["delta"]
+
+    cfg_overrides = captured["cfg_overrides"]
+    assert cfg_overrides["rag"]["chunk_size"] == 7
+    assert cfg_overrides["models"]["embed_model_name"] == "/models/base"
+    assert cfg_overrides["llm"]["temperature"] == 0.4
+
+    cfg = captured["cfg"]
+    assert cfg.rag.chunk_size == 7
+    assert getattr(cfg.models, "embed_model_name") == "/models/base"
+    assert cfg.llm.temperature == 0.4
 
 
 def test_run_inference_experiments_applies_rag_overrides_to_session(
