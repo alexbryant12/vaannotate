@@ -47,11 +47,20 @@ class IndexConfig:
 
 def _detect_device():
     import os
+    # Allow explicit override when the caller wants to pin models to a device.
+    explicit = os.getenv("EMBEDDING_DEVICE") or os.getenv("MODEL_DEVICE")
+    if explicit:
+        return explicit
     if os.getenv("CPU_ONLY", "0") == "1":
         return "cpu"
     try:
         import torch
         if getattr(torch, "cuda", None) and torch.cuda.is_available():
+            # When multiple GPUs are visible, prefer the second one to avoid
+            # colliding with large LLMs that default to GPU-0 when using
+            # auto-split or similar heuristics.
+            if torch.cuda.device_count() >= 2:
+                return "cuda:1"
             return "cuda"
     except Exception:
         pass
