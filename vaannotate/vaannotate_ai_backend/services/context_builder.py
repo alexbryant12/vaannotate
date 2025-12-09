@@ -362,6 +362,11 @@ class ContextBuilder:
                 "stage": "config",
                 "rag_mode": "patient_local",
                 "final_k": final_k,
+                "cfg_snapshot": {
+                    "top_k_final_cfg": getattr(cfg_rag, "top_k_final", None),
+                    "per_label_topk_cfg": getattr(cfg_rag, "per_label_topk", None),
+                    "topk_override": topk_override,
+                },
                 "min_k": min_k,
                 "mmr": {"lambda": lam, "multiplier": mmr_mult, "select_k": mmr_select_k},
             }
