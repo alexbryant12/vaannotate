@@ -426,10 +426,11 @@ def run_project_inference_experiments(
 
     sweeps_with_base = {
         name: _normalize_local_model_overrides(
-            merge_cfg_overrides(base_overrides, dict(overrides))
+            merge_cfg_overrides(base_overrides, sweeps_normalized.get(name, {}))
         )
-        for name, overrides in sweeps.items()
+        for name in sweeps.keys()
     }
+
     # Invariant: for each experiment 'name',
     #   final_cfg(name) ≈ OrchestratorConfig() ⊕ base_overrides ⊕ sweeps[name]
 
