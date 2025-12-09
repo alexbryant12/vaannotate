@@ -499,19 +499,27 @@ class RAGRetriever:
         keyword_fraction = max(0.0, min(1.0, keyword_fraction))
         use_kw    = keyword_fraction > 0.0 and bool(getattr(cfg_rag, "use_keywords", True))
         mmr_select_k = final_k * mmr_mult
+        mmr_enabled = bool(getattr(cfg_rag, "use_mmr", True))
 
         # λ (0..1)
         lam = mmr_lambda_override
-        if lam is None: lam = getattr(cfg_rag, "mmr_lambda", None)
-        lam = None if lam is None else float(lam)
-        if lam is not None: lam = max(0.0, min(1.0, lam))
+        if lam is None:
+            lam = getattr(cfg_rag, "mmr_lambda", None)
+        lam = None if lam is None or not mmr_enabled else float(lam)
+        if lam is not None:
+            lam = max(0.0, min(1.0, lam))
         diagnostics.update(
             {
                 "stage": "config",
                 "rag_mode": "patient_local",
                 "final_k": final_k,
                 "min_k": min_k,
-                "mmr": {"lambda": lam, "multiplier": mmr_mult, "select_k": mmr_select_k},
+                "mmr": {
+                    "enabled": mmr_enabled,
+                    "lambda": lam,
+                    "multiplier": mmr_mult,
+                    "select_k": mmr_select_k,
+                },
             }
         )
 
