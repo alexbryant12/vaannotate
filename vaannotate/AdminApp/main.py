@@ -279,6 +279,10 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         self.few_shot_edit.setPlaceholderText("few-shot, zero-shot")
         sweeps_layout.addRow("Few-shot (on/off)", self.few_shot_edit)
 
+        self.labeling_mode_edit = QtWidgets.QLineEdit()
+        self.labeling_mode_edit.setPlaceholderText("family, single_prompt")
+        sweeps_layout.addRow("Labeling mode", self.labeling_mode_edit)
+
         few_shot_row = QtWidgets.QHBoxLayout()
         self.few_shot_status = QtWidgets.QLabel("Few-shot examples not loaded")
         self.few_shot_status.setWordWrap(True)
@@ -420,6 +424,15 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         few_shot_values, few_shot_invalid = self._parse_bool_list(
             self.few_shot_edit.text(), allow_few_shot_tokens=True
         )
+        labeling_modes, labeling_invalid = self._parse_choice_list(
+            self.labeling_mode_edit.text(),
+            allowed={
+                "family": "family",
+                "single_prompt": "single_prompt",
+                "single-prompt": "single_prompt",
+                "singleprompt": "single_prompt",
+            },
+        )
 
         errors = []
         if chunk_invalid:
@@ -430,6 +443,8 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             errors.append(f"MMR: {', '.join(mmr_invalid)}")
         if few_shot_invalid:
             errors.append(f"Few-shot: {', '.join(few_shot_invalid)}")
+        if labeling_invalid:
+            errors.append(f"Labeling mode: {', '.join(labeling_invalid)}")
 
         if errors:
             QtWidgets.QMessageBox.warning(
@@ -443,16 +458,24 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
         topk_options = top_k_values or [None]
         mmr_options = use_mmr_values or [None]
         few_shot_options = few_shot_values or [None]
+        labeling_mode_options = labeling_modes or [None]
 
         missing_few_shot = any(val is True for val in few_shot_options) and not self._few_shot_examples
 
         sweeps: Dict[str, dict] = {}
-        for chunk_size, top_k, use_mmr, use_few_shot in itertools.product(
-            chunk_options, topk_options, mmr_options, few_shot_options
+        for (
+            chunk_size,
+            top_k,
+            use_mmr,
+            use_few_shot,
+            labeling_mode,
+        ) in itertools.product(
+            chunk_options, topk_options, mmr_options, few_shot_options, labeling_mode_options
         ):
             # Each sweep override is a delta-only config applied on top of the baseline.
             rag_cfg: dict = {}
             llm_cfg: dict = {}
+            llmfirst_cfg: dict = {}
             name_parts: list[str] = []
 
             if chunk_size is not None:
@@ -473,6 +496,10 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
                 )
                 name_parts.append("few_shot" if use_few_shot else "zero_shot")
 
+            if labeling_mode is not None:
+                llmfirst_cfg["inference_labeling_mode"] = labeling_mode
+                name_parts.append(labeling_mode)
+
             if not name_parts:
                 continue
 
@@ -482,6 +509,8 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
                 sweep_cfg["rag"] = rag_cfg
             if llm_cfg:
                 sweep_cfg["llm"] = llm_cfg
+            if llmfirst_cfg:
+                sweep_cfg["llmfirst"] = llmfirst_cfg
             sweeps[name] = sweep_cfg
 
         if missing_few_shot:
@@ -527,6 +556,22 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
                 values.append(True)
             elif token in falsy:
                 values.append(False)
+            else:
+                invalid.append(raw)
+        return values, invalid
+
+    @staticmethod
+    def _parse_choice_list(
+        text: str, *, allowed: Mapping[str, str]
+    ) -> tuple[list[str], list[str]]:
+        values: list[str] = []
+        invalid: list[str] = []
+        for raw in re.split(r"[,\s]+", text or ""):
+            if not raw:
+                continue
+            token = raw.strip().lower()
+            if token in allowed:
+                values.append(str(allowed[token]))
             else:
                 invalid.append(raw)
         return values, invalid
