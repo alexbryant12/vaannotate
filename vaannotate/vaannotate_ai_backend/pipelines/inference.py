@@ -144,7 +144,7 @@ class InferencePipeline:
                 info = preds.get(str(lid)) or {}
                 value = info.get("prediction") if isinstance(info, dict) else None
                 gated_ok = evaluate_gating(
-                    label_id=str(lid),
+                    child_id=str(lid),
                     unit_id=uid,
                     parent_preds=parent_preds,
                     label_types=label_types,
