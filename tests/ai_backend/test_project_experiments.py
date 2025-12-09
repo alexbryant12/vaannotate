@@ -141,7 +141,10 @@ def test_run_project_inference_experiments_applies_configs(monkeypatch, tmp_path
 
     normalized_sweep = captured["run_kwargs"]["normalized_sweeps"]["baseline"]
     assert normalized_sweep["llm"]["temperature"] == 0.2
-    assert "rag" not in normalized_sweep
+    assert normalized_sweep["rag"]["chunk_size"] == 321
+    assert normalized_sweep["label_config"] == {"prompt": "custom"}
+    assert normalized_sweep["models"]["embed_model_name"] == "/models/embed"
+    assert normalized_sweep["models"]["rerank_model_name"] == "/models/rerank"
 
     sweep_cfg = captured["run_kwargs"]["sweep_cfgs"]["baseline"]
     assert sweep_cfg.llm.backend == "azure"
@@ -541,7 +544,7 @@ def test_inference_sweeps_forward_final_topk(monkeypatch, tmp_path):
         prior_rounds=[1],
         labelset_id="ls",
         phenotype_level="single_doc",
-        sweeps={"topk": {"rag": {"top_k_final": 11}}},
+        sweeps={"topk": {"rag": {"final_topk": 11}}},
         base_outdir=tmp_path / "out",
         corpus_id=None,
         corpus_path=None,
