@@ -874,7 +874,6 @@ class LLMLabeler:
                     unit_id,
                     lid,
                     rules,
-                    topk_override=llmfirst_cfg.topk,
                     single_doc_context_mode=getattr(llmfirst_cfg, "single_doc_context", "rag"),
                     full_doc_char_limit=getattr(llmfirst_cfg, "single_doc_full_context_max_chars", None),
                 )
