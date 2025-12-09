@@ -412,13 +412,13 @@ def run_project_inference_experiments(
     if base_overrides:
         _apply_overrides(base_cfg, dict(base_overrides))
 
-    sweep_deltas_normalized = {
+    sweeps_normalized = {
         name: _normalize_local_model_overrides(dict(overrides))
         for name, overrides in sweeps.items()
     }
 
     sweep_cfgs = {}
-    for name, overrides in sweep_deltas_normalized.items():
+    for name, overrides in sweeps_normalized.items():
         sweep_cfg = copy.deepcopy(base_cfg)
         if overrides:
             _apply_overrides(sweep_cfg, dict(overrides))
@@ -433,9 +433,7 @@ def run_project_inference_experiments(
     # Invariant: for each experiment 'name',
     #   final_cfg(name) ≈ OrchestratorConfig() ⊕ base_overrides ⊕ sweeps[name]
 
-    share_session = not any(
-        _overrides_affect_backend(o) for o in sweep_deltas_normalized.values()
-    )
+    share_session = not any(_overrides_affect_backend(o) for o in sweeps_normalized.values())
     session: BackendSession | None = None
     if share_session:
         session_paths = Paths(
@@ -452,7 +450,7 @@ def run_project_inference_experiments(
         base_outdir=base_outdir,
         sweeps=sweeps_with_base,
         sweep_cfgs=sweep_cfgs,
-        normalized_sweeps=sweeps_with_base,
+        normalized_sweeps=sweeps_normalized,
         unit_ids=eval_unit_ids,
         label_config_bundle=label_config_bundle,
         session=session,
