@@ -58,6 +58,20 @@ def _normalize_local_model_overrides(
     top_k_final = rag_cfg.get("top_k_final")
     per_label_topk = rag_cfg.get("per_label_topk")
 
+    # Prefer explicit per_label_topk overrides over inherited top_k_final values
+    # (e.g., when a prior-round baseline included top_k_final but the sweep only
+    # sets per_label_topk). If per_label_topk is present and differs, promote it
+    # into top_k_final to avoid carrying forward stale baselines.
+    per_label_specified = "per_label_topk" in rag_cfg
+    top_final_specified = "top_k_final" in rag_cfg
+
+    if per_label_specified and (not top_final_specified or per_label_topk != top_k_final):
+        try:
+            rag_cfg["top_k_final"] = int(per_label_topk)
+        except Exception:
+            rag_cfg["top_k_final"] = per_label_topk
+        top_k_final = rag_cfg["top_k_final"]
+
     # If only the legacy knob is set, promote it to top_k_final.
     if top_k_final is None and per_label_topk is not None:
         try:
