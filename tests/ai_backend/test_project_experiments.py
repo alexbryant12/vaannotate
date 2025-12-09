@@ -5,7 +5,7 @@ import json
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
-from vaannotate.vaannotate_ai_backend import project_experiments
+from vaannotate.vaannotate_ai_backend import experiments, project_experiments
 
 
 class _DummyResult:
@@ -551,6 +551,66 @@ def test_inference_sweeps_forward_final_topk(monkeypatch, tmp_path):
     rag_cfg = captured.get("sweeps", {}).get("topk", {}).get("rag", {})
     assert rag_cfg.get("top_k_final") == 11
     assert rag_cfg.get("per_label_topk") == 11
+
+
+def test_baseline_topk_final_used_with_normalized_sweeps(monkeypatch, tmp_path):
+    def _fake_export_inputs_from_repo(*args, **kwargs):
+        notes_df = pd.DataFrame(
+            {"unit_id": ["1"], "patient_icn": ["p"], "doc_id": ["d"], "text": ["note"]}
+        )
+        ann_df = pd.DataFrame({"unit_id": ["1"], "label_id": ["0"], "label_value": ["y"]})
+        return notes_df, ann_df
+
+    def _fake_load_label_config_bundle(*args, **kwargs):
+        class _DummyBundle:
+            def with_current_fallback(self, label_config):
+                return self
+
+        return _DummyBundle()
+
+    class _DummySession:
+        models = None
+        store = None
+
+    captured: dict[str, list[dict]] = {}
+
+    def _fake_run_inference(**kwargs):
+        captured.setdefault("cfg_overrides", []).append(kwargs.get("cfg_overrides") or {})
+        df = pd.DataFrame(
+            [
+                {"unit_id": "1", "label_id": "l1", "prediction_value": "yes"},
+            ]
+        )
+        return df, {}
+
+    monkeypatch.setattr(
+        project_experiments, "export_inputs_from_repo", _fake_export_inputs_from_repo
+    )
+    monkeypatch.setattr(
+        project_experiments, "_load_label_config_bundle", _fake_load_label_config_bundle
+    )
+    monkeypatch.setattr(
+        project_experiments.BackendSession, "from_env", staticmethod(lambda *_, **__: _DummySession())
+    )
+    monkeypatch.setattr(experiments.BackendSession, "from_env", staticmethod(lambda *_, **__: _DummySession()))
+    monkeypatch.setattr(experiments, "run_inference", _fake_run_inference)
+
+    project_experiments.run_project_inference_experiments(
+        project_root=tmp_path,
+        pheno_id="p1",
+        prior_rounds=[1],
+        labelset_id="ls",
+        phenotype_level="single_doc",
+        sweeps={"topk": {}},
+        base_outdir=tmp_path / "out",
+        corpus_id=None,
+        corpus_path=None,
+        cfg_overrides_base={"rag": {"top_k_final": 15}},
+    )
+
+    assert captured.get("cfg_overrides")
+    rag_cfg = captured["cfg_overrides"][0].get("rag", {})
+    assert rag_cfg.get("top_k_final") == 15
 
 
 def test_build_gold_uses_date_values_for_consensus():

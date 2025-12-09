@@ -450,7 +450,7 @@ def run_project_inference_experiments(
         base_outdir=base_outdir,
         sweeps=sweeps_with_base,
         sweep_cfgs=sweep_cfgs,
-        normalized_sweeps=sweeps_normalized,
+        normalized_sweeps=sweeps_with_base,
         unit_ids=eval_unit_ids,
         label_config_bundle=label_config_bundle,
         session=session,
