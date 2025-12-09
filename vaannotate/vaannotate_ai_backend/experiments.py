@@ -273,11 +273,9 @@ def run_inference_experiments(
         return _wrapped
 
     for name, overrides in sweeps.items():
-        normalized_overrides = (
-            copy.deepcopy(normalized_sweeps[name])
-            if normalized_sweeps is not None and name in normalized_sweeps
-            else _normalize_local_model_overrides(dict(overrides))
-        )
+        normalized_overrides = _normalize_local_model_overrides(dict(overrides))
+        if normalized_sweeps is not None and name in normalized_sweeps:
+            normalized_overrides = copy.deepcopy(normalized_sweeps[name])
         if sweep_cfgs is not None and name in sweep_cfgs:
             sweep_cfg = copy.deepcopy(sweep_cfgs[name])
         else:
