@@ -442,7 +442,21 @@ def run_inference(
             label_queries_override = candidate
     if overrides:
         _apply_overrides(cfg, overrides)
-
+        
+    print("=== DEBUG orchestrator.run_inference ===")
+    rag_overrides = (cfg_overrides.get("rag") or {}) if isinstance(cfg_overrides, dict) else {}
+    print(
+        "  cfg_overrides.rag:",
+        "top_k_final=", rag_overrides.get("top_k_final"),
+        "per_label_topk=", rag_overrides.get("per_label_topk"),
+        "chunk_size=", rag_overrides.get("chunk_size"),
+    )
+    print(
+        "  cfg.rag after overrides:",
+        "top_k_final=", getattr(cfg.rag, "top_k_final", None),
+        "per_label_topk=", getattr(cfg.rag, "per_label_topk", None),
+        "chunk_size=", getattr(cfg.rag, "chunk_size", None),
+    )
     bundle = (label_config_bundle or EMPTY_BUNDLE).with_current_fallback(label_config)
     bundle = _apply_label_queries(bundle, label_queries_override)
 
