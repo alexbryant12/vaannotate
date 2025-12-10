@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from collections import Counter
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
@@ -108,16 +109,19 @@ def run_family_labeling_for_units(
         )
 
     for uid in iterable:
-        rows.extend(
-            fam.label_family_for_unit(
-                uid,
-                label_types,
-                per_label_rules,
-                json_only=True,
-                json_n_consistency=int(json_n_consistency),
-                json_jitter=bool(json_jitter),
-            )
+        start = time.perf_counter()
+        unit_rows = fam.label_family_for_unit(
+            uid,
+            label_types,
+            per_label_rules,
+            json_only=True,
+            json_n_consistency=int(json_n_consistency),
+            json_jitter=bool(json_jitter),
         )
+        runtime_s = time.perf_counter() - start
+        for row in unit_rows:
+            row["runtime_s"] = runtime_s
+        rows.extend(unit_rows)
 
     df = pd.DataFrame(rows)
     if df.empty:
