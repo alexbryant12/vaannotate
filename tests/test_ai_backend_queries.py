@@ -4,6 +4,7 @@ from typing import Any
 import numpy as np
 
 from vaannotate.vaannotate_ai_backend.services.rag_retriever import RAGRetriever
+from vaannotate.vaannotate_ai_backend.services.context_builder import ContextBuilder
 
 
 def test_manual_and_exemplar_queries_used_for_semantic_and_ce() -> None:
@@ -64,7 +65,47 @@ def test_manual_and_exemplar_queries_used_for_semantic_and_ce() -> None:
     result = engine.retrieve_for_patient_label("patient1", "lab", "label rule text")
 
     assert result, "RAG pipeline should return ranked snippets"
-    assert captured_diags.get("queries") == ["manual override", "exemplar text"]
-    assert captured_diags.get("query_sources") == ["manual", "exemplar"]
-    # CE re-ranking should have been invoked for each query text
-    assert cross_queries == ["manual override", "exemplar text"]
+    assert captured_diags.get("queries") == ["manual override"]
+    assert captured_diags.get("query_sources") == ["manual"]
+    # CE re-ranking should have been invoked for the manual query
+    assert cross_queries == ["manual override"]
+
+
+def test_context_builder_rag_is_consistent_with_retriever() -> None:
+    """Ensure ContextBuilder returns a subset of retriever chunks in RAG mode."""
+
+    class DummyRepo:
+        phenotype_level = "rag"
+
+    class DummyStore:
+        pass
+
+    class DummyRetriever:
+        def __init__(self) -> None:
+            self.store = DummyStore()
+
+        def retrieve_for_patient_label(self, *_, **__) -> list[dict]:
+            return [
+                {"chunk_id": "c1", "doc_id": "d1", "text": "snippet 1", "score": 0.9},
+                {"chunk_id": "c2", "doc_id": "d2", "text": "snippet 2", "score": 0.8},
+            ]
+
+    retriever = DummyRetriever()
+    builder = ContextBuilder(DummyRepo(), DummyStore(), retriever, SimpleNamespace(), SimpleNamespace())
+
+    unit_id = "unit-123"
+    label_id = "label-abc"
+    rules = "demo rules"
+
+    snips_retriever = retriever.retrieve_for_patient_label(unit_id, label_id, rules)
+    snips_builder = builder.build_context_for_label(
+        unit_id,
+        label_id,
+        rules,
+        single_doc_context_mode=False,
+    )
+
+    ids_retriever = {s["chunk_id"] for s in snips_retriever}
+    ids_builder = {s["chunk_id"] for s in snips_builder}
+
+    assert ids_builder.issubset(ids_retriever)

@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
-if "PySide6" not in sys.modules:
+def _install_pyside_stub() -> None:
     qt_module = types.ModuleType("PySide6")
     qtcore = types.ModuleType("PySide6.QtCore")
     qtgui = types.ModuleType("PySide6.QtGui")
@@ -164,6 +164,14 @@ if "PySide6" not in sys.modules:
     sys.modules["PySide6.QtCore"] = qtcore
     sys.modules["PySide6.QtGui"] = qtgui
     sys.modules["PySide6.QtWidgets"] = qtwidgets
+
+
+try:  # Fall back to a stub if Qt bindings are not importable in the test environment
+    from PySide6 import QtCore as _QtCore, QtGui as _QtGui, QtWidgets as _QtWidgets  # type: ignore
+except Exception:
+    for mod_name in ["PySide6", "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets"]:
+        sys.modules.pop(mod_name, None)
+    _install_pyside_stub()
 
 import vaannotate.AdminApp.main as admin_main
 from vaannotate.project import (
@@ -652,6 +660,9 @@ def test_assisted_review_respects_local_backend_env(monkeypatch: pytest.MonkeyPa
     from vaannotate.vaannotate_ai_backend.services import contexts as backend_contexts
     from vaannotate.vaannotate_ai_backend.services import family_labeler as backend_family_labeler
 
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+
     project_root = tmp_path / "Project"
     project_root.mkdir()
     builder = RoundBuilder(project_root)
@@ -659,6 +670,68 @@ def test_assisted_review_respects_local_backend_env(monkeypatch: pytest.MonkeyPa
     round_dir.mkdir()
     local_model_dir = tmp_path / "LocalLLM"
     local_model_dir.mkdir()
+
+    from huggingface_hub import file_download, utils as hf_utils
+
+    monkeypatch.setattr(
+        file_download,
+        "hf_hub_download",
+        lambda *args, **kwargs: str(local_model_dir / "dummy.bin"),
+    )
+    monkeypatch.setattr(
+        hf_utils._http,
+        "http_backoff",
+        lambda *args, **kwargs: types.SimpleNamespace(status_code=200, headers={}, url=""),
+    )
+
+    import requests
+
+    class _DummyResponse:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        requests.sessions.Session,
+        "request",
+        lambda self, method, url, **kwargs: _DummyResponse(url),
+    )
+
+    class DummyPipeline:
+        def __init__(self) -> None:
+            self.repo = types.SimpleNamespace(notes=None)
+            self.store = types.SimpleNamespace(build_chunk_index=lambda *a, **k: None)
+            self.cfg = types.SimpleNamespace(
+                rag=types.SimpleNamespace(),
+                index=types.SimpleNamespace(),
+                scjitter=types.SimpleNamespace(),
+                llmfirst=types.SimpleNamespace(),
+            )
+            self.retriever = types.SimpleNamespace()
+            self.llm = object()
+            self.label_config = {}
+
+        def _label_maps(self):  # noqa: D401
+            return {}, {}, {"Flag": "rule"}, {"Flag": "categorical_single"}
+
+    def _dummy_build_runner(*args, **kwargs):
+        env_snapshot["LLM_BACKEND"] = os.getenv("LLM_BACKEND")
+        env_snapshot["LOCAL_LLM_MODEL_DIR"] = os.getenv("LOCAL_LLM_MODEL_DIR")
+        env_snapshot["LOCAL_LLM_MAX_SEQ_LEN"] = os.getenv("LOCAL_LLM_MAX_SEQ_LEN")
+        env_snapshot["LOCAL_LLM_MAX_NEW_TOKENS"] = os.getenv("LOCAL_LLM_MAX_NEW_TOKENS")
+        return DummyPipeline()
+
+    monkeypatch.setattr(
+        "vaannotate.vaannotate_ai_backend.orchestration.build_active_learning_runner",
+        _dummy_build_runner,
+    )
 
     env_snapshot: Dict[str, object] = {}
 
