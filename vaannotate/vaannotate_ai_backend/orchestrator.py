@@ -100,6 +100,30 @@ def _apply_label_queries(
     )
 
 
+def _runtime_summary(df: pd.DataFrame) -> dict[str, float | int]:
+    """Aggregate per-unit runtime statistics for logging and UI display."""
+
+    if df is None or df.empty or "runtime_s" not in df.columns:
+        return {}
+
+    series = df["runtime_s"]
+    if "unit_id" in df.columns:
+        series = df.groupby("unit_id")["runtime_s"].first()
+
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if numeric.empty:
+        return {}
+
+    return {
+        "count": int(numeric.count()),
+        "avg_s": float(numeric.mean()),
+        "median_s": float(numeric.median()),
+        "p95_s": float(numeric.quantile(0.95)),
+        "min_s": float(numeric.min()),
+        "max_s": float(numeric.max()),
+    }
+
+
 def _build_test_stub_active_runner(paths: Paths):
     class _StubPipeline:
         def __init__(self, paths: Paths):
@@ -477,9 +501,12 @@ def run_inference(
                 )
             result_df = pipeline.run(unit_ids=unit_ids)
 
+    runtime_stats = _runtime_summary(result_df)
+
     artifacts = {
         "predictions": str(outdir / "inference_predictions.parquet"),
         "predictions_json": str(outdir / "inference_predictions.json"),
+        "runtime_summary": runtime_stats,
     }
 
     return result_df, artifacts

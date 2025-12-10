@@ -118,6 +118,7 @@ class InferencePipeline:
         _parent_to_children, _child_to_parents, _roots = build_label_dependencies(self.label_config)
 
         for uid in iterable:
+            start = time.perf_counter()
             ctx = self.ctx_builder.build_context_for_family(
                 uid,
                 label_ids=label_ids,
@@ -140,6 +141,7 @@ class InferencePipeline:
             for lid, info in preds.items():
                 parent_preds[(uid, str(lid))] = info.get("prediction") if isinstance(info, dict) else None
 
+            unit_rows: list[dict] = []
             for lid in label_ids:
                 info = preds.get(str(lid)) or {}
                 value = info.get("prediction") if isinstance(info, dict) else None
@@ -152,8 +154,7 @@ class InferencePipeline:
                 )
                 if not gated_ok:
                     value = None
-
-                rows.append(
+                unit_rows.append(
                     {
                         "unit_id": uid,
                         "label_id": str(lid),
@@ -165,6 +166,11 @@ class InferencePipeline:
                         "llm_runs": res.get("runs", []),
                     }
                 )
+
+            runtime_s = time.perf_counter() - start
+            for row in unit_rows:
+                row["runtime_s"] = runtime_s
+            rows.extend(unit_rows)
 
         return pd.DataFrame(rows)
 
