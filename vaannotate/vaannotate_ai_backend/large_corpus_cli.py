@@ -105,6 +105,7 @@ def create_prompt_inference_job(
     experiment_name: str | None = None,
     experiments_dir: str | Path | None = None,
     job_id: str | None = None,
+    prompt_job_dir: str | Path | None = None,
     job_dir: str | Path | None = None,
     batch_limit: int | None = None,
 ) -> PromptInferenceJob:
@@ -119,6 +120,7 @@ def create_prompt_inference_job(
         job_id=job_id or _default_job_id("prompt-infer"),
         prompt_job_id=prompt_job_id,
         project_root=project_root,
+        prompt_job_dir=Path(prompt_job_dir) if prompt_job_dir else None,
         phenotype_level=phenotype_level,
         labeling_mode=labeling_mode,
         cfg_overrides=overrides,
@@ -165,6 +167,7 @@ def main(argv: list[str] | None = None) -> None:
     infer.add_argument("phenotype_level")
     infer.add_argument("labeling_mode", choices=["family", "single_prompt"])
     infer.add_argument("--job-id")
+    infer.add_argument("--prompt-job-dir", type=Path)
     infer.add_argument("--job-dir", type=Path)
     infer.add_argument("--batch-limit", type=int)
     infer.add_argument("--cfg", help="JSON overrides or path to JSON file")
@@ -206,6 +209,7 @@ def main(argv: list[str] | None = None) -> None:
             experiment_name=args.experiment_name,
             experiments_dir=args.experiments_dir,
             job_id=args.job_id,
+            prompt_job_dir=args.prompt_job_dir,
             job_dir=args.job_dir,
             batch_limit=args.batch_limit,
         )

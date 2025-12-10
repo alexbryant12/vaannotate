@@ -50,6 +50,7 @@ class PromptInferenceJob:
     job_id: str
     prompt_job_id: str
     project_root: Path
+    prompt_job_dir: Path | None
     phenotype_level: str
     labeling_mode: str  # "family" | "single_prompt"
     cfg_overrides: dict[str, Any]
@@ -355,7 +356,7 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "outputs").mkdir(parents=True, exist_ok=True)
 
-    prompt_job_dir = job.project_root / "admin_tools" / "prompt_jobs" / job.prompt_job_id
+    prompt_job_dir = job.prompt_job_dir or job.project_root / "admin_tools" / "prompt_jobs" / job.prompt_job_id
     prompt_manifest = read_manifest(prompt_job_dir / "job_manifest.json")
 
     prompt_labeling_mode = prompt_manifest.get("labeling_mode") if prompt_manifest else None

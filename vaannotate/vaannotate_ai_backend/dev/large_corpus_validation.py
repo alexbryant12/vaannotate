@@ -115,6 +115,7 @@ def validate_large_corpus_parity(
         job_id=f"validate-infer-{run_id}",
         prompt_job_id=prompt_job.job_id,
         project_root=project_root,
+        prompt_job_dir=prompt_job.job_dir,
         phenotype_level=phenotype_level,
         labeling_mode=labeling_mode,
         cfg_overrides=cfg_overrides,
