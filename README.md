@@ -55,6 +55,15 @@ python -m vaannotate.ClientApp.main ./project_root/phenotypes/<pheno_id>/rounds/
 
 The client loads the assignment SQLite bundle locally, presents unit navigation, renders note text, and displays the label form. Changes are autosaved with audit log events, highlights can be captured directly from the note viewer, and completion is tracked per unit. Submitting creates a `submitted.json` receipt file that the Admin app imports.
 
+## Large corpus inference (two-stage)
+
+For long-running inference across large corpora, VAAnnotate provides a two-stage pipeline that decouples retrieval from LLM calls:
+
+1. **Stage A – prompt precomputation**: build RAG contexts and prompt batches with `python -m vaannotate.vaannotate_ai_backend.large_corpus_cli precompute`, which writes prompt parquet files under `admin_tools/prompt_jobs/<job_id>`.
+2. **Stage B – prompt inference**: run the LLM over those precomputed prompts with `python -m vaannotate.vaannotate_ai_backend.large_corpus_cli infer`, producing output batches under `admin_tools/prompt_inference/<job_id>`.
+
+Both **family** and **single_prompt** labeling modes are supported, and LLM overrides can be supplied during Stage B to evaluate alternate models without re-running retrieval.
+
 ## Project layout
 
 Generated projects follow the directory structure described in the specification, including per-round manifests, reviewer folders, aggregate databases, and export directories. All SQLite databases are created in WAL mode to support concurrent read access on shared drives.
