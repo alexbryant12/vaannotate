@@ -11,7 +11,6 @@ import pandas as pd
 
 from . import __version__
 from .label_configs import LabelConfigBundle, EMPTY_BUNDLE
-from .orchestrator import build_next_batch
 from vaannotate.project import (
     build_label_config,
     fetch_labelset,
@@ -681,6 +680,7 @@ def run_ai_backend_and_collect(
     exclude_unit_ids: Optional[Iterable[str]] = None,
     sampling_metadata: Optional[Mapping[str, object]] = None,
 ) -> BackendResult:
+    from .orchestrator import build_next_batch
     log = log_callback or (lambda message: None)
     log("Preparing AI backend inputs…")
     excluded_ids = {str(uid) for uid in (exclude_unit_ids or []) if str(uid)}
