@@ -51,6 +51,12 @@ from vaannotate.rounds import AssignmentUnit as RoundAssignmentUnit, RoundBuilde
 from vaannotate.vaannotate_ai_backend import CancelledError, BackendResult, run_ai_backend_and_collect
 from vaannotate.vaannotate_ai_backend import config as ai_config
 from vaannotate.vaannotate_ai_backend import project_experiments
+from vaannotate.vaannotate_ai_backend.pipelines.large_corpus_jobs import (
+    PromptInferenceJob,
+    PromptPrecomputeJob,
+    run_prompt_inference_job,
+    run_prompt_precompute_job,
+)
 
 PROJECT_MODELS = [
     models.Project,
@@ -1133,6 +1139,380 @@ def _format_metric(value: Any) -> str:
         return f"{float(value):.3f}"
     except Exception:
         return str(value)
+
+
+class _LargeCorpusJobWorker(QtCore.QObject):
+    finished = QtCore.Signal()
+    failed = QtCore.Signal(str)
+    log_message = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        *,
+        precompute_job: Optional[PromptPrecomputeJob] = None,
+        inference_job: Optional[PromptInferenceJob] = None,
+    ) -> None:
+        super().__init__()
+        self.precompute_job = precompute_job
+        self.inference_job = inference_job
+
+    @QtCore.Slot()
+    def run(self) -> None:  # noqa: D401 - Qt slot
+        try:
+            if self.precompute_job is not None:
+                self.log_message.emit(
+                    f"Starting prompt precompute job {self.precompute_job.job_id}…"
+                )
+                run_prompt_precompute_job(self.precompute_job)
+                self.log_message.emit("Prompt precompute job completed.")
+            elif self.inference_job is not None:
+                self.log_message.emit(
+                    f"Starting prompt inference job {self.inference_job.job_id}…"
+                )
+                run_prompt_inference_job(self.inference_job)
+                self.log_message.emit("Prompt inference job completed.")
+            else:
+                self.log_message.emit("No job configured.")
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+
+        self.finished.emit()
+
+
+class LargeCorpusJobDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget],
+        ctx: "ProjectContext",
+        pheno_row: Mapping[str, object],
+    ) -> None:
+        super().__init__(parent)
+        self.ctx = ctx
+        self.pheno_row = pheno_row
+        self.project_root = Path(ctx.project_root or Path.cwd())
+        self._default_precompute_id = self._build_default_job_id("prompts")
+        self._default_inference_id = self._build_default_job_id("inference")
+        self._running_workers: list[tuple[QtCore.QThread, _LargeCorpusJobWorker, AIRoundLogDialog]] = []
+        self._setup_ui()
+
+    def _build_default_job_id(self, suffix: str) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pheno_id = str(self.pheno_row.get("pheno_id") or "pheno")
+        return f"{pheno_id}_{suffix}_{timestamp}"
+
+    def _setup_ui(self) -> None:
+        self.setWindowTitle("Large corpus inference")
+        self.resize(700, 520)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(self._build_precompute_tab(), "Precompute prompts")
+        tabs.addTab(self._build_inference_tab(), "Run inference")
+        layout.addWidget(tabs)
+
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        button_box.rejected.connect(self.reject)
+        button_box.accepted.connect(self.accept)
+        layout.addWidget(button_box)
+
+    def _build_precompute_tab(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(widget)
+
+        self.precompute_job_id_edit = QtWidgets.QLineEdit(self._default_precompute_id)
+        self.precompute_job_id_edit.textChanged.connect(self._refresh_path_placeholders)
+        form.addRow("Prompt job ID", self.precompute_job_id_edit)
+
+        self.precompute_labelset_combo = QtWidgets.QComboBox()
+        for labelset in self.ctx.list_label_sets_for_pheno(str(self.pheno_row.get("pheno_id"))):
+            labelset_id = labelset.get("labelset_id")
+            name = labelset.get("name") or labelset_id or "Label set"
+            display = f"{name} ({labelset_id})" if labelset_id else name
+            self.precompute_labelset_combo.addItem(display, userData=labelset_id)
+        form.addRow("Label set", self.precompute_labelset_combo)
+
+        self.precompute_mode_combo = QtWidgets.QComboBox()
+        self.precompute_mode_combo.addItems(["family", "single_prompt"])
+        form.addRow("Labeling mode", self.precompute_mode_combo)
+
+        self.precompute_batch_spin = QtWidgets.QSpinBox()
+        self.precompute_batch_spin.setMinimum(1)
+        self.precompute_batch_spin.setMaximum(1000000)
+        self.precompute_batch_spin.setValue(128)
+        form.addRow("Batch size", self.precompute_batch_spin)
+
+        prompt_dir_placeholder = str(self._default_prompt_dir(self._default_precompute_id))
+        precompute_dir_row, self.precompute_dir_edit = self._path_selector(prompt_dir_placeholder)
+        form.addRow("Prompt job directory", precompute_dir_row)
+
+        self.precompute_overrides_edit = QtWidgets.QPlainTextEdit()
+        self.precompute_overrides_edit.setPlaceholderText("Optional JSON overrides for AI config")
+        form.addRow("Config overrides", self.precompute_overrides_edit)
+
+        run_button = QtWidgets.QPushButton("Run / resume precompute")
+        run_button.clicked.connect(self._on_run_precompute)
+        form.addRow(run_button)
+
+        note_label = QtWidgets.QLabel(
+            "Precompute builds prompt parquet batches. Re-running with the same job ID "
+            "will resume pending batches in the chosen directory."
+        )
+        note_label.setWordWrap(True)
+        form.addRow(note_label)
+
+        return widget
+
+    def _build_inference_tab(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(widget)
+
+        self.prompt_job_id_edit = QtWidgets.QLineEdit()
+        self.prompt_job_id_edit.textChanged.connect(self._refresh_path_placeholders)
+        form.addRow("Prompt job ID", self.prompt_job_id_edit)
+
+        prompt_dir_placeholder = str(self._default_prompt_dir(self._default_precompute_id))
+        prompt_dir_row, self.prompt_job_dir_edit = self._path_selector(prompt_dir_placeholder)
+        form.addRow("Prompt job directory", prompt_dir_row)
+
+        self.inference_job_id_edit = QtWidgets.QLineEdit(self._default_inference_id)
+        self.inference_job_id_edit.textChanged.connect(self._refresh_path_placeholders)
+        form.addRow("Inference job ID", self.inference_job_id_edit)
+
+        inference_dir_placeholder = str(self._default_inference_dir(self._default_inference_id))
+        inference_dir_row, self.inference_job_dir_edit = self._path_selector(inference_dir_placeholder)
+        form.addRow("Inference output directory", inference_dir_row)
+
+        self.inference_mode_combo = QtWidgets.QComboBox()
+        self.inference_mode_combo.addItems(["family", "single_prompt"])
+        form.addRow("Labeling mode", self.inference_mode_combo)
+
+        self.inference_batch_limit = QtWidgets.QSpinBox()
+        self.inference_batch_limit.setMinimum(0)
+        self.inference_batch_limit.setMaximum(1000000)
+        self.inference_batch_limit.setValue(0)
+        form.addRow("Batch limit (0 = all)", self.inference_batch_limit)
+
+        self.inference_cfg_overrides = QtWidgets.QPlainTextEdit()
+        self.inference_cfg_overrides.setPlaceholderText("Optional JSON overrides for AI config")
+        form.addRow("Config overrides", self.inference_cfg_overrides)
+
+        self.inference_llm_overrides = QtWidgets.QPlainTextEdit()
+        self.inference_llm_overrides.setPlaceholderText("Optional JSON overrides for LLM-only settings")
+        form.addRow("LLM overrides", self.inference_llm_overrides)
+
+        run_button = QtWidgets.QPushButton("Run / resume inference")
+        run_button.clicked.connect(self._on_run_inference)
+        form.addRow(run_button)
+
+        note_label = QtWidgets.QLabel(
+            "Inference consumes prompt parquet batches from the prompt job directory. "
+            "If outputs already exist, rerunning with the same job ID will resume pending batches."
+        )
+        note_label.setWordWrap(True)
+        form.addRow(note_label)
+
+        return widget
+
+    def _path_selector(self, placeholder: str) -> tuple[QtWidgets.QWidget, QtWidgets.QLineEdit]:
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        line_edit = QtWidgets.QLineEdit()
+        line_edit.setPlaceholderText(placeholder)
+        browse_button = QtWidgets.QPushButton("Browse…")
+        browse_button.clicked.connect(lambda: self._browse_for_dir(line_edit))
+        layout.addWidget(line_edit)
+        layout.addWidget(browse_button)
+        return container, line_edit
+
+    def _browse_for_dir(self, line_edit: QtWidgets.QLineEdit) -> None:
+        start_dir = line_edit.text().strip() or str(self.project_root)
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select directory",
+            start_dir,
+        )
+        if directory:
+            line_edit.setText(directory)
+
+    def _default_prompt_dir(self, job_id: str) -> Path:
+        return self.project_root / "admin_tools" / "prompt_jobs" / job_id
+
+    def _default_inference_dir(self, job_id: str) -> Path:
+        return self.project_root / "admin_tools" / "prompt_inference" / job_id
+
+    def _refresh_path_placeholders(self) -> None:
+        prompt_job_id = self.prompt_job_id_edit.text().strip() or self.precompute_job_id_edit.text().strip()
+        if not prompt_job_id:
+            prompt_job_id = self._default_precompute_id
+        inference_job_id = self.inference_job_id_edit.text().strip() or self._default_inference_id
+        self.precompute_dir_edit.setPlaceholderText(str(self._default_prompt_dir(self.precompute_job_id_edit.text().strip() or self._default_precompute_id)))
+        self.prompt_job_dir_edit.setPlaceholderText(str(self._default_prompt_dir(prompt_job_id)))
+        self.inference_job_dir_edit.setPlaceholderText(str(self._default_inference_dir(inference_job_id)))
+        if not self.prompt_job_id_edit.text().strip():
+            self.prompt_job_id_edit.setPlaceholderText(prompt_job_id)
+
+    def _parse_json_overrides(self, widget: QtWidgets.QPlainTextEdit, field: str) -> Optional[dict]:
+        raw = widget.toPlainText().strip()
+        if not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError("Overrides must be a JSON object")
+            return value
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid overrides",
+                f"Unable to parse {field}: {exc}",
+            )
+            return None
+
+    def _collect_precompute_job(self) -> Optional[PromptPrecomputeJob]:
+        labelset_id = self.precompute_labelset_combo.currentData()
+        if not labelset_id:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Large corpus inference",
+                "Please select a label set for prompt precompute.",
+            )
+            return None
+
+        cfg_overrides = self._parse_json_overrides(self.precompute_overrides_edit, "config overrides")
+        if cfg_overrides is None:
+            return None
+
+        job_id = self.precompute_job_id_edit.text().strip() or self._default_precompute_id
+        job_dir_text = self.precompute_dir_edit.text().strip()
+        job_dir = Path(job_dir_text) if job_dir_text else self._default_prompt_dir(job_id)
+
+        pheno_id = str(self.pheno_row.get("pheno_id") or "")
+        level = str(self.pheno_row.get("level") or "single_doc")
+        labeling_mode = str(self.precompute_mode_combo.currentText())
+        batch_size = int(self.precompute_batch_spin.value()) or 1
+
+        return PromptPrecomputeJob(
+            job_id=job_id,
+            project_root=self.project_root,
+            pheno_id=pheno_id,
+            labelset_id=str(labelset_id),
+            phenotype_level=level,
+            labeling_mode=labeling_mode,
+            cfg_overrides=cfg_overrides,
+            notes_path=None,
+            annotations_path=None,
+            job_dir=job_dir,
+            batch_size=batch_size,
+        )
+
+    def _collect_inference_job(self) -> Optional[PromptInferenceJob]:
+        cfg_overrides = self._parse_json_overrides(self.inference_cfg_overrides, "config overrides")
+        if cfg_overrides is None:
+            return None
+        llm_overrides = self._parse_json_overrides(self.inference_llm_overrides, "LLM overrides")
+        if llm_overrides is None:
+            return None
+
+        prompt_job_id = self.prompt_job_id_edit.text().strip() or self.precompute_job_id_edit.text().strip()
+        if not prompt_job_id:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Large corpus inference",
+                "Please provide the prompt job ID to read precomputed prompts.",
+            )
+            return None
+
+        prompt_dir_text = self.prompt_job_dir_edit.text().strip()
+        prompt_job_dir = Path(prompt_dir_text) if prompt_dir_text else self._default_prompt_dir(prompt_job_id)
+
+        job_id = self.inference_job_id_edit.text().strip() or self._default_inference_id
+        inference_dir_text = self.inference_job_dir_edit.text().strip()
+        inference_dir = Path(inference_dir_text) if inference_dir_text else self._default_inference_dir(job_id)
+
+        level = str(self.pheno_row.get("level") or "single_doc")
+        labeling_mode = str(self.inference_mode_combo.currentText())
+        batch_limit = int(self.inference_batch_limit.value()) or None
+
+        return PromptInferenceJob(
+            job_id=job_id,
+            prompt_job_id=prompt_job_id,
+            project_root=self.project_root,
+            prompt_job_dir=prompt_job_dir,
+            phenotype_level=level,
+            labeling_mode=labeling_mode,
+            cfg_overrides=cfg_overrides,
+            llm_overrides=llm_overrides or None,
+            job_dir=inference_dir,
+            batch_limit=batch_limit,
+        )
+
+    def _on_run_precompute(self) -> None:
+        job = self._collect_precompute_job()
+        if job is None:
+            return
+        self._start_worker(precompute_job=job)
+
+    def _on_run_inference(self) -> None:
+        job = self._collect_inference_job()
+        if job is None:
+            return
+        self._start_worker(inference_job=job)
+
+    def _start_worker(
+        self,
+        *,
+        precompute_job: Optional[PromptPrecomputeJob] = None,
+        inference_job: Optional[PromptInferenceJob] = None,
+    ) -> None:
+        worker = _LargeCorpusJobWorker(
+            precompute_job=precompute_job,
+            inference_job=inference_job,
+        )
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+
+        log_dialog = AIRoundLogDialog(self)
+        log_dialog.reset_for_run()
+        log_dialog.show()
+
+        worker.log_message.connect(log_dialog.log_output.appendPlainText)
+        worker.finished.connect(
+            lambda: self._finish_worker(thread, worker, log_dialog, success=True)
+        )
+        worker.failed.connect(
+            lambda message: self._finish_worker(thread, worker, log_dialog, success=False, message=message)
+        )
+        thread.started.connect(worker.run)
+        self._running_workers.append((thread, worker, log_dialog))
+        thread.start()
+
+    def _finish_worker(
+        self,
+        thread: QtCore.QThread,
+        worker: _LargeCorpusJobWorker,
+        dialog: AIRoundLogDialog,
+        *,
+        success: bool,
+        message: str | None = None,
+    ) -> None:
+        if success:
+            dialog.log_output.appendPlainText("Job finished.")
+        else:
+            dialog.log_output.appendPlainText(f"Job failed: {message}")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Large corpus inference",
+                f"Job failed: {message}",
+            )
+        dialog.mark_complete()
+
+        thread.quit()
+        thread.wait()
+        worker.deleteLater()
+        thread.deleteLater()
+        self._running_workers = [entry for entry in self._running_workers if entry[0] is not thread]
 
 
 def _deep_update_dict(target: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
@@ -7263,6 +7643,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 class ProjectTreeWidget(QtWidgets.QTreeWidget):
     node_selected = QtCore.Signal(dict)
     run_inference_experiments_requested = QtCore.Signal(QtWidgets.QTreeWidgetItem)
+    large_corpus_requested = QtCore.Signal(QtWidgets.QTreeWidgetItem)
 
     def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -7387,6 +7768,10 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
                 lambda _checked=False, item=item: self.run_inference_experiments_requested.emit(
                     item
                 )
+            )
+            large_corpus_action = menu.addAction("Large corpus inference…")
+            large_corpus_action.triggered.connect(
+                lambda _checked=False, item=item: self.large_corpus_requested.emit(item)
             )
             delete_action = menu.addAction("Delete phenotype…")
             delete_action.triggered.connect(lambda: self._delete_phenotype(item))
@@ -10887,6 +11272,7 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         self.tree.run_inference_experiments_requested.connect(
             self._on_run_inference_experiments
         )
+        self.tree.large_corpus_requested.connect(self._on_run_large_corpus)
         splitter.addWidget(self.tree)
 
         self.stack = QtWidgets.QStackedWidget()
@@ -11059,6 +11445,16 @@ class AdminMainWindow(QtWidgets.QMainWindow):
             "Inference experiments",
             f"Inference experiments failed: {message}",
         )
+
+    def _on_run_large_corpus(self, pheno_item: QtWidgets.QTreeWidgetItem) -> None:
+        data = pheno_item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        pheno_row = None
+        if isinstance(data, Mapping):
+            pheno_row = data.get("pheno") or data
+        if not isinstance(pheno_row, Mapping):
+            return
+        dialog = LargeCorpusJobDialog(self, self.ctx, pheno_row)
+        dialog.exec()
 
     def _on_run_inference_experiments(
         self, pheno_item: QtWidgets.QTreeWidgetItem
