@@ -4,13 +4,14 @@ import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional
 import pandas as pd
 
 from .config import OrchestratorConfig, Paths
 from .label_configs import LabelConfigBundle, EMPTY_BUNDLE
-from .orchestration import BackendSession
-from .orchestrator import _apply_overrides, run_inference
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .orchestration import BackendSession
 
 
 def _normalize_local_model_overrides(
@@ -171,7 +172,7 @@ def run_inference_experiments(
     cache_dir: Optional[Path] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
-    session: Optional[BackendSession] = None,
+    session: Optional["BackendSession"] = None,
 ) -> Dict[str, InferenceExperimentResult]:
     """Run multiple inference configurations (sweeps) and collect their outputs.
 
@@ -237,6 +238,9 @@ def run_inference_experiments(
     Dict[str, InferenceExperimentResult]
         Mapping from experiment name to result objects.
     """
+    from .orchestration import BackendSession
+    from .orchestrator import _apply_overrides, run_inference
+
     base_outdir = Path(base_outdir)
     base_outdir.mkdir(parents=True, exist_ok=True)
 
