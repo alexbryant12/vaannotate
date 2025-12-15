@@ -57,6 +57,7 @@ from vaannotate.vaannotate_ai_backend.pipelines.large_corpus_jobs import (
     run_prompt_inference_job,
     run_prompt_precompute_job,
 )
+from vaannotate.vaannotate_ai_backend.utils.job_manifest import read_manifest
 
 PROJECT_MODELS = [
     models.Project,
@@ -1194,6 +1195,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         self._default_precompute_id = self._build_default_job_id("prompts")
         self._default_inference_id = self._build_default_job_id("inference")
         self._running_workers: list[tuple[QtCore.QThread, _LargeCorpusJobWorker, AIRoundLogDialog]] = []
+        self._rounds = self._load_rounds()
         self._setup_ui()
 
     def _build_default_job_id(self, suffix: str) -> str:
@@ -1267,6 +1269,18 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         widget = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(widget)
 
+        self.round_combo = QtWidgets.QComboBox()
+        self.round_combo.addItem("Select round…", userData=None)
+        for round_row in self._rounds:
+            number = round_row.get("round_number")
+            round_id = round_row.get("round_id") or ""
+            display = f"Round {number}" if number is not None else str(round_id)
+            if round_id:
+                display = f"{display} ({round_id})"
+            self.round_combo.addItem(display, userData=round_id)
+        self.round_combo.currentIndexChanged.connect(self._on_round_selected)
+        form.addRow("Base round", self.round_combo)
+
         self.prompt_job_id_edit = QtWidgets.QLineEdit()
         self.prompt_job_id_edit.textChanged.connect(self._refresh_path_placeholders)
         form.addRow("Prompt job ID", self.prompt_job_id_edit)
@@ -1312,6 +1326,8 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         note_label.setWordWrap(True)
         form.addRow(note_label)
 
+        self._select_latest_round()
+
         return widget
 
     def _path_selector(self, placeholder: str) -> tuple[QtWidgets.QWidget, QtWidgets.QLineEdit]:
@@ -1353,6 +1369,8 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         if not self.prompt_job_id_edit.text().strip():
             self.prompt_job_id_edit.setPlaceholderText(prompt_job_id)
 
+        self._maybe_load_manifest_defaults()
+
     def _parse_json_overrides(self, widget: QtWidgets.QPlainTextEdit, field: str) -> Optional[dict]:
         raw = widget.toPlainText().strip()
         if not raw:
@@ -1371,15 +1389,6 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             return None
 
     def _collect_precompute_job(self) -> Optional[PromptPrecomputeJob]:
-        labelset_id = self.precompute_labelset_combo.currentData()
-        if not labelset_id:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Large corpus inference",
-                "Please select a label set for prompt precompute.",
-            )
-            return None
-
         cfg_overrides = self._parse_json_overrides(self.precompute_overrides_edit, "config overrides")
         if cfg_overrides is None:
             return None
@@ -1388,10 +1397,49 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         job_dir_text = self.precompute_dir_edit.text().strip()
         job_dir = Path(job_dir_text) if job_dir_text else self._default_prompt_dir(job_id)
 
+        manifest_overrides: dict[str, object] = {}
+        manifest_labelset: str | None = None
+        manifest_mode: str | None = None
+        manifest_batch: int | None = None
+        manifest = read_manifest(job_dir / "job_manifest.json")
+        if isinstance(manifest, Mapping):
+            manifest_overrides = (
+                manifest.get("cfg_overrides")
+                if isinstance(manifest.get("cfg_overrides"), Mapping)
+                else {}
+            )
+            manifest_labelset_raw = manifest.get("labelset_id")
+            manifest_labelset = str(manifest_labelset_raw) if manifest_labelset_raw is not None else None
+            manifest_mode_raw = manifest.get("labeling_mode")
+            manifest_mode = str(manifest_mode_raw) if manifest_mode_raw is not None else None
+            manifest_batch_raw = manifest.get("batch_size")
+            try:
+                manifest_batch = int(manifest_batch_raw) if manifest_batch_raw is not None else None
+            except Exception:  # noqa: BLE001
+                manifest_batch = None
+
+        if not cfg_overrides and manifest_overrides:
+            cfg_overrides = manifest_overrides
+            self.precompute_overrides_edit.setPlainText(json.dumps(cfg_overrides, indent=2))
+
+        labelset_id = self.precompute_labelset_combo.currentData()
+        if manifest_labelset:
+            idx = self.precompute_labelset_combo.findData(manifest_labelset)
+            if idx >= 0:
+                self.precompute_labelset_combo.setCurrentIndex(idx)
+                labelset_id = manifest_labelset
+        if not labelset_id:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Large corpus inference",
+                "Please select a label set for prompt precompute.",
+            )
+            return None
+
         pheno_id = str(self.pheno_row.get("pheno_id") or "")
         level = str(self.pheno_row.get("level") or "single_doc")
-        labeling_mode = str(self.precompute_mode_combo.currentText())
-        batch_size = int(self.precompute_batch_spin.value()) or 1
+        labeling_mode = manifest_mode or str(self.precompute_mode_combo.currentText())
+        batch_size = manifest_batch or int(self.precompute_batch_spin.value()) or 1
 
         return PromptPrecomputeJob(
             job_id=job_id,
@@ -1431,8 +1479,33 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         inference_dir_text = self.inference_job_dir_edit.text().strip()
         inference_dir = Path(inference_dir_text) if inference_dir_text else self._default_inference_dir(job_id)
 
+        prompt_manifest = read_manifest(prompt_job_dir / "job_manifest.json")
+        manifest = read_manifest(inference_dir / "job_manifest.json")
+
+        manifest_cfg = manifest.get("cfg_overrides") if isinstance(manifest, Mapping) and isinstance(manifest.get("cfg_overrides"), Mapping) else {}
+        manifest_llm = manifest.get("llm_overrides") if isinstance(manifest, Mapping) and isinstance(manifest.get("llm_overrides"), Mapping) else {}
+        if not cfg_overrides and manifest_cfg:
+            cfg_overrides = manifest_cfg
+            self.inference_cfg_overrides.setPlainText(json.dumps(cfg_overrides, indent=2))
+        if not llm_overrides and manifest_llm:
+            llm_overrides = manifest_llm
+            self.inference_llm_overrides.setPlainText(json.dumps(llm_overrides, indent=2))
+
         level = str(self.pheno_row.get("level") or "single_doc")
+        if isinstance(prompt_manifest, Mapping):
+            prompt_level = prompt_manifest.get("phenotype_level")
+            if isinstance(prompt_level, str):
+                level = prompt_level
+
         labeling_mode = str(self.inference_mode_combo.currentText())
+        if isinstance(manifest, Mapping):
+            manifest_mode = manifest.get("labeling_mode")
+            if manifest_mode:
+                labeling_mode = str(manifest_mode)
+        elif isinstance(prompt_manifest, Mapping):
+            prompt_mode = prompt_manifest.get("labeling_mode")
+            if prompt_mode:
+                labeling_mode = str(prompt_mode)
         batch_limit = int(self.inference_batch_limit.value()) or None
 
         return PromptInferenceJob(
@@ -1513,6 +1586,162 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         worker.deleteLater()
         thread.deleteLater()
         self._running_workers = [entry for entry in self._running_workers if entry[0] is not thread]
+
+    def _load_rounds(self) -> list[Mapping[str, object]]:
+        pheno_id = str(self.pheno_row.get("pheno_id") or "")
+        try:
+            rounds = self.ctx.list_rounds(pheno_id)
+        except Exception:  # noqa: BLE001
+            return []
+        try:
+            return sorted(
+                rounds,
+                key=lambda row: int(row.get("round_number") or 0),
+                reverse=True,
+            )
+        except Exception:  # noqa: BLE001
+            return rounds
+
+    def _select_latest_round(self) -> None:
+        if not self._rounds:
+            return
+        first_round_id = self._rounds[0].get("round_id")
+        if first_round_id is None:
+            return
+        idx = self.round_combo.findData(first_round_id)
+        if idx >= 0:
+            self.round_combo.setCurrentIndex(idx)
+            self._load_round_defaults(str(first_round_id))
+
+    def _load_round_defaults(self, round_id: str) -> None:
+        config = self.ctx.get_round_config(round_id)
+        if not isinstance(config, Mapping):
+            return
+
+        cfg_overrides, llm_overrides = self._extract_overrides_from_round(config)
+        if cfg_overrides:
+            cfg_text = json.dumps(cfg_overrides, indent=2)
+            self.precompute_overrides_edit.setPlainText(cfg_text)
+            self.inference_cfg_overrides.setPlainText(cfg_text)
+        if llm_overrides:
+            self.inference_llm_overrides.setPlainText(json.dumps(llm_overrides, indent=2))
+
+    def _extract_overrides_from_round(
+        self, config: Mapping[str, object]
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        ai_cfg = (
+            config.get("ai_backend")
+            if isinstance(config.get("ai_backend"), Mapping)
+            else {}
+        )
+        if not isinstance(ai_cfg, Mapping):
+            return {}, {}
+
+        overrides: dict[str, object] = {}
+        overrides.update({k: v for k, v in ai_cfg.items() if k != "config_overrides"})
+        config_overrides = (
+            ai_cfg.get("config_overrides")
+            if isinstance(ai_cfg.get("config_overrides"), Mapping)
+            else {}
+        )
+        if config_overrides:
+            overrides = _deep_update_dict(overrides, config_overrides)
+
+        llm_overrides = (
+            overrides.get("llm") if isinstance(overrides.get("llm"), Mapping) else {}
+        )
+        remaining_overrides = dict(overrides)
+        if llm_overrides:
+            remaining_overrides.pop("llm", None)
+
+        llm_fields = {
+            "backend",
+            "azure_api_version",
+            "azure_endpoint",
+            "local_model_dir",
+            "local_max_seq_len",
+            "local_max_new_tokens",
+            "model_name",
+            "rpm_limit",
+            "temperature",
+            "timeout",
+            "retry_max",
+            "retry_backoff",
+            "include_reasoning",
+            "few_shot_examples",
+        }
+        for key in list(remaining_overrides.keys()):
+            if key in llm_fields:
+                if not llm_overrides:
+                    llm_overrides = {}
+                llm_overrides.setdefault(key, remaining_overrides.pop(key))
+
+        return remaining_overrides, dict(llm_overrides)
+
+    def _on_round_selected(self) -> None:
+        round_id = self.round_combo.currentData()
+        if round_id:
+            self._load_round_defaults(str(round_id))
+
+    def _maybe_load_manifest_defaults(self) -> None:
+        prompt_job_id = (
+            self.prompt_job_id_edit.text().strip()
+            or self.precompute_job_id_edit.text().strip()
+        )
+        if prompt_job_id:
+            prompt_dir_text = self.prompt_job_dir_edit.text().strip()
+            prompt_dir = (
+                Path(prompt_dir_text)
+                if prompt_dir_text
+                else self._default_prompt_dir(prompt_job_id)
+            )
+            prompt_manifest = read_manifest(prompt_dir / "job_manifest.json")
+            if isinstance(prompt_manifest, Mapping):
+                mode = prompt_manifest.get("labeling_mode")
+                if mode:
+                    idx = self.inference_mode_combo.findText(str(mode))
+                    if idx >= 0:
+                        self.inference_mode_combo.setCurrentIndex(idx)
+                level = prompt_manifest.get("phenotype_level")
+                if level and isinstance(level, str):
+                    self.pheno_row = dict(self.pheno_row)
+                    self.pheno_row["level"] = level
+
+        job_id = self.inference_job_id_edit.text().strip() or self._default_inference_id
+        inference_dir_text = self.inference_job_dir_edit.text().strip()
+        inference_dir = (
+            Path(inference_dir_text)
+            if inference_dir_text
+            else self._default_inference_dir(job_id)
+        )
+        manifest = read_manifest(inference_dir / "job_manifest.json")
+        if not isinstance(manifest, Mapping):
+            return
+
+        manifest_cfg = (
+            manifest.get("cfg_overrides")
+            if isinstance(manifest.get("cfg_overrides"), Mapping)
+            else {}
+        )
+        manifest_llm = (
+            manifest.get("llm_overrides")
+            if isinstance(manifest.get("llm_overrides"), Mapping)
+            else {}
+        )
+
+        if manifest_cfg and not self.inference_cfg_overrides.toPlainText().strip():
+            self.inference_cfg_overrides.setPlainText(json.dumps(manifest_cfg, indent=2))
+        if manifest_llm and not self.inference_llm_overrides.toPlainText().strip():
+            self.inference_llm_overrides.setPlainText(json.dumps(manifest_llm, indent=2))
+        manifest_mode = manifest.get("labeling_mode")
+        if manifest_mode:
+            idx = self.inference_mode_combo.findText(str(manifest_mode))
+            if idx >= 0:
+                self.inference_mode_combo.setCurrentIndex(idx)
+
+        manifest_prompt_id = manifest.get("prompt_job_id")
+        if manifest_prompt_id and not self.prompt_job_id_edit.text().strip():
+            self.prompt_job_id_edit.setText(str(manifest_prompt_id))
 
 
 def _deep_update_dict(target: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
