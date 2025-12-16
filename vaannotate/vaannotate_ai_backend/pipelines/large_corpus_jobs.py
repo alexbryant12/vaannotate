@@ -97,9 +97,13 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
 
         manifest_path = job_dir / "job_manifest.json"
         manifest = read_manifest(manifest_path)
-        if not job.llm_overrides and isinstance(manifest, dict):
+        if isinstance(manifest, dict):
+            manifest_cfg = manifest.get("cfg_overrides")
+            if not job.cfg_overrides and isinstance(manifest_cfg, dict):
+                job.cfg_overrides = manifest_cfg
+
             manifest_llm = manifest.get("llm_overrides")
-            if isinstance(manifest_llm, dict):
+            if not job.llm_overrides and isinstance(manifest_llm, dict):
                 job.llm_overrides = manifest_llm
 
         if job.notes_path is not None and job.annotations_path is not None:
@@ -155,6 +159,9 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
                 "batch_size": job.batch_size,
                 "batches": [],
             }
+        elif isinstance(manifest, dict):
+            manifest["cfg_overrides"] = job.cfg_overrides
+            manifest["llm_overrides"] = job.llm_overrides or {}
 
         repo_notes = notes_df if job.notes_path is None else read_table(str(notes_path))
         manifest = _initialize_and_update_batches_for_prompt_precompute(manifest, job, repo_notes)
@@ -411,6 +418,17 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
             prompt_level,
         )
 
+    manifest_path = job_dir / "job_manifest.json"
+    manifest = read_manifest(manifest_path)
+    if isinstance(manifest, dict):
+        manifest_cfg = manifest.get("cfg_overrides")
+        if not job.cfg_overrides and isinstance(manifest_cfg, dict):
+            job.cfg_overrides = manifest_cfg
+
+        manifest_llm = manifest.get("llm_overrides")
+        if not job.llm_overrides and isinstance(manifest_llm, dict):
+            job.llm_overrides = manifest_llm
+
     cfg = OrchestratorConfig()
     overrides = _normalize_local_model_overrides(job.cfg_overrides or {})
     if overrides:
@@ -451,8 +469,6 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
     )
     llm_labeler: LLMLabeler = components["llm_labeler"]
 
-    manifest_path = job_dir / "job_manifest.json"
-    manifest = read_manifest(manifest_path)
     if not manifest:
         manifest = {
             "job_id": job.job_id,
@@ -463,6 +479,9 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
             "llm_overrides": job.llm_overrides or {},
             "batches": [],
         }
+    elif isinstance(manifest, dict):
+        manifest["cfg_overrides"] = job.cfg_overrides
+        manifest["llm_overrides"] = job.llm_overrides or {}
 
     manifest = _initialize_and_update_batches_for_prompt_inference(manifest, job, prompt_manifest)
     write_manifest_atomic(manifest_path, manifest)
