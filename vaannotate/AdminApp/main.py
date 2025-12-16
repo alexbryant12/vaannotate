@@ -1577,24 +1577,39 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
 
         worker.log_message.connect(log_dialog.log_output.appendPlainText)
         worker.finished.connect(
-            lambda: self._finish_worker(thread, worker, log_dialog, success=True)
+            self._on_worker_finished, QtCore.Qt.ConnectionType.QueuedConnection
         )
         worker.failed.connect(
-            lambda message: self._finish_worker(thread, worker, log_dialog, success=False, message=message)
+            self._on_worker_failed, QtCore.Qt.ConnectionType.QueuedConnection
         )
         thread.started.connect(worker.run)
         self._running_workers.append((thread, worker, log_dialog))
         thread.start()
 
+    @QtCore.Slot()
+    def _on_worker_finished(self) -> None:  # noqa: D401 - Qt slot
+        self._finish_worker(success=True)
+
+    @QtCore.Slot(str)
+    def _on_worker_failed(self, message: str) -> None:  # noqa: D401 - Qt slot
+        self._finish_worker(success=False, message=message)
+
     def _finish_worker(
         self,
-        thread: QtCore.QThread,
-        worker: _LargeCorpusJobWorker,
-        dialog: AIRoundLogDialog,
         *,
         success: bool,
         message: str | None = None,
     ) -> None:
+        sender = self.sender()
+        entry: tuple[QtCore.QThread, _LargeCorpusJobWorker, AIRoundLogDialog] | None = None
+        for candidate in self._running_workers:
+            if candidate[1] is sender:
+                entry = candidate
+                break
+        if entry is None:
+            return
+
+        thread, worker, dialog = entry
         if success:
             dialog.log_output.appendPlainText("Job finished.")
         else:
