@@ -158,12 +158,15 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
 
         repo_notes = notes_df if job.notes_path is None else read_table(str(notes_path))
         manifest = _initialize_and_update_batches_for_prompt_precompute(manifest, job, repo_notes)
+        write_manifest_atomic(manifest_path, manifest)
+
         manifest = _run_prompt_precompute_batches(
             manifest,
             job,
             cfg,
             session,
             label_config_bundle,
+            manifest_path,
         )
 
         write_manifest_atomic(manifest_path, manifest)
@@ -218,6 +221,7 @@ def _run_prompt_precompute_batches(
     cfg: OrchestratorConfig,
     session: BackendSession,
     label_config_bundle: LabelConfigBundle,
+    manifest_path: Path,
 ) -> dict:
     log = logging.getLogger(__name__)
 
@@ -364,6 +368,8 @@ def _run_prompt_precompute_batches(
         batch["status"] = "completed"
         batch["n_tasks"] = len(tasks)
 
+        write_manifest_atomic(manifest_path, manifest)
+
     return manifest
 
 
@@ -459,6 +465,8 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
         }
 
     manifest = _initialize_and_update_batches_for_prompt_inference(manifest, job, prompt_manifest)
+    write_manifest_atomic(manifest_path, manifest)
+
     manifest = _run_prompt_inference_batches(
         manifest,
         job,
@@ -467,6 +475,7 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
         label_config_bundle,
         prompt_job_dir,
         job_dir,
+        manifest_path,
     )
 
     write_manifest_atomic(manifest_path, manifest)
@@ -519,6 +528,7 @@ def _run_prompt_inference_batches(
     label_config_bundle: LabelConfigBundle,
     prompt_job_dir: Path,
     inference_job_dir: Path,
+    manifest_path: Path,
 ) -> dict:
     log = logging.getLogger(__name__)
 
@@ -589,6 +599,8 @@ def _run_prompt_inference_batches(
         batch["status"] = "completed"
         batch["n_rows"] = len(df_out)
         batch["output_path"] = str(Path("outputs") / out_path.name)
+
+        write_manifest_atomic(manifest_path, manifest)
 
     return manifest
 
