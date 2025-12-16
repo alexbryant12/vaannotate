@@ -1152,14 +1152,25 @@ class _LargeCorpusJobWorker(QtCore.QObject):
         *,
         precompute_job: Optional[PromptPrecomputeJob] = None,
         inference_job: Optional[PromptInferenceJob] = None,
+        env_overrides: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
         self.precompute_job = precompute_job
         self.inference_job = inference_job
+        self.env_overrides = {
+            str(key): str(value)
+            for key, value in (env_overrides or {}).items()
+            if str(value)
+        }
 
     @QtCore.Slot()
     def run(self) -> None:  # noqa: D401 - Qt slot
         try:
+            original_env: Dict[str, Optional[str]] = {}
+            for key, value in self.env_overrides.items():
+                original_env[key] = os.environ.get(key)
+                os.environ[key] = value
+
             if self.precompute_job is not None:
                 self.log_message.emit(
                     f"Starting prompt precompute job {self.precompute_job.job_id}…"
@@ -1177,6 +1188,12 @@ class _LargeCorpusJobWorker(QtCore.QObject):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
+        finally:
+            for key, value in self.env_overrides.items():
+                if key in original_env and original_env[key] is not None:
+                    os.environ[key] = original_env[key] or ""
+                elif key in os.environ:
+                    os.environ.pop(key, None)
 
         self.finished.emit()
 
@@ -1539,9 +1556,17 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         precompute_job: Optional[PromptPrecomputeJob] = None,
         inference_job: Optional[PromptInferenceJob] = None,
     ) -> None:
+        env_overrides: Optional[Dict[str, str]] = {}
+        parent = self.parent()
+        if parent and hasattr(parent, "_collect_ai_environment"):
+            env_overrides = parent._collect_ai_environment()  # type: ignore[assignment]
+            if env_overrides is None:
+                return
+
         worker = _LargeCorpusJobWorker(
             precompute_job=precompute_job,
             inference_job=inference_job,
+            env_overrides=env_overrides,
         )
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
