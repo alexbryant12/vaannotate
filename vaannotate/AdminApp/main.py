@@ -1656,6 +1656,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
 
         llm_fields = {
             "backend",
+            "azure_api_key",
             "azure_api_version",
             "azure_endpoint",
             "local_model_dir",
