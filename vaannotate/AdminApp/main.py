@@ -1659,12 +1659,15 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             return
 
         cfg_overrides, llm_overrides = self._extract_overrides_from_round(config)
+        ai_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         if cfg_overrides:
             cfg_text = json.dumps(cfg_overrides, indent=2)
             self.precompute_overrides_edit.setPlainText(cfg_text)
             self.inference_cfg_overrides.setPlainText(cfg_text)
         if llm_overrides:
             self.inference_llm_overrides.setPlainText(json.dumps(llm_overrides, indent=2))
+        if ai_cfg:
+            self._apply_ai_config_to_controls(ai_cfg)
 
     def _extract_overrides_from_round(
         self, config: Mapping[str, object]
