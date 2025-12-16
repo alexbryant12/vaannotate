@@ -1669,6 +1669,40 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         if ai_cfg:
             self._apply_ai_config_to_controls(ai_cfg)
 
+    def _apply_ai_config_to_controls(self, config: Mapping[str, object]) -> None:
+        """Apply AI backend defaults to the dialog controls.
+
+        Large corpus workflows only expose the override editors, so we mirror the
+        RoundBuilder behavior by hydrating those fields from either the raw
+        config or any nested ``config_overrides`` mapping. Missing or invalid
+        values are ignored.
+        """
+
+        effective_cfg = (
+            config.get("config_overrides")
+            if isinstance(config.get("config_overrides"), Mapping)
+            else config
+        )
+        if not isinstance(effective_cfg, Mapping):
+            return
+
+        if effective_cfg and not self.precompute_overrides_edit.toPlainText().strip():
+            self.precompute_overrides_edit.setPlainText(
+                json.dumps(effective_cfg, indent=2)
+            )
+        if effective_cfg and not self.inference_cfg_overrides.toPlainText().strip():
+            self.inference_cfg_overrides.setPlainText(
+                json.dumps(effective_cfg, indent=2)
+            )
+
+        llm_cfg = (
+            effective_cfg.get("llm")
+            if isinstance(effective_cfg.get("llm"), Mapping)
+            else {}
+        )
+        if llm_cfg and not self.inference_llm_overrides.toPlainText().strip():
+            self.inference_llm_overrides.setPlainText(json.dumps(llm_cfg, indent=2))
+
     def _extract_overrides_from_round(
         self, config: Mapping[str, object]
     ) -> tuple[dict[str, object], dict[str, object]]:
