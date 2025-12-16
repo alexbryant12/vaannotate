@@ -39,9 +39,10 @@ class PromptPrecomputeJob:
     phenotype_level: str  # e.g. "single_doc" | "multi_doc"
     labeling_mode: str  # "family" | "single_prompt"
     cfg_overrides: dict[str, Any]
-    notes_path: Path | None
-    annotations_path: Path | None
-    job_dir: Path | None
+    llm_overrides: dict[str, Any] | None = None
+    notes_path: Path | None = None
+    annotations_path: Path | None = None
+    job_dir: Path | None = None
     batch_size: int = 128
     env_overrides: dict[str, str] | None = None
 
@@ -94,6 +95,13 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
         (job_dir / "prompts_family").mkdir(parents=True, exist_ok=True)
         (job_dir / "cache").mkdir(parents=True, exist_ok=True)
 
+        manifest_path = job_dir / "job_manifest.json"
+        manifest = read_manifest(manifest_path)
+        if not job.llm_overrides and isinstance(manifest, dict):
+            manifest_llm = manifest.get("llm_overrides")
+            if isinstance(manifest_llm, dict):
+                job.llm_overrides = manifest_llm
+
         if job.notes_path is not None and job.annotations_path is not None:
             notes_path = job.notes_path
             ann_path = job.annotations_path
@@ -113,6 +121,12 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
         if overrides:
             _apply_overrides(cfg, dict(overrides))
 
+        llm_overrides = job.llm_overrides or {}
+        if llm_overrides:
+            _apply_overrides(cfg, {"llm": llm_overrides})
+            if "llmfirst" in llm_overrides:
+                _apply_overrides(cfg, {"llmfirst": llm_overrides.get("llmfirst")})
+
         session_paths = Paths(
             notes_path=str(notes_path),
             annotations_path=str(ann_path),
@@ -129,8 +143,6 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
             overrides=overrides.get("label_config") if isinstance(overrides, dict) else None,
         )
 
-        manifest_path = job_dir / "job_manifest.json"
-        manifest = read_manifest(manifest_path)
         if not manifest:
             manifest = {
                 "job_id": job.job_id,
@@ -139,6 +151,7 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
                 "phenotype_level": job.phenotype_level,
                 "labeling_mode": job.labeling_mode,
                 "cfg_overrides": job.cfg_overrides,
+                "llm_overrides": job.llm_overrides or {},
                 "batch_size": job.batch_size,
                 "batches": [],
             }
