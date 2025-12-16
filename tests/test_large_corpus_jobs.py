@@ -23,6 +23,7 @@ def test_prompt_precompute_applies_env_overrides(monkeypatch, tmp_path: Path) ->
     ann_df = pd.DataFrame({"unit_id": ["u1"], "label": ["y"]})
 
     manifest_environments: list[dict[str, str | None]] = []
+    configs: list[dict[str, object]] = []
 
     class DummyLabelBundle:
         current: dict = {}
@@ -43,6 +44,9 @@ def test_prompt_precompute_applies_env_overrides(monkeypatch, tmp_path: Path) ->
         return notes_df, ann_df
 
     def fake_backend_from_env(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        cfg = _args[1] if len(_args) >= 2 else _kwargs.get("config")
+        if cfg is not None:
+            configs.append({"llm_backend": getattr(cfg.llm, "backend", None)})
         manifest_environments.append(
             {
                 "AZURE_OPENAI_API_KEY": os.getenv("AZURE_OPENAI_API_KEY"),
@@ -88,6 +92,7 @@ def test_prompt_precompute_applies_env_overrides(monkeypatch, tmp_path: Path) ->
         phenotype_level="single_doc",
         labeling_mode="single_prompt",
         cfg_overrides={},
+        llm_overrides={"backend": "azure_openai"},
         notes_path=None,
         annotations_path=None,
         job_dir=None,
@@ -104,6 +109,8 @@ def test_prompt_precompute_applies_env_overrides(monkeypatch, tmp_path: Path) ->
         assert snapshot["AZURE_OPENAI_API_KEY"] == "test-key"
         assert snapshot["AZURE_OPENAI_API_VERSION"] == "2024-06-01"
         assert snapshot["AZURE_OPENAI_ENDPOINT"] == "https://example.azure.com/"
+
+    assert configs and configs[0]["llm_backend"] == "azure_openai"
 
     assert os.getenv("AZURE_OPENAI_API_KEY") is None
     assert os.getenv("AZURE_OPENAI_API_VERSION") is None

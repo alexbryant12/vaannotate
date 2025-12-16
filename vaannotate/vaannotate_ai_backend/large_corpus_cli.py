@@ -62,6 +62,7 @@ def create_prompt_precompute_job(
     *,
     batch_size: int = 128,
     cfg_overrides: dict[str, Any] | None = None,
+    llm_overrides: dict[str, Any] | None = None,
     experiment_name: str | None = None,
     experiments_dir: str | Path | None = None,
     job_id: str | None = None,
@@ -85,6 +86,7 @@ def create_prompt_precompute_job(
         phenotype_level=phenotype_level,
         labeling_mode=labeling_mode,
         cfg_overrides=overrides,
+        llm_overrides=llm_overrides,
         notes_path=Path(notes_path) if notes_path else None,
         annotations_path=Path(annotations_path) if annotations_path else None,
         job_dir=Path(job_dir) if job_dir else None,
@@ -160,6 +162,7 @@ def main(argv: list[str] | None = None) -> None:
     precompute.add_argument("--notes-path", type=Path)
     precompute.add_argument("--annotations-path", type=Path)
     precompute.add_argument("--cfg", help="JSON overrides or path to JSON file")
+    precompute.add_argument("--llm-cfg", help="LLM-only overrides or path to JSON file")
     precompute.add_argument("--experiment-name", help="Name from experiments manifest")
     precompute.add_argument("--experiments-dir", type=Path, help="Override experiments manifest dir")
 
@@ -183,6 +186,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "precompute":
         overrides = _parse_json_arg(args.cfg)
+        llm_overrides = _parse_json_arg(args.llm_cfg)
         create_prompt_precompute_job(
             project_root=args.project_root,
             pheno_id=args.pheno_id,
@@ -191,6 +195,7 @@ def main(argv: list[str] | None = None) -> None:
             labeling_mode=args.labeling_mode,
             batch_size=args.batch_size,
             cfg_overrides=overrides,
+            llm_overrides=llm_overrides,
             experiment_name=args.experiment_name,
             experiments_dir=args.experiments_dir,
             job_id=args.job_id,

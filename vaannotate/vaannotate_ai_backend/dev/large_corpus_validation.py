@@ -104,6 +104,7 @@ def validate_large_corpus_parity(
         phenotype_level=phenotype_level,
         labeling_mode=labeling_mode,
         cfg_overrides=cfg_overrides,
+        llm_overrides=llm_overrides,
         notes_path=notes_path,
         annotations_path=ann_path,
         job_dir=base_dir / "prompt_job",

@@ -1269,6 +1269,12 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         self.precompute_overrides_edit.setPlaceholderText("Optional JSON overrides for AI config")
         form.addRow("Config overrides", self.precompute_overrides_edit)
 
+        self.precompute_llm_overrides = QtWidgets.QPlainTextEdit()
+        self.precompute_llm_overrides.setPlaceholderText(
+            "Optional JSON overrides for LLM-only settings"
+        )
+        form.addRow("LLM overrides", self.precompute_llm_overrides)
+
         run_button = QtWidgets.QPushButton("Run / resume precompute")
         run_button.clicked.connect(self._on_run_precompute)
         form.addRow(run_button)
@@ -1409,12 +1415,18 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         cfg_overrides = self._parse_json_overrides(self.precompute_overrides_edit, "config overrides")
         if cfg_overrides is None:
             return None
+        llm_overrides = self._parse_json_overrides(
+            self.precompute_llm_overrides, "LLM overrides"
+        )
+        if llm_overrides is None:
+            return None
 
         job_id = self.precompute_job_id_edit.text().strip() or self._default_precompute_id
         job_dir_text = self.precompute_dir_edit.text().strip()
         job_dir = Path(job_dir_text) if job_dir_text else self._default_prompt_dir(job_id)
 
         manifest_overrides: dict[str, object] = {}
+        manifest_llm_overrides: dict[str, object] = {}
         manifest_labelset: str | None = None
         manifest_mode: str | None = None
         manifest_batch: int | None = None
@@ -1423,6 +1435,11 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             manifest_overrides = (
                 manifest.get("cfg_overrides")
                 if isinstance(manifest.get("cfg_overrides"), Mapping)
+                else {}
+            )
+            manifest_llm_overrides = (
+                manifest.get("llm_overrides")
+                if isinstance(manifest.get("llm_overrides"), Mapping)
                 else {}
             )
             manifest_labelset_raw = manifest.get("labelset_id")
@@ -1438,6 +1455,9 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         if not cfg_overrides and manifest_overrides:
             cfg_overrides = manifest_overrides
             self.precompute_overrides_edit.setPlainText(json.dumps(cfg_overrides, indent=2))
+        if not llm_overrides and manifest_llm_overrides:
+            llm_overrides = manifest_llm_overrides
+            self.precompute_llm_overrides.setPlainText(json.dumps(llm_overrides, indent=2))
 
         labelset_id = self.precompute_labelset_combo.currentData()
         if manifest_labelset:
@@ -1466,6 +1486,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             phenotype_level=level,
             labeling_mode=labeling_mode,
             cfg_overrides=cfg_overrides,
+            llm_overrides=llm_overrides,
             notes_path=None,
             annotations_path=None,
             job_dir=job_dir,
@@ -1665,6 +1686,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             self.precompute_overrides_edit.setPlainText(cfg_text)
             self.inference_cfg_overrides.setPlainText(cfg_text)
         if llm_overrides:
+            self.precompute_llm_overrides.setPlainText(json.dumps(llm_overrides, indent=2))
             self.inference_llm_overrides.setPlainText(json.dumps(llm_overrides, indent=2))
         if ai_cfg:
             self._apply_ai_config_to_controls(ai_cfg)
@@ -1700,6 +1722,8 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             if isinstance(effective_cfg.get("llm"), Mapping)
             else {}
         )
+        if llm_cfg and not self.precompute_llm_overrides.toPlainText().strip():
+            self.precompute_llm_overrides.setPlainText(json.dumps(llm_cfg, indent=2))
         if llm_cfg and not self.inference_llm_overrides.toPlainText().strip():
             self.inference_llm_overrides.setPlainText(json.dumps(llm_cfg, indent=2))
 
