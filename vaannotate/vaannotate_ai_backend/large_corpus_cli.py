@@ -68,6 +68,7 @@ def create_prompt_precompute_job(
     notes_path: str | Path | None = None,
     annotations_path: str | Path | None = None,
     job_dir: str | Path | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> PromptPrecomputeJob:
     """Create and run a prompt precompute job."""
 
@@ -88,6 +89,7 @@ def create_prompt_precompute_job(
         annotations_path=Path(annotations_path) if annotations_path else None,
         job_dir=Path(job_dir) if job_dir else None,
         batch_size=batch_size,
+        env_overrides={str(k): str(v) for k, v in (env_overrides or {}).items() if str(v)},
     )
 
     run_prompt_precompute_job(job)

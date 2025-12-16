@@ -108,6 +108,7 @@ def validate_large_corpus_parity(
         annotations_path=ann_path,
         job_dir=base_dir / "prompt_job",
         batch_size=len(notes_df),
+        env_overrides=None,
     )
     run_prompt_precompute_job(prompt_job)
 
