@@ -43,6 +43,7 @@ class PromptPrecomputeJob:
     annotations_path: Path | None
     job_dir: Path | None
     batch_size: int = 128
+    env_overrides: dict[str, str] | None = None
 
 
 @dataclass
@@ -76,72 +77,89 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
     log = logging.getLogger(__name__)
     log.info("Starting prompt precompute job %s", job.job_id)
 
-    job_dir = job.job_dir or job.project_root / "admin_tools" / "prompt_jobs" / job.job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    (job_dir / "prompts_single").mkdir(parents=True, exist_ok=True)
-    (job_dir / "prompts_family").mkdir(parents=True, exist_ok=True)
-    (job_dir / "cache").mkdir(parents=True, exist_ok=True)
+    applied_env: dict[str, str] = {
+        str(key): str(value)
+        for key, value in (job.env_overrides or {}).items()
+        if str(value)
+    }
+    original_env: dict[str, str | None] = {}
+    for key, value in applied_env.items():
+        original_env[key] = os.environ.get(key)
+        os.environ[key] = value
 
-    if job.notes_path is not None and job.annotations_path is not None:
-        notes_path = job.notes_path
-        ann_path = job.annotations_path
-    else:
-        notes_df, ann_df = export_inputs_from_repo(job.project_root, job.pheno_id, [])
-        notes_df = notes_df.copy()
-        notes_df["unit_id"] = _infer_unit_id_column(notes_df, job.phenotype_level)
+    try:
+        job_dir = job.job_dir or job.project_root / "admin_tools" / "prompt_jobs" / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "prompts_single").mkdir(parents=True, exist_ok=True)
+        (job_dir / "prompts_family").mkdir(parents=True, exist_ok=True)
+        (job_dir / "cache").mkdir(parents=True, exist_ok=True)
 
-        notes_path = job_dir / "notes.parquet"
-        ann_path = job_dir / "annotations.parquet"
+        if job.notes_path is not None and job.annotations_path is not None:
+            notes_path = job.notes_path
+            ann_path = job.annotations_path
+        else:
+            notes_df, ann_df = export_inputs_from_repo(job.project_root, job.pheno_id, [])
+            notes_df = notes_df.copy()
+            notes_df["unit_id"] = _infer_unit_id_column(notes_df, job.phenotype_level)
 
-        notes_df.to_parquet(notes_path)
-        ann_df.to_parquet(ann_path)
+            notes_path = job_dir / "notes.parquet"
+            ann_path = job_dir / "annotations.parquet"
 
-    cfg = OrchestratorConfig()
-    overrides = _normalize_local_model_overrides(job.cfg_overrides or {})
-    if overrides:
-        _apply_overrides(cfg, dict(overrides))
+            notes_df.to_parquet(notes_path)
+            ann_df.to_parquet(ann_path)
 
-    session_paths = Paths(
-        notes_path=str(notes_path),
-        annotations_path=str(ann_path),
-        outdir=str(job_dir / "_session"),
-        cache_dir_override=str(job_dir / "cache"),
-    )
-    session = BackendSession.from_env(session_paths, cfg)
+        cfg = OrchestratorConfig()
+        overrides = _normalize_local_model_overrides(job.cfg_overrides or {})
+        if overrides:
+            _apply_overrides(cfg, dict(overrides))
 
-    label_config_bundle = _load_label_config_bundle(
-        job.project_root,
-        job.pheno_id,
-        job.labelset_id,
-        [],
-        overrides=overrides.get("label_config") if isinstance(overrides, dict) else None,
-    )
+        session_paths = Paths(
+            notes_path=str(notes_path),
+            annotations_path=str(ann_path),
+            outdir=str(job_dir / "_session"),
+            cache_dir_override=str(job_dir / "cache"),
+        )
+        session = BackendSession.from_env(session_paths, cfg)
 
-    manifest_path = job_dir / "job_manifest.json"
-    manifest = read_manifest(manifest_path)
-    if not manifest:
-        manifest = {
-            "job_id": job.job_id,
-            "pheno_id": job.pheno_id,
-            "labelset_id": job.labelset_id,
-            "phenotype_level": job.phenotype_level,
-            "labeling_mode": job.labeling_mode,
-            "cfg_overrides": job.cfg_overrides,
-            "batch_size": job.batch_size,
-            "batches": [],
-        }
+        label_config_bundle = _load_label_config_bundle(
+            job.project_root,
+            job.pheno_id,
+            job.labelset_id,
+            [],
+            overrides=overrides.get("label_config") if isinstance(overrides, dict) else None,
+        )
 
-    repo_notes = notes_df if job.notes_path is None else read_table(str(notes_path))
-    manifest = _initialize_and_update_batches_for_prompt_precompute(manifest, job, repo_notes)
-    manifest = _run_prompt_precompute_batches(
-        manifest,
-        job,
-        cfg,
-        session,
-        label_config_bundle,
-    )
+        manifest_path = job_dir / "job_manifest.json"
+        manifest = read_manifest(manifest_path)
+        if not manifest:
+            manifest = {
+                "job_id": job.job_id,
+                "pheno_id": job.pheno_id,
+                "labelset_id": job.labelset_id,
+                "phenotype_level": job.phenotype_level,
+                "labeling_mode": job.labeling_mode,
+                "cfg_overrides": job.cfg_overrides,
+                "batch_size": job.batch_size,
+                "batches": [],
+            }
 
-    write_manifest_atomic(manifest_path, manifest)
+        repo_notes = notes_df if job.notes_path is None else read_table(str(notes_path))
+        manifest = _initialize_and_update_batches_for_prompt_precompute(manifest, job, repo_notes)
+        manifest = _run_prompt_precompute_batches(
+            manifest,
+            job,
+            cfg,
+            session,
+            label_config_bundle,
+        )
+
+        write_manifest_atomic(manifest_path, manifest)
+    finally:
+        for key, value in applied_env.items():
+            if key in original_env and original_env[key] is not None:
+                os.environ[key] = original_env[key] or ""
+            elif key in os.environ:
+                os.environ.pop(key, None)
 
 
 def _initialize_and_update_batches_for_prompt_precompute(
