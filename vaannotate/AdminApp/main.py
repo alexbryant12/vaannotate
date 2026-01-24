@@ -7596,31 +7596,31 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     "enabled": True,
                     "top_snippets": assisted_top_n,
                 }
-                if corpus_record:
-                    config_payload["corpus_name"] = corpus_record["name"]
-                    config_payload["corpus_path"] = corpus_record["relative_path"]
-                if sampling_metadata:
-                    config_payload["sampling"] = sampling_metadata
-                if filters.metadata_filters:
-                    metadata_payload: Dict[str, object] = {
-                        "conditions": [
-                            condition.to_payload() for condition in filters.metadata_filters
-                        ]
-                    }
-                    metadata_payload["logic"] = "any" if filters.match_any else "all"
-                    config_payload["filters"] = {"metadata": metadata_payload}
-                if strat_field_keys:
-                    config_payload["stratification"] = {
-                        "fields": strat_field_keys,
-                        "labels": [
-                            self._metadata_lookup[key].label
-                            for key in strat_field_keys
-                            if key in self._metadata_lookup
-                        ],
-                        "aliases": strat_aliases,
-                    }
-                if label_schema:
-                    config_payload["label_schema"] = label_schema
+            if corpus_record:
+                config_payload["corpus_name"] = corpus_record["name"]
+                config_payload["corpus_path"] = corpus_record["relative_path"]
+            if sampling_metadata:
+                config_payload["sampling"] = sampling_metadata
+            if filters.metadata_filters:
+                metadata_payload: Dict[str, object] = {
+                    "conditions": [
+                        condition.to_payload() for condition in filters.metadata_filters
+                    ]
+                }
+                metadata_payload["logic"] = "any" if filters.match_any else "all"
+                config_payload["filters"] = {"metadata": metadata_payload}
+            if strat_field_keys:
+                config_payload["stratification"] = {
+                    "fields": strat_field_keys,
+                    "labels": [
+                        self._metadata_lookup[key].label
+                        for key in strat_field_keys
+                        if key in self._metadata_lookup
+                    ],
+                    "aliases": strat_aliases,
+                }
+            if label_schema:
+                config_payload["label_schema"] = label_schema
             config = models.RoundConfig(
                 round_id=round_id,
                 config_json=json.dumps(config_payload, indent=2),
