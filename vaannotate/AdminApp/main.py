@@ -7630,8 +7630,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 reviewer_record = models.Reviewer(
                     reviewer_id=reviewer["id"],
                     name=reviewer.get("name", reviewer["id"]),
-                    email=reviewer.get("email", ""),
-                    windows_account=None,
+                    email=reviewer.get("email") or "",
+                    windows_account=reviewer.get("windows_account") or None,
                 )
                 reviewer_record.save(conn)
             for reviewer in reviewers:
