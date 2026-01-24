@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Set
 
-from .project import build_label_config, fetch_labelset
+from .project import build_label_config, fetch_labelset, register_reviewer
 from .schema import initialize_assignment_db, initialize_round_aggregate_db
 from .shared.metadata import (
     MetadataFilterCondition,
@@ -411,6 +411,22 @@ class RoundBuilder:
                 if csv_override:
                     config["preselected_units_csv"] = str(csv_override)
                 config["status"] = status
+                for reviewer in config["reviewers"]:
+                    reviewer_id = str(
+                        reviewer.get("id") or reviewer.get("reviewer_id") or ""
+                    ).strip()
+                    if not reviewer_id:
+                        continue
+                    name = str(reviewer.get("name") or reviewer_id).strip()
+                    email = reviewer.get("email")
+                    windows_account = reviewer.get("windows_account")
+                    register_reviewer(
+                        project_conn,
+                        reviewer_id,
+                        name,
+                        email=email,
+                        windows_account=windows_account,
+                    )
     
                 manifest_path = round_dir / "manifest.csv"
                 with manifest_path.open("w", encoding="utf-8", newline="") as fh:
