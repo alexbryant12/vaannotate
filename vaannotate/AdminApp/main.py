@@ -7621,30 +7621,30 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     }
                 if label_schema:
                     config_payload["label_schema"] = label_schema
-                config = models.RoundConfig(
-                    round_id=round_id,
-                    config_json=json.dumps(config_payload, indent=2),
+            config = models.RoundConfig(
+                round_id=round_id,
+                config_json=json.dumps(config_payload, indent=2),
+            )
+            config.save(conn)
+            for reviewer in reviewers:
+                reviewer_record = models.Reviewer(
+                    reviewer_id=reviewer["id"],
+                    name=reviewer.get("name", reviewer["id"]),
+                    email=reviewer.get("email", ""),
+                    windows_account=None,
                 )
-                config.save(conn)
-                for reviewer in reviewers:
-                    reviewer_record = models.Reviewer(
-                        reviewer_id=reviewer["id"],
-                        name=reviewer.get("name", reviewer["id"]),
-                        email=reviewer.get("email", ""),
-                        windows_account=None,
-                    )
-                    reviewer_record.save(conn)
-                for reviewer in reviewers:
-                    assignment = models.Assignment(
-                        assign_id=str(uuid.uuid4()),
-                        round_id=round_id,
-                        reviewer_id=reviewer["id"],
-                        sample_size=len(assignments[reviewer["id"]].units),
-                        overlap_n=overlap,
-                        created_at=round_record.created_at,
-                        status="open",
-                    )
-                    assignment.save(conn)
+                reviewer_record.save(conn)
+            for reviewer in reviewers:
+                assignment = models.Assignment(
+                    assign_id=str(uuid.uuid4()),
+                    round_id=round_id,
+                    reviewer_id=reviewer["id"],
+                    sample_size=len(assignments[reviewer["id"]].units),
+                    overlap_n=overlap,
+                    created_at=round_record.created_at,
+                    status="open",
+                )
+                assignment.save(conn)
         ctx.register_text_file(round_dir / "round_config.json", json.dumps(config_payload, indent=2))
         if label_schema is None:
             label_schema = self._build_label_schema(labelset_id, db)
