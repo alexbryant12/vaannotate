@@ -1199,6 +1199,10 @@ class _LargeCorpusJobWorker(QtCore.QObject):
 
 
 class LargeCorpusJobDialog(QtWidgets.QDialog):
+    _PRECOMPUTE_SOURCE_PROJECT_CORPUS = "project_corpus"
+    _PRECOMPUTE_SOURCE_EXTERNAL_DATASET = "external_dataset"
+    _PRECOMPUTE_SOURCE_EXPORTED_TABLES = "exported_tables"
+
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget],
@@ -1213,6 +1217,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         self._default_inference_id = self._build_default_job_id("inference")
         self._running_workers: list[tuple[QtCore.QThread, _LargeCorpusJobWorker, AIRoundLogDialog]] = []
         self._rounds = self._load_rounds()
+        self._precompute_corpus_path: str | None = None
         self._setup_ui()
 
     def _build_default_job_id(self, suffix: str) -> str:
@@ -1261,6 +1266,19 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         self.precompute_batch_spin.setValue(128)
         form.addRow("Batch size", self.precompute_batch_spin)
 
+        self.precompute_source_combo = QtWidgets.QComboBox()
+        self.precompute_source_combo.addItem("Project corpus", self._PRECOMPUTE_SOURCE_PROJECT_CORPUS)
+        self.precompute_source_combo.addItem("External dataset file", self._PRECOMPUTE_SOURCE_EXTERNAL_DATASET)
+        self.precompute_source_combo.addItem("Pre-exported notes/annotations", self._PRECOMPUTE_SOURCE_EXPORTED_TABLES)
+        self.precompute_source_combo.currentIndexChanged.connect(self._on_precompute_source_changed)
+        form.addRow("Input source", self.precompute_source_combo)
+
+        self.precompute_source_stack = QtWidgets.QStackedWidget()
+        self.precompute_source_stack.addWidget(self._build_precompute_project_corpus_source())
+        self.precompute_source_stack.addWidget(self._build_precompute_external_dataset_source())
+        self.precompute_source_stack.addWidget(self._build_precompute_exported_tables_source())
+        form.addRow("Source details", self.precompute_source_stack)
+
         prompt_dir_placeholder = str(self._default_prompt_dir(self._default_precompute_id))
         precompute_dir_row, self.precompute_dir_edit = self._path_selector(prompt_dir_placeholder)
         form.addRow("Prompt job directory", precompute_dir_row)
@@ -1286,6 +1304,65 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         note_label.setWordWrap(True)
         form.addRow(note_label)
 
+        return widget
+
+    def _build_precompute_project_corpus_source(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(widget)
+
+        corpus_row = QtWidgets.QHBoxLayout()
+        self.precompute_corpus_combo = QtWidgets.QComboBox()
+        self._populate_precompute_corpus_combo()
+        corpus_row.addWidget(self.precompute_corpus_combo)
+        browse_button = QtWidgets.QPushButton("Browse DB…")
+        browse_button.clicked.connect(self._browse_precompute_corpus_path)
+        corpus_row.addWidget(browse_button)
+        form.addRow("Corpus", corpus_row)
+
+        self.precompute_corpus_path_label = QtWidgets.QLabel("Using selected project corpus")
+        self.precompute_corpus_path_label.setWordWrap(True)
+        form.addRow("External DB override", self.precompute_corpus_path_label)
+        return widget
+
+    def _build_precompute_external_dataset_source(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(widget)
+        dataset_row, self.precompute_dataset_path_edit = self._file_selector(
+            "Select external dataset file",
+            "Dataset files (*.parquet *.pq *.csv *.tsv *.json *.jsonl *.db *.sqlite *.sqlite3);;All files (*)",
+        )
+        form.addRow("Dataset path", dataset_row)
+        self.precompute_dataset_columns_edit = QtWidgets.QPlainTextEdit()
+        self.precompute_dataset_columns_edit.setPlaceholderText(
+            'Optional JSON column map, e.g. {"text": "note_text", "doc_id": "document_id"}'
+        )
+        form.addRow("Column mapping", self.precompute_dataset_columns_edit)
+        help_label = QtWidgets.QLabel(
+            "The dataset must provide a text column, either directly or via the column mapping. "
+            "For single_doc jobs, doc_id is also required."
+        )
+        help_label.setWordWrap(True)
+        form.addRow(help_label)
+        return widget
+
+    def _build_precompute_exported_tables_source(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(widget)
+        notes_row, self.precompute_notes_path_edit = self._file_selector(
+            "Select notes table",
+            "Table files (*.parquet *.pq *.csv *.tsv);;All files (*)",
+        )
+        form.addRow("Notes path", notes_row)
+        ann_row, self.precompute_annotations_path_edit = self._file_selector(
+            "Select annotations table",
+            "Table files (*.parquet *.pq *.csv *.tsv);;All files (*)",
+        )
+        form.addRow("Annotations path", ann_row)
+        help_label = QtWidgets.QLabel(
+            "Use this when you already have exported notes and optional prior annotations prepared outside the project corpus."
+        )
+        help_label.setWordWrap(True)
+        form.addRow(help_label)
         return widget
 
     def _build_inference_tab(self) -> QtWidgets.QWidget:
@@ -1365,6 +1442,27 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         layout.addWidget(browse_button)
         return container, line_edit
 
+    def _file_selector(
+        self,
+        title: str,
+        file_filter: str,
+        *,
+        placeholder: str = "",
+    ) -> tuple[QtWidgets.QWidget, QtWidgets.QLineEdit]:
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        line_edit = QtWidgets.QLineEdit()
+        if placeholder:
+            line_edit.setPlaceholderText(placeholder)
+        browse_button = QtWidgets.QPushButton("Browse…")
+        browse_button.clicked.connect(
+            lambda: self._browse_for_file(line_edit, title, file_filter)
+        )
+        layout.addWidget(line_edit)
+        layout.addWidget(browse_button)
+        return container, line_edit
+
     def _browse_for_dir(self, line_edit: QtWidgets.QLineEdit) -> None:
         start_dir = line_edit.text().strip() or str(self.project_root)
         directory = QtWidgets.QFileDialog.getExistingDirectory(
@@ -1374,6 +1472,58 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         )
         if directory:
             line_edit.setText(directory)
+
+    def _browse_for_file(
+        self,
+        line_edit: QtWidgets.QLineEdit,
+        title: str,
+        file_filter: str,
+    ) -> None:
+        start_dir = line_edit.text().strip() or str(self.project_root)
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            title,
+            start_dir,
+            file_filter,
+        )
+        if path_str:
+            line_edit.setText(path_str)
+
+    def _populate_precompute_corpus_combo(self) -> None:
+        self.precompute_corpus_combo.clear()
+        corpora = self.ctx.list_corpora()
+        if not corpora:
+            self.precompute_corpus_combo.addItem("Select corpus…", None)
+            self.precompute_corpus_combo.setEnabled(False)
+            return
+        self.precompute_corpus_combo.setEnabled(True)
+        for corpus in corpora:
+            corpus_id = str(corpus.get("corpus_id") or "")
+            name = str(corpus.get("name") or corpus_id)
+            self.precompute_corpus_combo.addItem(f"{name} ({corpus_id})", corpus_id)
+        self.precompute_corpus_combo.setCurrentIndex(0)
+
+    def _browse_precompute_corpus_path(self) -> None:
+        start_dir = str(self.project_root)
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select corpus database",
+            start_dir,
+            "SQLite databases (*.db *.sqlite *.sqlite3);;All files (*)",
+        )
+        if path_str:
+            self._precompute_corpus_path = path_str
+            if hasattr(self, "precompute_corpus_path_label"):
+                self.precompute_corpus_path_label.setText(path_str)
+
+    def _on_precompute_source_changed(self) -> None:
+        source = self.precompute_source_combo.currentData()
+        if source == self._PRECOMPUTE_SOURCE_EXTERNAL_DATASET:
+            self.precompute_source_stack.setCurrentIndex(1)
+        elif source == self._PRECOMPUTE_SOURCE_EXPORTED_TABLES:
+            self.precompute_source_stack.setCurrentIndex(2)
+        else:
+            self.precompute_source_stack.setCurrentIndex(0)
 
     def _default_prompt_dir(self, job_id: str) -> Path:
         return self.project_root / "admin_tools" / "prompt_jobs" / job_id
@@ -1430,6 +1580,10 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         manifest_labelset: str | None = None
         manifest_mode: str | None = None
         manifest_batch: int | None = None
+        manifest_corpus_id: str | None = None
+        manifest_corpus_path: str | None = None
+        manifest_dataset_path: str | None = None
+        manifest_dataset_columns: dict[str, str] = {}
         manifest = read_manifest(job_dir / "job_manifest.json")
         if isinstance(manifest, Mapping):
             manifest_overrides = (
@@ -1451,6 +1605,28 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
                 manifest_batch = int(manifest_batch_raw) if manifest_batch_raw is not None else None
             except Exception:  # noqa: BLE001
                 manifest_batch = None
+            manifest_corpus_raw = manifest.get("corpus_id")
+            manifest_corpus_id = str(manifest_corpus_raw) if manifest_corpus_raw is not None else None
+            manifest_corpus_path_raw = manifest.get("corpus_path")
+            manifest_corpus_path = (
+                str(manifest_corpus_path_raw)
+                if manifest_corpus_path_raw is not None
+                else None
+            )
+            manifest_dataset_path_raw = manifest.get("dataset_path")
+            manifest_dataset_path = (
+                str(manifest_dataset_path_raw)
+                if manifest_dataset_path_raw is not None
+                else None
+            )
+            manifest_dataset_columns = (
+                {
+                    str(key): str(value)
+                    for key, value in manifest.get("dataset_column_map", {}).items()
+                }
+                if isinstance(manifest.get("dataset_column_map"), Mapping)
+                else {}
+            )
 
         if not cfg_overrides and manifest_overrides:
             cfg_overrides = manifest_overrides
@@ -1477,6 +1653,71 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         level = str(self.pheno_row.get("level") or "single_doc")
         labeling_mode = manifest_mode or str(self.precompute_mode_combo.currentText())
         batch_size = manifest_batch or int(self.precompute_batch_spin.value()) or 1
+        source_type = self.precompute_source_combo.currentData()
+        corpus_id: str | None = None
+        corpus_path: Path | None = None
+        notes_path: Path | None = None
+        annotations_path: Path | None = None
+        dataset_path: Path | None = None
+        dataset_column_map: dict[str, str] | None = None
+
+        if manifest_dataset_path and not self.precompute_dataset_path_edit.text().strip():
+            self.precompute_dataset_path_edit.setText(manifest_dataset_path)
+        if manifest_dataset_columns and not self.precompute_dataset_columns_edit.toPlainText().strip():
+            self.precompute_dataset_columns_edit.setPlainText(
+                json.dumps(manifest_dataset_columns, indent=2)
+            )
+        if manifest_corpus_path and not self._precompute_corpus_path:
+            self._precompute_corpus_path = manifest_corpus_path
+            self.precompute_corpus_path_label.setText(manifest_corpus_path)
+        if manifest_corpus_id:
+            idx = self.precompute_corpus_combo.findData(manifest_corpus_id)
+            if idx >= 0:
+                self.precompute_corpus_combo.setCurrentIndex(idx)
+
+        if source_type == self._PRECOMPUTE_SOURCE_EXTERNAL_DATASET:
+            dataset_path_text = self.precompute_dataset_path_edit.text().strip() or manifest_dataset_path or ""
+            if not dataset_path_text:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Large corpus inference",
+                    "Please choose an external dataset file for prompt precompute.",
+                )
+                return None
+            dataset_columns = self._parse_json_overrides(
+                self.precompute_dataset_columns_edit,
+                "dataset column mapping",
+            )
+            if dataset_columns is None:
+                return None
+            dataset_path = Path(dataset_path_text)
+            dataset_column_map = {str(key): str(value) for key, value in (dataset_columns or {}).items()}
+        elif source_type == self._PRECOMPUTE_SOURCE_EXPORTED_TABLES:
+            notes_path_text = self.precompute_notes_path_edit.text().strip()
+            annotations_path_text = self.precompute_annotations_path_edit.text().strip()
+            if not notes_path_text:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Large corpus inference",
+                    "Please choose a notes table for prompt precompute.",
+                )
+                return None
+            notes_path = Path(notes_path_text)
+            annotations_path = Path(annotations_path_text) if annotations_path_text else None
+        else:
+            corpus_id_data = self.precompute_corpus_combo.currentData()
+            corpus_id = str(corpus_id_data) if corpus_id_data else None
+            if manifest_corpus_id and not corpus_id:
+                corpus_id = manifest_corpus_id
+            corpus_path_text = self._precompute_corpus_path or manifest_corpus_path or ""
+            corpus_path = Path(corpus_path_text) if corpus_path_text else None
+            if not corpus_id and corpus_path is None:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Large corpus inference",
+                    "Please select a project corpus or browse to a corpus database.",
+                )
+                return None
 
         return PromptPrecomputeJob(
             job_id=job_id,
@@ -1487,8 +1728,12 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             labeling_mode=labeling_mode,
             cfg_overrides=cfg_overrides,
             llm_overrides=llm_overrides,
-            notes_path=None,
-            annotations_path=None,
+            corpus_id=corpus_id,
+            corpus_path=corpus_path,
+            notes_path=notes_path,
+            annotations_path=annotations_path,
+            dataset_path=dataset_path,
+            dataset_column_map=dataset_column_map,
             job_dir=job_dir,
             batch_size=batch_size,
         )
@@ -1808,6 +2053,51 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
                 if level and isinstance(level, str):
                     self.pheno_row = dict(self.pheno_row)
                     self.pheno_row["level"] = level
+                dataset_path = prompt_manifest.get("dataset_path")
+                notes_path = prompt_manifest.get("notes_path")
+                annotations_path = prompt_manifest.get("annotations_path")
+                corpus_id = prompt_manifest.get("corpus_id")
+                corpus_path = prompt_manifest.get("corpus_path")
+                dataset_columns = (
+                    prompt_manifest.get("dataset_column_map")
+                    if isinstance(prompt_manifest.get("dataset_column_map"), Mapping)
+                    else {}
+                )
+                if dataset_path:
+                    idx = self.precompute_source_combo.findData(
+                        self._PRECOMPUTE_SOURCE_EXTERNAL_DATASET
+                    )
+                    if idx >= 0:
+                        self.precompute_source_combo.setCurrentIndex(idx)
+                    if not self.precompute_dataset_path_edit.text().strip():
+                        self.precompute_dataset_path_edit.setText(str(dataset_path))
+                    if dataset_columns and not self.precompute_dataset_columns_edit.toPlainText().strip():
+                        self.precompute_dataset_columns_edit.setPlainText(
+                            json.dumps(dataset_columns, indent=2)
+                        )
+                elif notes_path:
+                    idx = self.precompute_source_combo.findData(
+                        self._PRECOMPUTE_SOURCE_EXPORTED_TABLES
+                    )
+                    if idx >= 0:
+                        self.precompute_source_combo.setCurrentIndex(idx)
+                    if not self.precompute_notes_path_edit.text().strip():
+                        self.precompute_notes_path_edit.setText(str(notes_path))
+                    if annotations_path and not self.precompute_annotations_path_edit.text().strip():
+                        self.precompute_annotations_path_edit.setText(str(annotations_path))
+                else:
+                    idx = self.precompute_source_combo.findData(
+                        self._PRECOMPUTE_SOURCE_PROJECT_CORPUS
+                    )
+                    if idx >= 0:
+                        self.precompute_source_combo.setCurrentIndex(idx)
+                    if corpus_id:
+                        corpus_idx = self.precompute_corpus_combo.findData(str(corpus_id))
+                        if corpus_idx >= 0:
+                            self.precompute_corpus_combo.setCurrentIndex(corpus_idx)
+                    if corpus_path and not self._precompute_corpus_path:
+                        self._precompute_corpus_path = str(corpus_path)
+                        self.precompute_corpus_path_label.setText(str(corpus_path))
 
         job_id = self.inference_job_id_edit.text().strip() or self._default_inference_id
         inference_dir_text = self.inference_job_dir_edit.text().strip()

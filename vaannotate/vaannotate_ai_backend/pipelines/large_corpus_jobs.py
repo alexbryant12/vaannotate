@@ -40,6 +40,8 @@ class PromptPrecomputeJob:
     labeling_mode: str  # "family" | "single_prompt"
     cfg_overrides: dict[str, Any]
     llm_overrides: dict[str, Any] | None = None
+    corpus_id: str | None = None
+    corpus_path: Path | None = None
     notes_path: Path | None = None
     annotations_path: Path | None = None
     dataset_path: Path | None = None
@@ -193,7 +195,13 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
             notes_df.to_parquet(notes_path, index=False)
             _empty_annotations_frame().to_parquet(ann_path, index=False)
         else:
-            notes_df, ann_df = export_inputs_from_repo(job.project_root, job.pheno_id, [])
+            notes_df, ann_df = export_inputs_from_repo(
+                job.project_root,
+                job.pheno_id,
+                [],
+                corpus_id=job.corpus_id,
+                corpus_path=str(job.corpus_path) if job.corpus_path else None,
+            )
             notes_df = notes_df.copy()
             notes_df["unit_id"] = _infer_unit_id_column(notes_df, job.phenotype_level)
 
@@ -239,6 +247,10 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
                 "labeling_mode": job.labeling_mode,
                 "cfg_overrides": job.cfg_overrides,
                 "llm_overrides": job.llm_overrides or {},
+                "corpus_id": job.corpus_id,
+                "corpus_path": str(job.corpus_path) if job.corpus_path else None,
+                "notes_path": str(job.notes_path) if job.notes_path else None,
+                "annotations_path": str(job.annotations_path) if job.annotations_path else None,
                 "batch_size": job.batch_size,
                 "dataset_path": str(job.dataset_path) if job.dataset_path else None,
                 "dataset_column_map": job.dataset_column_map or {},
@@ -247,6 +259,22 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
         elif isinstance(manifest, dict):
             manifest["cfg_overrides"] = job.cfg_overrides
             manifest["llm_overrides"] = job.llm_overrides or {}
+            manifest["corpus_id"] = job.corpus_id if job.corpus_id else manifest.get("corpus_id")
+            manifest["corpus_path"] = (
+                str(job.corpus_path)
+                if job.corpus_path
+                else manifest.get("corpus_path")
+            )
+            manifest["notes_path"] = (
+                str(job.notes_path)
+                if job.notes_path
+                else manifest.get("notes_path")
+            )
+            manifest["annotations_path"] = (
+                str(job.annotations_path)
+                if job.annotations_path
+                else manifest.get("annotations_path")
+            )
             manifest["dataset_path"] = str(job.dataset_path) if job.dataset_path else manifest.get("dataset_path")
             manifest["dataset_column_map"] = job.dataset_column_map or manifest.get("dataset_column_map") or {}
 
