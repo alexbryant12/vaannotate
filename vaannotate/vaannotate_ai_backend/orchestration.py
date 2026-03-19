@@ -36,6 +36,7 @@ def _build_shared_components(
     phenotype_level: str | None = None,
     *,
     include_pooler: bool = False,
+    include_llm: bool = True,
     models: Models | None = None,
     store: EmbeddingStore | None = None,
 ):
@@ -101,15 +102,17 @@ def _build_shared_components(
     except Exception:
         pass
 
-    backend = build_llm_backend(cfg.llm)
-    llm_labeler = LLMLabeler(
-        backend,
-        label_config_bundle,
-        cfg.llm,
-        sc_cfg=cfg.scjitter,
-        cache_dir=paths.cache_dir,
-    )
-    llm_labeler.label_config = label_config_bundle.current or {}
+    llm_labeler = None
+    if include_llm:
+        backend = build_llm_backend(cfg.llm)
+        llm_labeler = LLMLabeler(
+            backend,
+            label_config_bundle,
+            cfg.llm,
+            sc_cfg=cfg.scjitter,
+            cache_dir=paths.cache_dir,
+        )
+        llm_labeler.label_config = label_config_bundle.current or {}
 
     pooler = None
     if include_pooler:

@@ -1172,6 +1172,7 @@ class _LargeCorpusJobWorker(QtCore.QObject):
                 os.environ[key] = value
 
             if self.precompute_job is not None:
+                self.precompute_job.status_callback = self.log_message.emit
                 self.log_message.emit(
                     f"Starting prompt precompute job {self.precompute_job.job_id}…"
                 )

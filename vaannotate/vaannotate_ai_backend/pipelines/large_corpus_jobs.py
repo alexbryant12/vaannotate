@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -49,6 +50,7 @@ class PromptPrecomputeJob:
     job_dir: Path | None = None
     batch_size: int = 128
     env_overrides: dict[str, str] | None = None
+    status_callback: Callable[[str], None] | None = None
 
 
 @dataclass
@@ -134,6 +136,29 @@ def _ordered_label_ids(label_config: dict[str, Any], label_types: dict[str, str]
     return ordered
 
 
+def _emit_precompute_status(job: PromptPrecomputeJob, message: str) -> None:
+    logger = logging.getLogger(__name__)
+    logger.info(message)
+    if job.status_callback is not None:
+        try:
+            job.status_callback(message)
+        except Exception:
+            logger.debug("Prompt precompute status callback failed", exc_info=True)
+
+
+def _format_eta(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "ETA unknown"
+    rounded = int(round(seconds))
+    minutes, secs = divmod(rounded, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"ETA {hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"ETA {minutes}m {secs}s"
+    return f"ETA {secs}s"
+
+
 def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
     """
     Build RAG contexts and prompt tasks for a large unlabeled corpus.
@@ -148,8 +173,7 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
     - Updates the manifest using write_manifest_atomic.
     """
 
-    log = logging.getLogger(__name__)
-    log.info("Starting prompt precompute job %s", job.job_id)
+    _emit_precompute_status(job, f"Starting prompt precompute job {job.job_id}")
 
     applied_env: dict[str, str] = {
         str(key): str(value)
@@ -282,6 +306,17 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
         manifest = _initialize_and_update_batches_for_prompt_precompute(manifest, job, repo_notes)
         write_manifest_atomic(manifest_path, manifest)
 
+        completed_batches = sum(
+            1 for batch in manifest.get("batches", []) if batch.get("status") == "completed"
+        )
+        total_batches = len(manifest.get("batches", []))
+        total_units = sum(len(batch.get("unit_ids", []) or []) for batch in manifest.get("batches", []))
+        _emit_precompute_status(
+            job,
+            f"Prepared prompt precompute for {total_units} units across {total_batches} batches "
+            f"({completed_batches} already completed). Building retrieval index…",
+        )
+
         manifest = _run_prompt_precompute_batches(
             manifest,
             job,
@@ -345,8 +380,6 @@ def _run_prompt_precompute_batches(
     label_config_bundle: LabelConfigBundle,
     manifest_path: Path,
 ) -> dict:
-    log = logging.getLogger(__name__)
-
     job_dir = job.job_dir or job.project_root / "admin_tools" / "prompt_jobs" / job.job_id
 
     paths = Paths(
@@ -361,6 +394,7 @@ def _run_prompt_precompute_batches(
         cfg,
         label_config_bundle,
         phenotype_level=job.phenotype_level,
+        include_llm=False,
         models=session.models,
         store=session.store,
     )
@@ -368,7 +402,13 @@ def _run_prompt_precompute_batches(
     repo = components["repo"]
     store = components["store"]
     context_builder = components["context_builder"]
-    llm_labeler = components["llm_labeler"]
+    llm_labeler = LLMLabeler(
+        object(),
+        label_config_bundle,
+        cfg.llm,
+        sc_cfg=cfg.scjitter,
+        cache_dir=str(job_dir / "cache"),
+    )
 
     store.build_chunk_index(repo.notes, cfg.rag, cfg.index)
 
@@ -388,6 +428,19 @@ def _run_prompt_precompute_batches(
     label_ids = _ordered_label_ids(label_config, label_types)
 
     rag_fingerprint = store._compute_corpus_fingerprint(repo.notes, cfg.rag)
+    prompts_per_unit = max(1, len(label_ids)) if job.labeling_mode == "family" else 1
+    total_batches = len(manifest.get("batches", []))
+    total_prompts = sum(
+        len(batch.get("unit_ids", []) or []) * prompts_per_unit
+        for batch in manifest.get("batches", [])
+    )
+    completed_prompts = sum(
+        int(batch.get("n_tasks") or 0)
+        for batch in manifest.get("batches", [])
+        if batch.get("status") == "completed"
+    )
+    started_at = time.monotonic()
+    processed_this_run = 0
 
     for batch in manifest.get("batches", []):
         batch_id = batch.get("batch_id")
@@ -402,9 +455,18 @@ def _run_prompt_precompute_batches(
 
         unit_ids = [str(u) for u in batch.get("unit_ids", [])]
         tasks: list[SinglePromptTask | FamilyPromptTask] = []
+        remaining_before = max(total_prompts - completed_prompts, 0)
+        elapsed = max(time.monotonic() - started_at, 0.0)
+        rate = (processed_this_run / elapsed) if elapsed > 0 and processed_this_run > 0 else None
+        eta_before = (remaining_before / rate) if rate and rate > 0 else None
+        _emit_precompute_status(
+            job,
+            f"Precompute batch {int(batch_id) + 1}/{total_batches}: "
+            f"{completed_prompts:,} prompts done, {remaining_before:,} prompts to go, "
+            f"{_format_eta(eta_before)}.",
+        )
 
         if job.labeling_mode == "single_prompt":
-            log.info("Building single-prompt batch %s with %d units", batch_id, len(unit_ids))
             for unit_id in unit_ids:
                 ctx_snippets = context_builder.build_context_for_family(
                     unit_id,
@@ -451,7 +513,6 @@ def _run_prompt_precompute_batches(
             batch["path"] = str(out_path.relative_to(job_dir))
 
         elif job.labeling_mode == "family":
-            log.info("Building family-prompt batch %s with %d units", batch_id, len(unit_ids))
             ordered_labels = label_ids
 
             for unit_id in unit_ids:
@@ -500,13 +561,32 @@ def _run_prompt_precompute_batches(
             batch["path"] = str(out_path.relative_to(job_dir))
 
         else:
-            log.warning("Unknown labeling mode %s; skipping batch %s", job.labeling_mode, batch_id)
+            logging.getLogger(__name__).warning(
+                "Unknown labeling mode %s; skipping batch %s", job.labeling_mode, batch_id
+            )
             continue
 
         batch["status"] = "completed"
         batch["n_tasks"] = len(tasks)
+        completed_prompts += len(tasks)
+        processed_this_run += len(tasks)
 
         write_manifest_atomic(manifest_path, manifest)
+        remaining_after = max(total_prompts - completed_prompts, 0)
+        elapsed = max(time.monotonic() - started_at, 0.0)
+        rate = (processed_this_run / elapsed) if elapsed > 0 and processed_this_run > 0 else None
+        eta_after = (remaining_after / rate) if rate and rate > 0 else None
+        _emit_precompute_status(
+            job,
+            f"Completed batch {int(batch_id) + 1}/{total_batches}: "
+            f"{completed_prompts:,}/{total_prompts:,} prompts done, "
+            f"{remaining_after:,} prompts to go, {_format_eta(eta_after)}.",
+        )
+
+    _emit_precompute_status(
+        job,
+        f"Prompt precompute finished: {completed_prompts:,}/{total_prompts:,} prompts completed.",
+    )
 
     return manifest
 
