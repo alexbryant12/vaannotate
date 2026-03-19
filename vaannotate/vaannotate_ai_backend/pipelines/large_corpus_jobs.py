@@ -159,6 +159,15 @@ def _format_eta(seconds: float | None) -> str:
     return f"ETA {secs}s"
 
 
+def _prompt_precompute_requires_retrieval_index(
+    cfg: OrchestratorConfig,
+    phenotype_level: str,
+) -> bool:
+    level = str(phenotype_level or "").strip().lower()
+    context_mode = str(getattr(cfg.llmfirst, "single_doc_context", "rag") or "rag").strip().lower()
+    return not (level == "single_doc" and context_mode == "full")
+
+
 def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
     """
     Build RAG contexts and prompt tasks for a large unlabeled corpus.
@@ -311,11 +320,19 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
         )
         total_batches = len(manifest.get("batches", []))
         total_units = sum(len(batch.get("unit_ids", []) or []) for batch in manifest.get("batches", []))
-        _emit_precompute_status(
-            job,
-            f"Prepared prompt precompute for {total_units} units across {total_batches} batches "
-            f"({completed_batches} already completed). Building retrieval index…",
+        needs_retrieval_index = _prompt_precompute_requires_retrieval_index(
+            cfg,
+            job.phenotype_level,
         )
+        prep_message = (
+            f"Prepared prompt precompute for {total_units} units across {total_batches} batches "
+            f"({completed_batches} already completed). "
+        )
+        if needs_retrieval_index:
+            prep_message += "Building retrieval index…"
+        else:
+            prep_message += "Using full-document single-doc context; skipping retrieval index build."
+        _emit_precompute_status(job, prep_message)
 
         manifest = _run_prompt_precompute_batches(
             manifest,
@@ -410,7 +427,12 @@ def _run_prompt_precompute_batches(
         cache_dir=str(job_dir / "cache"),
     )
 
-    store.build_chunk_index(repo.notes, cfg.rag, cfg.index)
+    needs_retrieval_index = _prompt_precompute_requires_retrieval_index(
+        cfg,
+        job.phenotype_level,
+    )
+    if needs_retrieval_index:
+        store.build_chunk_index(repo.notes, cfg.rag, cfg.index)
 
     try:
         rules_map = label_config_bundle.current_rules_map(components.get("label_config"))
@@ -475,6 +497,8 @@ def _run_prompt_precompute_batches(
                     topk_per_label=cfg.rag.top_k_final,
                     max_snippets=None,
                     max_chars=getattr(cfg.llmfirst, "single_prompt_max_chars", None),
+                    single_doc_context_mode=getattr(cfg.llmfirst, "single_doc_context", "rag"),
+                    full_doc_char_limit=getattr(cfg.llmfirst, "single_doc_full_context_max_chars", None),
                 )
 
                 rules_subset = {lid: rules_map.get(lid, "") for lid in label_ids}
