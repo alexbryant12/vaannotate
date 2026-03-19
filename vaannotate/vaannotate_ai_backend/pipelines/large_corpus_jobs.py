@@ -42,6 +42,8 @@ class PromptPrecomputeJob:
     llm_overrides: dict[str, Any] | None = None
     notes_path: Path | None = None
     annotations_path: Path | None = None
+    dataset_path: Path | None = None
+    dataset_column_map: dict[str, str] | None = None
     job_dir: Path | None = None
     batch_size: int = 128
     env_overrides: dict[str, str] | None = None
@@ -59,6 +61,75 @@ class PromptInferenceJob:
     llm_overrides: dict[str, Any] | None
     job_dir: Path | None = None
     batch_limit: int | None = None
+
+
+def _empty_annotations_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "round_id",
+            "unit_id",
+            "doc_id",
+            "label_id",
+            "reviewer_id",
+            "label_value",
+            "label_value_num",
+            "label_value_date",
+            "labelset_id",
+            "document_text",
+            "rationales_json",
+            "document_metadata_json",
+            "label_rules",
+            "reviewer_notes",
+        ]
+    )
+
+
+def _prepare_notes_from_external_dataset(
+    dataset_path: Path,
+    phenotype_level: str,
+    dataset_column_map: dict[str, str] | None,
+) -> pd.DataFrame:
+    df = read_table(str(dataset_path)).copy()
+    colmap = {str(k): str(v) for k, v in (dataset_column_map or {}).items() if str(k) and str(v)}
+    rename_map = {src: dest for dest, src in colmap.items() if src in df.columns}
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    if "text" not in df.columns:
+        raise ValueError("External inference dataset must provide a 'text' column or map one via dataset_column_map.")
+
+    if "doc_id" not in df.columns:
+        if phenotype_level == "single_doc":
+            raise ValueError("single_doc prompt precompute requires a 'doc_id' column in the external dataset.")
+        df["doc_id"] = df["unit_id"].astype(str) if "unit_id" in df.columns else df.index.astype(str)
+
+    if "patient_icn" not in df.columns:
+        fallback = "unit_id" if "unit_id" in df.columns else "doc_id"
+        df["patient_icn"] = df[fallback].astype(str)
+
+    if "unit_id" not in df.columns:
+        df["unit_id"] = _infer_unit_id_column(df, phenotype_level)
+    else:
+        df["unit_id"] = df["unit_id"].astype(str)
+
+    df["doc_id"] = df["doc_id"].astype(str)
+    df["patient_icn"] = df["patient_icn"].astype(str)
+    df["text"] = df["text"].astype(str)
+    if "notetype" not in df.columns:
+        df["notetype"] = ""
+    return df
+
+
+def _ordered_label_ids(label_config: dict[str, Any], label_types: dict[str, str]) -> list[str]:
+    _parent_to_children, child_to_parents, roots = build_label_dependencies(label_config or {})
+    ordered = list(roots)
+    for lid in sorted(label_types.keys()):
+        if lid not in ordered:
+            ordered.append(lid)
+    for lid in sorted(child_to_parents.keys()):
+        if lid not in ordered:
+            ordered.append(lid)
+    return ordered
 
 
 def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
@@ -106,9 +177,21 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
             if not job.llm_overrides and isinstance(manifest_llm, dict):
                 job.llm_overrides = manifest_llm
 
-        if job.notes_path is not None and job.annotations_path is not None:
+        if job.notes_path is not None:
             notes_path = job.notes_path
-            ann_path = job.annotations_path
+            ann_path = job.annotations_path or (job_dir / "annotations.parquet")
+            if job.annotations_path is None:
+                _empty_annotations_frame().to_parquet(ann_path, index=False)
+        elif job.dataset_path is not None:
+            notes_df = _prepare_notes_from_external_dataset(
+                job.dataset_path,
+                job.phenotype_level,
+                job.dataset_column_map,
+            )
+            notes_path = job_dir / "notes.parquet"
+            ann_path = job_dir / "annotations.parquet"
+            notes_df.to_parquet(notes_path, index=False)
+            _empty_annotations_frame().to_parquet(ann_path, index=False)
         else:
             notes_df, ann_df = export_inputs_from_repo(job.project_root, job.pheno_id, [])
             notes_df = notes_df.copy()
@@ -157,13 +240,17 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
                 "cfg_overrides": job.cfg_overrides,
                 "llm_overrides": job.llm_overrides or {},
                 "batch_size": job.batch_size,
+                "dataset_path": str(job.dataset_path) if job.dataset_path else None,
+                "dataset_column_map": job.dataset_column_map or {},
                 "batches": [],
             }
         elif isinstance(manifest, dict):
             manifest["cfg_overrides"] = job.cfg_overrides
             manifest["llm_overrides"] = job.llm_overrides or {}
+            manifest["dataset_path"] = str(job.dataset_path) if job.dataset_path else manifest.get("dataset_path")
+            manifest["dataset_column_map"] = job.dataset_column_map or manifest.get("dataset_column_map") or {}
 
-        repo_notes = notes_df if job.notes_path is None else read_table(str(notes_path))
+        repo_notes = notes_df if (job.notes_path is None or job.dataset_path is not None) else read_table(str(notes_path))
         manifest = _initialize_and_update_batches_for_prompt_precompute(manifest, job, repo_notes)
         write_manifest_atomic(manifest_path, manifest)
 
@@ -253,6 +340,7 @@ def _run_prompt_precompute_batches(
     repo = components["repo"]
     store = components["store"]
     context_builder = components["context_builder"]
+    llm_labeler = components["llm_labeler"]
 
     store.build_chunk_index(repo.notes, cfg.rag, cfg.index)
 
@@ -268,7 +356,8 @@ def _run_prompt_precompute_batches(
 
     rules_map = rules_map or {}
     label_types = label_types or {}
-    label_ids = sorted(label_types.keys())
+    label_config = (label_config_bundle.current or {}).copy()
+    label_ids = _ordered_label_ids(label_config, label_types)
 
     rag_fingerprint = store._compute_corpus_fingerprint(repo.notes, cfg.rag)
 
@@ -311,10 +400,17 @@ def _run_prompt_precompute_batches(
                         rules_map=rules_subset,
                         label_types=label_type_subset,
                         rag_fingerprint=rag_fingerprint,
+                        prompt_payload=llm_labeler.build_multi_label_prompt_payload(
+                            label_ids=label_ids,
+                            label_types=label_type_subset,
+                            rules_map=rules_subset,
+                            ctx_snippets=ctx_snippets,
+                        ),
                         meta={
                             "pheno_id": job.pheno_id,
                             "labelset_id": job.labelset_id,
                             "phenotype_level": job.phenotype_level,
+                            "label_order": label_ids,
                         },
                     )
                 )
@@ -328,12 +424,7 @@ def _run_prompt_precompute_batches(
 
         elif job.labeling_mode == "family":
             log.info("Building family-prompt batch %s with %d units", batch_id, len(unit_ids))
-            label_config = label_config_bundle.current or {}
-            _parent_to_children, _child_to_parents, roots = build_label_dependencies(label_config)
-            ordered_labels = list(roots)
-            for lid in sorted(label_types.keys()):
-                if lid not in ordered_labels:
-                    ordered_labels.append(lid)
+            ordered_labels = label_ids
 
             for unit_id in unit_ids:
                 for label_id in ordered_labels:
@@ -353,10 +444,22 @@ def _run_prompt_precompute_batches(
                             label_rules=rules_map.get(label_id, ""),
                             ctx_snippets=ctx_snippets,
                             rag_fingerprint=rag_fingerprint,
+                            prompt_payload=llm_labeler.build_single_label_prompt_payload(
+                                label_id=label_id,
+                                label_type=label_types.get(label_id, ""),
+                                label_rules=rules_map.get(label_id, ""),
+                                snippets=ctx_snippets,
+                            ),
                             meta={
                                 "pheno_id": job.pheno_id,
                                 "labelset_id": job.labelset_id,
                                 "phenotype_level": job.phenotype_level,
+                                "label_order": ordered_labels,
+                                "gated_by": list((label_config.get(label_id, {}) or {}).get("gated_by", []))
+                                if isinstance((label_config.get(label_id, {}) or {}).get("gated_by", []), list)
+                                else ([str((label_config.get(label_id, {}) or {}).get("gated_by"))]
+                                      if (label_config.get(label_id, {}) or {}).get("gated_by")
+                                      else []),
                             },
                         )
                     )

@@ -264,3 +264,158 @@ def test_prompt_inference_resumes_with_manifest_overrides(monkeypatch, tmp_path:
     assert manifest and manifest.get("cfg_overrides") == inference_manifest["cfg_overrides"]
     assert manifest.get("llm_overrides") == inference_manifest["llm_overrides"]
 
+
+def test_prompt_precompute_external_dataset_family_generates_all_labels(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir(parents=True)
+    dataset_path = tmp_path / "notes.feather"
+    pd.DataFrame(
+        {
+            "person_id": ["p1"],
+            "note_id": ["d1"],
+            "note_text": ["Patient has diabetes documented in the chart."],
+        }
+    ).to_feather(dataset_path)
+
+    class DummyLabelBundle:
+        current = {
+            "root": {"type": "binary", "rule": "Root rule"},
+            "child": {"type": "binary", "rule": "Child rule", "gated_by": "root"},
+        }
+
+        @staticmethod
+        def current_rules_map(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {"root": "Root rule", "child": "Child rule"}
+
+        @staticmethod
+        def current_label_types(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {"root": "binary", "child": "binary"}
+
+    class DummyStore:
+        def build_chunk_index(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return None
+
+        def _compute_corpus_fingerprint(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return "fp-1"
+
+    class DummySession:
+        models = object()
+        store = DummyStore()
+
+    class DummyContextBuilder:
+        def build_context_for_label(self, unit_id, label_id, label_rules):  # type: ignore[no-untyped-def]
+            return [{"doc_id": unit_id, "chunk_id": label_id, "text": label_rules, "score": 1.0, "metadata": {}}]
+
+        def build_context_for_family(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return [{"doc_id": "d1", "chunk_id": "all", "text": "context", "score": 1.0, "metadata": {}}]
+
+    class DummyLLMLabeler:
+        def build_single_label_prompt_payload(self, **kwargs):  # type: ignore[no-untyped-def]
+            return {"prompt": {"system": kwargs["label_id"], "user": "ctx"}, "messages": [], "response_format": {}}
+
+        def build_multi_label_prompt_payload(self, **kwargs):  # type: ignore[no-untyped-def]
+            return {"prompt": {"system": ",".join(kwargs["label_ids"]), "user": "ctx"}, "messages": [], "response_format": {}}
+
+    def fake_backend_from_env(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return DummySession()
+
+    def fake_load_label_config_bundle(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return DummyLabelBundle()
+
+    def fake_build_shared_components(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        notes_df = pd.read_parquet(project_root / "admin_tools" / "prompt_jobs" / "job-ext" / "notes.parquet")
+        return {
+            "repo": type("R", (), {"notes": notes_df})(),
+            "store": DummyStore(),
+            "context_builder": DummyContextBuilder(),
+            "llm_labeler": DummyLLMLabeler(),
+        }
+
+    monkeypatch.setattr(jobs.BackendSession, "from_env", staticmethod(fake_backend_from_env))
+    monkeypatch.setattr(jobs, "_load_label_config_bundle", fake_load_label_config_bundle)
+    monkeypatch.setattr(jobs, "_build_shared_components", fake_build_shared_components)
+
+    job = jobs.PromptPrecomputeJob(
+        job_id="job-ext",
+        project_root=project_root,
+        pheno_id="p1",
+        labelset_id="ls",
+        phenotype_level="multi_doc",
+        labeling_mode="family",
+        cfg_overrides={},
+        dataset_path=dataset_path,
+        dataset_column_map={"patient_icn": "person_id", "doc_id": "note_id", "text": "note_text"},
+        batch_size=10,
+    )
+
+    jobs.run_prompt_precompute_job(job)
+
+    out_path = project_root / "admin_tools" / "prompt_jobs" / "job-ext" / "prompts_family" / "prompts_batch_00000.parquet"
+    df = pd.read_parquet(out_path)
+    assert set(df["label_id"]) == {"root", "child"}
+    assert "prompt_payload" in df.columns
+    assert (project_root / "admin_tools" / "prompt_jobs" / "job-ext" / "notes.parquet").exists()
+
+
+def test_prompt_precompute_single_prompt_stores_prompt_payload(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir(parents=True)
+    notes_df = pd.DataFrame({"unit_id": ["u1"], "patient_icn": ["p1"], "doc_id": ["d1"], "text": ["example"]})
+    ann_df = pd.DataFrame({"unit_id": ["u1"], "label": ["y"]})
+
+    class DummyStore:
+        def build_chunk_index(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return None
+
+        def _compute_corpus_fingerprint(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return "fp-2"
+
+    class DummySession:
+        models = object()
+        store = DummyStore()
+
+    class DummyBundle:
+        current = {"a": {"type": "binary", "rule": "Rule A"}, "b": {"type": "binary", "rule": "Rule B"}}
+
+        @staticmethod
+        def current_rules_map(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {"a": "Rule A", "b": "Rule B"}
+
+        @staticmethod
+        def current_label_types(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {"a": "binary", "b": "binary"}
+
+    class DummyContextBuilder:
+        def build_context_for_family(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return [{"doc_id": "d1", "chunk_id": "all", "text": "family ctx", "score": 1.0, "metadata": {}}]
+
+    class DummyLLMLabeler:
+        def build_multi_label_prompt_payload(self, **kwargs):  # type: ignore[no-untyped-def]
+            return {"prompt": {"system": "sys", "user": "ctx"}, "messages": [], "response_format": {}, "label_ids": kwargs["label_ids"]}
+
+    monkeypatch.setattr(jobs, "export_inputs_from_repo", lambda *_args, **_kwargs: (notes_df, ann_df))
+    monkeypatch.setattr(jobs.BackendSession, "from_env", staticmethod(lambda *_args, **_kwargs: DummySession()))
+    monkeypatch.setattr(jobs, "_load_label_config_bundle", lambda *_args, **_kwargs: DummyBundle())
+    monkeypatch.setattr(
+        jobs,
+        "_build_shared_components",
+        lambda *_args, **_kwargs: {"repo": type("R", (), {"notes": notes_df})(), "store": DummyStore(), "context_builder": DummyContextBuilder(), "llm_labeler": DummyLLMLabeler()},
+    )
+
+    job = jobs.PromptPrecomputeJob(
+        job_id="job-single",
+        project_root=project_root,
+        pheno_id="p1",
+        labelset_id="ls",
+        phenotype_level="multi_doc",
+        labeling_mode="single_prompt",
+        cfg_overrides={},
+        batch_size=10,
+    )
+
+    jobs.run_prompt_precompute_job(job)
+
+    out_path = project_root / "admin_tools" / "prompt_jobs" / "job-single" / "prompts_single" / "prompts_batch_00000.parquet"
+    df = pd.read_parquet(out_path)
+    assert "prompt_payload" in df.columns
+    assert "a" in str(df.iloc[0]["prompt_payload"])

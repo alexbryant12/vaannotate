@@ -148,6 +148,138 @@ class LLMLabeler:
             used += len(frag)
         return "\n\n".join(ctx)
 
+    def build_single_label_prompt_payload(
+        self,
+        *,
+        label_id: str,
+        label_type: str,
+        label_rules: str,
+        snippets: List[dict],
+        temperature: float | None = None,
+        system_suffix: str = "",
+    ) -> dict[str, Any]:
+        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
+        ordered_snippets = self._ordered_snippets(snippets)
+        ctx_text = self._build_context_text(ordered_snippets)
+        opts = _options_for_label(label_id, label_type, self.label_config)
+        lt_norm = (label_type or "").strip().lower()
+        categorical_types = self.CATEGORICAL_TYPES
+        use_options = bool(opts) and lt_norm in categorical_types
+        option_values = [str(opt) for opt in (opts or [])]
+        is_multi_select = lt_norm == "categorical_multi"
+        unknown_option_configured = any(_canon_str(o).lower() == "unknown" for o in option_values)
+
+        guideline_text = label_rules if label_rules else "(no additional guidelines)"
+        response_keys = "reasoning, prediction" if include_reasoning else "prediction"
+        system_segments: list[str] = [
+            "You are a meticulous clinical annotator for EHR data.",
+            f"Your task: label '{label_id}' (type: {label_type}). Use the evidence snippets from this patient's notes.",
+            f"Label rules:\n{guideline_text}",
+        ]
+        if use_options:
+            if is_multi_select:
+                system_segments.append("Select every option that is supported by the evidence from the list below.")
+                system_segments.append("Options:")
+                system_segments.extend(f"- {opt}" for opt in option_values)
+                deny_unknown = " Do NOT answer 'unknown' unless it appears in the options above." if not unknown_option_configured else ""
+                system_segments.append(
+                    "Return a compact JSON object where each included option key is set to 'Yes' if it applies (omit or set to 'No' when it does not)." + deny_unknown
+                )
+            else:
+                system_segments.append("Choose the single best option from the list below based on the evidence.")
+                system_segments.append("Options:")
+                system_segments.extend(f"- {opt}" for opt in option_values)
+                system_segments.append(
+                    f"Set prediction to exactly one of: {', '.join(option_values)}. Do not invent new options."
+                )
+        else:
+            system_segments.append("If insufficient evidence, reply with 'unknown'.")
+        if include_reasoning:
+            system_segments.append("Think step-by-step citing specific evidence, and keep the reasoning concise.")
+        system_segments.append(f"Return strict JSON only with keys: {response_keys}.")
+        system_segments.append("No additional keys or text.")
+
+        system = "\n\n".join(system_segments)
+        if system_suffix:
+            system = system + "\n" + str(system_suffix)
+        few_shot_msgs = self._few_shot_messages(label_id)
+        schema = {
+            "type": "object",
+            "properties": {"prediction": self._prediction_schema(label_type, option_values, categorical_types)},
+            "required": ["prediction"],
+            "additionalProperties": include_reasoning,
+        }
+        if include_reasoning:
+            schema["properties"]["reasoning"] = {"type": "string"}
+        return {
+            "messages": [{"role": "system", "content": system}, *few_shot_msgs, {"role": "user", "content": ctx_text}],
+            "prompt": {"system": system, "messages": few_shot_msgs, "user": ctx_text},
+            "response_format": {"type": "json_object", "json_schema": schema},
+            "params": {"temperature": self.cfg.temperature if temperature is None else temperature},
+        }
+
+    def build_multi_label_prompt_payload(
+        self,
+        *,
+        label_ids: list[str],
+        label_types: Mapping[str, str],
+        rules_map: Mapping[str, str],
+        ctx_snippets: list[dict],
+    ) -> dict[str, Any]:
+        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
+        ordered_snippets = self._ordered_snippets(ctx_snippets)
+        ctx_text = self._build_context_text(ordered_snippets)
+
+        label_summaries: list[str] = []
+        schema = {"type": "object", "properties": {}, "additionalProperties": False, "required": []}
+        for lid in label_ids:
+            ltype = label_types.get(lid, "categorical") if isinstance(label_types, Mapping) else "categorical"
+            rules = rules_map.get(lid, "") if isinstance(rules_map, Mapping) else ""
+            opts = _options_for_label(lid, ltype, self.label_config)
+            option_values = [str(o) for o in (opts or [])]
+            is_multi = (ltype or "").strip().lower() == "categorical_multi"
+            label_lines = [f"Label '{lid}' (type: {ltype})"]
+            if option_values:
+                label_lines.append("Options:")
+                label_lines.extend(f"- {opt}" for opt in option_values)
+            if rules:
+                label_lines.append(f"Guidelines:\n{rules}")
+            label_lines.append("If no evidence, respond with 'no' or 'unknown'.")
+            if is_multi:
+                label_lines.append("Select all supported options; omit unsupported ones.")
+                label_lines.append(
+                    "Set prediction to a JSON object with each selected option key set to 'Yes' (omit or set to 'No' when unsupported)."
+                )
+            label_summaries.append("\n".join(label_lines))
+            label_schema = {
+                "type": "object",
+                "properties": {"prediction": self._prediction_schema(ltype, option_values, self.CATEGORICAL_TYPES)},
+                "required": ["prediction"],
+                "additionalProperties": include_reasoning,
+            }
+            if include_reasoning:
+                label_schema["properties"]["reasoning"] = {"type": "string"}
+            schema["properties"][lid] = label_schema
+            schema["required"].append(lid)
+
+        system_prompt = "\n\n".join(
+            [
+                "You are a meticulous clinical annotator for EHR data.",
+                "Given the patient context, extract all requested labels in one pass.",
+                "Use 'no' or 'unknown' when evidence is missing or insufficient.",
+                "Each label must return JSON with keys: prediction (required) and reasoning (optional).",
+                "Label details:",
+                "\n\n".join(label_summaries),
+            ]
+        )
+        few_shot_msgs = self._few_shot_messages_for_labels(label_ids)
+        return {
+            "messages": [{"role": "system", "content": system_prompt}, *few_shot_msgs, {"role": "user", "content": ctx_text}],
+            "prompt": {"system": system_prompt, "messages": few_shot_msgs, "user": ctx_text},
+            "response_format": {"type": "json_object", "json_schema": schema},
+            "params": {"temperature": self.cfg.temperature},
+        }
+
     @staticmethod
     def _norm_token(x) -> str:
         if x is None:
@@ -416,10 +548,7 @@ class LLMLabeler:
         snippets = self._ordered_snippets(snippets)
 
         rng = random.Random()
-        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
-
         preds, runs = [], []
-        system_intro = "You are a meticulous clinical annotator for EHR data."
 
         for i in range(n_consistency):
             sc_meta = ""
@@ -437,69 +566,28 @@ class LLMLabeler:
                 t_lo, t_hi = temp_range
                 t = rng.uniform(float(t_lo), float(t_hi))
                 sc_meta = f"<!-- sc:vote={i};k={k};drop={drop_p:.2f};shuf={int(shuffle_context)};temp={t:.2f} -->"
-                ctx_text = self._build_context_text(cand)
                 temperature_this_vote = t
             else:
                 sc_meta = ""
-                ctx_text = self._build_context_text(snippets)
+                cand = list(snippets)
                 temperature_this_vote = self.cfg.temperature
 
+            prompt_payload = self.build_single_label_prompt_payload(
+                label_id=label_id,
+                label_type=label_type,
+                label_rules=label_rules,
+                snippets=cand,
+                temperature=temperature_this_vote,
+                system_suffix=sc_meta,
+            )
+            messages = prompt_payload["messages"]
+            schema = prompt_payload["response_format"]["json_schema"]
             opts = _options_for_label(label_id, label_type, self.label_config)
             lt_norm = (label_type or "").strip().lower()
             categorical_types = self.CATEGORICAL_TYPES
             use_options = bool(opts) and lt_norm in categorical_types
             option_values = [str(opt) for opt in (opts or [])]
             is_multi_select = lt_norm == "categorical_multi"
-            unknown_option_configured = any(_canon_str(o).lower() == "unknown" for o in option_values)
-
-            guideline_text = label_rules if label_rules else "(no additional guidelines)"
-            response_keys = "reasoning, prediction" if include_reasoning else "prediction"
-
-            system_segments: list[str] = [
-                system_intro,
-                f"Your task: label '{label_id}' (type: {label_type}). Use the evidence snippets from this patient's notes.",
-                f"Label rules:\n{guideline_text}",
-            ]
-            if use_options:
-                if is_multi_select:
-                    system_segments.append("Select every option that is supported by the evidence from the list below.")
-                    system_segments.append("Options:")
-                    system_segments.extend(f"- {opt}" for opt in option_values)
-                    deny_unknown = " Do NOT answer 'unknown' unless it appears in the options above." if not unknown_option_configured else ""
-                    system_segments.append(
-                        "Return a compact JSON object where each included option key is set to 'Yes' if it applies (omit or set to 'No' when it does not)." + deny_unknown
-                    )
-                else:
-                    system_segments.append("Choose the single best option from the list below based on the evidence.")
-                    system_segments.append("Options:")
-                    system_segments.extend(f"- {opt}" for opt in option_values)
-                    system_segments.append(
-                        f"Set prediction to exactly one of: {', '.join(option_values)}. Do not invent new options."
-                    )
-            else:
-                system_segments.append("If insufficient evidence, reply with 'unknown'.")
-
-            if include_reasoning:
-                system_segments.append(
-                    "Think step-by-step citing specific evidence, and keep the reasoning concise."
-                )
-            system_segments.append(f"Return strict JSON only with keys: {response_keys}.")
-            system_segments.append("No additional keys or text.")
-
-            system_body = "\n\n".join(system_segments)
-            system = system_body + ("\n" + sc_meta if sc_meta else "")
-
-            few_shot_msgs = self._few_shot_messages(label_id)
-            messages = ([{"role": "system", "content": system}] + few_shot_msgs + [{"role": "user", "content": ctx_text}])
-            prediction_schema = self._prediction_schema(label_type, option_values, categorical_types)
-            schema = {
-                "type": "object",
-                "properties": {"prediction": prediction_schema},
-                "required": ["prediction"],
-                "additionalProperties": include_reasoning,
-            }
-            if include_reasoning:
-                schema["properties"]["reasoning"] = {"type": "string"}
             try:
                 result = self.backend.json_call(
                     messages,
@@ -518,7 +606,7 @@ class LLMLabeler:
                         "unit_id": unit_id,
                         "label_id": label_id,
                         "label_type": label_type,
-                        "prompt": {"system": system, "messages": few_shot_msgs, "user": ctx_text},
+                        "prompt": prompt_payload["prompt"],
                         "params": {"temperature": temperature_this_vote},
                         "output": content,
                         "rag_diagnostics": rag_diagnostics or {},
@@ -537,7 +625,7 @@ class LLMLabeler:
                 obj = content if isinstance(content, Mapping) else None
 
             pred_raw = (obj or {}).get("prediction")
-            reasoning = (obj or {}).get("reasoning") if include_reasoning else None
+            reasoning = (obj or {}).get("reasoning") if bool(getattr(self.cfg, "include_reasoning", True)) else None
             pred_norm = None
             if use_options:
                 if is_multi_select:
@@ -626,65 +714,14 @@ class LLMLabeler:
             }
         """
 
-        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
-        ordered_snippets = self._ordered_snippets(ctx_snippets)
-        ctx_text = self._build_context_text(ordered_snippets)
-        categorical_types = self.CATEGORICAL_TYPES
-
-        label_summaries: list[str] = []
-        schema = {"type": "object", "properties": {}, "additionalProperties": False, "required": []}
-        for lid in label_ids:
-            ltype = label_types.get(lid, "categorical") if isinstance(label_types, Mapping) else "categorical"
-            rules = rules_map.get(lid, "") if isinstance(rules_map, Mapping) else ""
-            opts = _options_for_label(lid, ltype, self.label_config)
-            option_values = [str(o) for o in (opts or [])]
-            is_multi = (ltype or "").strip().lower() == "categorical_multi"
-
-            label_lines = [f"Label '{lid}' (type: {ltype})"]
-            if option_values:
-                label_lines.append("Options:")
-                label_lines.extend(f"- {opt}" for opt in option_values)
-            if rules:
-                label_lines.append(f"Guidelines:\n{rules}")
-            label_lines.append("If no evidence, respond with 'no' or 'unknown'.")
-            if is_multi:
-                label_lines.append(
-                    "Select all supported options; omit unsupported ones."
-                )
-                label_lines.append(
-                    "Set prediction to a JSON object with each selected option key set to 'Yes' (omit or set to 'No' when unsupported)."
-                )
-            label_summaries.append("\n".join(label_lines))
-
-            label_schema = {
-                "type": "object",
-                "properties": {
-                    "prediction": self._prediction_schema(ltype, option_values, self.CATEGORICAL_TYPES)
-                },
-                "required": ["prediction"],
-                "additionalProperties": include_reasoning,
-            }
-            if include_reasoning:
-                label_schema["properties"]["reasoning"] = {"type": "string"}
-            schema["properties"][lid] = label_schema
-            schema["required"].append(lid)
-
-        system_segments = [
-            "You are a meticulous clinical annotator for EHR data.",
-            "Given the patient context, extract all requested labels in one pass.",
-            "Use 'no' or 'unknown' when evidence is missing or insufficient.",
-            "Each label must return JSON with keys: prediction (required) and reasoning (optional).",
-            "Label details:",
-            "\n\n".join(label_summaries),
-        ]
-        system_prompt = "\n\n".join(system_segments)
-
-        few_shot_msgs = self._few_shot_messages_for_labels(label_ids)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            *few_shot_msgs,
-            {"role": "user", "content": ctx_text},
-        ]
+        prompt_payload = self.build_multi_label_prompt_payload(
+            label_ids=label_ids,
+            label_types=label_types,
+            rules_map=rules_map,
+            ctx_snippets=ctx_snippets,
+        )
+        messages = prompt_payload["messages"]
+        schema = prompt_payload["response_format"]["json_schema"]
 
         try:
             result = self.backend.json_call(
@@ -703,7 +740,7 @@ class LLMLabeler:
                 {
                     "unit_id": unit_id,
                     "label_ids": label_ids,
-                    "prompt": {"system": system_prompt, "messages": few_shot_msgs, "user": ctx_text},
+                    "prompt": prompt_payload["prompt"],
                     "output": content,
                 },
             )

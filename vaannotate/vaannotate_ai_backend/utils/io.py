@@ -14,6 +14,8 @@ def read_table(path: str) -> pd.DataFrame:
         return pd.read_csv(path)
     if ext == "tsv":
         return pd.read_csv(path, sep="\t")
+    if ext == "feather":
+        return pd.read_feather(path)
     if ext in ("parquet", "pq"):
         return pd.read_parquet(path)
     if ext == "jsonl":
@@ -32,6 +34,8 @@ def write_table(df: pd.DataFrame, path: str):
     ext = path.lower().split(".")[-1]
     if ext == "csv":
         df.to_csv(path, index=False)
+    elif ext == "feather":
+        df.to_feather(path)
     elif ext in ("parquet", "pq"):
         df.to_parquet(path, index=False)
     elif ext == "jsonl":
