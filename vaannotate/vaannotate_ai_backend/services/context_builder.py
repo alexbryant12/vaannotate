@@ -138,6 +138,8 @@ class ContextBuilder:
         topk_per_label: int | None = None,
         max_snippets: int | None = None,
         max_chars: int | None = None,
+        single_doc_context_mode: str = "rag",
+        full_doc_char_limit: int | None = None,
     ) -> list[dict]:
         """
         Build a single merged context for a unit across many labels.
@@ -162,7 +164,13 @@ class ContextBuilder:
                 topk = None
 
         for label_id in label_ids:
-            snippets = self.build_context_for_label(unit_id, label_id, rules_map.get(label_id, ""))
+            snippets = self.build_context_for_label(
+                unit_id,
+                label_id,
+                rules_map.get(label_id, ""),
+                single_doc_context_mode=single_doc_context_mode,
+                full_doc_char_limit=full_doc_char_limit,
+            )
             if topk is not None:
                 snippets = snippets[:topk]
             collected.extend(snippets)
