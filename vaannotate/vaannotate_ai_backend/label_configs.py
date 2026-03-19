@@ -36,6 +36,12 @@ class LabelConfigBundle:
     legacy: Dict[str, Dict[str, object]] = field(default_factory=dict)
     round_labelsets: Dict[str, str] = field(default_factory=dict)
 
+    @property
+    def current_config(self) -> Dict[str, object]:
+        """Compatibility alias for call sites that expect ``current_config``."""
+
+        return self.current or {}
+
     def __post_init__(self) -> None:
         if self.current is not None:
             object.__setattr__(self, "current", sanitize_label_config(self.current))

@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 
@@ -42,6 +42,7 @@ class PromptPrecomputeJob:
     llm_overrides: dict[str, Any] | None = None
     notes_path: Path | None = None
     annotations_path: Path | None = None
+    notes_column_map: dict[str, str] | None = None
     job_dir: Path | None = None
     batch_size: int = 128
     env_overrides: dict[str, str] | None = None
@@ -59,6 +60,248 @@ class PromptInferenceJob:
     llm_overrides: dict[str, Any] | None
     job_dir: Path | None = None
     batch_limit: int | None = None
+
+
+def _normalize_precompute_column_map(column_map: Mapping[str, Any] | None) -> dict[str, str]:
+    if not isinstance(column_map, Mapping):
+        return {}
+    normalized: dict[str, str] = {}
+    for key, value in column_map.items():
+        name = str(value or "").strip()
+        if name:
+            normalized[str(key)] = name
+    return normalized
+
+
+def _empty_annotations_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "round_id",
+            "unit_id",
+            "doc_id",
+            "label_id",
+            "reviewer_id",
+            "label_value",
+            "label_value_num",
+            "label_value_date",
+            "labelset_id",
+            "document_text",
+            "rationales_json",
+            "document_metadata_json",
+            "label_rules",
+            "reviewer_notes",
+        ]
+    )
+
+
+def _coerce_notes_from_dataset(
+    notes_df: pd.DataFrame,
+    phenotype_level: str,
+    column_map: Mapping[str, Any] | None = None,
+) -> pd.DataFrame:
+    resolved = _normalize_precompute_column_map(column_map)
+    source = notes_df.copy()
+
+    def _pick(target: str, *candidates: str) -> pd.Series | None:
+        for name in (resolved.get(target), *candidates):
+            if name and name in source.columns:
+                return source[name]
+        return None
+
+    text_col = _pick("text", "text", "document_text", "note_text")
+    if text_col is None:
+        raise ValueError("Notes dataset must provide a text column or --text-column mapping")
+
+    doc_col = _pick("doc_id", "doc_id", "document_id", "note_id", "id")
+    patient_col = _pick("patient_icn", "patient_icn", "patient_id", "patient", "person_id")
+    unit_col = _pick("unit_id", "unit_id")
+    notetype_col = _pick("notetype", "notetype", "note_type")
+
+    level = str(phenotype_level or "multi_doc").strip().lower()
+    if level == "single_doc":
+        base_doc = doc_col if doc_col is not None else unit_col
+        if base_doc is None:
+            raise ValueError(
+                "Single-document prompt precompute requires a doc_id column or --doc-id-column/--unit-id-column"
+            )
+        doc_values = base_doc.astype(str)
+        patient_values = (
+            patient_col.astype(str)
+            if patient_col is not None
+            else doc_values
+        )
+        unit_values = unit_col.astype(str) if unit_col is not None else doc_values
+    else:
+        base_patient = patient_col if patient_col is not None else unit_col
+        if base_patient is None:
+            raise ValueError(
+                "Multi-document prompt precompute requires a patient_icn column or --patient-id-column/--unit-id-column"
+            )
+        patient_values = base_patient.astype(str)
+        doc_values = (
+            doc_col.astype(str)
+            if doc_col is not None
+            else pd.Series(
+                [f"{patient_values.iloc[idx]}::{idx}" for idx in range(len(source))],
+                index=source.index,
+            )
+        )
+        unit_values = unit_col.astype(str) if unit_col is not None else patient_values
+
+    normalized = pd.DataFrame(
+        {
+            "patient_icn": patient_values.astype(str),
+            "doc_id": doc_values.astype(str),
+            "text": text_col.fillna("").astype(str),
+            "unit_id": unit_values.astype(str),
+            "notetype": (
+                notetype_col.fillna("").astype(str)
+                if notetype_col is not None
+                else ""
+            ),
+        },
+        index=source.index,
+    )
+
+    passthrough = {
+        "patient_icn",
+        "doc_id",
+        "text",
+        "unit_id",
+        "notetype",
+        *[value for value in resolved.values()],
+    }
+    for column in source.columns:
+        if column not in passthrough and column not in normalized.columns:
+            normalized[column] = source[column]
+    return normalized.reset_index(drop=True)
+
+
+def _coerce_annotations_from_dataset(
+    ann_df: pd.DataFrame | None,
+    notes_df: pd.DataFrame,
+    phenotype_level: str,
+) -> pd.DataFrame:
+    if ann_df is None or ann_df.empty:
+        return _empty_annotations_df()
+
+    normalized = ann_df.copy()
+    if "round_id" not in normalized.columns:
+        normalized["round_id"] = ""
+    if "reviewer_id" not in normalized.columns:
+        normalized["reviewer_id"] = "prompt_precompute"
+    if "label_id" not in normalized.columns:
+        normalized["label_id"] = ""
+    if "label_value" not in normalized.columns:
+        normalized["label_value"] = ""
+
+    note_lookup = notes_df[["doc_id", "unit_id", "text"]].drop_duplicates(subset=["doc_id"]).copy()
+    if "doc_id" not in normalized.columns:
+        if "unit_id" in normalized.columns and str(phenotype_level).strip().lower() == "single_doc":
+            normalized["doc_id"] = normalized["unit_id"].astype(str)
+        else:
+            normalized["doc_id"] = ""
+    normalized["doc_id"] = normalized["doc_id"].astype(str)
+
+    if "unit_id" not in normalized.columns:
+        normalized = normalized.merge(
+            note_lookup[["doc_id", "unit_id"]],
+            on="doc_id",
+            how="left",
+        )
+    normalized["unit_id"] = normalized["unit_id"].fillna("").astype(str)
+
+    if "document_text" not in normalized.columns:
+        normalized = normalized.merge(
+            note_lookup[["doc_id", "text"]].rename(columns={"text": "document_text"}),
+            on="doc_id",
+            how="left",
+        )
+    normalized["document_text"] = normalized["document_text"].fillna("").astype(str)
+
+    for column, default in (
+        ("label_value_num", pd.NA),
+        ("label_value_date", pd.NaT),
+        ("labelset_id", ""),
+        ("rationales_json", None),
+        ("document_metadata_json", None),
+        ("label_rules", ""),
+        ("reviewer_notes", ""),
+    ):
+        if column not in normalized.columns:
+            normalized[column] = default
+
+    ordered_cols = list(_empty_annotations_df().columns)
+    for column in ordered_cols:
+        if column not in normalized.columns:
+            normalized[column] = ""
+    return normalized[ordered_cols].reset_index(drop=True)
+
+
+def _stage_precompute_inputs(
+    job: PromptPrecomputeJob,
+    job_dir: Path,
+    manifest: dict[str, Any] | None,
+) -> tuple[Path, Path, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    notes_target = job_dir / "notes.parquet"
+    ann_target = job_dir / "annotations.parquet"
+    source_meta: dict[str, Any] = {
+        "notes_path": str(job.notes_path) if job.notes_path else None,
+        "annotations_path": str(job.annotations_path) if job.annotations_path else None,
+        "notes_column_map": _normalize_precompute_column_map(job.notes_column_map),
+    }
+
+    if job.notes_path is None:
+        notes_df, ann_df = export_inputs_from_repo(job.project_root, job.pheno_id, [])
+        notes_df = notes_df.copy()
+        notes_df["unit_id"] = _infer_unit_id_column(notes_df, job.phenotype_level)
+        ann_df = ann_df.copy()
+        notes_df.to_parquet(notes_target, index=False)
+        ann_df.to_parquet(ann_target, index=False)
+        source_meta["source_kind"] = "project_export"
+        return notes_target, ann_target, notes_df, ann_df, source_meta
+
+    raw_notes_df = read_table(str(job.notes_path))
+    notes_df = _coerce_notes_from_dataset(raw_notes_df, job.phenotype_level, job.notes_column_map)
+    raw_ann_df = read_table(str(job.annotations_path)) if job.annotations_path else None
+    ann_df = _coerce_annotations_from_dataset(raw_ann_df, notes_df, job.phenotype_level)
+
+    notes_df.to_parquet(notes_target, index=False)
+    ann_df.to_parquet(ann_target, index=False)
+
+    source_meta.update(
+        {
+            "source_kind": "external_dataset",
+            "input_row_count": int(len(notes_df)),
+            "annotation_row_count": int(len(ann_df)),
+            "staged_notes_path": str(notes_target.relative_to(job_dir)),
+            "staged_annotations_path": str(ann_target.relative_to(job_dir)),
+        }
+    )
+    return notes_target, ann_target, notes_df, ann_df, source_meta
+
+
+def _family_label_order(label_config: Mapping[str, Any] | None, label_types: Mapping[str, str]) -> list[str]:
+    parent_to_children, _child_to_parents, roots = build_label_dependencies(dict(label_config or {}))
+    discovered = [str(label_id) for label_id in roots]
+    ordered: list[str] = []
+    visited: set[str] = set()
+
+    def _visit(label_id: str) -> None:
+        key = str(label_id)
+        if not key or key in visited:
+            return
+        visited.add(key)
+        ordered.append(key)
+        for child_id in sorted(parent_to_children.get(key, [])):
+            _visit(child_id)
+
+    for label_id in discovered:
+        _visit(label_id)
+    for label_id in sorted(str(label_id) for label_id in label_types.keys()):
+        if str(label_id) not in visited:
+            _visit(str(label_id))
+    return ordered
 
 
 def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
@@ -106,19 +349,11 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
             if not job.llm_overrides and isinstance(manifest_llm, dict):
                 job.llm_overrides = manifest_llm
 
-        if job.notes_path is not None and job.annotations_path is not None:
-            notes_path = job.notes_path
-            ann_path = job.annotations_path
-        else:
-            notes_df, ann_df = export_inputs_from_repo(job.project_root, job.pheno_id, [])
-            notes_df = notes_df.copy()
-            notes_df["unit_id"] = _infer_unit_id_column(notes_df, job.phenotype_level)
-
-            notes_path = job_dir / "notes.parquet"
-            ann_path = job_dir / "annotations.parquet"
-
-            notes_df.to_parquet(notes_path)
-            ann_df.to_parquet(ann_path)
+        notes_path, ann_path, notes_df, _ann_df, source_meta = _stage_precompute_inputs(
+            job,
+            job_dir,
+            manifest if isinstance(manifest, dict) else None,
+        )
 
         cfg = OrchestratorConfig()
         overrides = _normalize_local_model_overrides(job.cfg_overrides or {})
@@ -156,14 +391,16 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
                 "labeling_mode": job.labeling_mode,
                 "cfg_overrides": job.cfg_overrides,
                 "llm_overrides": job.llm_overrides or {},
+                "input_source": source_meta,
                 "batch_size": job.batch_size,
                 "batches": [],
             }
         elif isinstance(manifest, dict):
             manifest["cfg_overrides"] = job.cfg_overrides
             manifest["llm_overrides"] = job.llm_overrides or {}
+            manifest["input_source"] = source_meta
 
-        repo_notes = notes_df if job.notes_path is None else read_table(str(notes_path))
+        repo_notes = notes_df
         manifest = _initialize_and_update_batches_for_prompt_precompute(manifest, job, repo_notes)
         write_manifest_atomic(manifest_path, manifest)
 
@@ -197,20 +434,14 @@ def _initialize_and_update_batches_for_prompt_precompute(
         repo_notes = repo_notes.copy()
         repo_notes["unit_id"] = _infer_unit_id_column(repo_notes, job.phenotype_level)
 
-    batches = manifest.get("batches") or []
-    if batches:
-        manifest["batches"] = batches
-        return manifest
-
     unit_ids = sorted({str(u) for u in repo_notes["unit_id"].astype(str)})
     batch_size = int(job.batch_size or 0) or 1
-
-    manifest_batches: list[dict] = []
+    expected_batches: list[dict[str, Any]] = []
     for idx in range(0, len(unit_ids), batch_size):
         chunk = unit_ids[idx : idx + batch_size]
-        manifest_batches.append(
+        expected_batches.append(
             {
-                "batch_id": len(manifest_batches),
+                "batch_id": len(expected_batches),
                 "unit_ids": chunk,
                 "status": "pending",
                 "n_tasks": 0,
@@ -218,7 +449,29 @@ def _initialize_and_update_batches_for_prompt_precompute(
             }
         )
 
-    manifest["batches"] = manifest_batches
+    batches = manifest.get("batches") or []
+    if not batches:
+        manifest["batches"] = expected_batches
+        return manifest
+
+    preserved: list[dict[str, Any]] = []
+    by_id = {int(batch.get("batch_id")): batch for batch in batches if batch.get("batch_id") is not None}
+    for expected in expected_batches:
+        existing = by_id.get(int(expected["batch_id"]))
+        if not existing:
+            preserved.append(expected)
+            continue
+        existing_unit_ids = [str(value) for value in existing.get("unit_ids", [])]
+        if existing_unit_ids != expected["unit_ids"]:
+            existing = {
+                **expected,
+                "status": "pending",
+                "n_tasks": 0,
+                "path": None,
+            }
+        preserved.append(existing)
+
+    manifest["batches"] = preserved
     return manifest
 
 
@@ -329,11 +582,7 @@ def _run_prompt_precompute_batches(
         elif job.labeling_mode == "family":
             log.info("Building family-prompt batch %s with %d units", batch_id, len(unit_ids))
             label_config = label_config_bundle.current or {}
-            _parent_to_children, _child_to_parents, roots = build_label_dependencies(label_config)
-            ordered_labels = list(roots)
-            for lid in sorted(label_types.keys()):
-                if lid not in ordered_labels:
-                    ordered_labels.append(lid)
+            ordered_labels = _family_label_order(label_config, label_types)
 
             for unit_id in unit_ids:
                 for label_id in ordered_labels:
@@ -357,6 +606,7 @@ def _run_prompt_precompute_batches(
                                 "pheno_id": job.pheno_id,
                                 "labelset_id": job.labelset_id,
                                 "phenotype_level": job.phenotype_level,
+                                "gated_by": (label_config.get(label_id, {}) or {}).get("gated_by"),
                             },
                         )
                     )
@@ -703,12 +953,7 @@ def _run_family_prompt_batch(
 
     ctx_by_pair = {(t.unit_id, t.label_id): t for t in tasks}
 
-    parent_to_children, child_to_parents, roots = build_label_dependencies(
-        label_config_bundle.current_config
-    )
-
-    all_label_ids = sorted(label_types.keys())
-    ordered_labels = list(roots) + [lid for lid in all_label_ids if lid not in roots]
+    ordered_labels = _family_label_order(label_config_bundle.current_config, label_types)
 
     unit_ids = sorted({t.unit_id for t in tasks})
     rows = []

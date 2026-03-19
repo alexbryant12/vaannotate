@@ -16,6 +16,8 @@ def read_table(path: str) -> pd.DataFrame:
         return pd.read_csv(path, sep="\t")
     if ext in ("parquet", "pq"):
         return pd.read_parquet(path)
+    if ext in ("feather", "ftr"):
+        return pd.read_feather(path)
     if ext == "jsonl":
         return pd.read_json(path, lines=True)
     raise ValueError(f"Unsupported table extension: {path}")
