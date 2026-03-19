@@ -68,6 +68,8 @@ def create_prompt_precompute_job(
     job_id: str | None = None,
     notes_path: str | Path | None = None,
     annotations_path: str | Path | None = None,
+    dataset_path: str | Path | None = None,
+    dataset_column_map: dict[str, str] | None = None,
     job_dir: str | Path | None = None,
     env_overrides: dict[str, str] | None = None,
 ) -> PromptPrecomputeJob:
@@ -89,6 +91,8 @@ def create_prompt_precompute_job(
         llm_overrides=llm_overrides,
         notes_path=Path(notes_path) if notes_path else None,
         annotations_path=Path(annotations_path) if annotations_path else None,
+        dataset_path=Path(dataset_path) if dataset_path else None,
+        dataset_column_map=dataset_column_map,
         job_dir=Path(job_dir) if job_dir else None,
         batch_size=batch_size,
         env_overrides={str(k): str(v) for k, v in (env_overrides or {}).items() if str(v)},
@@ -161,6 +165,8 @@ def main(argv: list[str] | None = None) -> None:
     precompute.add_argument("--job-dir", type=Path)
     precompute.add_argument("--notes-path", type=Path)
     precompute.add_argument("--annotations-path", type=Path)
+    precompute.add_argument("--dataset-path", type=Path, help="External corpus table for prompt generation.")
+    precompute.add_argument("--dataset-columns", help="JSON mapping from canonical columns to source columns.")
     precompute.add_argument("--cfg", help="JSON overrides or path to JSON file")
     precompute.add_argument("--llm-cfg", help="LLM-only overrides or path to JSON file")
     precompute.add_argument("--experiment-name", help="Name from experiments manifest")
@@ -201,6 +207,8 @@ def main(argv: list[str] | None = None) -> None:
             job_id=args.job_id,
             notes_path=args.notes_path,
             annotations_path=args.annotations_path,
+            dataset_path=args.dataset_path,
+            dataset_column_map=_parse_json_arg(args.dataset_columns),
             job_dir=args.job_dir,
         )
     elif args.command == "infer":

@@ -18,6 +18,7 @@ class SinglePromptTask:
     rules_map: dict[str, str]  # label_id -> rule text
     label_types: dict[str, str]  # label_id -> type ("binary", "categorical", "date", etc.)
     rag_fingerprint: str
+    prompt_payload: dict
     meta: dict  # pheno_id, labelset_id, phenotype_level, etc.
 
 
@@ -31,6 +32,7 @@ class FamilyPromptTask:
     label_rules: str
     ctx_snippets: list[dict]  # RAG snippets for this (unit,label) only
     rag_fingerprint: str
+    prompt_payload: dict
     meta: dict
 
 
@@ -41,7 +43,7 @@ def single_prompt_tasks_to_df(tasks: list[SinglePromptTask]) -> pd.DataFrame:
     if df.empty:
         return df
 
-    return _jsonify_cols(df, ["ctx_snippets", "rules_map", "label_types", "meta"])
+    return _jsonify_cols(df, ["ctx_snippets", "rules_map", "label_types", "prompt_payload", "meta"])
 
 
 def family_prompt_tasks_to_df(tasks: list[FamilyPromptTask]) -> pd.DataFrame:
@@ -51,7 +53,7 @@ def family_prompt_tasks_to_df(tasks: list[FamilyPromptTask]) -> pd.DataFrame:
     if df.empty:
         return df
 
-    return _jsonify_cols(df, ["ctx_snippets", "meta"])
+    return _jsonify_cols(df, ["ctx_snippets", "prompt_payload", "meta"])
 
 
 def _parse_jsonish(value, default):
@@ -83,6 +85,7 @@ def df_to_single_prompt_tasks(df: pd.DataFrame) -> List[SinglePromptTask]:
                 rules_map=_parse_jsonish(row.get("rules_map"), {}),
                 label_types=_parse_jsonish(row.get("label_types"), {}),
                 rag_fingerprint=row.get("rag_fingerprint"),
+                prompt_payload=_parse_jsonish(row.get("prompt_payload"), {}),
                 meta=_parse_jsonish(row.get("meta"), {}),
             )
         )
@@ -108,6 +111,7 @@ def df_to_family_prompt_tasks(df: pd.DataFrame) -> List[FamilyPromptTask]:
                 label_rules=str(row.get("label_rules")),
                 ctx_snippets=_parse_jsonish(row.get("ctx_snippets"), []),
                 rag_fingerprint=row.get("rag_fingerprint"),
+                prompt_payload=_parse_jsonish(row.get("prompt_payload"), {}),
                 meta=_parse_jsonish(row.get("meta"), {}),
             )
         )
