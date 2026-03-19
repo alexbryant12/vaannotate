@@ -66,6 +66,8 @@ def create_prompt_precompute_job(
     experiment_name: str | None = None,
     experiments_dir: str | Path | None = None,
     job_id: str | None = None,
+    corpus_id: str | None = None,
+    corpus_path: str | Path | None = None,
     notes_path: str | Path | None = None,
     annotations_path: str | Path | None = None,
     dataset_path: str | Path | None = None,
@@ -89,6 +91,8 @@ def create_prompt_precompute_job(
         labeling_mode=labeling_mode,
         cfg_overrides=overrides,
         llm_overrides=llm_overrides,
+        corpus_id=corpus_id,
+        corpus_path=Path(corpus_path) if corpus_path else None,
         notes_path=Path(notes_path) if notes_path else None,
         annotations_path=Path(annotations_path) if annotations_path else None,
         dataset_path=Path(dataset_path) if dataset_path else None,
@@ -163,6 +167,8 @@ def main(argv: list[str] | None = None) -> None:
     precompute.add_argument("--batch-size", type=int, default=128)
     precompute.add_argument("--job-id")
     precompute.add_argument("--job-dir", type=Path)
+    precompute.add_argument("--corpus-id")
+    precompute.add_argument("--corpus-path", type=Path)
     precompute.add_argument("--notes-path", type=Path)
     precompute.add_argument("--annotations-path", type=Path)
     precompute.add_argument("--dataset-path", type=Path, help="External corpus table for prompt generation.")
@@ -205,6 +211,8 @@ def main(argv: list[str] | None = None) -> None:
             experiment_name=args.experiment_name,
             experiments_dir=args.experiments_dir,
             job_id=args.job_id,
+            corpus_id=args.corpus_id,
+            corpus_path=args.corpus_path,
             notes_path=args.notes_path,
             annotations_path=args.annotations_path,
             dataset_path=args.dataset_path,
