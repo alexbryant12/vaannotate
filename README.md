@@ -59,10 +59,10 @@ The client loads the assignment SQLite bundle locally, presents unit navigation,
 
 For long-running inference across large corpora, VAAnnotate provides a two-stage pipeline that decouples retrieval from LLM calls:
 
-1. **Stage A – prompt precomputation**: build RAG contexts and prompt batches with `python -m vaannotate.vaannotate_ai_backend.large_corpus_cli precompute`, which writes prompt parquet files under `admin_tools/prompt_jobs/<job_id>`. Supply `--cfg` for general overrides and `--llm-cfg` for LLM-specific settings that should influence retrieval prompts.
+1. **Stage A – prompt precomputation**: build RAG contexts and prompt batches with `python -m vaannotate.vaannotate_ai_backend.large_corpus_cli precompute`, which writes prompt parquet files under `admin_tools/prompt_jobs/<job_id>`. Supply `--cfg` for general overrides and `--llm-cfg` for LLM-specific settings that should influence retrieval prompts. This stage can now read prompts directly from external tabular datasets (for example parquet or feather) via `--notes-path`, with column mapping flags such as `--text-column`, `--doc-id-column`, and `--patient-id-column`, so very large inference corpora do not need to be imported into the project first.
 2. **Stage B – prompt inference**: run the LLM over those precomputed prompts with `python -m vaannotate.vaannotate_ai_backend.large_corpus_cli infer`, producing output batches under `admin_tools/prompt_inference/<job_id>`.
 
-Both **family** and **single_prompt** labeling modes are supported, and LLM overrides can be supplied during either stage to evaluate alternate models without re-running retrieval.
+Both **family** and **single_prompt** labeling modes are supported, and LLM overrides can be supplied during either stage to evaluate alternate models without re-running retrieval. Prompt precompute jobs stage normalized notes/annotation parquet files inside the job directory and use a resumable manifest, so interrupted runs can restart cleanly without rebuilding finished prompt batches.
 
 ## Project layout
 

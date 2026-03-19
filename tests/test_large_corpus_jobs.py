@@ -264,3 +264,177 @@ def test_prompt_inference_resumes_with_manifest_overrides(monkeypatch, tmp_path:
     assert manifest and manifest.get("cfg_overrides") == inference_manifest["cfg_overrides"]
     assert manifest.get("llm_overrides") == inference_manifest["llm_overrides"]
 
+
+def test_prompt_precompute_accepts_external_dataset_and_stages_annotations(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir(parents=True)
+
+    notes_source = tmp_path / "notes.feather"
+    pd.DataFrame(
+        {
+            "person_id": ["p1", "p1", "p2"],
+            "note_id": ["d1", "d2", "d3"],
+            "note_text": ["alpha", "beta", "gamma"],
+            "note_type": ["A", "B", "C"],
+        }
+    ).to_feather(notes_source)
+
+    seen_paths: list[tuple[str, str]] = []
+
+    class DummySession:
+        models = object()
+        store = object()
+
+    def fake_backend_from_env(paths, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        seen_paths.append((paths.notes_path, paths.annotations_path))
+        return DummySession()
+
+    def fake_load_label_config_bundle(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return type(
+            "Bundle",
+            (),
+            {
+                "current_rules_map": staticmethod(lambda *_args, **_kwargs: {"L1": "rule"}),
+                "current_label_types": staticmethod(lambda *_args, **_kwargs: {"L1": "binary"}),
+                "current": {"L1": {"gated_by": None}},
+            },
+        )()
+
+    def fake_run_batches(manifest, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return manifest
+
+    monkeypatch.setattr(jobs.BackendSession, "from_env", staticmethod(fake_backend_from_env))
+    monkeypatch.setattr(jobs, "_load_label_config_bundle", fake_load_label_config_bundle)
+    monkeypatch.setattr(jobs, "_run_prompt_precompute_batches", fake_run_batches)
+
+    job = jobs.PromptPrecomputeJob(
+        job_id="job-external",
+        project_root=project_root,
+        pheno_id="ph",
+        labelset_id="ls",
+        phenotype_level="multi_doc",
+        labeling_mode="single_prompt",
+        cfg_overrides={},
+        notes_path=notes_source,
+        annotations_path=None,
+        notes_column_map={
+            "patient_icn": "person_id",
+            "doc_id": "note_id",
+            "text": "note_text",
+            "notetype": "note_type",
+        },
+        batch_size=2,
+    )
+
+    jobs.run_prompt_precompute_job(job)
+
+    prompt_job_dir = project_root / "admin_tools" / "prompt_jobs" / "job-external"
+    staged_notes = pd.read_parquet(prompt_job_dir / "notes.parquet")
+    staged_ann = pd.read_parquet(prompt_job_dir / "annotations.parquet")
+
+    assert list(staged_notes["patient_icn"]) == ["p1", "p1", "p2"]
+    assert list(staged_notes["doc_id"]) == ["d1", "d2", "d3"]
+    assert list(staged_notes["unit_id"]) == ["p1", "p1", "p2"]
+    assert list(staged_notes["notetype"]) == ["A", "B", "C"]
+    assert staged_ann.empty
+    assert seen_paths == [
+        (
+            str(prompt_job_dir / "notes.parquet"),
+            str(prompt_job_dir / "annotations.parquet"),
+        )
+    ]
+
+    manifest = jobs.read_manifest(prompt_job_dir / "job_manifest.json")
+    assert manifest["input_source"]["source_kind"] == "external_dataset"
+    assert manifest["input_source"]["notes_column_map"]["text"] == "note_text"
+    assert [batch["unit_ids"] for batch in manifest["batches"]] == [["p1", "p2"]]
+
+
+def test_family_prompt_precompute_orders_parents_before_descendants(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    job_dir = project_root / "admin_tools" / "prompt_jobs" / "job-family"
+    (job_dir / "cache").mkdir(parents=True, exist_ok=True)
+    (job_dir / "prompts_family").mkdir(parents=True, exist_ok=True)
+    (job_dir / "prompts_single").mkdir(parents=True, exist_ok=True)
+
+    notes_df = pd.DataFrame(
+        {
+            "patient_icn": ["p1"],
+            "doc_id": ["d1"],
+            "text": ["family note"],
+            "unit_id": ["p1"],
+        }
+    )
+    notes_df.to_parquet(job_dir / "notes.parquet", index=False)
+    jobs._empty_annotations_df().to_parquet(job_dir / "annotations.parquet", index=False)
+
+    class DummyStore:
+        def build_chunk_index(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return None
+
+        @staticmethod
+        def _compute_corpus_fingerprint(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return "fp"
+
+    class DummyContextBuilder:
+        @staticmethod
+        def build_context_for_label(unit_id, label_id, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return [{"doc_id": unit_id, "chunk_id": label_id, "text": f"{unit_id}:{label_id}", "score": 1.0}]
+
+    session = type("Session", (), {"models": object(), "store": DummyStore()})()
+    label_config = {
+        "Root": {"type": "binary"},
+        "Child": {"type": "binary", "gated_by": "Root"},
+        "Grandchild": {"type": "binary", "gated_by": "Child"},
+    }
+    bundle = type(
+        "Bundle",
+        (),
+        {
+            "current": label_config,
+            "current_config": label_config,
+            "current_rules_map": staticmethod(lambda *_args, **_kwargs: {k: "" for k in label_config}),
+            "current_label_types": staticmethod(lambda *_args, **_kwargs: {k: "binary" for k in label_config}),
+        },
+    )()
+
+    monkeypatch.setattr(
+        jobs,
+        "_build_shared_components",
+        lambda *_args, **_kwargs: {  # type: ignore[no-untyped-def]
+            "repo": type("Repo", (), {"notes": notes_df})(),
+            "store": session.store,
+            "context_builder": DummyContextBuilder(),
+        },
+    )
+
+    manifest = {
+        "job_id": "job-family",
+        "batches": [{"batch_id": 0, "unit_ids": ["p1"], "status": "pending", "n_tasks": 0, "path": None}],
+    }
+    job = jobs.PromptPrecomputeJob(
+        job_id="job-family",
+        project_root=project_root,
+        pheno_id="ph",
+        labelset_id="ls",
+        phenotype_level="multi_doc",
+        labeling_mode="family",
+        cfg_overrides={},
+        job_dir=job_dir,
+        batch_size=1,
+    )
+
+    jobs._run_prompt_precompute_batches(
+        manifest,
+        job,
+        jobs.OrchestratorConfig(),
+        session,
+        bundle,
+        job_dir / "job_manifest.json",
+    )
+
+    prompts = pd.read_parquet(job_dir / "prompts_family" / "prompts_batch_00000.parquet")
+    assert list(prompts["label_id"]) == ["Root", "Child", "Grandchild"]

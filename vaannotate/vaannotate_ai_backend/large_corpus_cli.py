@@ -68,6 +68,7 @@ def create_prompt_precompute_job(
     job_id: str | None = None,
     notes_path: str | Path | None = None,
     annotations_path: str | Path | None = None,
+    notes_column_map: dict[str, str] | None = None,
     job_dir: str | Path | None = None,
     env_overrides: dict[str, str] | None = None,
 ) -> PromptPrecomputeJob:
@@ -89,6 +90,7 @@ def create_prompt_precompute_job(
         llm_overrides=llm_overrides,
         notes_path=Path(notes_path) if notes_path else None,
         annotations_path=Path(annotations_path) if annotations_path else None,
+        notes_column_map=dict(notes_column_map or {}),
         job_dir=Path(job_dir) if job_dir else None,
         batch_size=batch_size,
         env_overrides={str(k): str(v) for k, v in (env_overrides or {}).items() if str(v)},
@@ -161,6 +163,11 @@ def main(argv: list[str] | None = None) -> None:
     precompute.add_argument("--job-dir", type=Path)
     precompute.add_argument("--notes-path", type=Path)
     precompute.add_argument("--annotations-path", type=Path)
+    precompute.add_argument("--text-column")
+    precompute.add_argument("--doc-id-column")
+    precompute.add_argument("--patient-id-column")
+    precompute.add_argument("--unit-id-column")
+    precompute.add_argument("--notetype-column")
     precompute.add_argument("--cfg", help="JSON overrides or path to JSON file")
     precompute.add_argument("--llm-cfg", help="LLM-only overrides or path to JSON file")
     precompute.add_argument("--experiment-name", help="Name from experiments manifest")
@@ -187,6 +194,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "precompute":
         overrides = _parse_json_arg(args.cfg)
         llm_overrides = _parse_json_arg(args.llm_cfg)
+        column_map = {
+            key: value
+            for key, value in {
+                "text": args.text_column,
+                "doc_id": args.doc_id_column,
+                "patient_icn": args.patient_id_column,
+                "unit_id": args.unit_id_column,
+                "notetype": args.notetype_column,
+            }.items()
+            if value
+        }
         create_prompt_precompute_job(
             project_root=args.project_root,
             pheno_id=args.pheno_id,
@@ -201,6 +219,7 @@ def main(argv: list[str] | None = None) -> None:
             job_id=args.job_id,
             notes_path=args.notes_path,
             annotations_path=args.annotations_path,
+            notes_column_map=column_map,
             job_dir=args.job_dir,
         )
     elif args.command == "infer":
