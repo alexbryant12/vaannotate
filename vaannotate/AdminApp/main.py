@@ -1219,6 +1219,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         self._running_workers: list[tuple[QtCore.QThread, _LargeCorpusJobWorker, AIRoundLogDialog]] = []
         self._rounds = self._load_rounds()
         self._precompute_corpus_path: str | None = None
+        self._precompute_label_schema: Mapping[str, object] | None = None
         self._setup_ui()
 
     def _build_default_job_id(self, suffix: str) -> str:
@@ -1255,6 +1256,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             name = labelset.get("name") or labelset_id or "Label set"
             display = f"{name} ({labelset_id})" if labelset_id else name
             self.precompute_labelset_combo.addItem(display, userData=labelset_id)
+        self.precompute_labelset_combo.currentIndexChanged.connect(self._on_precompute_labelset_changed)
         form.addRow("Label set", self.precompute_labelset_combo)
 
         self.precompute_mode_combo = QtWidgets.QComboBox()
@@ -1286,13 +1288,31 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
 
         self.precompute_overrides_edit = QtWidgets.QPlainTextEdit()
         self.precompute_overrides_edit.setPlaceholderText("Optional JSON overrides for AI config")
+        self.precompute_overrides_edit.textChanged.connect(self._update_precompute_advanced_summary)
         form.addRow("Config overrides", self.precompute_overrides_edit)
 
         self.precompute_llm_overrides = QtWidgets.QPlainTextEdit()
         self.precompute_llm_overrides.setPlaceholderText(
             "Optional JSON overrides for LLM-only settings"
         )
+        self.precompute_llm_overrides.textChanged.connect(self._update_precompute_advanced_summary)
         form.addRow("LLM overrides", self.precompute_llm_overrides)
+
+        advanced_row = QtWidgets.QWidget()
+        advanced_layout = QtWidgets.QVBoxLayout(advanced_row)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(4)
+        self.precompute_advanced_summary = QtWidgets.QLabel()
+        self.precompute_advanced_summary.setWordWrap(True)
+        advanced_layout.addWidget(self.precompute_advanced_summary)
+        self.precompute_advanced_settings_btn = QtWidgets.QPushButton("Prompt job settings…")
+        self.precompute_advanced_settings_btn.setToolTip(
+            "Open a structured editor for retrieval, prompting, indexing, and LLM settings "
+            "used by this prompt precompute job."
+        )
+        self.precompute_advanced_settings_btn.clicked.connect(self._open_precompute_advanced_settings)
+        advanced_layout.addWidget(self.precompute_advanced_settings_btn)
+        form.addRow("Advanced AI settings", advanced_row)
 
         run_button = QtWidgets.QPushButton("Run / resume precompute")
         run_button.clicked.connect(self._on_run_precompute)
@@ -1305,6 +1325,8 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         note_label.setWordWrap(True)
         form.addRow(note_label)
 
+        self._on_precompute_labelset_changed()
+        self._update_precompute_advanced_summary()
         return widget
 
     def _build_precompute_project_corpus_source(self) -> QtWidgets.QWidget:
@@ -1561,6 +1583,144 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
                 f"Unable to parse {field}: {exc}",
             )
             return None
+
+    @staticmethod
+    def _parse_json_overrides_silent(widget: QtWidgets.QPlainTextEdit) -> tuple[Optional[dict], bool]:
+        raw = widget.toPlainText().strip()
+        if not raw:
+            return {}, False
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                return None, True
+            return value, False
+        except Exception:
+            return None, True
+
+    def _on_precompute_labelset_changed(self) -> None:
+        labelset_id = self.precompute_labelset_combo.currentData()
+        if not labelset_id:
+            self._precompute_label_schema = None
+            self._update_precompute_advanced_summary()
+            return
+        try:
+            payload = self.ctx.load_labelset_details(str(labelset_id))
+        except Exception:  # noqa: BLE001
+            payload = None
+        self._precompute_label_schema = payload if isinstance(payload, Mapping) else None
+        self._update_precompute_advanced_summary()
+
+    def _build_precompute_config_snapshot(self) -> Optional[Dict[str, Any]]:
+        cfg_overrides = self._parse_json_overrides(self.precompute_overrides_edit, "config overrides")
+        if cfg_overrides is None:
+            return None
+        llm_overrides = self._parse_json_overrides(self.precompute_llm_overrides, "LLM overrides")
+        if llm_overrides is None:
+            return None
+
+        cfg = ai_config.OrchestratorConfig()
+        config_snapshot: Dict[str, Any] = {
+            "index": asdict(cfg.index),
+            "rag": asdict(cfg.rag),
+            "llm": asdict(cfg.llm),
+            "select": asdict(cfg.select),
+            "llmfirst": asdict(cfg.llmfirst),
+            "disagree": asdict(cfg.disagree),
+            "diversity": asdict(cfg.diversity),
+            "scjitter": asdict(cfg.scjitter),
+            "final_llm_labeling": bool(cfg.final_llm_labeling),
+            "final_llm_labeling_n_consistency": int(cfg.final_llm_labeling_n_consistency),
+        }
+        if cfg_overrides:
+            _deep_update_dict(config_snapshot, cfg_overrides)
+        if llm_overrides:
+            llm_cfg = config_snapshot.get("llm")
+            if not isinstance(llm_cfg, dict):
+                llm_cfg = {}
+                config_snapshot["llm"] = llm_cfg
+            _deep_update_dict(llm_cfg, llm_overrides)
+        return config_snapshot
+
+    def _open_precompute_advanced_settings(self) -> None:
+        config = self._build_precompute_config_snapshot()
+        if config is None:
+            return
+        dialog = AIAdvancedConfigDialog(
+            self,
+            config,
+            label_schema=self._precompute_label_schema,
+        )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        result_config = dialog.result_config or {}
+        self.precompute_overrides_edit.setPlainText(json.dumps(result_config, indent=2))
+        self._update_precompute_advanced_summary(config=result_config)
+
+    def _update_precompute_advanced_summary(
+        self,
+        *,
+        config: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        summary_label = getattr(self, "precompute_advanced_summary", None)
+        if not isinstance(summary_label, QtWidgets.QLabel):
+            return
+        effective_config = config
+        if effective_config is None:
+            cfg_overrides, cfg_invalid = self._parse_json_overrides_silent(self.precompute_overrides_edit)
+            llm_overrides, llm_invalid = self._parse_json_overrides_silent(self.precompute_llm_overrides)
+            if cfg_invalid or llm_invalid:
+                summary_label.setText(
+                    "Current prompt-job settings could not be summarized because one of the JSON "
+                    "override fields is invalid. Fix the JSON or use Prompt job settings."
+                )
+                return
+            cfg = ai_config.OrchestratorConfig()
+            effective_config = {
+                "index": asdict(cfg.index),
+                "rag": asdict(cfg.rag),
+                "llm": asdict(cfg.llm),
+                "select": asdict(cfg.select),
+                "llmfirst": asdict(cfg.llmfirst),
+                "disagree": asdict(cfg.disagree),
+                "diversity": asdict(cfg.diversity),
+                "scjitter": asdict(cfg.scjitter),
+                "final_llm_labeling": bool(cfg.final_llm_labeling),
+                "final_llm_labeling_n_consistency": int(cfg.final_llm_labeling_n_consistency),
+            }
+            if cfg_overrides:
+                _deep_update_dict(effective_config, cfg_overrides)
+            if llm_overrides:
+                llm_cfg = effective_config.get("llm")
+                if not isinstance(llm_cfg, dict):
+                    llm_cfg = {}
+                    effective_config["llm"] = llm_cfg
+                _deep_update_dict(llm_cfg, llm_overrides)
+        if not isinstance(effective_config, Mapping):
+            summary_label.setText(
+                "Use Prompt job settings to edit the retrieval, prompting, indexing, and LLM "
+                "settings for this precompute job."
+            )
+            return
+        rag_cfg = effective_config.get("rag", {}) if isinstance(effective_config.get("rag"), Mapping) else {}
+        llm_cfg = effective_config.get("llm", {}) if isinstance(effective_config.get("llm"), Mapping) else {}
+        llmfirst_cfg = (
+            effective_config.get("llmfirst", {})
+            if isinstance(effective_config.get("llmfirst"), Mapping)
+            else {}
+        )
+        mode = str(llmfirst_cfg.get("single_doc_context") or "rag")
+        chunk_size = rag_cfg.get("chunk_size", ai_config.RAGConfig().chunk_size)
+        top_k = rag_cfg.get("top_k_final", ai_config.RAGConfig().top_k_final)
+        backend = str(llm_cfg.get("backend") or ai_config.LLMConfig().backend)
+        prompt_chars = llmfirst_cfg.get(
+            "single_prompt_max_chars",
+            ai_config.LLMFirstConfig().single_prompt_max_chars,
+        )
+        summary_label.setText(
+            "Current prompt-job settings: "
+            f"backend={backend}, single_doc_context={mode}, rag.chunk_size={chunk_size}, "
+            f"rag.top_k_final={top_k}, llmfirst.single_prompt_max_chars={prompt_chars}."
+        )
 
     def _collect_precompute_job(self) -> Optional[PromptPrecomputeJob]:
         cfg_overrides = self._parse_json_overrides(self.precompute_overrides_edit, "config overrides")
