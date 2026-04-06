@@ -876,6 +876,8 @@ def _run_prompt_inference_batches(
     manifest_path: Path,
 ) -> dict:
     log = logging.getLogger(__name__)
+    max_batches = int(job.batch_limit) if job.batch_limit and int(job.batch_limit) > 0 else None
+    processed_batches = 0
 
     try:
         rules_map = label_config_bundle.current_rules_map()
@@ -891,6 +893,8 @@ def _run_prompt_inference_batches(
     label_types = label_types or {}
 
     for batch in manifest.get("batches", []):
+        if max_batches is not None and processed_batches >= max_batches:
+            break
         batch_id = batch.get("batch_id")
         out_path_str = batch.get("output_path")
         out_path = inference_job_dir / str(out_path_str) if out_path_str else None
@@ -944,6 +948,7 @@ def _run_prompt_inference_batches(
         batch["status"] = "completed"
         batch["n_rows"] = len(df_out)
         batch["output_path"] = str(Path("outputs") / out_path.name)
+        processed_batches += 1
 
         write_manifest_atomic(manifest_path, manifest)
 

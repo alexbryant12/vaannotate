@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
 
 from vaannotate.vaannotate_ai_backend import config as ai_config
 from vaannotate.vaannotate_ai_backend.label_configs import LabelConfigBundle
-from vaannotate.vaannotate_ai_backend.llm_backends import JSONCallResult
+from vaannotate.vaannotate_ai_backend.llm_backends import JSONCallResult, _first_choice_or_raise
 from vaannotate.vaannotate_ai_backend.services.llm_labeler import LLMLabeler
 
 
@@ -248,6 +248,21 @@ def test_label_bundle_preserves_multiselect_routing(tmp_path):
     assert calls["fc"] == 0
     assert calls["json"] == 1
     assert rows[0]["prediction"] == "Option A"
+
+
+def test_first_choice_or_raise_returns_first_choice() -> None:
+    resp = types.SimpleNamespace(choices=["first", "second"])
+    assert _first_choice_or_raise(resp, operation="json_call") == "first"
+
+
+def test_first_choice_or_raise_raises_for_empty_choices() -> None:
+    resp = types.SimpleNamespace(choices=[])
+    try:
+        _first_choice_or_raise(resp, operation="forced_choice")
+    except RuntimeError as exc:
+        assert "forced_choice returned no choices" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("Expected RuntimeError for empty choices")
 
 
 def test_multilabel_prompt_switches_to_multi_select(tmp_path):
