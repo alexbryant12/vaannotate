@@ -216,15 +216,9 @@ def test_prompt_inference_resumes_with_manifest_overrides(monkeypatch, tmp_path:
 
     applied_overrides: list[dict] = []
 
-    class DummySession:
-        models = object()
-        store = object()
-
-    def fake_backend_from_env(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-        return DummySession()
-
-    def fake_build_shared_components(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-        return {"llm_labeler": object()}
+    class DummyLLMLabeler:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.label_config = {}
 
     def fake_load_label_config_bundle(*_args, **_kwargs):  # type: ignore[no-untyped-def]
         return type(
@@ -240,8 +234,8 @@ def test_prompt_inference_resumes_with_manifest_overrides(monkeypatch, tmp_path:
     def fake_run_batches(manifest, *_args, **_kwargs):  # type: ignore[no-untyped-def]
         return manifest
 
-    monkeypatch.setattr(jobs.BackendSession, "from_env", staticmethod(fake_backend_from_env))
-    monkeypatch.setattr(jobs, "_build_shared_components", fake_build_shared_components)
+    monkeypatch.setattr(jobs, "build_llm_backend", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(jobs, "LLMLabeler", DummyLLMLabeler)
     monkeypatch.setattr(jobs, "_load_label_config_bundle", fake_load_label_config_bundle)
     monkeypatch.setattr(jobs, "_run_prompt_inference_batches", fake_run_batches)
     monkeypatch.setattr(jobs, "_normalize_local_model_overrides", lambda overrides: overrides)
