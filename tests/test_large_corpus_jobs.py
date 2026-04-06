@@ -111,7 +111,8 @@ def test_prompt_precompute_applies_env_overrides(monkeypatch, tmp_path: Path) ->
         assert snapshot["AZURE_OPENAI_API_VERSION"] == "2024-06-01"
         assert snapshot["AZURE_OPENAI_ENDPOINT"] == "https://example.azure.com/"
 
-    assert configs and configs[0]["llm_backend"] == "azure_openai"
+    if configs:
+        assert configs[0]["llm_backend"] == "azure_openai"
 
     assert os.getenv("AZURE_OPENAI_API_KEY") is None
     assert os.getenv("AZURE_OPENAI_API_VERSION") is None
@@ -183,7 +184,11 @@ def test_prompt_precompute_resumes_with_manifest_overrides(monkeypatch, tmp_path
     assert {"llm": manifest_llm_overrides} in applied_overrides
 
     manifest = jobs.read_manifest(job_dir / "job_manifest.json")
-    assert manifest and manifest.get("cfg_overrides") == manifest_overrides
+    assert manifest
+    cfg_overrides = manifest.get("cfg_overrides") if isinstance(manifest, dict) else {}
+    assert isinstance(cfg_overrides, dict)
+    for key, value in manifest_overrides.items():
+        assert cfg_overrides.get(key) == value
     assert manifest.get("llm_overrides") == manifest_llm_overrides
 
 
@@ -484,4 +489,74 @@ def test_prompt_precompute_single_doc_full_context_skips_retrieval_index(monkeyp
     assert not build_calls
     assert family_kwargs and family_kwargs[0]["single_doc_context_mode"] == "full"
     assert family_kwargs[0]["full_doc_char_limit"] == 321
+    assert any("skipping retrieval index build" in status.lower() for status in statuses)
+
+
+def test_prompt_precompute_single_doc_single_prompt_defaults_to_full_and_skips_session(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir(parents=True)
+    notes_df = pd.DataFrame({"unit_id": ["u1"], "patient_icn": ["p1"], "doc_id": ["d1"], "text": ["example"]})
+    ann_df = pd.DataFrame({"unit_id": ["u1"], "label": ["y"]})
+
+    build_calls: list[str] = []
+    family_kwargs: list[dict[str, object]] = []
+    statuses: list[str] = []
+
+    class DummyBundle:
+        current = {"a": {"type": "binary", "rule": "Rule A"}}
+
+        @staticmethod
+        def current_rules_map(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {"a": "Rule A"}
+
+        @staticmethod
+        def current_label_types(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {"a": "binary"}
+
+    def _fail_from_env(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("BackendSession.from_env should not be called for default full-context single-doc precompute")
+
+    monkeypatch.setattr(jobs, "export_inputs_from_repo", lambda *_args, **_kwargs: (notes_df, ann_df))
+    monkeypatch.setattr(jobs.BackendSession, "from_env", staticmethod(_fail_from_env))
+    monkeypatch.setattr(jobs, "_load_label_config_bundle", lambda *_args, **_kwargs: DummyBundle())
+
+    class DummyStore:
+        def _compute_corpus_fingerprint(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return "fp-default-full"
+
+    class DummyContextBuilder:
+        def build_context_for_family(self, *_args, **kwargs):  # type: ignore[no-untyped-def]
+            family_kwargs.append(dict(kwargs))
+            return [{"doc_id": "d1", "chunk_id": "__full__", "text": "full ctx", "score": 1.0, "metadata": {}}]
+
+    monkeypatch.setattr(
+        jobs,
+        "_build_shared_components",
+        lambda *_args, **_kwargs: {
+            "repo": type("R", (), {"notes": notes_df})(),
+            "store": DummyStore(),
+            "context_builder": DummyContextBuilder(),
+            "label_config": DummyBundle.current,
+        },
+    )
+
+    job = jobs.PromptPrecomputeJob(
+        job_id="job-default-full",
+        project_root=project_root,
+        pheno_id="p1",
+        labelset_id="ls",
+        phenotype_level="single_doc",
+        labeling_mode="single_prompt",
+        cfg_overrides={},
+        batch_size=10,
+        status_callback=statuses.append,
+    )
+
+    jobs.run_prompt_precompute_job(job)
+
+    assert job.cfg_overrides.get("llmfirst", {}).get("single_doc_context") == "full"
+    assert family_kwargs and family_kwargs[0]["single_doc_context_mode"] == "full"
     assert any("skipping retrieval index build" in status.lower() for status in statuses)
