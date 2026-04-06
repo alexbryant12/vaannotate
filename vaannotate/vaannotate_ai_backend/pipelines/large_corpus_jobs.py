@@ -14,6 +14,7 @@ from ..adapters import _load_label_config_bundle, export_inputs_from_repo
 from ..config import OrchestratorConfig, Paths
 from ..experiments import _normalize_local_model_overrides
 from ..label_configs import LabelConfigBundle
+from ..llm_backends import build_llm_backend
 from ..orchestration import _build_shared_components, BackendSession
 from ..orchestrator import _apply_overrides
 from ..services import LLMLabeler
@@ -781,23 +782,18 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
         overrides=label_overrides,
     )
 
-    session_paths = Paths(
-        notes_path=str(prompt_job_dir / "notes.parquet"),
-        annotations_path=str(prompt_job_dir / "annotations.parquet"),
-        outdir=str(job_dir / "_session"),
-        cache_dir_override=str(job_dir / "cache"),
-    )
-    session = BackendSession.from_env(session_paths, cfg)
-
-    components = _build_shared_components(
-        session_paths,
-        cfg,
+    llm_labeler = LLMLabeler(
+        build_llm_backend(cfg.llm),
         label_config_bundle,
-        phenotype_level=job.phenotype_level,
-        models=session.models,
-        store=session.store,
+        cfg.llm,
+        sc_cfg=cfg.scjitter,
+        cache_dir=str(job_dir / "cache"),
     )
-    llm_labeler: LLMLabeler = components["llm_labeler"]
+    llm_labeler.label_config = (
+        getattr(label_config_bundle, "current", None)
+        or getattr(label_config_bundle, "current_config", None)
+        or {}
+    )
 
     if not manifest:
         manifest = {
