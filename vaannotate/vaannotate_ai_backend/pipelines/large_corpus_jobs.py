@@ -962,9 +962,14 @@ def _run_single_prompt_batch(
     label_types: dict[str, str],
 ) -> pd.DataFrame:
     tasks = df_to_single_prompt_tasks(df_prompts)
+    current_label_config = (
+        getattr(label_config_bundle, "current", None)
+        or getattr(label_config_bundle, "current_config", None)
+        or {}
+    )
 
     parent_to_children, child_to_parents, roots = build_label_dependencies(
-        label_config_bundle.current_config
+        current_label_config
     )
 
     rows: list[dict] = []
@@ -997,7 +1002,7 @@ def _run_single_prompt_batch(
                 unit_id=unit_id,
                 parent_preds=parent_preds,
                 label_types=task.label_types,
-                label_config=label_config_bundle.current_config,
+                label_config=current_label_config,
             )
             if not gated_ok:
                 value = None
@@ -1030,11 +1035,16 @@ def _run_family_prompt_batch(
     label_types: dict[str, str],
 ) -> pd.DataFrame:
     tasks = df_to_family_prompt_tasks(df_prompts)
+    current_label_config = (
+        getattr(label_config_bundle, "current", None)
+        or getattr(label_config_bundle, "current_config", None)
+        or {}
+    )
 
     ctx_by_pair = {(t.unit_id, t.label_id): t for t in tasks}
 
     parent_to_children, child_to_parents, roots = build_label_dependencies(
-        label_config_bundle.current_config
+        current_label_config
     )
 
     all_label_ids = sorted(label_types.keys())
@@ -1056,7 +1066,7 @@ def _run_family_prompt_batch(
                 unit_id=unit_id,
                 parent_preds=parent_preds,
                 label_types=label_types,
-                label_config=label_config_bundle.current_config,
+                label_config=current_label_config,
             )
             if not allowed:
                 continue

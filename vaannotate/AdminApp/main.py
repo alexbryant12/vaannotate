@@ -2542,6 +2542,7 @@ AI_CONFIG_TOOLTIPS: Dict[str, Dict[str, str]] = {
         "rpm_limit": "Requests-per-minute throttle; leave 0 to disable.",
         "include_reasoning": "Ask the LLM to return reasoning/rationale text.",
         "few_shot_examples": "Optional JSON mapping of label_id → examples, each with 'context' and JSON 'answer'.",
+        "azure_api_key": "Azure OpenAI API key used when backend=azure.",
         "azure_api_version": "Azure OpenAI API version to target.",
         "azure_endpoint": "Custom Azure OpenAI endpoint URL.",
         "local_model_dir": "Path to the local ExLlamaV2 model directory.",
@@ -2974,6 +2975,7 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
                 "max_context_chars",
                 "rpm_limit",
                 "include_reasoning",
+                "azure_api_key",
                 "azure_api_version",
                 "azure_endpoint",
                 "local_model_dir",
@@ -3002,6 +3004,7 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
                 "max_context_chars",
                 "rpm_limit",
                 "include_reasoning",
+                "azure_api_key",
                 "azure_api_version",
                 "azure_endpoint",
                 "local_model_dir",
@@ -3293,6 +3296,9 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
         else:
             edit = QtWidgets.QLineEdit()
             edit.setText("" if value is None else str(value))
+            if section == "llm" and name == "azure_api_key":
+                edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+                edit.setPlaceholderText("Enter Azure OpenAI API key")
             widget = edit
         if tooltip:
             widget.setToolTip(tooltip)
