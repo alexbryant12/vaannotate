@@ -1180,6 +1180,7 @@ class _LargeCorpusJobWorker(QtCore.QObject):
                 run_prompt_precompute_job(self.precompute_job)
                 self.log_message.emit("Prompt precompute job completed.")
             elif self.inference_job is not None:
+                self.inference_job.status_callback = self.log_message.emit
                 self.log_message.emit(
                     f"Starting prompt inference job {self.inference_job.job_id}…"
                 )
@@ -1430,6 +1431,12 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         self.inference_batch_limit.setMaximum(1000000)
         self.inference_batch_limit.setValue(0)
         form.addRow("Batch limit (0 = all)", self.inference_batch_limit)
+
+        self.inference_off_hours_only = QtWidgets.QCheckBox(
+            "Only run off-hours/weekends (10p-6a ET weekdays; all day Sat/Sun)"
+        )
+        self.inference_off_hours_only.setChecked(False)
+        form.addRow("Run window", self.inference_off_hours_only)
 
         self.inference_cfg_overrides = QtWidgets.QPlainTextEdit()
         self.inference_cfg_overrides.setPlaceholderText("Optional JSON overrides for AI config")
@@ -2121,6 +2128,10 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         if not llm_overrides and manifest_llm:
             llm_overrides = manifest_llm
             self.inference_llm_overrides.setPlainText(json.dumps(llm_overrides, indent=2))
+        if isinstance(manifest, Mapping):
+            manifest_off_hours_only = manifest.get("off_hours_only")
+            if isinstance(manifest_off_hours_only, bool):
+                self.inference_off_hours_only.setChecked(manifest_off_hours_only)
 
         level = str(self.pheno_row.get("level") or "single_doc")
         if isinstance(prompt_manifest, Mapping):
@@ -2138,6 +2149,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             if prompt_mode:
                 labeling_mode = str(prompt_mode)
         batch_limit = int(self.inference_batch_limit.value()) or None
+        off_hours_only = bool(self.inference_off_hours_only.isChecked())
 
         return PromptInferenceJob(
             job_id=job_id,
@@ -2150,6 +2162,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             llm_overrides=llm_overrides or None,
             job_dir=inference_dir,
             batch_limit=batch_limit,
+            off_hours_only=off_hours_only,
         )
 
     def _on_run_precompute(self) -> None:

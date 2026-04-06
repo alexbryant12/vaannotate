@@ -4,9 +4,11 @@ import logging
 import os
 import time
 import hashlib
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -67,6 +69,24 @@ class PromptInferenceJob:
     llm_overrides: dict[str, Any] | None
     job_dir: Path | None = None
     batch_limit: int | None = None
+    off_hours_only: bool = False
+    status_callback: Callable[[str], None] | None = None
+
+
+def _inference_explicitly_configures_logprobs(
+    cfg_overrides: dict[str, Any] | None,
+    llm_overrides: dict[str, Any] | None,
+) -> bool:
+    cfg_llm = cfg_overrides.get("llm") if isinstance(cfg_overrides, dict) else None
+    if isinstance(cfg_llm, dict) and (
+        "logprobs" in cfg_llm or "top_logprobs" in cfg_llm
+    ):
+        return True
+    if isinstance(llm_overrides, dict) and (
+        "logprobs" in llm_overrides or "top_logprobs" in llm_overrides
+    ):
+        return True
+    return False
 
 
 def _empty_annotations_frame() -> pd.DataFrame:
@@ -146,6 +166,16 @@ def _emit_precompute_status(job: PromptPrecomputeJob, message: str) -> None:
             job.status_callback(message)
         except Exception:
             logger.debug("Prompt precompute status callback failed", exc_info=True)
+
+
+def _emit_inference_status(job: PromptInferenceJob, message: str) -> None:
+    logger = logging.getLogger(__name__)
+    logger.info(message)
+    if job.status_callback is not None:
+        try:
+            job.status_callback(message)
+        except Exception:
+            logger.debug("Prompt inference status callback failed", exc_info=True)
 
 
 def _format_eta(seconds: float | None) -> str:
@@ -725,7 +755,7 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
     """
 
     log = logging.getLogger(__name__)
-    log.info("Starting prompt inference job %s", job.job_id)
+    _emit_inference_status(job, f"Starting prompt inference job {job.job_id}")
 
     job_dir = job.job_dir or job.project_root / "admin_tools" / "prompt_inference" / job.job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -760,6 +790,10 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
         if not job.llm_overrides and isinstance(manifest_llm, dict):
             job.llm_overrides = manifest_llm
 
+        manifest_off_hours_only = manifest.get("off_hours_only")
+        if not job.off_hours_only and isinstance(manifest_off_hours_only, bool):
+            job.off_hours_only = manifest_off_hours_only
+
     cfg = OrchestratorConfig()
     overrides = _normalize_local_model_overrides(job.cfg_overrides or {})
     if overrides:
@@ -770,6 +804,10 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
         _apply_overrides(cfg, {"llm": llm_overrides})
         if "llmfirst" in llm_overrides:
             _apply_overrides(cfg, {"llmfirst": llm_overrides.get("llmfirst")})
+
+    if not _inference_explicitly_configures_logprobs(job.cfg_overrides, job.llm_overrides):
+        cfg.llm.logprobs = False
+        cfg.llm.top_logprobs = 0
 
     pheno_id = prompt_manifest.get("pheno_id") if prompt_manifest else None
     labelset_id = prompt_manifest.get("labelset_id") if prompt_manifest else None
@@ -803,14 +841,26 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
             "phenotype_level": job.phenotype_level,
             "cfg_overrides": job.cfg_overrides,
             "llm_overrides": job.llm_overrides or {},
+            "off_hours_only": bool(job.off_hours_only),
             "batches": [],
         }
     elif isinstance(manifest, dict):
         manifest["cfg_overrides"] = job.cfg_overrides
         manifest["llm_overrides"] = job.llm_overrides or {}
+        manifest["off_hours_only"] = bool(job.off_hours_only)
 
     manifest = _initialize_and_update_batches_for_prompt_inference(manifest, job, prompt_manifest)
     write_manifest_atomic(manifest_path, manifest)
+
+    total_batches = len(manifest.get("batches", []))
+    completed_batches = sum(
+        1 for batch in manifest.get("batches", []) if batch.get("status") == "completed"
+    )
+    _emit_inference_status(
+        job,
+        f"Prepared prompt inference for {total_batches} batches "
+        f"({completed_batches} already completed).",
+    )
 
     manifest = _run_prompt_inference_batches(
         manifest,
@@ -824,6 +874,13 @@ def run_prompt_inference_job(job: PromptInferenceJob) -> None:
     )
 
     write_manifest_atomic(manifest_path, manifest)
+    completed_after = sum(
+        1 for batch in manifest.get("batches", []) if batch.get("status") == "completed"
+    )
+    _emit_inference_status(
+        job,
+        f"Prompt inference finished: {completed_after}/{len(manifest.get('batches', []))} batches completed.",
+    )
 
 
 def _initialize_and_update_batches_for_prompt_inference(
@@ -891,8 +948,15 @@ def _run_prompt_inference_batches(
 
     rules_map = rules_map or {}
     label_types = label_types or {}
+    total_batches = len(manifest.get("batches", []))
+    completed_batches = sum(
+        1 for batch in manifest.get("batches", []) if batch.get("status") == "completed"
+    )
+    started_at = time.time()
 
     for batch in manifest.get("batches", []):
+        if job.off_hours_only:
+            _wait_for_off_hours_inference_window(log)
         if max_batches is not None and processed_batches >= max_batches:
             break
         batch_id = batch.get("batch_id")
@@ -949,10 +1013,80 @@ def _run_prompt_inference_batches(
         batch["n_rows"] = len(df_out)
         batch["output_path"] = str(Path("outputs") / out_path.name)
         processed_batches += 1
+        completed_batches += 1
 
         write_manifest_atomic(manifest_path, manifest)
+        elapsed = max(time.time() - started_at, 1e-6)
+        avg_seconds_per_batch = elapsed / max(completed_batches, 1)
+        remaining_batches = max(total_batches - completed_batches, 0)
+        eta_seconds = avg_seconds_per_batch * remaining_batches
+        _emit_inference_status(
+            job,
+            f"Completed inference batch {int(batch_id) + 1}/{total_batches}: "
+            f"{completed_batches}/{total_batches} batches done, "
+            f"{remaining_batches} remaining, {_format_eta(eta_seconds)}.",
+        )
 
     return manifest
+
+
+def _in_off_hours_inference_window(now_utc: datetime | None = None) -> bool:
+    """Return True when now is in the allowed large-corpus inference window.
+
+    Allowed schedule:
+    - Monday-Friday: 10:00 PM to 6:00 AM America/New_York
+    - Saturday-Sunday: all day
+    """
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    now_est = now_utc.astimezone(ZoneInfo("America/New_York"))
+    weekday = now_est.weekday()  # 0=Mon ... 6=Sun
+    if weekday >= 5:
+        return True
+    return now_est.hour >= 22 or now_est.hour < 6
+
+
+def _seconds_until_next_off_hours_window(now_utc: datetime | None = None) -> float:
+    """Return seconds until the next allowed inference window in America/New_York."""
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    eastern = ZoneInfo("America/New_York")
+    now_est = now_utc.astimezone(eastern)
+    if _in_off_hours_inference_window(now_utc):
+        return 0.0
+
+    weekday = now_est.weekday()
+    current_day_at_22 = now_est.replace(hour=22, minute=0, second=0, microsecond=0)
+    if weekday < 4:
+        next_start = current_day_at_22
+    elif weekday == 4:
+        # Friday daytime -> weekend opens at midnight between Friday/Saturday.
+        next_start = (now_est + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        next_start = now_est
+
+    return max((next_start - now_est).total_seconds(), 0.0)
+
+
+def _wait_for_off_hours_inference_window(log: logging.Logger) -> None:
+    if _in_off_hours_inference_window():
+        return
+
+    seconds = _seconds_until_next_off_hours_window()
+    sleep_seconds = max(seconds, 60.0)
+    log.info(
+        "Off-hours-only inference enabled; pausing for %.0f seconds until next allowed window.",
+        sleep_seconds,
+    )
+    time.sleep(sleep_seconds)
 
 
 def _run_single_prompt_batch(
