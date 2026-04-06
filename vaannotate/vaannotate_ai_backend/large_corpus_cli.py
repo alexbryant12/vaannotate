@@ -13,6 +13,7 @@ from .pipelines.large_corpus_jobs import (
     run_prompt_inference_job,
     run_prompt_precompute_job,
 )
+from .utils.job_manifest import read_manifest
 
 LOG = logging.getLogger(__name__)
 
@@ -147,6 +148,79 @@ def create_prompt_inference_job(
     return job
 
 
+def _infer_project_root_from_inference_job_dir(job_dir: Path) -> Path | None:
+    parts = tuple(job_dir.parts)
+    if len(parts) >= 3 and parts[-3:] == ("admin_tools", "prompt_inference", job_dir.name):
+        return job_dir.parents[2]
+    return None
+
+
+def resume_prompt_inference_job(
+    job_dir: str | Path | None = None,
+    *,
+    batch_limit: int | None = None,
+    off_hours_only: bool | None = None,
+    project_root: str | Path | None = None,
+    prompt_job_dir: str | Path | None = None,
+) -> PromptInferenceJob:
+    """Resume a prompt inference job from an existing inference job directory."""
+
+    resolved_job_dir = Path(job_dir) if job_dir else Path.cwd()
+    manifest_path = resolved_job_dir / "job_manifest.json"
+    manifest = read_manifest(manifest_path)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Expected inference manifest at {manifest_path}")
+
+    prompt_job_id = str(manifest.get("prompt_job_id") or "").strip()
+    if not prompt_job_id:
+        raise ValueError(f"Missing prompt_job_id in {manifest_path}")
+
+    phenotype_level = str(manifest.get("phenotype_level") or "").strip()
+    if not phenotype_level:
+        raise ValueError(f"Missing phenotype_level in {manifest_path}")
+
+    labeling_mode = str(manifest.get("labeling_mode") or "").strip()
+    if labeling_mode not in {"family", "single_prompt"}:
+        raise ValueError(f"Invalid labeling_mode {labeling_mode!r} in {manifest_path}")
+
+    cfg_overrides = manifest.get("cfg_overrides")
+    llm_overrides = manifest.get("llm_overrides")
+    default_off_hours_only = bool(manifest.get("off_hours_only"))
+
+    resolved_project_root = (
+        Path(project_root)
+        if project_root
+        else _infer_project_root_from_inference_job_dir(resolved_job_dir)
+    )
+    if resolved_project_root is None:
+        raise ValueError(
+            "Unable to infer project_root from inference job directory. "
+            "Pass --project-root explicitly."
+        )
+
+    resolved_prompt_job_dir = (
+        Path(prompt_job_dir)
+        if prompt_job_dir
+        else resolved_project_root / "admin_tools" / "prompt_jobs" / prompt_job_id
+    )
+
+    job = PromptInferenceJob(
+        job_id=str(manifest.get("job_id") or resolved_job_dir.name),
+        prompt_job_id=prompt_job_id,
+        project_root=resolved_project_root,
+        prompt_job_dir=resolved_prompt_job_dir,
+        phenotype_level=phenotype_level,
+        labeling_mode=labeling_mode,
+        cfg_overrides=cfg_overrides if isinstance(cfg_overrides, dict) else {},
+        llm_overrides=llm_overrides if isinstance(llm_overrides, dict) else None,
+        job_dir=resolved_job_dir,
+        batch_limit=batch_limit,
+        off_hours_only=default_off_hours_only if off_hours_only is None else bool(off_hours_only),
+    )
+    run_prompt_inference_job(job)
+    return job
+
+
 def _parse_json_arg(value: str | None) -> dict[str, Any] | None:
     if not value:
         return None
@@ -199,6 +273,30 @@ def main(argv: list[str] | None = None) -> None:
     infer.add_argument("--experiment-name", help="Name from experiments manifest")
     infer.add_argument("--experiments-dir", type=Path, help="Override experiments manifest dir")
 
+    resume_infer = sub.add_parser(
+        "resume-infer",
+        help="Resume an existing prompt inference job from its job directory (defaults to CWD).",
+    )
+    resume_infer.add_argument("job_dir", type=Path, nargs="?", default=Path.cwd())
+    resume_infer.add_argument("--project-root", type=Path, help="Override project root inference.")
+    resume_infer.add_argument("--prompt-job-dir", type=Path, help="Override prompt job directory.")
+    resume_infer.add_argument("--batch-limit", type=int, help="Process at most this many pending batches.")
+    off_hours_group = resume_infer.add_mutually_exclusive_group()
+    off_hours_group.add_argument(
+        "--off-hours-only",
+        dest="off_hours_only",
+        action="store_const",
+        const=True,
+        help="Force off-hours-only inference scheduling for this resume run.",
+    )
+    off_hours_group.add_argument(
+        "--disable-off-hours-only",
+        dest="off_hours_only",
+        action="store_const",
+        const=False,
+        help="Disable off-hours-only inference scheduling for this resume run.",
+    )
+
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO)
@@ -243,6 +341,14 @@ def main(argv: list[str] | None = None) -> None:
             job_dir=args.job_dir,
             batch_limit=args.batch_limit,
             off_hours_only=bool(args.off_hours_only),
+        )
+    elif args.command == "resume-infer":
+        resume_prompt_inference_job(
+            job_dir=args.job_dir,
+            batch_limit=args.batch_limit,
+            off_hours_only=args.off_hours_only,
+            project_root=args.project_root,
+            prompt_job_dir=args.prompt_job_dir,
         )
 
 
