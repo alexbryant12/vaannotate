@@ -148,6 +148,54 @@ class LLMLabeler:
             used += len(frag)
         return "\n\n".join(ctx)
 
+    @staticmethod
+    def _response_keys_text(include_reasoning: bool) -> str:
+        return "prediction (required) and reasoning (optional)" if include_reasoning else "prediction (required)"
+
+    @staticmethod
+    def _compact_json(payload: Any) -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _parse_jsonish_answer(self, raw_answer: Any) -> Any:
+        if isinstance(raw_answer, str):
+            text = raw_answer.strip()
+            if text:
+                try:
+                    return json.loads(text)
+                except Exception:
+                    return raw_answer
+            return raw_answer
+        return raw_answer
+
+    def _normalize_few_shot_answer(self, raw_answer: Any, *, include_reasoning: bool) -> dict[str, Any]:
+        parsed = self._parse_jsonish_answer(raw_answer)
+        normalized: dict[str, Any] = {}
+        if isinstance(parsed, Mapping):
+            if "prediction" in parsed:
+                normalized["prediction"] = parsed.get("prediction")
+            else:
+                # Backward-compat: treat arbitrary object payload as a prediction
+                # object (common for legacy multi-select examples like
+                # {"Option A": "Yes", "Option B": "No"}).
+                normalized["prediction"] = dict(parsed)
+            if include_reasoning and parsed.get("reasoning") is not None:
+                normalized["reasoning"] = parsed.get("reasoning")
+        else:
+            normalized["prediction"] = parsed
+        if "prediction" not in normalized:
+            normalized["prediction"] = "unknown"
+        return normalized
+
+    def _raw_few_shot_examples(self, label_id: str) -> list[Mapping[str, Any]]:
+        examples_cfg = getattr(self.cfg, "few_shot_examples", {}) or {}
+        if not isinstance(examples_cfg, Mapping):
+            return []
+        label_key = str(label_id)
+        label_examples = examples_cfg.get(label_key) or examples_cfg.get(label_key.lower())
+        if not isinstance(label_examples, (list, tuple)):
+            return []
+        return [entry for entry in label_examples if isinstance(entry, Mapping)]
+
     def build_single_label_prompt_payload(
         self,
         *,
@@ -170,7 +218,7 @@ class LLMLabeler:
         unknown_option_configured = any(_canon_str(o).lower() == "unknown" for o in option_values)
 
         guideline_text = label_rules if label_rules else "(no additional guidelines)"
-        response_keys = "reasoning, prediction" if include_reasoning else "prediction"
+        response_keys = self._response_keys_text(include_reasoning)
         system_segments: list[str] = [
             "You are a meticulous clinical annotator for EHR data.",
             f"Your task: label '{label_id}' (type: {label_type}). Use the evidence snippets from this patient's notes.",
@@ -202,7 +250,7 @@ class LLMLabeler:
         system = "\n\n".join(system_segments)
         if system_suffix:
             system = system + "\n" + str(system_suffix)
-        few_shot_msgs = self._few_shot_messages(label_id)
+        few_shot_msgs = self._few_shot_messages(label_id, include_reasoning=include_reasoning)
         schema = {
             "type": "object",
             "properties": {"prediction": self._prediction_schema(label_type, option_values, categorical_types)},
@@ -262,17 +310,18 @@ class LLMLabeler:
             schema["properties"][lid] = label_schema
             schema["required"].append(lid)
 
+        response_keys = self._response_keys_text(include_reasoning)
         system_prompt = "\n\n".join(
             [
                 "You are a meticulous clinical annotator for EHR data.",
                 "Given the patient context, extract all requested labels in one pass.",
                 "Use 'no' or 'unknown' when evidence is missing or insufficient.",
-                "Each label must return JSON with keys: prediction (required) and reasoning (optional).",
+                f"Each label must return JSON with keys: {response_keys}.",
                 "Label details:",
                 "\n\n".join(label_summaries),
             ]
         )
-        few_shot_msgs = self._few_shot_messages_for_labels(label_ids)
+        few_shot_msgs = self._few_shot_messages_for_labels(label_ids, include_reasoning=include_reasoning)
         return {
             "messages": [{"role": "system", "content": system_prompt}, *few_shot_msgs, {"role": "user", "content": ctx_text}],
             "prompt": {"system": system_prompt, "messages": few_shot_msgs, "user": ctx_text},
@@ -467,18 +516,10 @@ class LLMLabeler:
                 pairs += 1
         return float(sim_sum / max(1, pairs))
 
-    def _few_shot_messages(self, label_id: str) -> list[dict[str, str]]:
-        examples_cfg = getattr(self.cfg, "few_shot_examples", {}) or {}
-        if not isinstance(examples_cfg, Mapping):
-            return []
-        label_key = str(label_id)
-        label_examples = examples_cfg.get(label_key) or examples_cfg.get(label_key.lower())
-        if not isinstance(label_examples, (list, tuple)):
-            return []
+    def _few_shot_messages(self, label_id: str, *, include_reasoning: bool) -> list[dict[str, str]]:
+        label_examples = self._raw_few_shot_examples(label_id)
         messages: list[dict[str, str]] = []
         for entry in label_examples:
-            if not isinstance(entry, Mapping):
-                continue
             answer = entry.get("answer")
             context = entry.get("context")
             if context is not None:
@@ -487,19 +528,23 @@ class LLMLabeler:
                     ctx_text = f"EHR context:\n{ctx_text}"
                 messages.append({"role": "user", "content": ctx_text})
             if answer is not None:
-                messages.append({"role": "assistant", "content": str(answer)})
+                normalized = self._normalize_few_shot_answer(answer, include_reasoning=include_reasoning)
+                messages.append({"role": "assistant", "content": self._compact_json(normalized)})
         return messages
 
-    def _few_shot_messages_for_labels(self, label_ids: Iterable[str]) -> list[dict[str, str]]:
+    def _few_shot_messages_for_labels(self, label_ids: Iterable[str], *, include_reasoning: bool) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
         for label_id in label_ids:
-            for entry in self._few_shot_messages(label_id):
-                role = entry.get("role") if isinstance(entry, Mapping) else None
-                content = entry.get("content") if isinstance(entry, Mapping) else None
-                if role not in {"user", "assistant"} or not isinstance(content, str):
-                    continue
-                prefix = f"[label {label_id}] "
-                messages.append({"role": role, "content": prefix + content})
+            for entry in self._raw_few_shot_examples(label_id):
+                context = entry.get("context")
+                answer = entry.get("answer")
+                if context is not None:
+                    ctx_text = str(context).strip()
+                    if ctx_text:
+                        messages.append({"role": "user", "content": f"Label: {label_id}\nEHR context:\n{ctx_text}"})
+                if answer is not None:
+                    normalized = self._normalize_few_shot_answer(answer, include_reasoning=include_reasoning)
+                    messages.append({"role": "assistant", "content": self._compact_json({str(label_id): normalized})})
         return messages
 
     def summarize_label_rule_for_rerank(self, label_id: str, label_rules: str, max_sentences: int = 2) -> str:
@@ -764,6 +809,8 @@ class LLMLabeler:
             }
         ]
 
+        categorical_types = self.CATEGORICAL_TYPES
+        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
         predictions: dict[str, dict] = {}
         for lid in label_ids:
             ltype = label_types.get(lid, "categorical") if isinstance(label_types, Mapping) else "categorical"
