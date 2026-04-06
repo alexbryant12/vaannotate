@@ -309,3 +309,106 @@ def test_multilabel_prompt_switches_to_multi_select(tmp_path):
 
     assert result["predictions"]["Multi"]["prediction"] == "Option A"
     assert result["predictions"]["Single"]["prediction"] == "Option B"
+
+
+def test_multilabel_prompt_omits_reasoning_when_disabled(tmp_path):
+    calls: dict[str, object] = {}
+
+    class DummyBackend:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def json_call(self, messages, **kwargs):  # noqa: D401
+            calls["messages"] = list(messages)
+            calls["response_format"] = kwargs.get("response_format")
+            payload = {"Flag": {"prediction": "yes", "reasoning": "ignored"}}
+            return JSONCallResult(
+                data=payload,
+                content=json.dumps(payload),
+                raw_response=None,
+                latency_s=0.01,
+                logprobs=None,
+            )
+
+    llm_cfg = ai_config.LLMConfig()
+    llm_cfg.include_reasoning = False
+    annotator = LLMLabeler(
+        DummyBackend(llm_cfg),
+        LabelConfigBundle(),
+        llm_cfg,
+        sc_cfg=ai_config.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
+
+    annotator.annotate_multi(
+        unit_id="unit-reasoning-off",
+        label_ids=["Flag"],
+        label_types={"Flag": "categorical"},
+        rules_map={"Flag": ""},
+        ctx_snippets=[{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}],
+    )
+
+    system_message = next(msg["content"] for msg in calls["messages"] if msg["role"] == "system")
+    assert "reasoning (optional)" not in system_message
+    assert "prediction (required)" in system_message
+    response_format = calls.get("response_format") or {}
+    schema = (response_format.get("json_schema") if isinstance(response_format, dict) else {}) or {}
+    label_schema = (schema.get("properties") or {}).get("Flag", {}) or {}
+    assert "reasoning" not in ((label_schema.get("properties") or {}))
+
+
+def test_single_label_few_shot_answer_is_normalized_to_json(tmp_path):
+    class DummyBackend:
+        def json_call(self, *_, **__):  # pragma: no cover - not invoked in this test
+            raise AssertionError("json_call should not be reached")
+
+    llm_cfg = ai_config.LLMConfig()
+    llm_cfg.few_shot_examples = {"Flag": [{"context": "c1", "answer": "yes"}]}
+    annotator = LLMLabeler(
+        llm_backend=DummyBackend(),
+        label_config_bundle=LabelConfigBundle(),
+        llm_config=llm_cfg,
+        sc_cfg=ai_config.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
+
+    payload = annotator.build_single_label_prompt_payload(
+        label_id="Flag",
+        label_type="categorical",
+        label_rules="",
+        snippets=[{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}],
+    )
+    messages = payload["messages"]
+    assistant_example = next(msg["content"] for msg in messages if msg["role"] == "assistant")
+    assert json.loads(assistant_example) == {"prediction": "yes"}
+
+
+def test_multi_label_few_shot_answer_is_wrapped_by_label(tmp_path):
+    class DummyBackend:
+        def json_call(self, *_, **__):  # pragma: no cover - not invoked in this test
+            raise AssertionError("json_call should not be reached")
+
+    llm_cfg = ai_config.LLMConfig()
+    llm_cfg.include_reasoning = False
+    llm_cfg.few_shot_examples = {
+        "Flag": [{"context": "c1", "answer": '{"prediction":"yes","reasoning":"because"}'}]
+    }
+    annotator = LLMLabeler(
+        llm_backend=DummyBackend(),
+        label_config_bundle=LabelConfigBundle(),
+        llm_config=llm_cfg,
+        sc_cfg=ai_config.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
+
+    payload = annotator.build_multi_label_prompt_payload(
+        label_ids=["Flag"],
+        label_types={"Flag": "categorical"},
+        rules_map={"Flag": ""},
+        ctx_snippets=[{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}],
+    )
+    assistant_example = next(
+        msg["content"] for msg in payload["messages"] if msg["role"] == "assistant"
+    )
+    parsed = json.loads(assistant_example)
+    assert parsed == {"Flag": {"prediction": "yes"}}
