@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -168,6 +169,73 @@ def _prompt_precompute_requires_retrieval_index(
     return not (level == "single_doc" and context_mode == "full")
 
 
+def _single_doc_precompute_defaults_to_full_context(job: PromptPrecomputeJob) -> bool:
+    if str(job.phenotype_level or "").strip().lower() != "single_doc":
+        return False
+    if str(job.labeling_mode or "").strip().lower() != "single_prompt":
+        return False
+
+    cfg_llmfirst = job.cfg_overrides.get("llmfirst") if isinstance(job.cfg_overrides, dict) else None
+    if isinstance(cfg_llmfirst, dict) and cfg_llmfirst.get("single_doc_context") is not None:
+        return False
+
+    llm_overrides = job.llm_overrides if isinstance(job.llm_overrides, dict) else {}
+    llmfirst_overrides = llm_overrides.get("llmfirst") if isinstance(llm_overrides, dict) else None
+    if isinstance(llmfirst_overrides, dict) and llmfirst_overrides.get("single_doc_context") is not None:
+        return False
+
+    return True
+
+
+class _NoIndexStore:
+    """Minimal store for full-document single-doc prompt precompute jobs."""
+
+    chunk_meta: list[dict[str, Any]]
+
+    def __init__(self) -> None:
+        self.chunk_meta = []
+
+    def get_patient_chunk_indices(self, _doc_id: str) -> list[int]:
+        return []
+
+    def _compute_corpus_fingerprint(self, notes_df: pd.DataFrame, rag_cfg: Any) -> str:
+        h = hashlib.blake2b(digest_size=16)
+        h.update(
+            f"no_index:chunk_size={getattr(rag_cfg, 'chunk_size', None)},overlap={getattr(rag_cfg, 'chunk_overlap', None)}".encode(
+                "utf-8"
+            )
+        )
+        if isinstance(notes_df, pd.DataFrame):
+            if "hash" in notes_df.columns and "doc_id" in notes_df.columns:
+                pairs = (
+                    notes_df[["doc_id", "hash"]]
+                    .fillna("")
+                    .astype(str)
+                    .sort_values(["doc_id", "hash"])
+                )
+                for row in pairs.itertuples(index=False):
+                    h.update(f"{row.doc_id}:{row.hash}|".encode("utf-8"))
+            elif "doc_id" in notes_df.columns and "text" in notes_df.columns:
+                pairs = (
+                    notes_df[["doc_id", "text"]]
+                    .fillna("")
+                    .astype(str)
+                    .sort_values("doc_id")
+                )
+                for row in pairs.itertuples(index=False):
+                    h.update(f"{row.doc_id}:{row.text}|".encode("utf-8"))
+        return h.hexdigest()
+
+
+class _NoIndexEmbedder:
+    name_or_path = "no-index"
+
+
+class _NoIndexModels:
+    embedder = _NoIndexEmbedder()
+    reranker = object()
+
+
 def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
     """
     Build RAG contexts and prompt tasks for a large unlabeled corpus.
@@ -255,13 +323,30 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
             if "llmfirst" in llm_overrides:
                 _apply_overrides(cfg, {"llmfirst": llm_overrides.get("llmfirst")})
 
+        if _single_doc_precompute_defaults_to_full_context(job):
+            setattr(cfg.llmfirst, "single_doc_context", "full")
+            if not isinstance(job.cfg_overrides, dict):
+                job.cfg_overrides = {}
+            llmfirst_cfg = job.cfg_overrides.get("llmfirst")
+            if not isinstance(llmfirst_cfg, dict):
+                llmfirst_cfg = {}
+                job.cfg_overrides["llmfirst"] = llmfirst_cfg
+            llmfirst_cfg.setdefault("single_doc_context", "full")
+
         session_paths = Paths(
             notes_path=str(notes_path),
             annotations_path=str(ann_path),
             outdir=str(job_dir / "_session"),
             cache_dir_override=str(job_dir / "cache"),
         )
-        session = BackendSession.from_env(session_paths, cfg)
+
+        needs_retrieval_index = _prompt_precompute_requires_retrieval_index(
+            cfg,
+            job.phenotype_level,
+        )
+        session: BackendSession | None = None
+        if needs_retrieval_index:
+            session = BackendSession.from_env(session_paths, cfg)
 
         label_config_bundle = _load_label_config_bundle(
             job.project_root,
@@ -320,10 +405,6 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
         )
         total_batches = len(manifest.get("batches", []))
         total_units = sum(len(batch.get("unit_ids", []) or []) for batch in manifest.get("batches", []))
-        needs_retrieval_index = _prompt_precompute_requires_retrieval_index(
-            cfg,
-            job.phenotype_level,
-        )
         prep_message = (
             f"Prepared prompt precompute for {total_units} units across {total_batches} batches "
             f"({completed_batches} already completed). "
@@ -340,7 +421,8 @@ def run_prompt_precompute_job(job: PromptPrecomputeJob) -> None:
             cfg,
             session,
             label_config_bundle,
-            manifest_path,
+            needs_retrieval_index=needs_retrieval_index,
+            manifest_path=manifest_path,
         )
 
         write_manifest_atomic(manifest_path, manifest)
@@ -393,8 +475,10 @@ def _run_prompt_precompute_batches(
     manifest: dict,
     job: PromptPrecomputeJob,
     cfg: OrchestratorConfig,
-    session: BackendSession,
+    session: BackendSession | None,
     label_config_bundle: LabelConfigBundle,
+    *,
+    needs_retrieval_index: bool,
     manifest_path: Path,
 ) -> dict:
     job_dir = job.job_dir or job.project_root / "admin_tools" / "prompt_jobs" / job.job_id
@@ -406,19 +490,34 @@ def _run_prompt_precompute_batches(
         cache_dir_override=str(job_dir / "cache"),
     )
 
-    components = _build_shared_components(
-        paths,
-        cfg,
-        label_config_bundle,
-        phenotype_level=job.phenotype_level,
-        include_llm=False,
-        models=session.models,
-        store=session.store,
-    )
-
-    repo = components["repo"]
-    store = components["store"]
-    context_builder = components["context_builder"]
+    if needs_retrieval_index:
+        if session is None:
+            session = BackendSession.from_env(paths, cfg)
+        components = _build_shared_components(
+            paths,
+            cfg,
+            label_config_bundle,
+            phenotype_level=job.phenotype_level,
+            include_llm=False,
+            models=session.models,
+            store=session.store,
+        )
+        repo = components["repo"]
+        store = components["store"]
+        context_builder = components["context_builder"]
+    else:
+        components = _build_shared_components(
+            paths,
+            cfg,
+            label_config_bundle,
+            phenotype_level=job.phenotype_level,
+            include_llm=False,
+            models=_NoIndexModels(),
+            store=_NoIndexStore(),
+        )
+        repo = components["repo"]
+        store = components["store"]
+        context_builder = components["context_builder"]
     llm_labeler = LLMLabeler(
         object(),
         label_config_bundle,
@@ -427,10 +526,6 @@ def _run_prompt_precompute_batches(
         cache_dir=str(job_dir / "cache"),
     )
 
-    needs_retrieval_index = _prompt_precompute_requires_retrieval_index(
-        cfg,
-        job.phenotype_level,
-    )
     if needs_retrieval_index:
         store.build_chunk_index(repo.notes, cfg.rag, cfg.index)
 

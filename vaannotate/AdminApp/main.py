@@ -388,6 +388,7 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
             self,
             self._build_inference_backend_config(),
             label_schema=self._labelset_schema,
+            workflow="inference_experiments",
         )
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self._cfg_overrides_base = dialog.result_config or {}
@@ -1432,11 +1433,28 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
 
         self.inference_cfg_overrides = QtWidgets.QPlainTextEdit()
         self.inference_cfg_overrides.setPlaceholderText("Optional JSON overrides for AI config")
+        self.inference_cfg_overrides.textChanged.connect(self._update_inference_advanced_summary)
         form.addRow("Config overrides", self.inference_cfg_overrides)
 
         self.inference_llm_overrides = QtWidgets.QPlainTextEdit()
         self.inference_llm_overrides.setPlaceholderText("Optional JSON overrides for LLM-only settings")
+        self.inference_llm_overrides.textChanged.connect(self._update_inference_advanced_summary)
         form.addRow("LLM overrides", self.inference_llm_overrides)
+
+        inference_advanced_row = QtWidgets.QWidget()
+        inference_advanced_layout = QtWidgets.QVBoxLayout(inference_advanced_row)
+        inference_advanced_layout.setContentsMargins(0, 0, 0, 0)
+        inference_advanced_layout.setSpacing(4)
+        self.inference_advanced_summary = QtWidgets.QLabel()
+        self.inference_advanced_summary.setWordWrap(True)
+        inference_advanced_layout.addWidget(self.inference_advanced_summary)
+        self.inference_advanced_settings_btn = QtWidgets.QPushButton("Inference job settings…")
+        self.inference_advanced_settings_btn.setToolTip(
+            "Open a structured editor for LLM and prompting settings used by prompt inference."
+        )
+        self.inference_advanced_settings_btn.clicked.connect(self._open_inference_advanced_settings)
+        inference_advanced_layout.addWidget(self.inference_advanced_settings_btn)
+        form.addRow("Advanced AI settings", inference_advanced_row)
 
         run_button = QtWidgets.QPushButton("Run / resume inference")
         run_button.clicked.connect(self._on_run_inference)
@@ -1450,6 +1468,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
         form.addRow(note_label)
 
         self._select_latest_round()
+        self._update_inference_advanced_summary()
 
         return widget
 
@@ -1649,6 +1668,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             self,
             config,
             label_schema=self._precompute_label_schema,
+            workflow="prompt_precompute",
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
@@ -1897,6 +1917,173 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
             dataset_column_map=dataset_column_map,
             job_dir=job_dir,
             batch_size=batch_size,
+        )
+
+    @staticmethod
+    def _split_llm_overrides_from_config(
+        config: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        llm_fields = {
+            "backend",
+            "azure_api_key",
+            "azure_api_version",
+            "azure_endpoint",
+            "local_model_dir",
+            "local_max_seq_len",
+            "local_max_new_tokens",
+            "model_name",
+            "rpm_limit",
+            "temperature",
+            "timeout",
+            "retry_max",
+            "retry_backoff",
+            "include_reasoning",
+            "few_shot_examples",
+            "prediction_field",
+            "n_consistency",
+            "logprobs",
+            "top_logprobs",
+            "max_context_chars",
+            "context_order",
+        }
+        llm_overrides = (
+            dict(config.get("llm"))
+            if isinstance(config.get("llm"), Mapping)
+            else {}
+        )
+        cfg_overrides = dict(config)
+        if llm_overrides:
+            cfg_overrides.pop("llm", None)
+        for key in list(cfg_overrides.keys()):
+            if key in llm_fields:
+                llm_overrides.setdefault(key, cfg_overrides.pop(key))
+        return cfg_overrides, llm_overrides
+
+    def _build_inference_config_snapshot(self) -> Optional[dict[str, Any]]:
+        cfg_overrides = self._parse_json_overrides(
+            self.inference_cfg_overrides,
+            "config overrides",
+        )
+        if cfg_overrides is None:
+            return None
+        llm_overrides = self._parse_json_overrides(
+            self.inference_llm_overrides,
+            "LLM overrides",
+        )
+        if llm_overrides is None:
+            return None
+        cfg = ai_config.OrchestratorConfig()
+        config_snapshot: dict[str, Any] = {
+            "index": asdict(cfg.index),
+            "rag": asdict(cfg.rag),
+            "llm": asdict(cfg.llm),
+            "select": asdict(cfg.select),
+            "llmfirst": asdict(cfg.llmfirst),
+            "disagree": asdict(cfg.disagree),
+            "diversity": asdict(cfg.diversity),
+            "scjitter": asdict(cfg.scjitter),
+            "final_llm_labeling": bool(cfg.final_llm_labeling),
+            "final_llm_labeling_n_consistency": int(cfg.final_llm_labeling_n_consistency),
+        }
+        if cfg_overrides:
+            _deep_update_dict(config_snapshot, cfg_overrides)
+        if llm_overrides:
+            llm_cfg = config_snapshot.get("llm")
+            if not isinstance(llm_cfg, dict):
+                llm_cfg = {}
+                config_snapshot["llm"] = llm_cfg
+            _deep_update_dict(llm_cfg, llm_overrides)
+        return config_snapshot
+
+    def _open_inference_advanced_settings(self) -> None:
+        config = self._build_inference_config_snapshot()
+        if config is None:
+            return
+        dialog = AIAdvancedConfigDialog(
+            self,
+            config,
+            label_schema=self._precompute_label_schema,
+            workflow="prompt_inference",
+        )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        result_config = dialog.result_config or {}
+        cfg_overrides, llm_overrides = self._split_llm_overrides_from_config(result_config)
+        self.inference_cfg_overrides.setPlainText(
+            json.dumps(cfg_overrides, indent=2) if cfg_overrides else ""
+        )
+        self.inference_llm_overrides.setPlainText(
+            json.dumps(llm_overrides, indent=2) if llm_overrides else ""
+        )
+        self._update_inference_advanced_summary(config=result_config)
+
+    def _update_inference_advanced_summary(
+        self,
+        *,
+        config: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        summary_label = getattr(self, "inference_advanced_summary", None)
+        if not isinstance(summary_label, QtWidgets.QLabel):
+            return
+        effective_config = config
+        if effective_config is None:
+            cfg_overrides, cfg_invalid = self._parse_json_overrides_silent(self.inference_cfg_overrides)
+            llm_overrides, llm_invalid = self._parse_json_overrides_silent(self.inference_llm_overrides)
+            if cfg_invalid or llm_invalid:
+                summary_label.setText(
+                    "Current inference settings could not be summarized because one of the JSON "
+                    "override fields is invalid. Fix the JSON or use Inference job settings."
+                )
+                return
+            cfg = ai_config.OrchestratorConfig()
+            effective_config = {
+                "index": asdict(cfg.index),
+                "rag": asdict(cfg.rag),
+                "llm": asdict(cfg.llm),
+                "select": asdict(cfg.select),
+                "llmfirst": asdict(cfg.llmfirst),
+                "disagree": asdict(cfg.disagree),
+                "diversity": asdict(cfg.diversity),
+                "scjitter": asdict(cfg.scjitter),
+                "final_llm_labeling": bool(cfg.final_llm_labeling),
+                "final_llm_labeling_n_consistency": int(cfg.final_llm_labeling_n_consistency),
+            }
+            if cfg_overrides:
+                _deep_update_dict(effective_config, cfg_overrides)
+            if llm_overrides:
+                llm_cfg = effective_config.get("llm")
+                if not isinstance(llm_cfg, dict):
+                    llm_cfg = {}
+                    effective_config["llm"] = llm_cfg
+                _deep_update_dict(llm_cfg, llm_overrides)
+        if not isinstance(effective_config, Mapping):
+            summary_label.setText(
+                "Use Inference job settings to edit LLM and prompting options for this run."
+            )
+            return
+        llm_cfg = effective_config.get("llm", {}) if isinstance(effective_config.get("llm"), Mapping) else {}
+        llmfirst_cfg = (
+            effective_config.get("llmfirst", {})
+            if isinstance(effective_config.get("llmfirst"), Mapping)
+            else {}
+        )
+        backend = str(llm_cfg.get("backend") or ai_config.LLMConfig().backend)
+        model_name = str(llm_cfg.get("model_name") or ai_config.LLMConfig().model_name)
+        timeout = llm_cfg.get("timeout", ai_config.LLMConfig().timeout)
+        include_reasoning = bool(
+            llm_cfg.get("include_reasoning", ai_config.LLMConfig().include_reasoning)
+        )
+        mode = str(
+            llmfirst_cfg.get(
+                "inference_labeling_mode",
+                ai_config.LLMFirstConfig().inference_labeling_mode,
+            )
+            or "family"
+        )
+        summary_label.setText(
+            "Current inference settings: "
+            f"backend={backend}, model={model_name}, mode={mode}, timeout={timeout}, "
+            f"include_reasoning={include_reasoning}."
         )
 
     def _collect_inference_job(self) -> Optional[PromptInferenceJob]:
@@ -2721,19 +2908,175 @@ class LabelFewShotExamplesEditor(QtWidgets.QWidget):
 
 
 class AIAdvancedConfigDialog(QtWidgets.QDialog):
-    """Dialog that surfaces all AI backend configuration options."""
+    """Dialog that surfaces AI backend configuration options by workflow."""
+
+    _WORKFLOW_LABELS: dict[str, str] = {
+        "general": "General",
+        "active_learning": "Active learning",
+        "prompt_precompute": "Prompt precompute",
+        "prompt_inference": "Prompt inference",
+        "inference_experiments": "Inference experiments",
+    }
+
+    _WORKFLOW_VISIBLE_SECTIONS: dict[str, set[str]] = {
+        "general": {
+            "index",
+            "rag",
+            "llm",
+            "select",
+            "llmfirst",
+            "disagree",
+            "diversity",
+            "scjitter",
+            "orchestrator",
+        },
+        "active_learning": {
+            "index",
+            "rag",
+            "llm",
+            "select",
+            "llmfirst",
+            "disagree",
+            "diversity",
+            "scjitter",
+            "orchestrator",
+        },
+        "prompt_precompute": {"index", "rag", "llm", "llmfirst"},
+        "prompt_inference": {"llm", "llmfirst"},
+        "inference_experiments": {"index", "rag", "llm", "llmfirst"},
+    }
+
+    _WORKFLOW_FIELD_ALLOWLISTS: dict[str, dict[str, set[str]]] = {
+        "prompt_precompute": {
+            "index": {"type", "nlist", "nprobe", "hnsw_M", "hnsw_efSearch", "persist"},
+            "rag": {
+                "chunk_size",
+                "chunk_overlap",
+                "normalize_embeddings",
+                "top_k_final",
+                "use_mmr",
+                "mmr_lambda",
+                "keyword_fraction",
+                "keywords",
+                "label_keywords",
+                "min_context_chunks",
+                "neighbor_hops",
+                "pool_factor",
+                "pool_oversample",
+            },
+            "llm": {
+                "model_name",
+                "backend",
+                "temperature",
+                "timeout",
+                "retry_max",
+                "retry_backoff",
+                "max_context_chars",
+                "rpm_limit",
+                "include_reasoning",
+                "azure_api_version",
+                "azure_endpoint",
+                "local_model_dir",
+                "local_max_seq_len",
+                "local_max_new_tokens",
+                "context_order",
+            },
+            "llmfirst": {
+                "inference_labeling_mode",
+                "single_prompt_max_labels",
+                "single_prompt_max_chars",
+                "single_doc_context",
+                "single_doc_full_context_max_chars",
+                "context_order",
+                "progress_min_interval_s",
+            },
+        },
+        "prompt_inference": {
+            "llm": {
+                "model_name",
+                "backend",
+                "temperature",
+                "timeout",
+                "retry_max",
+                "retry_backoff",
+                "max_context_chars",
+                "rpm_limit",
+                "include_reasoning",
+                "azure_api_version",
+                "azure_endpoint",
+                "local_model_dir",
+                "local_max_seq_len",
+                "local_max_new_tokens",
+                "context_order",
+            },
+            "llmfirst": {
+                "inference_labeling_mode",
+                "single_prompt_max_labels",
+                "single_prompt_max_chars",
+                "context_order",
+                "progress_min_interval_s",
+            },
+        },
+        "inference_experiments": {
+            "index": {"type", "nlist", "nprobe", "hnsw_M", "hnsw_efSearch", "persist"},
+            "rag": {
+                "chunk_size",
+                "chunk_overlap",
+                "normalize_embeddings",
+                "top_k_final",
+                "use_mmr",
+                "mmr_lambda",
+                "keyword_fraction",
+                "keywords",
+                "label_keywords",
+                "min_context_chunks",
+                "neighbor_hops",
+                "pool_factor",
+                "pool_oversample",
+            },
+            "llm": {
+                "model_name",
+                "backend",
+                "temperature",
+                "timeout",
+                "retry_max",
+                "retry_backoff",
+                "max_context_chars",
+                "rpm_limit",
+                "include_reasoning",
+                "azure_api_version",
+                "azure_endpoint",
+                "local_model_dir",
+                "local_max_seq_len",
+                "local_max_new_tokens",
+                "context_order",
+            },
+            "llmfirst": {
+                "inference_labeling_mode",
+                "single_prompt_max_labels",
+                "single_prompt_max_chars",
+                "single_doc_context",
+                "single_doc_full_context_max_chars",
+                "context_order",
+                "progress_min_interval_s",
+            },
+        },
+    }
 
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget],
         config: Mapping[str, Any],
         label_schema: Optional[Mapping[str, object]] = None,
+        workflow: str = "general",
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("AI backend advanced settings")
+        workflow_name = self._WORKFLOW_LABELS.get(workflow, self._WORKFLOW_LABELS["general"])
+        self.setWindowTitle(f"AI backend advanced settings ({workflow_name})")
         self.resize(760, 820)
         self._config: Dict[str, Any] = dict(config)
         self.result_config: Dict[str, Any] = {}
+        self._workflow = workflow if workflow in self._WORKFLOW_VISIBLE_SECTIONS else "general"
         labels_obj = label_schema.get("labels") if isinstance(label_schema, Mapping) else None
         self._label_schema_labels: list[Mapping[str, object]] = []
         if isinstance(labels_obj, Sequence):
@@ -2759,12 +3102,16 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
         ]
 
         for title, key in sections:
+            if not self._section_visible(key):
+                continue
             section_values = self._config.get(key, {}) if isinstance(self._config.get(key), Mapping) else {}
             group = QtWidgets.QGroupBox(title)
             form = QtWidgets.QFormLayout(group)
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
             widgets: Dict[str, QtWidgets.QWidget] = {}
             for field_name, value in section_values.items():
+                if not self._field_visible(key, field_name):
+                    continue
                 if key == "rag":
                     if self._label_schema_labels and field_name == "label_queries":
                         continue
@@ -2801,17 +3148,20 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
             self._section_widgets[key] = widgets
             container_layout.addWidget(group)
 
-        orch_group = QtWidgets.QGroupBox("Orchestrator")
-        orch_form = QtWidgets.QFormLayout(orch_group)
-        orch_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self._orch_widgets: Dict[str, QtWidgets.QWidget] = {}
-        for field_name in ("final_llm_labeling", "final_llm_labeling_n_consistency"):
-            value = self._config.get(field_name)
-            widget = self._build_field_widget("orchestrator", field_name, value)
-            self._orch_widgets[field_name] = widget
-            label_text = field_name.replace("_", " ").capitalize()
-            orch_form.addRow(label_text, widget)
-        container_layout.addWidget(orch_group)
+        if self._section_visible("orchestrator"):
+            orch_group = QtWidgets.QGroupBox("Orchestrator")
+            orch_form = QtWidgets.QFormLayout(orch_group)
+            orch_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+            for field_name in ("final_llm_labeling", "final_llm_labeling_n_consistency"):
+                if not self._field_visible("orchestrator", field_name):
+                    continue
+                value = self._config.get(field_name)
+                widget = self._build_field_widget("orchestrator", field_name, value)
+                self._orch_widgets[field_name] = widget
+                label_text = field_name.replace("_", " ").capitalize()
+                orch_form.addRow(label_text, widget)
+            container_layout.addWidget(orch_group)
 
         container_layout.addStretch()
         scroll.setWidget(container)
@@ -2824,6 +3174,19 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
         button_box.accepted.connect(self._on_accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
+
+    def _section_visible(self, section: str) -> bool:
+        allowed = self._WORKFLOW_VISIBLE_SECTIONS.get(self._workflow, self._WORKFLOW_VISIBLE_SECTIONS["general"])
+        return section in allowed
+
+    def _field_visible(self, section: str, field_name: str) -> bool:
+        workflow_allowlists = self._WORKFLOW_FIELD_ALLOWLISTS.get(self._workflow)
+        if not workflow_allowlists:
+            return True
+        section_allowlist = workflow_allowlists.get(section)
+        if not section_allowlist:
+            return False
+        return field_name in section_allowlist
 
     def _build_field_widget(
         self,
@@ -5512,7 +5875,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _open_ai_advanced_settings(self) -> None:
         config = self._build_ai_config_snapshot()
-        dialog = AIAdvancedConfigDialog(self, config, label_schema=self._active_label_schema())
+        dialog = AIAdvancedConfigDialog(
+            self,
+            config,
+            label_schema=self._active_label_schema(),
+            workflow="active_learning",
+        )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         self._ai_engine_overrides = dialog.result_config or {}
