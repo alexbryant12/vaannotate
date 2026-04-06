@@ -120,6 +120,7 @@ def create_prompt_inference_job(
     prompt_job_dir: str | Path | None = None,
     job_dir: str | Path | None = None,
     batch_limit: int | None = None,
+    off_hours_only: bool = False,
 ) -> PromptInferenceJob:
     """Create and run a prompt inference job."""
 
@@ -139,6 +140,7 @@ def create_prompt_inference_job(
         llm_overrides=llm_overrides,
         job_dir=Path(job_dir) if job_dir else None,
         batch_limit=batch_limit,
+        off_hours_only=off_hours_only,
     )
 
     run_prompt_inference_job(job)
@@ -187,6 +189,11 @@ def main(argv: list[str] | None = None) -> None:
     infer.add_argument("--prompt-job-dir", type=Path)
     infer.add_argument("--job-dir", type=Path)
     infer.add_argument("--batch-limit", type=int)
+    infer.add_argument(
+        "--off-hours-only",
+        action="store_true",
+        help="Restrict large-corpus inference to 10pm-6am ET on weekdays and all weekend.",
+    )
     infer.add_argument("--cfg", help="JSON overrides or path to JSON file")
     infer.add_argument("--llm-cfg", help="LLM-only overrides or path to JSON file")
     infer.add_argument("--experiment-name", help="Name from experiments manifest")
@@ -235,6 +242,7 @@ def main(argv: list[str] | None = None) -> None:
             prompt_job_dir=args.prompt_job_dir,
             job_dir=args.job_dir,
             batch_limit=args.batch_limit,
+            off_hours_only=bool(args.off_hours_only),
         )
 
 

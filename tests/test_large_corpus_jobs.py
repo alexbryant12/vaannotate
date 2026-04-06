@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
@@ -262,6 +263,128 @@ def test_prompt_inference_resumes_with_manifest_overrides(monkeypatch, tmp_path:
     manifest = jobs.read_manifest(job_dir / "job_manifest.json")
     assert manifest and manifest.get("cfg_overrides") == inference_manifest["cfg_overrides"]
     assert manifest.get("llm_overrides") == inference_manifest["llm_overrides"]
+
+
+def test_prompt_inference_defaults_logprobs_off(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    prompt_job_dir = project_root / "admin_tools" / "prompt_jobs" / "prompt-1"
+    prompt_job_dir.mkdir(parents=True)
+    (prompt_job_dir / "job_manifest.json").write_text(
+        json.dumps(
+            {
+                "pheno_id": "p1",
+                "labelset_id": "ls",
+                "phenotype_level": "single_doc",
+                "labeling_mode": "single_prompt",
+                "batches": [],
+            }
+        )
+    )
+
+    captured: dict[str, object] = {}
+
+    class DummyLLMLabeler:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.label_config = {}
+
+    def fake_build_llm_backend(llm_cfg):  # type: ignore[no-untyped-def]
+        captured["logprobs"] = llm_cfg.logprobs
+        captured["top_logprobs"] = llm_cfg.top_logprobs
+        return object()
+
+    def fake_load_label_config_bundle(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return type(
+            "Bundle",
+            (),
+            {
+                "current_rules_map": staticmethod(lambda *_args, **_kwargs: {}),
+                "current_label_types": staticmethod(lambda *_args, **_kwargs: {}),
+                "current_config": {},
+            },
+        )()
+
+    monkeypatch.setattr(jobs, "build_llm_backend", fake_build_llm_backend)
+    monkeypatch.setattr(jobs, "LLMLabeler", DummyLLMLabeler)
+    monkeypatch.setattr(jobs, "_load_label_config_bundle", fake_load_label_config_bundle)
+    monkeypatch.setattr(jobs, "_run_prompt_inference_batches", lambda manifest, *_args, **_kwargs: manifest)
+
+    job = jobs.PromptInferenceJob(
+        job_id="job-default-logprobs-off",
+        prompt_job_id="prompt-1",
+        project_root=project_root,
+        prompt_job_dir=prompt_job_dir,
+        phenotype_level="single_doc",
+        labeling_mode="single_prompt",
+        cfg_overrides={},
+        llm_overrides=None,
+        job_dir=project_root / "admin_tools" / "prompt_inference" / "job-default-logprobs-off",
+    )
+
+    jobs.run_prompt_inference_job(job)
+
+    assert captured["logprobs"] is False
+    assert captured["top_logprobs"] == 0
+
+
+def test_prompt_inference_respects_explicit_logprobs_override(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    prompt_job_dir = project_root / "admin_tools" / "prompt_jobs" / "prompt-1"
+    prompt_job_dir.mkdir(parents=True)
+    (prompt_job_dir / "job_manifest.json").write_text(
+        json.dumps(
+            {
+                "pheno_id": "p1",
+                "labelset_id": "ls",
+                "phenotype_level": "single_doc",
+                "labeling_mode": "single_prompt",
+                "batches": [],
+            }
+        )
+    )
+
+    captured: dict[str, object] = {}
+
+    class DummyLLMLabeler:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.label_config = {}
+
+    def fake_build_llm_backend(llm_cfg):  # type: ignore[no-untyped-def]
+        captured["logprobs"] = llm_cfg.logprobs
+        captured["top_logprobs"] = llm_cfg.top_logprobs
+        return object()
+
+    def fake_load_label_config_bundle(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return type(
+            "Bundle",
+            (),
+            {
+                "current_rules_map": staticmethod(lambda *_args, **_kwargs: {}),
+                "current_label_types": staticmethod(lambda *_args, **_kwargs: {}),
+                "current_config": {},
+            },
+        )()
+
+    monkeypatch.setattr(jobs, "build_llm_backend", fake_build_llm_backend)
+    monkeypatch.setattr(jobs, "LLMLabeler", DummyLLMLabeler)
+    monkeypatch.setattr(jobs, "_load_label_config_bundle", fake_load_label_config_bundle)
+    monkeypatch.setattr(jobs, "_run_prompt_inference_batches", lambda manifest, *_args, **_kwargs: manifest)
+
+    job = jobs.PromptInferenceJob(
+        job_id="job-explicit-logprobs-on",
+        prompt_job_id="prompt-1",
+        project_root=project_root,
+        prompt_job_dir=prompt_job_dir,
+        phenotype_level="single_doc",
+        labeling_mode="single_prompt",
+        cfg_overrides={},
+        llm_overrides={"logprobs": True, "top_logprobs": 3},
+        job_dir=project_root / "admin_tools" / "prompt_inference" / "job-explicit-logprobs-on",
+    )
+
+    jobs.run_prompt_inference_job(job)
+
+    assert captured["logprobs"] is True
+    assert captured["top_logprobs"] == 3
 
 
 def test_prompt_precompute_external_dataset_family_generates_all_labels(monkeypatch, tmp_path: Path) -> None:
@@ -625,3 +748,149 @@ def test_prompt_inference_batch_limit_caps_processed_batches(monkeypatch, tmp_pa
     assert (inference_job_dir / "outputs" / "outputs_batch_00000.parquet").exists()
     assert (inference_job_dir / "outputs" / "outputs_batch_00001.parquet").exists()
     assert not (inference_job_dir / "outputs" / "outputs_batch_00002.parquet").exists()
+
+
+def test_inference_off_hours_window_logic_weekday_and_weekend() -> None:
+    # Monday daytime ET -> blocked
+    monday_day_utc = datetime(2026, 1, 5, 17, 0, tzinfo=timezone.utc)  # 12:00 ET
+    assert jobs._in_off_hours_inference_window(monday_day_utc) is False
+
+    # Monday late ET -> allowed
+    monday_night_utc = datetime(2026, 1, 6, 4, 0, tzinfo=timezone.utc)  # 23:00 ET Monday
+    assert jobs._in_off_hours_inference_window(monday_night_utc) is True
+
+    # Saturday daytime ET -> allowed
+    saturday_utc = datetime(2026, 1, 10, 16, 0, tzinfo=timezone.utc)  # 11:00 ET Saturday
+    assert jobs._in_off_hours_inference_window(saturday_utc) is True
+
+
+def test_inference_off_hours_waits_between_batches(monkeypatch, tmp_path: Path) -> None:
+    prompt_job_dir = tmp_path / "prompt_job"
+    inference_job_dir = tmp_path / "inference_job"
+    prompt_job_dir.mkdir(parents=True)
+    inference_job_dir.mkdir(parents=True)
+    (inference_job_dir / "outputs").mkdir(parents=True)
+
+    pd.DataFrame({"x": [1]}).to_parquet(prompt_job_dir / "prompts_0.parquet", index=False)
+
+    manifest = {
+        "batches": [
+            {
+                "batch_id": 0,
+                "prompt_batch_path": "prompts_0.parquet",
+                "status": "pending",
+                "n_rows": 0,
+                "output_path": None,
+            }
+        ]
+    }
+
+    job = jobs.PromptInferenceJob(
+        job_id="inf-off-hours",
+        prompt_job_id="prompt-1",
+        project_root=tmp_path,
+        prompt_job_dir=prompt_job_dir,
+        phenotype_level="single_doc",
+        labeling_mode="single_prompt",
+        cfg_overrides={},
+        llm_overrides=None,
+        job_dir=inference_job_dir,
+        off_hours_only=True,
+    )
+
+    waited: list[bool] = []
+    monkeypatch.setattr(jobs, "_wait_for_off_hours_inference_window", lambda *_args, **_kwargs: waited.append(True))
+    monkeypatch.setattr(
+        jobs,
+        "_run_single_prompt_batch",
+        lambda *_args, **_kwargs: pd.DataFrame([{"unit_id": "u1", "label_id": "l1"}]),
+    )
+
+    class DummyBundle:
+        @staticmethod
+        def current_rules_map(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {}
+
+        @staticmethod
+        def current_label_types(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {}
+
+    jobs._run_prompt_inference_batches(
+        manifest,
+        job,
+        jobs.OrchestratorConfig(),
+        llm_labeler=object(),
+        label_config_bundle=DummyBundle(),
+        prompt_job_dir=prompt_job_dir,
+        inference_job_dir=inference_job_dir,
+        manifest_path=inference_job_dir / "job_manifest.json",
+    )
+
+    assert waited == [True]
+
+
+def test_prompt_inference_emits_status_after_each_completed_batch(monkeypatch, tmp_path: Path) -> None:
+    prompt_job_dir = tmp_path / "prompt_job"
+    inference_job_dir = tmp_path / "inference_job"
+    prompt_job_dir.mkdir(parents=True)
+    inference_job_dir.mkdir(parents=True)
+    (inference_job_dir / "outputs").mkdir(parents=True)
+
+    for batch_id in range(2):
+        pd.DataFrame({"x": [batch_id]}).to_parquet(prompt_job_dir / f"prompts_{batch_id}.parquet", index=False)
+
+    manifest = {
+        "batches": [
+            {
+                "batch_id": i,
+                "prompt_batch_path": f"prompts_{i}.parquet",
+                "status": "pending",
+                "n_rows": 0,
+                "output_path": None,
+            }
+            for i in range(2)
+        ]
+    }
+
+    statuses: list[str] = []
+    job = jobs.PromptInferenceJob(
+        job_id="inf-status",
+        prompt_job_id="prompt-1",
+        project_root=tmp_path,
+        prompt_job_dir=prompt_job_dir,
+        phenotype_level="single_doc",
+        labeling_mode="single_prompt",
+        cfg_overrides={},
+        llm_overrides=None,
+        job_dir=inference_job_dir,
+        status_callback=statuses.append,
+    )
+
+    monkeypatch.setattr(
+        jobs,
+        "_run_single_prompt_batch",
+        lambda *_args, **_kwargs: pd.DataFrame([{"unit_id": "u1", "label_id": "l1"}]),
+    )
+
+    class DummyBundle:
+        @staticmethod
+        def current_rules_map(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {}
+
+        @staticmethod
+        def current_label_types(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {}
+
+    jobs._run_prompt_inference_batches(
+        manifest,
+        job,
+        jobs.OrchestratorConfig(),
+        llm_labeler=object(),
+        label_config_bundle=DummyBundle(),
+        prompt_job_dir=prompt_job_dir,
+        inference_job_dir=inference_job_dir,
+        manifest_path=inference_job_dir / "job_manifest.json",
+    )
+
+    per_batch_statuses = [msg for msg in statuses if msg.startswith("Completed inference batch ")]
+    assert len(per_batch_statuses) == 2
