@@ -554,3 +554,74 @@ def test_prompt_precompute_single_doc_single_prompt_defaults_to_full_and_skips_s
     assert job.cfg_overrides.get("llmfirst", {}).get("single_doc_context") == "full"
     assert family_kwargs and family_kwargs[0]["single_doc_context_mode"] == "full"
     assert any("skipping retrieval index build" in status.lower() for status in statuses)
+
+
+def test_prompt_inference_batch_limit_caps_processed_batches(monkeypatch, tmp_path: Path) -> None:
+    prompt_job_dir = tmp_path / "prompt_job"
+    inference_job_dir = tmp_path / "inference_job"
+    prompt_job_dir.mkdir(parents=True)
+    inference_job_dir.mkdir(parents=True)
+    (inference_job_dir / "outputs").mkdir(parents=True)
+
+    for batch_id in range(3):
+        pd.DataFrame({"x": [batch_id]}).to_parquet(prompt_job_dir / f"prompts_{batch_id}.parquet", index=False)
+
+    manifest = {
+        "batches": [
+            {
+                "batch_id": i,
+                "prompt_batch_path": f"prompts_{i}.parquet",
+                "status": "pending",
+                "n_rows": 0,
+                "output_path": None,
+            }
+            for i in range(3)
+        ]
+    }
+
+    job = jobs.PromptInferenceJob(
+        job_id="inf-1",
+        prompt_job_id="prompt-1",
+        project_root=tmp_path,
+        prompt_job_dir=prompt_job_dir,
+        phenotype_level="single_doc",
+        labeling_mode="single_prompt",
+        cfg_overrides={},
+        llm_overrides=None,
+        job_dir=inference_job_dir,
+        batch_limit=2,
+    )
+
+    monkeypatch.setattr(
+        jobs,
+        "_run_single_prompt_batch",
+        lambda *_args, **_kwargs: pd.DataFrame([{"unit_id": "u1", "label_id": "l1"}]),
+    )
+
+    class DummyBundle:
+        @staticmethod
+        def current_rules_map(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {}
+
+        @staticmethod
+        def current_label_types(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return {}
+
+    out = jobs._run_prompt_inference_batches(
+        manifest,
+        job,
+        jobs.OrchestratorConfig(),
+        llm_labeler=object(),
+        label_config_bundle=DummyBundle(),
+        prompt_job_dir=prompt_job_dir,
+        inference_job_dir=inference_job_dir,
+        manifest_path=inference_job_dir / "job_manifest.json",
+    )
+
+    completed_ids = [b["batch_id"] for b in out["batches"] if b["status"] == "completed"]
+    pending_ids = [b["batch_id"] for b in out["batches"] if b["status"] != "completed"]
+    assert completed_ids == [0, 1]
+    assert pending_ids == [2]
+    assert (inference_job_dir / "outputs" / "outputs_batch_00000.parquet").exists()
+    assert (inference_job_dir / "outputs" / "outputs_batch_00001.parquet").exists()
+    assert not (inference_job_dir / "outputs" / "outputs_batch_00002.parquet").exists()

@@ -106,6 +106,22 @@ def _reasoning_first(obj: Mapping[str, Any] | Any) -> Mapping[str, Any] | Any:
     return ordered
 
 
+def _first_choice_or_raise(resp: Any, *, operation: str) -> Any:
+    """Return the first completion choice or raise a helpful error."""
+
+    choices = getattr(resp, "choices", None)
+    if (
+        not isinstance(choices, SequenceABC)
+        or isinstance(choices, (str, bytes, bytearray))
+        or len(choices) == 0
+    ):
+        raise RuntimeError(
+            f"{operation} returned no choices from the LLM backend. "
+            "Verify backend credentials, model deployment, and response format."
+        )
+    return choices[0]
+
+
 @dataclass
 class JSONCallResult:
     """Structured result returned by :meth:`LLMBackend.json_call`."""
@@ -236,7 +252,7 @@ class AzureOpenAIBackend(LLMBackend):
         resp = self.client.chat.completions.create(**kwargs)
         latency = time.time() - t0
         self._post_call()
-        choice = resp.choices[0]
+        choice = _first_choice_or_raise(resp, operation="json_call")
         message = getattr(choice, "message", None)
         content = getattr(message, "content", None) if message else None
         parsed = getattr(message, "parsed", None) if message else None
@@ -299,7 +315,7 @@ class AzureOpenAIBackend(LLMBackend):
         resp = self.client.chat.completions.create(**kwargs)
         latency = time.time() - t0
         self._post_call()
-        choice = resp.choices[0]
+        choice = _first_choice_or_raise(resp, operation="forced_choice")
         logprobs_obj = getattr(choice, "logprobs", None)
         items = getattr(logprobs_obj, "content", None) or []
         letter_logps = {letter: -1e9 for letter in letters}
@@ -840,4 +856,3 @@ def build_llm_backend(cfg: LLMConfig) -> LLMBackend:
     if backend_name in {"exllama", "exllamav2", "local"}:
         return ExLlamaV2Backend(cfg)
     raise ValueError(f"Unsupported LLM backend: {cfg.backend}")
-
