@@ -1,7 +1,10 @@
 from typing import TYPE_CHECKING, Any
 
-from .active_learning import ActiveLearningPipeline
-from .inference import InferencePipeline
+if TYPE_CHECKING:  # pragma: no cover
+    from .active_learning import ActiveLearningPipeline
+    from .inference import InferencePipeline
+    from .large_corpus_jobs import PromptInferenceJob, PromptPrecomputeJob
+
 from .prompt_tasks import (
     FamilyPromptTask,
     SinglePromptTask,
@@ -11,16 +14,20 @@ from .prompt_tasks import (
     single_prompt_tasks_to_df,
 )
 
-if TYPE_CHECKING:  # pragma: no cover
-    # Import lazily at runtime to avoid circular import during orchestration setup.
-    from .large_corpus_jobs import PromptInferenceJob, PromptPrecomputeJob
-
 
 def __getattr__(name: str) -> Any:
+    if name in {"ActiveLearningPipeline", "InferencePipeline"}:
+        from .active_learning import ActiveLearningPipeline
+        from .inference import InferencePipeline
+
+        return {
+            "ActiveLearningPipeline": ActiveLearningPipeline,
+            "InferencePipeline": InferencePipeline,
+        }[name]
     if name in {"PromptInferenceJob", "PromptPrecomputeJob"}:
         from .large_corpus_jobs import PromptInferenceJob, PromptPrecomputeJob
 
-        return {  # type: ignore[return-value]
+        return {
             "PromptInferenceJob": PromptInferenceJob,
             "PromptPrecomputeJob": PromptPrecomputeJob,
         }[name]

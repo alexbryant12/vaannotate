@@ -5,15 +5,36 @@ import json
 import logging
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .pipelines.large_corpus_jobs import (
-    PromptInferenceJob,
-    PromptPrecomputeJob,
-    run_prompt_inference_job,
-    run_prompt_precompute_job,
-)
 from .utils.job_manifest import read_manifest
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .pipelines.large_corpus_jobs import PromptInferenceJob, PromptPrecomputeJob
+
+
+def _jobs_api() -> dict[str, Any]:
+    from .pipelines.large_corpus_jobs import (
+        PromptInferenceJob,
+        PromptPrecomputeJob,
+        run_prompt_inference_job,
+        run_prompt_precompute_job,
+    )
+
+    return {
+        "PromptInferenceJob": PromptInferenceJob,
+        "PromptPrecomputeJob": PromptPrecomputeJob,
+        "run_prompt_inference_job": run_prompt_inference_job,
+        "run_prompt_precompute_job": run_prompt_precompute_job,
+    }
+
+
+def run_prompt_precompute_job(job: Any) -> None:
+    _jobs_api()["run_prompt_precompute_job"](job)
+
+
+def run_prompt_inference_job(job: Any) -> None:
+    _jobs_api()["run_prompt_inference_job"](job)
 
 LOG = logging.getLogger(__name__)
 
@@ -75,7 +96,7 @@ def create_prompt_precompute_job(
     dataset_column_map: dict[str, str] | None = None,
     job_dir: str | Path | None = None,
     env_overrides: dict[str, str] | None = None,
-) -> PromptPrecomputeJob:
+) -> "PromptPrecomputeJob":
     """Create and run a prompt precompute job."""
 
     project_root = Path(project_root)
@@ -83,6 +104,7 @@ def create_prompt_precompute_job(
         project_root, experiment_name, Path(experiments_dir) if experiments_dir else None
     )
 
+    PromptPrecomputeJob = _jobs_api()["PromptPrecomputeJob"]
     job = PromptPrecomputeJob(
         job_id=job_id or _default_job_id("prompt-precompute"),
         project_root=project_root,
@@ -122,7 +144,7 @@ def create_prompt_inference_job(
     job_dir: str | Path | None = None,
     batch_limit: int | None = None,
     off_hours_only: bool = False,
-) -> PromptInferenceJob:
+) -> "PromptInferenceJob":
     """Create and run a prompt inference job."""
 
     project_root = Path(project_root)
@@ -130,6 +152,7 @@ def create_prompt_inference_job(
         project_root, experiment_name, Path(experiments_dir) if experiments_dir else None
     )
 
+    PromptInferenceJob = _jobs_api()["PromptInferenceJob"]
     job = PromptInferenceJob(
         job_id=job_id or _default_job_id("prompt-infer"),
         prompt_job_id=prompt_job_id,
@@ -162,7 +185,7 @@ def resume_prompt_inference_job(
     off_hours_only: bool | None = None,
     project_root: str | Path | None = None,
     prompt_job_dir: str | Path | None = None,
-) -> PromptInferenceJob:
+) -> "PromptInferenceJob":
     """Resume a prompt inference job from an existing inference job directory."""
 
     resolved_job_dir = Path(job_dir) if job_dir else Path.cwd()
@@ -204,6 +227,7 @@ def resume_prompt_inference_job(
         else resolved_project_root / "admin_tools" / "prompt_jobs" / prompt_job_id
     )
 
+    PromptInferenceJob = _jobs_api()["PromptInferenceJob"]
     job = PromptInferenceJob(
         job_id=str(manifest.get("job_id") or resolved_job_dir.name),
         prompt_job_id=prompt_job_id,
