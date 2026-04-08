@@ -160,8 +160,8 @@ def add_labelset(
         conn.execute(
             """
             INSERT OR REPLACE INTO labels(
-                label_id,labelset_id,name,type,required,order_index,rules,gating_expr,na_allowed,unit,min,max,keywords_json,few_shot_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                label_id,labelset_id,name,type,required,order_index,rules,gating_expr,na_allowed,include_reasoning,unit,min,max,keywords_json,few_shot_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 label_id,
@@ -173,6 +173,7 @@ def add_labelset(
                 label.get("rules"),
                 label.get("gating_expr"),
                 1 if label.get("na_allowed") else 0,
+                1 if label.get("include_reasoning", include_reasoning) else 0,
                 label.get("unit"),
                 label.get("min"),
                 label.get("max"),
@@ -266,6 +267,7 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
                 "rules": label["rules"],
                 "gating_expr": label["gating_expr"],
                 "na_allowed": bool(label["na_allowed"]),
+                "include_reasoning": bool(label["include_reasoning"]) if "include_reasoning" in label.keys() else bool(labelset_row["include_reasoning"]),
                 "unit": label["unit"],
                 "min": label["min"],
                 "max": label["max"],

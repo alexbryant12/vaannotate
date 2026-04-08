@@ -427,3 +427,32 @@ def test_multi_label_few_shot_answer_is_wrapped_by_label(tmp_path):
     )
     parsed = json.loads(assistant_example)
     assert parsed == {"Flag": {"prediction": "yes"}}
+
+
+def test_multilabel_prompt_supports_per_label_reasoning_flags(tmp_path):
+    class DummyBackend:
+        def json_call(self, *_, **__):  # pragma: no cover - not invoked in this test
+            raise AssertionError("json_call should not be reached")
+
+    llm_cfg = ai_config.LLMConfig()
+    llm_cfg.include_reasoning = False
+    llm_cfg.include_reasoning_by_label = {"A": True, "B": False}
+    annotator = LLMLabeler(
+        llm_backend=DummyBackend(),
+        label_config_bundle=LabelConfigBundle(),
+        llm_config=llm_cfg,
+        sc_cfg=ai_config.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
+
+    payload = annotator.build_multi_label_prompt_payload(
+        label_ids=["A", "B"],
+        label_types={"A": "categorical", "B": "categorical"},
+        rules_map={"A": "", "B": ""},
+        ctx_snippets=[{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}],
+    )
+    schema = payload["response_format"]["json_schema"]
+    a_props = ((schema.get("properties") or {}).get("A", {}) or {}).get("properties") or {}
+    b_props = ((schema.get("properties") or {}).get("B", {}) or {}).get("properties") or {}
+    assert "reasoning" in a_props
+    assert "reasoning" not in b_props

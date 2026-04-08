@@ -192,6 +192,7 @@ def test_label_keywords_and_examples_round_trip(tmp_path: Path) -> None:
                 "name": "Keywords",
                 "type": "text",
                 "required": False,
+                "include_reasoning": True,
                 "keywords": ["alpha", "beta"],
                 "few_shot_examples": [
                     {"context": "example context", "answer": "answer text"}
@@ -217,6 +218,7 @@ def test_label_keywords_and_examples_round_trip(tmp_path: Path) -> None:
     assert fetched.get("include_reasoning") is True
     assert isinstance(labels, list) and labels
     label = labels[0]
+    assert label["include_reasoning"] is True
     assert label["keywords"] == ["alpha", "beta"]
     assert label["few_shot_examples"] == [
         {"context": "example context", "answer": "answer text"}

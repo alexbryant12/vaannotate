@@ -196,6 +196,24 @@ class LLMLabeler:
             return []
         return [entry for entry in label_examples if isinstance(entry, Mapping)]
 
+    def _include_reasoning_for_label(self, label_id: str) -> bool:
+        per_label = getattr(self.cfg, "include_reasoning_by_label", {}) or {}
+        if isinstance(per_label, Mapping):
+            for key in (str(label_id), str(label_id).lower()):
+                if key in per_label:
+                    value = per_label.get(key)
+                    if isinstance(value, bool):
+                        return value
+                    if isinstance(value, (int, float)):
+                        return bool(int(value))
+                    if isinstance(value, str):
+                        text = value.strip().lower()
+                        if text in {"1", "true", "t", "yes", "y", "on"}:
+                            return True
+                        if text in {"0", "false", "f", "no", "n", "off"}:
+                            return False
+        return bool(getattr(self.cfg, "include_reasoning", True))
+
     def build_single_label_prompt_payload(
         self,
         *,
@@ -206,7 +224,7 @@ class LLMLabeler:
         temperature: float | None = None,
         system_suffix: str = "",
     ) -> dict[str, Any]:
-        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
+        include_reasoning = self._include_reasoning_for_label(label_id)
         ordered_snippets = self._ordered_snippets(snippets)
         ctx_text = self._build_context_text(ordered_snippets)
         opts = _options_for_label(label_id, label_type, self.label_config)
@@ -274,7 +292,7 @@ class LLMLabeler:
         rules_map: Mapping[str, str],
         ctx_snippets: list[dict],
     ) -> dict[str, Any]:
-        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
+        include_reasoning_by_label = {str(lid): self._include_reasoning_for_label(str(lid)) for lid in label_ids}
         ordered_snippets = self._ordered_snippets(ctx_snippets)
         ctx_text = self._build_context_text(ordered_snippets)
 
@@ -299,6 +317,7 @@ class LLMLabeler:
                     "Set prediction to a JSON object with each selected option key set to 'Yes' (omit or set to 'No' when unsupported)."
                 )
             label_summaries.append("\n".join(label_lines))
+            include_reasoning = include_reasoning_by_label.get(str(lid), bool(getattr(self.cfg, "include_reasoning", True)))
             label_schema = {
                 "type": "object",
                 "properties": {"prediction": self._prediction_schema(ltype, option_values, self.CATEGORICAL_TYPES)},
@@ -310,7 +329,8 @@ class LLMLabeler:
             schema["properties"][lid] = label_schema
             schema["required"].append(lid)
 
-        response_keys = self._response_keys_text(include_reasoning)
+        any_reasoning = any(include_reasoning_by_label.values())
+        response_keys = self._response_keys_text(any_reasoning)
         system_prompt = "\n\n".join(
             [
                 "You are a meticulous clinical annotator for EHR data.",
@@ -321,7 +341,7 @@ class LLMLabeler:
                 "\n\n".join(label_summaries),
             ]
         )
-        few_shot_msgs = self._few_shot_messages_for_labels(label_ids, include_reasoning=include_reasoning)
+        few_shot_msgs = self._few_shot_messages_for_labels(label_ids, include_reasoning_by_label=include_reasoning_by_label)
         return {
             "messages": [{"role": "system", "content": system_prompt}, *few_shot_msgs, {"role": "user", "content": ctx_text}],
             "prompt": {"system": system_prompt, "messages": few_shot_msgs, "user": ctx_text},
@@ -532,9 +552,16 @@ class LLMLabeler:
                 messages.append({"role": "assistant", "content": self._compact_json(normalized)})
         return messages
 
-    def _few_shot_messages_for_labels(self, label_ids: Iterable[str], *, include_reasoning: bool) -> list[dict[str, str]]:
+    def _few_shot_messages_for_labels(
+        self,
+        label_ids: Iterable[str],
+        *,
+        include_reasoning_by_label: Mapping[str, bool] | None = None,
+    ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
+        reasoning_map = include_reasoning_by_label or {}
         for label_id in label_ids:
+            include_reasoning = bool(reasoning_map.get(str(label_id), self._include_reasoning_for_label(str(label_id))))
             for entry in self._raw_few_shot_examples(label_id):
                 context = entry.get("context")
                 answer = entry.get("answer")
@@ -670,7 +697,7 @@ class LLMLabeler:
                 obj = content if isinstance(content, Mapping) else None
 
             pred_raw = (obj or {}).get("prediction")
-            reasoning = (obj or {}).get("reasoning") if bool(getattr(self.cfg, "include_reasoning", True)) else None
+            reasoning = (obj or {}).get("reasoning") if self._include_reasoning_for_label(label_id) else None
             pred_norm = None
             if use_options:
                 if is_multi_select:
@@ -810,7 +837,6 @@ class LLMLabeler:
         ]
 
         categorical_types = self.CATEGORICAL_TYPES
-        include_reasoning = bool(getattr(self.cfg, "include_reasoning", True))
         predictions: dict[str, dict] = {}
         for lid in label_ids:
             ltype = label_types.get(lid, "categorical") if isinstance(label_types, Mapping) else "categorical"
@@ -821,7 +847,12 @@ class LLMLabeler:
             is_multi_select = lt_norm == "categorical_multi"
 
             raw_entry = (obj or {}).get(lid) if isinstance(obj, Mapping) else None
-            reasoning = raw_entry.get("reasoning") if include_reasoning and isinstance(raw_entry, Mapping) else None
+            include_reasoning_for_label = self._include_reasoning_for_label(str(lid))
+            reasoning = (
+                raw_entry.get("reasoning")
+                if include_reasoning_for_label and isinstance(raw_entry, Mapping)
+                else None
+            )
             raw_prediction = None
             if isinstance(raw_entry, Mapping):
                 raw_prediction = raw_entry.get("prediction")

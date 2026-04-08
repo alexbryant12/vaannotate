@@ -1226,6 +1226,41 @@ class RoundBuilder:
         return cleaned
 
     @staticmethod
+    def _extract_label_reasoning_map(
+        config: Mapping[str, Any],
+        labelset: Mapping[str, Any] | None = None,
+    ) -> Dict[str, bool]:
+        result: Dict[str, bool] = {}
+        ai_backend_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
+        overrides = ai_backend_cfg.get("config_overrides") if isinstance(ai_backend_cfg, Mapping) and isinstance(ai_backend_cfg.get("config_overrides"), Mapping) else {}
+        llm_overrides = overrides.get("llm") if isinstance(overrides, Mapping) and isinstance(overrides.get("llm"), Mapping) else {}
+        for candidate in (
+            ai_backend_cfg.get("include_reasoning_by_label") if isinstance(ai_backend_cfg, Mapping) else None,
+            llm_overrides.get("include_reasoning_by_label") if isinstance(llm_overrides, Mapping) else None,
+        ):
+            if isinstance(candidate, Mapping):
+                for label_id, value in candidate.items():
+                    parsed = RoundBuilder._coerce_optional_bool(value)
+                    if parsed is not None:
+                        result[str(label_id)] = parsed
+        if labelset:
+            labels = labelset.get("labels") if isinstance(labelset, Mapping) else None
+            if isinstance(labels, Sequence):
+                default_reasoning = RoundBuilder._coerce_optional_bool(labelset.get("include_reasoning"))
+                for label in labels:
+                    if not isinstance(label, Mapping):
+                        continue
+                    label_id = str(label.get("label_id") or "")
+                    if not label_id:
+                        continue
+                    parsed = RoundBuilder._coerce_optional_bool(label.get("include_reasoning"))
+                    if parsed is None:
+                        parsed = default_reasoning
+                    if parsed is not None:
+                        result[label_id] = parsed
+        return result
+
+    @staticmethod
     def _extract_label_keywords(config: Mapping[str, Any]) -> Dict[str, list[str]]:
         ai_backend_cfg = config.get("ai_backend") if isinstance(config.get("ai_backend"), Mapping) else {}
         rag_cfg = ai_backend_cfg.get("rag") if isinstance(ai_backend_cfg, Mapping) and isinstance(ai_backend_cfg.get("rag"), Mapping) else {}
@@ -1415,6 +1450,9 @@ class RoundBuilder:
         cfg.final_llm_labeling_n_consistency = max(1, consistency)
         setattr(cfg.llmfirst, "final_llm_label_consistency", cfg.final_llm_labeling_n_consistency)
         setattr(cfg.llm, "include_reasoning", bool(include_reasoning))
+        label_reasoning_map = self._extract_label_reasoning_map(config, labelset)
+        if label_reasoning_map:
+            setattr(cfg.llm, "include_reasoning_by_label", label_reasoning_map)
         few_shot_examples = self._extract_few_shot_examples(config, labelset)
         if few_shot_examples:
             try:

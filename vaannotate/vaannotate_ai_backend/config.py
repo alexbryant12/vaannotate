@@ -82,6 +82,7 @@ class LLMConfig:
     max_context_chars: int = 1200000
     rpm_limit: Optional[int] = 30
     include_reasoning: bool = False
+    include_reasoning_by_label: dict[str, bool] = field(default_factory=dict)
     # Azure OpenAI specific knobs
     azure_api_key: Optional[str] = field(
         default_factory=lambda: os.getenv("AZURE_OPENAI_API_KEY")

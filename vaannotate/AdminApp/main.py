@@ -3603,6 +3603,7 @@ class AIRoundWorker(QtCore.QObject):
                         rules=label.get("rules", ""),
                         gating_expr=None,
                         na_allowed=int(label.get("na_allowed", False)),
+                        include_reasoning=int(label.get("include_reasoning", False)),
                         unit=None,
                         min=None,
                         max=None,
@@ -4474,6 +4475,7 @@ class ProjectContext(QtCore.QObject):
                     rules=label.get("rules", ""),
                     gating_expr=label.get("gating_expr"),
                     na_allowed=1 if label.get("na_allowed") else 0,
+                    include_reasoning=1 if label.get("include_reasoning", include_reasoning) else 0,
                     unit=label.get("unit"),
                     min=label.get("min"),
                     max=label.get("max"),
@@ -4731,6 +4733,8 @@ class LabelEditorDialog(QtWidgets.QDialog):
         form.addRow("Required", self.required_check)
         self.na_check = QtWidgets.QCheckBox("Allow N/A")
         form.addRow("N/A", self.na_check)
+        self.include_reasoning_check = QtWidgets.QCheckBox("Include reasoning")
+        form.addRow("Reasoning", self.include_reasoning_check)
         self.gating_edit = QtWidgets.QLineEdit()
         form.addRow("Gating expression", self.gating_edit)
         self.rules_edit = QtWidgets.QPlainTextEdit()
@@ -4782,6 +4786,7 @@ class LabelEditorDialog(QtWidgets.QDialog):
             self.type_combo.setCurrentIndex(index)
         self.required_check.setChecked(bool(data.get("required")))
         self.na_check.setChecked(bool(data.get("na_allowed")))
+        self.include_reasoning_check.setChecked(bool(data.get("include_reasoning")))
         self.gating_edit.setText(str(data.get("gating_expr", "")))
         self.rules_edit.setPlainText(str(data.get("rules", "")))
         self.unit_edit.setText(str(data.get("unit") or ""))
@@ -4907,6 +4912,7 @@ class LabelEditorDialog(QtWidgets.QDialog):
             "type": type_value,
             "required": self.required_check.isChecked(),
             "na_allowed": self.na_check.isChecked(),
+            "include_reasoning": self.include_reasoning_check.isChecked(),
             "gating_expr": self.gating_edit.text().strip() or None,
             "rules": self.rules_edit.toPlainText().strip(),
             "unit": self.unit_edit.text().strip() or None,
@@ -5612,6 +5618,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_log_output: Optional[QtWidgets.QPlainTextEdit] = None
         self._ai_engine_overrides: Dict[str, Any] = {}
         self._labelset_include_reasoning = False
+        self._label_reasoning_by_label: Dict[str, bool] = {}
         self._assisted_review_reminder_shown = False
         self._llm_prompt_shown = False
         self.ctx.project_changed.connect(self._refresh_labelset_options)
@@ -5672,7 +5679,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         backend_choice = self._current_ai_backend()
         if backend_choice:
             llm_cfg["backend"] = backend_choice
-        llm_cfg["include_reasoning"] = bool(getattr(self, "_labelset_include_reasoning", False))
+        reasoning_map = {
+            str(label_id): bool(value)
+            for label_id, value in getattr(self, "_label_reasoning_by_label", {}).items()
+            if str(label_id)
+        }
+        llm_cfg["include_reasoning"] = any(reasoning_map.values()) if reasoning_map else bool(
+            getattr(self, "_labelset_include_reasoning", False)
+        )
+        llm_cfg["include_reasoning_by_label"] = reasoning_map
         if backend_choice == "azure":
             if hasattr(self, "ai_azure_key_edit"):
                 azure_key = self.ai_azure_key_edit.text().strip()
@@ -5820,7 +5835,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _on_labelset_changed(self) -> None:
         schema = self._active_label_schema()
-        self._labelset_include_reasoning = bool(schema.get("include_reasoning")) if isinstance(schema, Mapping) else False
+        labelset_default_reasoning = bool(schema.get("include_reasoning")) if isinstance(schema, Mapping) else False
+        self._labelset_include_reasoning = labelset_default_reasoning
+        self._label_reasoning_by_label = {}
         keywords: Dict[str, List[str]] = {}
         queries: Dict[str, str] = {}
         few_shot: Dict[str, List[Dict[str, str]]] = {}
@@ -5832,6 +5849,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 label_id = str(label.get("label_id") or "")
                 if not label_id:
                     continue
+                self._label_reasoning_by_label[label_id] = bool(
+                    label.get("include_reasoning", labelset_default_reasoning)
+                )
                 label_keywords = label.get("keywords")
                 if isinstance(label_keywords, Sequence):
                     kw_values = [str(kw).strip() for kw in label_keywords if str(kw).strip()]
@@ -5895,9 +5915,19 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             updated = True
 
         llm_cfg = self._ai_engine_overrides.get("llm") if isinstance(self._ai_engine_overrides.get("llm"), Mapping) else {}
-        if not isinstance(llm_cfg, Mapping) or llm_cfg.get("include_reasoning") != self._labelset_include_reasoning:
+        target_include = bool(self._labelset_include_reasoning)
+        if self._label_reasoning_by_label:
+            target_include = any(self._label_reasoning_by_label.values())
+        target_reasoning_map = {k: bool(v) for k, v in self._label_reasoning_by_label.items()}
+        current_map = llm_cfg.get("include_reasoning_by_label") if isinstance(llm_cfg, Mapping) else None
+        if (
+            not isinstance(llm_cfg, Mapping)
+            or llm_cfg.get("include_reasoning") != target_include
+            or current_map != target_reasoning_map
+        ):
             llm_cfg = dict(llm_cfg)
-            llm_cfg["include_reasoning"] = self._labelset_include_reasoning
+            llm_cfg["include_reasoning"] = target_include
+            llm_cfg["include_reasoning_by_label"] = target_reasoning_map
             self._ai_engine_overrides["llm"] = llm_cfg
             updated = True
 
@@ -7563,7 +7593,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 )
             except Exception:  # noqa: BLE001
                 overrides["final_llm_labeling_n_consistency"] = 1
-        include_reasoning_value = bool(getattr(self, "_labelset_include_reasoning", False))
+        reasoning_map = {
+            str(label_id): bool(value)
+            for label_id, value in getattr(self, "_label_reasoning_by_label", {}).items()
+            if str(label_id)
+        }
+        include_reasoning_value = any(reasoning_map.values()) if reasoning_map else bool(
+            getattr(self, "_labelset_include_reasoning", False)
+        )
         overrides["final_llm_include_reasoning"] = include_reasoning_value
         llmfirst_overrides: Dict[str, Any] = {}
         if isinstance(overrides.get("llmfirst"), Mapping):
@@ -7589,6 +7626,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if backend_choice:
             llm_overrides["backend"] = backend_choice
         llm_overrides["include_reasoning"] = include_reasoning_value
+        llm_overrides["include_reasoning_by_label"] = reasoning_map
         if backend_choice == "azure":
             if hasattr(self, "ai_azure_version_edit"):
                 version = self.ai_azure_version_edit.text().strip()
@@ -8104,6 +8142,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         "type": label["type"],
                         "required": bool(label["required"]),
                         "na_allowed": bool(label["na_allowed"]),
+                        "include_reasoning": bool(label["include_reasoning"])
+                        if "include_reasoning" in label.keys()
+                        else bool(labelset_row["include_reasoning"]) if labelset_row else False,
                         "rules": label["rules"],
                         "unit": label["unit"],
                         "range": {"min": label["min"], "max": label["max"]},
@@ -8335,6 +8376,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         rules="",
                         gating_expr=None,
                         na_allowed=0,
+                        include_reasoning=0,
                         unit=None,
                         min=None,
                         max=None,
@@ -8372,6 +8414,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 config_payload["final_llm_labeling"] = final_llm_enabled
             if final_llm_enabled or assisted_enabled:
                 include_reasoning = bool(getattr(self, "_labelset_include_reasoning", False))
+                if getattr(self, "_label_reasoning_by_label", {}):
+                    include_reasoning = any(bool(v) for v in self._label_reasoning_by_label.values())
                 config_payload["final_llm_include_reasoning"] = include_reasoning
                 backend_choice = self._current_random_backend()
                 if backend_choice:
@@ -8422,6 +8466,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         if max_new > 0:
                             backend_cfg["local_max_new_tokens"] = max_new
                 if backend_cfg:
+                    if getattr(self, "_label_reasoning_by_label", {}):
+                        backend_cfg["include_reasoning_by_label"] = {
+                            str(label_id): bool(value)
+                            for label_id, value in self._label_reasoning_by_label.items()
+                            if str(label_id)
+                        }
                     config_payload.setdefault("ai_backend", {}).update(backend_cfg)
             if assisted_enabled:
                 config_payload["assisted_review"] = {
