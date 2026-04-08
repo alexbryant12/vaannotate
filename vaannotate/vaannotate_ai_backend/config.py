@@ -67,7 +67,7 @@ class RAGConfig:
 @dataclass
 class LLMConfig:
     model_name: str = field(
-        default_factory=lambda: os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        default_factory=lambda: os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
     )
     backend: str = field(default_factory=lambda: os.getenv("LLM_BACKEND", "azure"))
     temperature: float = 0.2
