@@ -3588,6 +3588,7 @@ class AIRoundWorker(QtCore.QObject):
                     version=1,
                     created_at=context.created_at,
                     created_by=context.created_by,
+                    include_reasoning=0,
                     notes="Auto-generated",
                 )
                 labelset.save(conn)
@@ -3602,6 +3603,7 @@ class AIRoundWorker(QtCore.QObject):
                         rules=label.get("rules", ""),
                         gating_expr=None,
                         na_allowed=int(label.get("na_allowed", False)),
+                        include_reasoning=int(label.get("include_reasoning", False)),
                         unit=None,
                         min=None,
                         max=None,
@@ -4441,6 +4443,7 @@ class ProjectContext(QtCore.QObject):
         labelset_id: str,
         created_by: str,
         notes: str,
+        include_reasoning: bool,
         labels: List[Dict[str, object]],
         pheno_id: Optional[str] = None,
     ) -> models.LabelSet:
@@ -4455,6 +4458,7 @@ class ProjectContext(QtCore.QObject):
             version=1,
             created_at=created_at,
             created_by=created_by,
+            include_reasoning=1 if include_reasoning else 0,
             notes=notes,
         )
         db = self.require_db()
@@ -4471,6 +4475,7 @@ class ProjectContext(QtCore.QObject):
                     rules=label.get("rules", ""),
                     gating_expr=label.get("gating_expr"),
                     na_allowed=1 if label.get("na_allowed") else 0,
+                    include_reasoning=1 if label.get("include_reasoning", include_reasoning) else 0,
                     unit=label.get("unit"),
                     min=label.get("min"),
                     max=label.get("max"),
@@ -4728,6 +4733,8 @@ class LabelEditorDialog(QtWidgets.QDialog):
         form.addRow("Required", self.required_check)
         self.na_check = QtWidgets.QCheckBox("Allow N/A")
         form.addRow("N/A", self.na_check)
+        self.include_reasoning_check = QtWidgets.QCheckBox("Include reasoning")
+        form.addRow("Reasoning", self.include_reasoning_check)
         self.gating_edit = QtWidgets.QLineEdit()
         form.addRow("Gating expression", self.gating_edit)
         self.rules_edit = QtWidgets.QPlainTextEdit()
@@ -4779,6 +4786,7 @@ class LabelEditorDialog(QtWidgets.QDialog):
             self.type_combo.setCurrentIndex(index)
         self.required_check.setChecked(bool(data.get("required")))
         self.na_check.setChecked(bool(data.get("na_allowed")))
+        self.include_reasoning_check.setChecked(bool(data.get("include_reasoning")))
         self.gating_edit.setText(str(data.get("gating_expr", "")))
         self.rules_edit.setPlainText(str(data.get("rules", "")))
         self.unit_edit.setText(str(data.get("unit") or ""))
@@ -4904,6 +4912,7 @@ class LabelEditorDialog(QtWidgets.QDialog):
             "type": type_value,
             "required": self.required_check.isChecked(),
             "na_allowed": self.na_check.isChecked(),
+            "include_reasoning": self.include_reasoning_check.isChecked(),
             "gating_expr": self.gating_edit.text().strip() or None,
             "rules": self.rules_edit.toPlainText().strip(),
             "unit": self.unit_edit.text().strip() or None,
@@ -4944,6 +4953,9 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         form.addRow("Created by", self.creator_edit)
         self.notes_edit = QtWidgets.QPlainTextEdit()
         form.addRow("Notes", self.notes_edit)
+        self.include_reasoning_checkbox = QtWidgets.QCheckBox("Include reasoning in LLM outputs")
+        self.include_reasoning_checkbox.setChecked(False)
+        form.addRow("Reasoning", self.include_reasoning_checkbox)
         layout.addLayout(form)
 
         self.label_list = QtWidgets.QListWidget()
@@ -5033,6 +5045,8 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         return candidate
 
     def _apply_copied_labelset(self, payload: Dict[str, object]) -> None:
+        if hasattr(self, "include_reasoning_checkbox"):
+            self.include_reasoning_checkbox.setChecked(bool(payload.get("include_reasoning")))
         used_ids = set(self.ctx.list_all_label_ids())
         new_labels: List[Dict[str, object]] = []
         id_map: Dict[str, str] = {}
@@ -5246,6 +5260,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             "labelset_id": self.id_edit.text().strip(),
             "created_by": self.creator_edit.text().strip() or "admin",
             "notes": self.notes_edit.toPlainText().strip() or "",
+            "include_reasoning": bool(self.include_reasoning_checkbox.isChecked()),
             "labels": labels_payload,
         }
 
@@ -5602,6 +5617,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_log_dialog: Optional[AIRoundLogDialog] = None
         self.ai_log_output: Optional[QtWidgets.QPlainTextEdit] = None
         self._ai_engine_overrides: Dict[str, Any] = {}
+        self._labelset_include_reasoning = False
+        self._label_reasoning_by_label: Dict[str, bool] = {}
         self._assisted_review_reminder_shown = False
         self._llm_prompt_shown = False
         self.ctx.project_changed.connect(self._refresh_labelset_options)
@@ -5662,9 +5679,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         backend_choice = self._current_ai_backend()
         if backend_choice:
             llm_cfg["backend"] = backend_choice
-        include_checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
-        if isinstance(include_checkbox, QtWidgets.QCheckBox):
-            llm_cfg["include_reasoning"] = bool(include_checkbox.isChecked())
+        reasoning_map = {
+            str(label_id): bool(value)
+            for label_id, value in getattr(self, "_label_reasoning_by_label", {}).items()
+            if str(label_id)
+        }
+        llm_cfg["include_reasoning"] = any(reasoning_map.values()) if reasoning_map else bool(
+            getattr(self, "_labelset_include_reasoning", False)
+        )
+        llm_cfg["include_reasoning_by_label"] = reasoning_map
         if backend_choice == "azure":
             if hasattr(self, "ai_azure_key_edit"):
                 azure_key = self.ai_azure_key_edit.text().strip()
@@ -5753,10 +5776,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         reranker_path = effective_cfg.get("reranker_model_dir")
         if hasattr(self, "ai_reranker_path_edit") and isinstance(reranker_path, str):
             self.ai_reranker_path_edit.setText(reranker_path)
-        include_reasoning = llm_cfg.get("include_reasoning")
-        checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
-        if isinstance(checkbox, QtWidgets.QCheckBox) and isinstance(include_reasoning, bool):
-            checkbox.setChecked(include_reasoning)
         if backend_choice == "azure":
             if hasattr(self, "ai_azure_key_edit") and llm_cfg.get("azure_api_key"):
                 self.ai_azure_key_edit.setText(str(llm_cfg.get("azure_api_key")))
@@ -5816,6 +5835,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _on_labelset_changed(self) -> None:
         schema = self._active_label_schema()
+        labelset_default_reasoning = bool(schema.get("include_reasoning")) if isinstance(schema, Mapping) else False
+        self._labelset_include_reasoning = labelset_default_reasoning
+        self._label_reasoning_by_label = {}
         keywords: Dict[str, List[str]] = {}
         queries: Dict[str, str] = {}
         few_shot: Dict[str, List[Dict[str, str]]] = {}
@@ -5827,6 +5849,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 label_id = str(label.get("label_id") or "")
                 if not label_id:
                     continue
+                self._label_reasoning_by_label[label_id] = bool(
+                    label.get("include_reasoning", labelset_default_reasoning)
+                )
                 label_keywords = label.get("keywords")
                 if isinstance(label_keywords, Sequence):
                     kw_values = [str(kw).strip() for kw in label_keywords if str(kw).strip()]
@@ -5889,6 +5914,23 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self._ai_engine_overrides["llm"] = llm_cfg
             updated = True
 
+        llm_cfg = self._ai_engine_overrides.get("llm") if isinstance(self._ai_engine_overrides.get("llm"), Mapping) else {}
+        target_include = bool(self._labelset_include_reasoning)
+        if self._label_reasoning_by_label:
+            target_include = any(self._label_reasoning_by_label.values())
+        target_reasoning_map = {k: bool(v) for k, v in self._label_reasoning_by_label.items()}
+        current_map = llm_cfg.get("include_reasoning_by_label") if isinstance(llm_cfg, Mapping) else None
+        if (
+            not isinstance(llm_cfg, Mapping)
+            or llm_cfg.get("include_reasoning") != target_include
+            or current_map != target_reasoning_map
+        ):
+            llm_cfg = dict(llm_cfg)
+            llm_cfg["include_reasoning"] = target_include
+            llm_cfg["include_reasoning_by_label"] = target_reasoning_map
+            self._ai_engine_overrides["llm"] = llm_cfg
+            updated = True
+
         if updated:
             self._apply_ai_config_to_controls(self._ai_engine_overrides)
 
@@ -5911,9 +5953,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.random_final_llm_group.setEnabled(bool(checked))
 
     def _on_ai_final_llm_toggled(self, checked: bool) -> None:
-        checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
-        if isinstance(checkbox, QtWidgets.QCheckBox):
-            checkbox.setEnabled(bool(checked))
+        _ = checked
 
     def _on_assisted_review_toggled(self, checked: bool) -> None:
         if hasattr(self, "assisted_review_spin"):
@@ -6296,9 +6336,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         random_rerank_row.setStretch(1, 0)
         random_llm_layout.addRow("Re-ranker model", random_rerank_row)
 
-        self.random_include_reasoning_checkbox = QtWidgets.QCheckBox("Include reasoning")
-        self.random_include_reasoning_checkbox.setChecked(False)
-        random_llm_layout.addRow("Include reasoning", self.random_include_reasoning_checkbox)
 
         self._random_azure_widgets = [
             w
@@ -6464,9 +6501,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_final_llm_checkbox.toggled.connect(self._on_ai_final_llm_toggled)
         ai_config_layout.addRow("Final LLM labeling", self.ai_final_llm_checkbox)
 
-        self.ai_include_reasoning_checkbox = QtWidgets.QCheckBox("Include reasoning")
-        self.ai_include_reasoning_checkbox.setChecked(False)
-        ai_config_layout.addRow("Include reasoning", self.ai_include_reasoning_checkbox)
         self.ai_context_order_combo = QtWidgets.QComboBox()
         self.ai_context_order_combo.addItem("Relevance ranking", "relevance")
         self.ai_context_order_combo.addItem("Chronological", "chronological")
@@ -6771,12 +6805,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if hasattr(self, "random_final_llm_checkbox") and isinstance(final_llm_value, bool):
             self.random_final_llm_checkbox.setChecked(final_llm_value)
             self._on_random_final_llm_toggled(final_llm_value)
-        include_reasoning_value = config.get("final_llm_include_reasoning")
-        if (
-            hasattr(self, "random_include_reasoning_checkbox")
-            and isinstance(include_reasoning_value, bool)
-        ):
-            self.random_include_reasoning_checkbox.setChecked(include_reasoning_value)
 
     def _collect_filters(self) -> SamplingFilters:
         conditions: List[MetadataFilterCondition] = []
@@ -7565,11 +7593,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 )
             except Exception:  # noqa: BLE001
                 overrides["final_llm_labeling_n_consistency"] = 1
-        include_reasoning_value: Optional[bool] = None
-        include_checkbox = getattr(self, "ai_include_reasoning_checkbox", None)
-        if isinstance(include_checkbox, QtWidgets.QCheckBox):
-            include_reasoning_value = bool(include_checkbox.isChecked())
-            overrides["final_llm_include_reasoning"] = include_reasoning_value
+        reasoning_map = {
+            str(label_id): bool(value)
+            for label_id, value in getattr(self, "_label_reasoning_by_label", {}).items()
+            if str(label_id)
+        }
+        include_reasoning_value = any(reasoning_map.values()) if reasoning_map else bool(
+            getattr(self, "_labelset_include_reasoning", False)
+        )
+        overrides["final_llm_include_reasoning"] = include_reasoning_value
         llmfirst_overrides: Dict[str, Any] = {}
         if isinstance(overrides.get("llmfirst"), Mapping):
             llmfirst_overrides.update(overrides.get("llmfirst", {}))
@@ -7593,8 +7625,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         backend_choice = self._current_ai_backend()
         if backend_choice:
             llm_overrides["backend"] = backend_choice
-        if include_reasoning_value is not None:
-            llm_overrides["include_reasoning"] = include_reasoning_value
+        llm_overrides["include_reasoning"] = include_reasoning_value
+        llm_overrides["include_reasoning_by_label"] = reasoning_map
         if backend_choice == "azure":
             if hasattr(self, "ai_azure_version_edit"):
                 version = self.ai_azure_version_edit.text().strip()
@@ -8110,6 +8142,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         "type": label["type"],
                         "required": bool(label["required"]),
                         "na_allowed": bool(label["na_allowed"]),
+                        "include_reasoning": bool(label["include_reasoning"])
+                        if "include_reasoning" in label.keys()
+                        else bool(labelset_row["include_reasoning"]) if labelset_row else False,
                         "rules": label["rules"],
                         "unit": label["unit"],
                         "range": {"min": label["min"], "max": label["max"]},
@@ -8125,6 +8160,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 payload["created_by"] = labelset_row["created_by"]
                 payload["created_at"] = labelset_row["created_at"]
                 payload["notes"] = labelset_row["notes"]
+                payload["include_reasoning"] = bool(labelset_row["include_reasoning"])
             return payload
 
         if conn is not None:
@@ -8325,6 +8361,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     version=1,
                     created_at=created_at,
                     created_by="system",
+                    include_reasoning=0,
                     notes="Auto-generated",
                 )
                 labelset.save(conn)
@@ -8339,6 +8376,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         rules="",
                         gating_expr=None,
                         na_allowed=0,
+                        include_reasoning=0,
                         unit=None,
                         min=None,
                         max=None,
@@ -8375,9 +8413,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 final_llm_enabled = bool(self.random_final_llm_checkbox.isChecked())
                 config_payload["final_llm_labeling"] = final_llm_enabled
             if final_llm_enabled or assisted_enabled:
-                include_reasoning = False
-                if isinstance(getattr(self, "random_include_reasoning_checkbox", None), QtWidgets.QCheckBox):
-                    include_reasoning = bool(self.random_include_reasoning_checkbox.isChecked())
+                include_reasoning = bool(getattr(self, "_labelset_include_reasoning", False))
+                if getattr(self, "_label_reasoning_by_label", {}):
+                    include_reasoning = any(bool(v) for v in self._label_reasoning_by_label.values())
                 config_payload["final_llm_include_reasoning"] = include_reasoning
                 backend_choice = self._current_random_backend()
                 if backend_choice:
@@ -8428,6 +8466,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         if max_new > 0:
                             backend_cfg["local_max_new_tokens"] = max_new
                 if backend_cfg:
+                    if getattr(self, "_label_reasoning_by_label", {}):
+                        backend_cfg["include_reasoning_by_label"] = {
+                            str(label_id): bool(value)
+                            for label_id, value in self._label_reasoning_by_label.items()
+                            if str(label_id)
+                        }
                     config_payload.setdefault("ai_backend", {}).update(backend_cfg)
             if assisted_enabled:
                 config_payload["assisted_review"] = {
@@ -9005,6 +9049,7 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
                 labelset_id=str(values.get("labelset_id", "")),
                 created_by=str(values.get("created_by", "admin")),
                 notes=str(values.get("notes", "")),
+                include_reasoning=bool(values.get("include_reasoning")),
                 labels=[dict(label) for label in values.get("labels", [])],
             )
         except Exception as exc:  # noqa: BLE001

@@ -46,10 +46,14 @@ PROJECT_SCHEMA = [
         version INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         created_by TEXT NOT NULL,
+        include_reasoning INTEGER NOT NULL DEFAULT 0,
         notes TEXT,
         FOREIGN KEY(project_id) REFERENCES projects(project_id),
         FOREIGN KEY(pheno_id) REFERENCES phenotypes(pheno_id)
     );
+    """,
+    """
+    ALTER TABLE label_sets ADD COLUMN include_reasoning INTEGER NOT NULL DEFAULT 0;
     """,
     """
     CREATE TABLE IF NOT EXISTS labels(
@@ -62,6 +66,7 @@ PROJECT_SCHEMA = [
         rules TEXT,
         gating_expr TEXT,
         na_allowed INTEGER DEFAULT 0,
+        include_reasoning INTEGER NOT NULL DEFAULT 0,
         unit TEXT,
         min REAL,
         max REAL,
@@ -69,6 +74,9 @@ PROJECT_SCHEMA = [
         few_shot_json TEXT,
         PRIMARY KEY(labelset_id, label_id)
     );
+    """,
+    """
+    ALTER TABLE labels ADD COLUMN include_reasoning INTEGER NOT NULL DEFAULT 0;
     """,
     """
     CREATE TABLE IF NOT EXISTS label_options(

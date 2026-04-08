@@ -136,6 +136,7 @@ class LabelSet(Record):
     version: int
     created_at: str
     created_by: str
+    include_reasoning: int
     notes: str
 
     __tablename__ = "label_sets"
@@ -148,6 +149,7 @@ class LabelSet(Record):
             version INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
+            include_reasoning INTEGER NOT NULL DEFAULT 0,
             notes TEXT NOT NULL,
             FOREIGN KEY(pheno_id) REFERENCES phenotypes(pheno_id),
             FOREIGN KEY(project_id) REFERENCES projects(project_id)
@@ -167,6 +169,7 @@ class Label(Record):
     rules: str
     gating_expr: Optional[str]
     na_allowed: int
+    include_reasoning: int
     unit: Optional[str]
     min: Optional[float]
     max: Optional[float]
@@ -186,6 +189,7 @@ class Label(Record):
             rules TEXT NOT NULL,
             gating_expr TEXT NULL,
             na_allowed INTEGER NOT NULL,
+            include_reasoning INTEGER NOT NULL DEFAULT 0,
             unit TEXT NULL,
             min REAL NULL,
             max REAL NULL,
