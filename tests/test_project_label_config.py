@@ -1,4 +1,5 @@
 import sys
+import sqlite3
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -256,3 +257,65 @@ def test_round_builder_prefers_labelset_reasoning_flag() -> None:
 
     assert builder._final_llm_include_reasoning(config, labelset={"include_reasoning": True}) is True
     assert builder._final_llm_include_reasoning(config, labelset={"include_reasoning": False}) is False
+
+
+def test_fetch_labelset_backfills_reasoning_for_legacy_schema() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE label_sets (
+            labelset_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            pheno_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            notes TEXT
+        );
+        CREATE TABLE labels (
+            label_id TEXT NOT NULL,
+            labelset_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            required INTEGER NOT NULL DEFAULT 0,
+            order_index INTEGER NOT NULL,
+            rules TEXT,
+            gating_expr TEXT,
+            na_allowed INTEGER NOT NULL DEFAULT 0,
+            unit TEXT,
+            min REAL,
+            max REAL,
+            keywords_json TEXT,
+            few_shot_json TEXT,
+            PRIMARY KEY(labelset_id, label_id)
+        );
+        CREATE TABLE label_options (
+            option_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            labelset_id TEXT NOT NULL,
+            label_id TEXT NOT NULL,
+            value TEXT NOT NULL,
+            display TEXT NOT NULL,
+            order_index INTEGER NOT NULL DEFAULT 0,
+            weight REAL
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO label_sets(labelset_id, project_id, pheno_id, version, created_at, created_by, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("legacy_ls", "proj", "phen", 1, "2026-01-01T00:00:00Z", "tester", ""),
+    )
+    conn.execute(
+        """
+        INSERT INTO labels(label_id, labelset_id, name, type, required, order_index, rules, gating_expr, na_allowed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("l1", "legacy_ls", "Legacy", "text", 0, 0, "", None, 0),
+    )
+
+    fetched = fetch_labelset(conn, "legacy_ls")
+    assert fetched["include_reasoning"] is False
+    assert fetched["labels"][0]["include_reasoning"] is False

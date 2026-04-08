@@ -429,6 +429,39 @@ def test_multi_label_few_shot_answer_is_wrapped_by_label(tmp_path):
     assert parsed == {"Flag": {"prediction": "yes"}}
 
 
+def test_few_shot_reasoning_field_is_included_when_enabled(tmp_path):
+    class DummyBackend:
+        def json_call(self, *_, **__):  # pragma: no cover - not invoked in this test
+            raise AssertionError("json_call should not be reached")
+
+    llm_cfg = ai_config.LLMConfig()
+    llm_cfg.include_reasoning = True
+    llm_cfg.few_shot_examples = {
+        "Flag": [{"context": "c1", "answer": "yes", "reasoning": "because evidence supports it"}]
+    }
+    annotator = LLMLabeler(
+        llm_backend=DummyBackend(),
+        label_config_bundle=LabelConfigBundle(),
+        llm_config=llm_cfg,
+        sc_cfg=ai_config.SCJitterConfig(),
+        cache_dir=str(tmp_path),
+    )
+
+    payload = annotator.build_single_label_prompt_payload(
+        label_id="Flag",
+        label_type="categorical",
+        label_rules="",
+        snippets=[{"doc_id": "doc-1", "chunk_id": 1, "text": "note", "metadata": {}}],
+    )
+    assistant_example = next(
+        msg["content"] for msg in payload["messages"] if msg["role"] == "assistant"
+    )
+    assert json.loads(assistant_example) == {
+        "prediction": "yes",
+        "reasoning": "because evidence supports it",
+    }
+
+
 def test_multilabel_prompt_supports_per_label_reasoning_flags(tmp_path):
     class DummyBackend:
         def json_call(self, *_, **__):  # pragma: no cover - not invoked in this test

@@ -2715,6 +2715,7 @@ class _FewShotEntryDialog(QtWidgets.QDialog):
         *,
         context: str = "",
         answer: str = "",
+        reasoning: str = "",
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit few-shot example")
@@ -2736,6 +2737,13 @@ class _FewShotEntryDialog(QtWidgets.QDialog):
         self.answer_edit.setPlainText(str(answer))
         form.addRow("Answer", self.answer_edit)
 
+        self.reasoning_edit = QtWidgets.QPlainTextEdit()
+        self.reasoning_edit.setPlaceholderText(
+            "Optional reasoning/rationale paired with the answer."
+        )
+        self.reasoning_edit.setPlainText(str(reasoning))
+        form.addRow("Reasoning (optional)", self.reasoning_edit)
+
         layout.addLayout(form)
 
         buttons = QtWidgets.QDialogButtonBox(
@@ -2746,12 +2754,16 @@ class _FewShotEntryDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def values(self) -> tuple[str, str]:
-        return self.context_edit.toPlainText().strip(), self.answer_edit.toPlainText().strip()
+    def values(self) -> tuple[str, str, str]:
+        return (
+            self.context_edit.toPlainText().strip(),
+            self.answer_edit.toPlainText().strip(),
+            self.reasoning_edit.toPlainText().strip(),
+        )
 
 
 class _FewShotTable(QtWidgets.QWidget):
-    """Simple table for entering context/answer pairs."""
+    """Simple table for entering context/answer/reasoning examples."""
 
     def __init__(self, existing: Sequence[Mapping[str, object]] | None = None) -> None:
         super().__init__()
@@ -2759,13 +2771,18 @@ class _FewShotTable(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self._table = QtWidgets.QTableWidget(0, 2)
-        self._table.setHorizontalHeaderLabels(["Context", "Answer (JSON or text)"])
+        self._table = QtWidgets.QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(
+            ["Context", "Answer (JSON or text)", "Reasoning (optional)"]
+        )
         self._table.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.ResizeMode.Stretch
         )
         self._table.horizontalHeader().setSectionResizeMode(
             1, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        self._table.horizontalHeader().setSectionResizeMode(
+            2, QtWidgets.QHeaderView.ResizeMode.Stretch
         )
         self._table.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
@@ -2804,23 +2821,26 @@ class _FewShotTable(QtWidgets.QWidget):
                     continue
                 context = entry.get("context")
                 answer = entry.get("answer")
+                reasoning = entry.get("reasoning")
                 self._add_row(
                     context if context is not None else "",
                     answer if answer is not None else "",
+                    reasoning if reasoning is not None else "",
                 )
 
-    def _add_row(self, context: str = "", answer: str = "") -> None:
+    def _add_row(self, context: str = "", answer: str = "", reasoning: str = "") -> None:
         row = self._table.rowCount()
         self._table.insertRow(row)
         self._table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(context)))
         self._table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(answer)))
+        self._table.setItem(row, 2, QtWidgets.QTableWidgetItem(str(reasoning)))
         self._table.selectRow(row)
 
     def _on_add(self) -> None:
         dialog = _FewShotEntryDialog(self)
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            context, answer = dialog.values()
-            self._add_row(context, answer)
+            context, answer, reasoning = dialog.values()
+            self._add_row(context, answer, reasoning)
 
     def _on_edit(self) -> None:
         row = self._table.currentRow()
@@ -2854,30 +2874,37 @@ class _FewShotTable(QtWidgets.QWidget):
     def _edit_row(self, row: int) -> None:
         context_item = self._table.item(row, 0)
         answer_item = self._table.item(row, 1)
+        reasoning_item = self._table.item(row, 2)
         dialog = _FewShotEntryDialog(
             self,
             context=context_item.text() if context_item else "",
             answer=answer_item.text() if answer_item else "",
+            reasoning=reasoning_item.text() if reasoning_item else "",
         )
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            context, answer = dialog.values()
+            context, answer, reasoning = dialog.values()
             self._table.setItem(row, 0, QtWidgets.QTableWidgetItem(context))
             self._table.setItem(row, 1, QtWidgets.QTableWidgetItem(answer))
+            self._table.setItem(row, 2, QtWidgets.QTableWidgetItem(reasoning))
 
     def to_examples(self) -> list[dict[str, str]]:
         examples: list[dict[str, str]] = []
         for row in range(self._table.rowCount()):
             context_item = self._table.item(row, 0)
             answer_item = self._table.item(row, 1)
+            reasoning_item = self._table.item(row, 2)
             context = context_item.text().strip() if context_item else ""
             answer = answer_item.text().strip() if answer_item else ""
-            if not context and not answer:
+            reasoning = reasoning_item.text().strip() if reasoning_item else ""
+            if not context and not answer and not reasoning:
                 continue
             example: dict[str, str] = {}
             if context:
                 example["context"] = context
             if answer:
                 example["answer"] = answer
+            if reasoning:
+                example["reasoning"] = reasoning
             if example:
                 examples.append(example)
         return examples
@@ -8084,6 +8111,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         conn: Optional[sqlite3.Connection] = None,
     ) -> Dict[str, object]:
         def fetch(connection: sqlite3.Connection) -> Dict[str, object]:
+            def row_has_key(row: sqlite3.Row | None, key: str) -> bool:
+                return bool(row is not None and key in row.keys())
+
+            def row_bool(row: sqlite3.Row | None, key: str, default: bool = False) -> bool:
+                if not row_has_key(row, key):
+                    return default
+                return bool(row[key])
+
             labelset_row = connection.execute(
                 "SELECT * FROM label_sets WHERE labelset_id=?",
                 (labelset_id,),
@@ -8131,6 +8166,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                                     example["context"] = str(entry.get("context"))
                                 if entry.get("answer"):
                                     example["answer"] = str(entry.get("answer"))
+                                if entry.get("reasoning"):
+                                    example["reasoning"] = str(entry.get("reasoning"))
                                 if example:
                                     few_shot_examples.append(example)
                     except Exception:  # noqa: BLE001
@@ -8142,9 +8179,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         "type": label["type"],
                         "required": bool(label["required"]),
                         "na_allowed": bool(label["na_allowed"]),
-                        "include_reasoning": bool(label["include_reasoning"])
-                        if "include_reasoning" in label.keys()
-                        else bool(labelset_row["include_reasoning"]) if labelset_row else False,
+                        "include_reasoning": row_bool(
+                            label,
+                            "include_reasoning",
+                            default=row_bool(labelset_row, "include_reasoning", default=False),
+                        ),
                         "rules": label["rules"],
                         "unit": label["unit"],
                         "range": {"min": label["min"], "max": label["max"]},
@@ -8160,7 +8199,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 payload["created_by"] = labelset_row["created_by"]
                 payload["created_at"] = labelset_row["created_at"]
                 payload["notes"] = labelset_row["notes"]
-                payload["include_reasoning"] = bool(labelset_row["include_reasoning"])
+                payload["include_reasoning"] = row_bool(labelset_row, "include_reasoning", default=False)
             return payload
 
         if conn is not None:
