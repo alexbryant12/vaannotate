@@ -9,9 +9,11 @@ import pandas as pd
 
 from .config import OrchestratorConfig, Paths
 from .label_configs import LabelConfigBundle, EMPTY_BUNDLE
+from .orchestration import BackendSession
+from .orchestrator import _apply_overrides, run_inference
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .orchestration import BackendSession
+    pass
 
 
 def _normalize_local_model_overrides(
@@ -238,9 +240,6 @@ def run_inference_experiments(
     Dict[str, InferenceExperimentResult]
         Mapping from experiment name to result objects.
     """
-    from .orchestration import BackendSession
-    from .orchestrator import _apply_overrides, run_inference
-
     base_outdir = Path(base_outdir)
     base_outdir.mkdir(parents=True, exist_ok=True)
 
@@ -325,24 +324,6 @@ def run_inference_experiments(
         else:
             exp_session = session or _build_session_for_cfg(name, sweep_cfg)
 
-        #debugging block
-        print(
-            f"=== DEBUG experiments.run_inference_experiments: sweep={name} ==="
-        )
-        rag_overrides = (normalized_overrides.get("rag") or {}) if isinstance(normalized_overrides, dict) else {}
-        print(
-            "  normalized_overrides.rag:",
-            "top_k_final=", rag_overrides.get("top_k_final"),
-            "per_label_topk=", rag_overrides.get("per_label_topk"),
-            "chunk_size=", rag_overrides.get("chunk_size"),
-        )
-        print(
-            "  sweep_cfg.rag:",
-            "top_k_final=", getattr(sweep_cfg.rag, "top_k_final", None),
-            "per_label_topk=", getattr(sweep_cfg.rag, "per_label_topk", None),
-            "chunk_size=", getattr(sweep_cfg.rag, "chunk_size", None),
-        )
-        
         df, artifacts = run_inference(
             notes_df=index_notes_df,
             ann_df=index_ann_df,
