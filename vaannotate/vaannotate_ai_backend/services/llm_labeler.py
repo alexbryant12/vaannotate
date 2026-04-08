@@ -540,7 +540,16 @@ class LLMLabeler:
         label_examples = self._raw_few_shot_examples(label_id)
         messages: list[dict[str, str]] = []
         for entry in label_examples:
-            answer = entry.get("answer")
+            answer: Any = entry.get("answer")
+            reasoning = entry.get("reasoning")
+            if (
+                include_reasoning
+                and isinstance(reasoning, str)
+                and reasoning.strip()
+                and answer is not None
+                and not isinstance(answer, Mapping)
+            ):
+                answer = {"prediction": answer, "reasoning": reasoning}
             context = entry.get("context")
             if context is not None:
                 ctx_text = str(context)
@@ -564,7 +573,16 @@ class LLMLabeler:
             include_reasoning = bool(reasoning_map.get(str(label_id), self._include_reasoning_for_label(str(label_id))))
             for entry in self._raw_few_shot_examples(label_id):
                 context = entry.get("context")
-                answer = entry.get("answer")
+                answer: Any = entry.get("answer")
+                reasoning = entry.get("reasoning")
+                if (
+                    include_reasoning
+                    and isinstance(reasoning, str)
+                    and reasoning.strip()
+                    and answer is not None
+                    and not isinstance(answer, Mapping)
+                ):
+                    answer = {"prediction": answer, "reasoning": reasoning}
                 if context is not None:
                     ctx_text = str(context).strip()
                     if ctx_text:

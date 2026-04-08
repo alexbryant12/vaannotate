@@ -203,6 +203,14 @@ def add_labelset(
 
 
 def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
+    def _row_has_key(row: sqlite3.Row | None, key: str) -> bool:
+        return bool(row is not None and key in row.keys())
+
+    def _row_bool(row: sqlite3.Row | None, key: str, default: bool = False) -> bool:
+        if not _row_has_key(row, key):
+            return default
+        return bool(row[key])
+
     labelset_row = conn.execute(
         "SELECT * FROM label_sets WHERE labelset_id=?",
         (labelset_id,),
@@ -252,6 +260,8 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
                             example_payload["context"] = entry.get("context")
                         if entry.get("answer") is not None:
                             example_payload["answer"] = entry.get("answer")
+                        if entry.get("reasoning") is not None:
+                            example_payload["reasoning"] = entry.get("reasoning")
                         if example_payload:
                             few_shot_examples.append(example_payload)
             except Exception:  # noqa: BLE001
@@ -267,7 +277,11 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
                 "rules": label["rules"],
                 "gating_expr": label["gating_expr"],
                 "na_allowed": bool(label["na_allowed"]),
-                "include_reasoning": bool(label["include_reasoning"]) if "include_reasoning" in label.keys() else bool(labelset_row["include_reasoning"]),
+                "include_reasoning": _row_bool(
+                    label,
+                    "include_reasoning",
+                    default=_row_bool(labelset_row, "include_reasoning", default=False),
+                ),
                 "unit": label["unit"],
                 "min": label["min"],
                 "max": label["max"],
@@ -277,7 +291,7 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
             }
         )
     labelset = dict(labelset_row)
-    labelset["include_reasoning"] = bool(labelset.get("include_reasoning"))
+    labelset["include_reasoning"] = _row_bool(labelset_row, "include_reasoning", default=False)
     labelset["labels"] = label_dicts
     return labelset
 
