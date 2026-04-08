@@ -122,15 +122,16 @@ def add_labelset(
     created_by: str,
     notes: str | None,
     labels: Iterable[dict],
+    include_reasoning: bool = False,
 ) -> None:
     created_at = datetime.utcnow().isoformat()
     conn.execute(
         """
         INSERT OR REPLACE INTO label_sets(
-            labelset_id, project_id, pheno_id, version, created_at, created_by, notes
-        ) VALUES (?,?,?,?,?,?,?)
+            labelset_id, project_id, pheno_id, version, created_at, created_by, include_reasoning, notes
+        ) VALUES (?,?,?,?,?,?,?,?)
         """,
-        (labelset_id, project_id, pheno_id, version, created_at, created_by, notes),
+        (labelset_id, project_id, pheno_id, version, created_at, created_by, 1 if include_reasoning else 0, notes),
     )
     seen_label_ids: set[str] = set()
     for idx, label in enumerate(labels):
@@ -274,6 +275,7 @@ def fetch_labelset(conn: sqlite3.Connection, labelset_id: str) -> dict:
             }
         )
     labelset = dict(labelset_row)
+    labelset["include_reasoning"] = bool(labelset.get("include_reasoning"))
     labelset["labels"] = label_dicts
     return labelset
 

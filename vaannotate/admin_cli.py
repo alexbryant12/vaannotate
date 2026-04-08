@@ -122,6 +122,7 @@ def createlabelset(
             created_by=data.get("created_by", "cli"),
             notes=data.get("notes"),
             labels=data["labels"],
+            include_reasoning=bool(data.get("include_reasoning", False)),
         )
         conn.commit()
     print(f"Label set {data['labelset_id']} stored")

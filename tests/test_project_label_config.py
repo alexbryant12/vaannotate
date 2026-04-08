@@ -184,6 +184,7 @@ def test_label_keywords_and_examples_round_trip(tmp_path: Path) -> None:
         "pheno_id": "phen",
         "version": 1,
         "created_by": "tester",
+        "include_reasoning": True,
         "notes": None,
         "labels": [
             {
@@ -213,6 +214,7 @@ def test_label_keywords_and_examples_round_trip(tmp_path: Path) -> None:
         fetched = fetch_labelset(conn, "ls_features")
 
     labels = fetched.get("labels", [])
+    assert fetched.get("include_reasoning") is True
     assert isinstance(labels, list) and labels
     label = labels[0]
     assert label["keywords"] == ["alpha", "beta"]
@@ -244,3 +246,11 @@ def test_apply_label_queries_and_extract(tmp_path: Path) -> None:
     }
     extracted = RoundBuilder._extract_label_queries(config_override)
     assert extracted == {"lab1": "override query", "lab2": "second"}
+
+
+def test_round_builder_prefers_labelset_reasoning_flag() -> None:
+    builder = RoundBuilder.__new__(RoundBuilder)
+    config = {"final_llm_include_reasoning": False, "llm_labeling": {"include_reasoning": False}}
+
+    assert builder._final_llm_include_reasoning(config, labelset={"include_reasoning": True}) is True
+    assert builder._final_llm_include_reasoning(config, labelset={"include_reasoning": False}) is False

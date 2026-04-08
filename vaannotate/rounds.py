@@ -319,7 +319,7 @@ class RoundBuilder:
         else:
             final_llm_enabled = bool(final_llm_flag)
         config["final_llm_labeling"] = final_llm_enabled
-        include_reasoning = self._final_llm_include_reasoning(config)
+        include_reasoning = self._final_llm_include_reasoning(config, labelset=None)
         config["final_llm_include_reasoning"] = include_reasoning
         final_llm_outputs: Dict[str, str] = {}
         overrides = {
@@ -364,6 +364,8 @@ class RoundBuilder:
                         corpus_path = (self.project_root / corpus_path).resolve()
                 with self._connect_corpus(corpus_path) as corpus_conn:
                     labelset = fetch_labelset(project_conn, config["labelset_id"])
+                    include_reasoning = self._final_llm_include_reasoning(config, labelset=labelset)
+                    config["final_llm_include_reasoning"] = include_reasoning
                     round_number = config.get("round_number")
                     csv_override: Path | None = None
                     if not preselected_units_csv:
@@ -1030,7 +1032,7 @@ class RoundBuilder:
                     reviewer_assignments=reviewer_assignments,
                     config=config,
                     config_base=config_base,
-                    include_reasoning=self._final_llm_include_reasoning(config),
+                    include_reasoning=self._final_llm_include_reasoning(config, labelset=labelset),
                 )
                 if auto_submit_llm and outputs:
                     try:
@@ -1127,8 +1129,15 @@ class RoundBuilder:
                 return False
         return None
 
-    def _final_llm_include_reasoning(self, config: Mapping[str, Any]) -> bool:
-        candidates: list[object] = [config.get("final_llm_include_reasoning")]
+    def _final_llm_include_reasoning(
+        self,
+        config: Mapping[str, Any],
+        labelset: Mapping[str, Any] | None = None,
+    ) -> bool:
+        candidates: list[object] = []
+        if isinstance(labelset, Mapping):
+            candidates.append(labelset.get("include_reasoning"))
+        candidates.append(config.get("final_llm_include_reasoning"))
         llm_cfg = config.get("llm_labeling")
         if isinstance(llm_cfg, Mapping):
             candidates.append(llm_cfg.get("include_reasoning"))
