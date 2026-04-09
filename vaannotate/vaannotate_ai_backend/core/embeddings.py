@@ -12,13 +12,13 @@ import re
 import time
 import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from ..utils.runtime import iter_with_bar as _iter_with_bar
+from .index_config import IndexConfig
 
 if TYPE_CHECKING:
     from ..config import ModelConfig
@@ -35,16 +35,6 @@ except Exception:
         from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
     except Exception:
         raise ImportError("Please install langchain-text-splitters or langchain to use RecursiveCharacterTextSplitter.")
-@dataclass
-class IndexConfig:
-    type: str = "flat"    # flat | hnsw | ivf
-    nlist: int = 2048     # IVF lists
-    nprobe: int = 32      # IVF search probes
-    hnsw_M: int = 32      # HNSW graph degree
-    hnsw_efSearch: int = 64
-    persist: bool = True
-
-
 def _detect_device():
     import os
     # Allow explicit override when the caller wants to pin models to a device.
@@ -758,5 +748,4 @@ class EmbeddingStore:
                 except Exception:
                     continue
         return [i for i,m in enumerate(self.chunk_meta) if m.get("unit_id")==uid]
-
 
