@@ -794,6 +794,8 @@ class LLMLabeler:
         Returns a dict with:
             {
                 "runs": [ ... raw call metadata ... ],
+                "json_valid": <bool>,
+                "error": <optional error string>,
                 "predictions": {
                     "<label_id>": {
                         "prediction": <value>,
@@ -836,7 +838,7 @@ class LLMLabeler:
             )
         except Exception:
             LLM_RECORDER.record("json_multi_error", {"unit_id": unit_id, "label_ids": label_ids})
-            return {"runs": [], "predictions": {}}
+            return {"runs": [], "predictions": {}, "json_valid": False, "error": "json_call_failed"}
 
         if isinstance(content, str):
             try:
@@ -846,6 +848,7 @@ class LLMLabeler:
         else:
             obj = content if isinstance(content, Mapping) else None
 
+        json_valid = isinstance(obj, Mapping)
         runs = [
             {
                 "raw_output": content,
@@ -894,7 +897,7 @@ class LLMLabeler:
 
             predictions[lid] = {"prediction": pred_norm, "reasoning": reasoning}
 
-        return {"runs": runs, "predictions": predictions}
+        return {"runs": runs, "predictions": predictions, "json_valid": json_valid, "error": None}
 
     def forced_choice_probe(
         self,
