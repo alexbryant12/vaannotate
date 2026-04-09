@@ -1108,6 +1108,15 @@ def _run_single_prompt_batch(
     )
 
     rows: list[dict] = []
+    malformed_streak = 0
+    streak_limit = int(
+        getattr(
+            getattr(getattr(llm_labeler, "cfg", None), "llmfirst", None),
+            "malformed_json_unit_streak_limit",
+            10,
+        )
+        or 10
+    )
     for task in tasks:
         unit_id = str(task.unit_id)
         label_ids = [str(lid) for lid in task.label_ids]
@@ -1122,6 +1131,17 @@ def _run_single_prompt_batch(
 
         preds = result.get("predictions") or {}
         runs = result.get("runs", [])
+        json_valid = bool(result.get("json_valid", bool(preds)))
+        if not json_valid:
+            malformed_streak += 1
+            if malformed_streak >= streak_limit:
+                raise RuntimeError(
+                    "Stopping prompt inference after "
+                    f"{malformed_streak} consecutive malformed JSON unit responses. "
+                    "This usually indicates an LLM API outage or network connectivity issue."
+                )
+        else:
+            malformed_streak = 0
 
         parent_preds = {
             (unit_id, str(lid)): info.get("prediction") if isinstance(info, dict) else None

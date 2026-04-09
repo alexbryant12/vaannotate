@@ -140,6 +140,7 @@ class LLMFirstConfig:
     inference_labeling_mode: str = "family"  # "family" | "single_prompt"
     single_prompt_max_labels: int = 64
     single_prompt_max_chars: int = 16000
+    malformed_json_unit_streak_limit: int = 10
     # forced-choice micro-probe
     fc_enable: bool = True
     #label enrichment for probe

@@ -894,3 +894,103 @@ def test_prompt_inference_emits_status_after_each_completed_batch(monkeypatch, t
 
     per_batch_statuses = [msg for msg in statuses if msg.startswith("Completed inference batch ")]
     assert len(per_batch_statuses) == 2
+
+
+def test_single_prompt_batch_stops_after_consecutive_malformed_json() -> None:
+    df_prompts = pd.DataFrame(
+        [
+            {
+                "job_id": "j1",
+                "prompt_id": f"j1:unit:u{i}",
+                "unit_id": f"u{i}",
+                "label_ids": ["L1"],
+                "ctx_snippets": [],
+                "rules_map": {"L1": "rule"},
+                "label_types": {"L1": "categorical"},
+                "rag_fingerprint": "fp",
+                "prompt_payload": {},
+                "meta": {},
+            }
+            for i in range(10)
+        ]
+    )
+
+    class DummyLabeler:
+        def __init__(self) -> None:
+            self.cfg = type(
+                "Cfg",
+                (),
+                {"llmfirst": type("LLMFirst", (), {"malformed_json_unit_streak_limit": 10})()},
+            )()
+
+        def annotate_multi(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return {"runs": [], "predictions": {}, "json_valid": False}
+
+    class DummyBundle:
+        current = {}
+
+    try:
+        jobs._run_single_prompt_batch(
+            df_prompts,
+            llm_labeler=DummyLabeler(),
+            label_config_bundle=DummyBundle(),
+            rules_map={"L1": "rule"},
+            label_types={"L1": "categorical"},
+        )
+        assert False, "Expected RuntimeError after malformed JSON streak limit is reached"
+    except RuntimeError as exc:
+        assert "consecutive malformed JSON unit responses" in str(exc)
+
+
+def test_single_prompt_batch_resets_malformed_json_streak_after_valid_response() -> None:
+    df_prompts = pd.DataFrame(
+        [
+            {
+                "job_id": "j2",
+                "prompt_id": f"j2:unit:u{i}",
+                "unit_id": f"u{i}",
+                "label_ids": ["L1"],
+                "ctx_snippets": [],
+                "rules_map": {"L1": "rule"},
+                "label_types": {"L1": "categorical"},
+                "rag_fingerprint": "fp",
+                "prompt_payload": {},
+                "meta": {},
+            }
+            for i in range(12)
+        ]
+    )
+
+    class DummyLabeler:
+        def __init__(self) -> None:
+            self.cfg = type(
+                "Cfg",
+                (),
+                {"llmfirst": type("LLMFirst", (), {"malformed_json_unit_streak_limit": 10})()},
+            )()
+            self.calls = 0
+
+        def annotate_multi(self, **_kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls <= 9:
+                return {"runs": [], "predictions": {}, "json_valid": False}
+            if self.calls == 10:
+                return {
+                    "runs": [],
+                    "predictions": {"L1": {"prediction": "yes", "reasoning": None}},
+                    "json_valid": True,
+                }
+            return {"runs": [], "predictions": {}, "json_valid": False}
+
+    class DummyBundle:
+        current = {}
+
+    out = jobs._run_single_prompt_batch(
+        df_prompts,
+        llm_labeler=DummyLabeler(),
+        label_config_bundle=DummyBundle(),
+        rules_map={"L1": "rule"},
+        label_types={"L1": "categorical"},
+    )
+
+    assert len(out) == 12
