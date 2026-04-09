@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from .core.index_config import IndexConfig
+from .core.embeddings import IndexConfig
 
 
 def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
