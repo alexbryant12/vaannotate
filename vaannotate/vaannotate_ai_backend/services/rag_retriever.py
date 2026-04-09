@@ -524,9 +524,10 @@ class RAGRetriever:
         )
 
         # ---- label-aware query + embedding ----
+        repo = getattr(self, "_repo", None)
         try:
-            label_types = repo.label_types()
-        except Exception:
+            label_types = repo.label_types() if repo is not None else {}
+        except (AttributeError, RuntimeError, ValueError, TypeError):
             label_types = {}
         base_k = getattr(self.cfg, "exemplar_K", None)
         K_use = int(base_k if base_k is not None else 6)
@@ -803,6 +804,5 @@ class RAGRetriever:
                 if (uid, label_id) in seen_pairs: continue
                 out[uid] = max(out.get(uid, 0.0), float(s))
         return out
-
 
 
