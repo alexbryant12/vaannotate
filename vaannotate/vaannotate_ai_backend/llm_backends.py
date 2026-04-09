@@ -198,6 +198,52 @@ class LLMBackend:
         """Allow backends with external resources to provide an explicit close."""
         return None
 
+    @staticmethod
+    def _json_retry_limit(response_format: Optional[Mapping[str, Any]]) -> int:
+        """Return maximum attempts for JSON-object validation failures."""
+        return 2 if response_format else 1
+
+    @staticmethod
+    def _parse_json_candidate(
+        *,
+        content: Any,
+        parsed: Any = None,
+    ) -> tuple[Any, str]:
+        """Best-effort parse of backend response payload into a JSON candidate."""
+        text_content = content
+        if parsed is not None:
+            data_candidate = parsed
+            if not text_content:
+                try:
+                    text_content = json.dumps(parsed)
+                except Exception:
+                    text_content = str(parsed)
+            return data_candidate, str(text_content or "")
+
+        if text_content is None:
+            text_content = ""
+        text_content = str(text_content)
+        data_candidate: Any = text_content
+        if text_content:
+            data_candidate = json.loads(text_content)
+        return data_candidate, text_content
+
+    @staticmethod
+    def _validate_json_object_candidate(
+        *,
+        response_format: Optional[Mapping[str, Any]],
+        data_candidate: Any,
+        raw_content: str,
+    ) -> None:
+        """Raise when JSON mode is requested but response isn't a JSON object."""
+        if not response_format:
+            return
+        if not isinstance(data_candidate, MappingABC):
+            raise ValueError(
+                "Expected JSON object but received: "
+                f"{str(data_candidate if data_candidate is not None else raw_content)[:2000]}"
+            )
+
 
 class AzureOpenAIBackend(LLMBackend):
     """Backend that wraps Azure OpenAI chat completions."""
@@ -248,39 +294,37 @@ class AzureOpenAIBackend(LLMBackend):
                 kwargs["response_format"] = response_format
         if logprobs and top_logprobs:
             kwargs["top_logprobs"] = int(top_logprobs)
-        t0 = time.time()
-        resp = self.client.chat.completions.create(**kwargs)
-        latency = time.time() - t0
-        self._post_call()
-        choice = _first_choice_or_raise(resp, operation="json_call")
-        message = getattr(choice, "message", None)
-        content = getattr(message, "content", None) if message else None
-        parsed = getattr(message, "parsed", None) if message else None
-
-        # Azure JSON mode may populate `message.parsed` instead of `content`
-        if parsed is not None:
-            data_candidate = parsed
-            if not content:
-                try:
-                    content = json.dumps(parsed)
-                except Exception:
-                    content = str(parsed)
-        else:
+        max_attempts = self._json_retry_limit(response_format)
+        attempts = 0
+        last_exc: Exception | None = None
+        while True:
+            attempts += 1
+            t0 = time.time()
+            resp = self.client.chat.completions.create(**kwargs)
+            latency = time.time() - t0
+            self._post_call()
+            choice = _first_choice_or_raise(resp, operation="json_call")
+            message = getattr(choice, "message", None)
+            content = getattr(message, "content", None) if message else None
+            parsed = getattr(message, "parsed", None) if message else None
             if content is None:
                 content = getattr(choice, "content", "")
-            content = content or ""
-            data_candidate = content
-            if content:
-                try:
-                    data_candidate = json.loads(content)
-                except Exception as exc:
-                    if response_format:
+            try:
+                data_candidate, content = self._parse_json_candidate(content=content, parsed=parsed)
+                self._validate_json_object_candidate(
+                    response_format=response_format,
+                    data_candidate=data_candidate,
+                    raw_content=content,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempts >= max_attempts:
+                    if response_format and isinstance(content, str):
                         snippet = content[:2000]
                         raise ValueError(f"Failed to parse JSON response: {snippet}") from exc
-
-        if response_format and not isinstance(data_candidate, MappingABC):
-            raise ValueError(f"Expected JSON object but received: {str(data_candidate)[:2000]}")
-
+                    raise
+                continue
         data = _reasoning_first(data_candidate)
         logprob_info = getattr(choice, "logprobs", None)
         if logprob_info is not None:
@@ -642,7 +686,8 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         token_logprobs: List[float] = []
         data: Mapping[str, Any] | None = None
         latency = 0.0
-        while attempts < 2:
+        max_attempts = self._json_retry_limit(response_format)
+        while attempts < max_attempts:
             t0 = time.time()
             text, token_ids, token_logprobs = self._generate(
                 prompt,
@@ -653,12 +698,18 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
             latency = time.time() - t0
             self._post_call()
             try:
-                data = _reasoning_first(self._tolerant_json_loads(text))
+                parsed = self._tolerant_json_loads(text)
+                self._validate_json_object_candidate(
+                    response_format=response_format,
+                    data_candidate=parsed,
+                    raw_content=text,
+                )
+                data = _reasoning_first(parsed)
                 break
             except Exception as exc:
                 last_error = exc
                 attempts += 1
-                if attempts >= 2:
+                if attempts >= max_attempts:
                     raise
                 continue
         else:  # pragma: no cover - defensive
