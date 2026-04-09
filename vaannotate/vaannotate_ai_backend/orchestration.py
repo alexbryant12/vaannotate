@@ -4,29 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import Mapping, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 from .config import OrchestratorConfig, Paths
 from .core.data import DataRepository
-from .core.embeddings import EmbeddingStore, Models, build_models_from_env
 from .label_configs import LabelConfigBundle
-from .llm_backends import build_llm_backend
-from .pipelines.active_learning import ActiveLearningPipeline
-from .pipelines.inference import InferencePipeline
-from .services import (
-    ActiveLearningSelector,
-    ContextBuilder,
-    DiversitySelector,
-    DisagreementScorer,
-    LLMLabeler,
-    LLMUncertaintyScorer,
-)
-from .services.disagreement_expander import DisagreementExpander
-from .services.pooling import LabelAwarePooler, kcenter_select
-from .services.rag_retriever import RAGRetriever
 from .utils.io import read_table
 from .utils.jsonish import _jsonify_cols
 from .utils.runtime import check_cancelled, iter_with_bar
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .core.embeddings import EmbeddingStore, Models
+    from .pipelines.active_learning import ActiveLearningPipeline
+    from .pipelines.inference import InferencePipeline
+    from .services import LLMLabeler
 
 
 def _build_shared_components(
@@ -45,8 +36,12 @@ def _build_shared_components(
     repo = DataRepository(notes_df, ann_df, phenotype_level=phenotype_level)
 
     if models is None:
+        from .core.embeddings import build_models_from_env
+
         models = build_models_from_env(cfg.models)
     if store is None:
+        from .core.embeddings import EmbeddingStore
+
         store = EmbeddingStore(
             models,
             cache_dir=paths.cache_dir,
@@ -88,6 +83,10 @@ def _build_shared_components(
                 setattr(cfg.llm, "few_shot_examples", extracted)
             except Exception:
                 pass
+    from .llm_backends import build_llm_backend
+    from .services import ContextBuilder
+    from .services.rag_retriever import RAGRetriever
+
     rag = RAGRetriever(
         store,
         models,
@@ -141,7 +140,7 @@ def _build_shared_components(
 
 
 def _build_rerank_rule_overrides(
-    llm_labeler: LLMLabeler, rules_map: Mapping[str, str]
+    llm_labeler: "LLMLabeler", rules_map: Mapping[str, str]
 ) -> dict[str, str]:
     if not llm_labeler or not isinstance(rules_map, Mapping):
         return {}
@@ -188,6 +187,16 @@ def build_active_learning_runner(
     models: Models | None = None,
     store: EmbeddingStore | None = None,
 ) -> ActiveLearningPipeline:
+    from .pipelines.active_learning import ActiveLearningPipeline
+    from .services import (
+        ActiveLearningSelector,
+        DiversitySelector,
+        DisagreementScorer,
+        LLMUncertaintyScorer,
+    )
+    from .services.disagreement_expander import DisagreementExpander
+    from .services.pooling import LabelAwarePooler, kcenter_select
+
     components = _build_shared_components(
         paths,
         cfg,
@@ -262,6 +271,8 @@ def build_inference_runner(
     models: Models | None = None,
     store: EmbeddingStore | None = None,
 ) -> InferencePipeline:
+    from .pipelines.inference import InferencePipeline
+
     components = _build_shared_components(
         paths,
         cfg,
@@ -302,6 +313,8 @@ class BackendSession:
         constructing the EmbeddingStore, but does not instantiate any
         downstream components (retriever, labeler, etc.).
         """
+        from .core.embeddings import EmbeddingStore, build_models_from_env
+
         models = build_models_from_env(cfg.models)
         store = EmbeddingStore(
             models,
