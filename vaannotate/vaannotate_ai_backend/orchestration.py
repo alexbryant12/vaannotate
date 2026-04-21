@@ -84,7 +84,7 @@ def _build_shared_components(
             except Exception:
                 pass
     from .llm_backends import build_llm_backend
-    from .services import ContextBuilder
+    from .services import ContextBuilder, LLMLabeler
     from .services.rag_retriever import RAGRetriever
 
     rag = RAGRetriever(
@@ -115,6 +115,8 @@ def _build_shared_components(
 
     pooler = None
     if include_pooler:
+        from .services.pooling import LabelAwarePooler
+
         pooler = LabelAwarePooler(
             repo,
             store,
