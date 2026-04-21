@@ -1306,6 +1306,38 @@ class AssignmentContext(QtCore.QObject):
             self.save_state_changed.emit(message)
 
 
+class _VerticalResizeHandle(QtWidgets.QFrame):
+    dragged = QtCore.Signal(int)
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(8)
+        self.setCursor(QtCore.Qt.CursorShape.SizeVerCursor)
+        self._last_global_y: Optional[int] = None
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._last_global_y = event.globalPosition().toPoint().y()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if self._last_global_y is None:
+            super().mouseMoveEvent(event)
+            return
+        current_y = event.globalPosition().toPoint().y()
+        delta = current_y - self._last_global_y
+        self._last_global_y = current_y
+        if delta:
+            self.dragged.emit(delta)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        self._last_global_y = None
+        super().mouseReleaseEvent(event)
+
+
 class AnnotationForm(QtWidgets.QScrollArea):
     def __init__(
         self,
@@ -1402,6 +1434,10 @@ class AnnotationForm(QtWidgets.QScrollArea):
         llm_btn.setEnabled(False)
         header_layout.addWidget(llm_btn)
         state["llm_btn"] = llm_btn
+        clear_btn = QtWidgets.QPushButton("Clear labels")
+        clear_btn.setAutoDefault(False)
+        clear_btn.clicked.connect(lambda _checked, lid=label.label_id: self._clear_label(lid))
+        header_layout.addWidget(clear_btn)
         if label.na_allowed:
             na_box = QtWidgets.QCheckBox("N/A")
             na_box.stateChanged.connect(
@@ -1552,25 +1588,13 @@ class AnnotationForm(QtWidgets.QScrollArea):
         highlight_layout.addWidget(highlight_list)
         state["highlight_list"] = highlight_list
 
-        highlight_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        highlight_splitter.setChildrenCollapsible(False)
-        highlight_splitter.setHandleWidth(6)
-        highlight_splitter.addWidget(highlight_section)
-
-        highlight_spacer = QtWidgets.QWidget()
-        highlight_spacer.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Preferred,
-            QtWidgets.QSizePolicy.Policy.Expanding,
+        resize_handle = _VerticalResizeHandle()
+        resize_handle.setToolTip("Drag to resize the highlights table")
+        resize_handle.dragged.connect(
+            lambda delta, tree=highlight_list: self._resize_highlight_list(tree, delta)
         )
-        highlight_splitter.addWidget(highlight_spacer)
-        highlight_splitter.setStretchFactor(0, 0)
-        highlight_splitter.setStretchFactor(1, 1)
-        highlight_splitter.setCollapsible(0, True)
-        raw_height = max(1, highlight_section.sizeHint().height())
-        initial_height = max(40, raw_height // 3)
-        highlight_splitter.setSizes([initial_height, max(40, raw_height - initial_height)])
-
-        v_layout.addWidget(highlight_splitter)
+        highlight_layout.addWidget(resize_handle)
+        v_layout.addWidget(highlight_section)
         self.label_widgets[label.label_id] = state
         return wrapper
 
@@ -1881,6 +1905,26 @@ class AnnotationForm(QtWidgets.QScrollArea):
         self.current_rationales = self.ctx.load_rationales(self.current_unit_id)
         self._refresh_highlights(label_id)
         self._select_highlight(label_id, rationale_id)
+
+    def _clear_label(self, label_id: str) -> None:
+        if not self.current_unit_id:
+            return
+        widgets = self.label_widgets.get(label_id, {})
+        with self._suspend_widget_signals():
+            self._reset_widgets(widgets)
+        self.ctx.save_annotation(
+            self.current_unit_id,
+            label_id,
+            {"value": None, "value_num": None, "value_date": None, "na": False, "notes": None},
+        )
+        for entry in list(self.current_rationales.get(label_id, [])):
+            rationale_id = str(entry.get("rationale_id", ""))
+            if rationale_id:
+                self.ctx.delete_rationale(self.current_unit_id, label_id, rationale_id)
+        self.current_rationales = self.ctx.load_rationales(self.current_unit_id)
+        self._refresh_highlights(label_id)
+        self._update_gating()
+        self._update_completion()
 
     def _delete_highlight(self, label_id: str) -> None:
         if not self.current_unit_id:
@@ -2193,10 +2237,29 @@ class AnnotationForm(QtWidgets.QScrollArea):
             return True
         field = field.strip()
         expected = expected.strip().strip("'\"")
+        parent_widgets = self._find_label_widgets(field)
+        if parent_widgets is None or not self._has_value(parent_widgets):
+            return False
         value = values.get(field, "")
         if isinstance(value, list):
             return expected in value
         return str(value) == expected
+
+    def _find_label_widgets(self, field: str) -> Optional[Dict[str, object]]:
+        for widgets in self.label_widgets.values():
+            definition = widgets.get("definition")
+            if not isinstance(definition, LabelDefinition):
+                continue
+            if definition.label_id == field or definition.name == field:
+                return widgets
+        return None
+
+    @staticmethod
+    def _resize_highlight_list(highlight_list: QtWidgets.QTreeWidget, delta: int) -> None:
+        current = highlight_list.minimumHeight()
+        if current <= 0:
+            current = max(40, highlight_list.height())
+        highlight_list.setMinimumHeight(max(40, current + delta))
 
     def _has_value(self, widgets: Dict[str, object]) -> bool:
         if "na_box" in widgets and widgets["na_box"].isChecked():  # type: ignore[index]
