@@ -93,6 +93,48 @@ def test_build_label_config_dependency_tree() -> None:
     assert grules[0]["values"] == ["positive"]
 
 
+def test_build_label_config_supports_or_and_contains() -> None:
+    labelset = {
+        "labelset_id": "ls_or_contains",
+        "labelset_name": "Demo OR/contains",
+        "labels": [
+            {
+                "label_id": "Parent",
+                "name": "Parent Label",
+                "type": "categorical_multi",
+                "required": False,
+                "options": [
+                    {"value": "X", "display": "X"},
+                    {"value": "Y", "display": "Y"},
+                    {"value": "Z", "display": "Z"},
+                ],
+            },
+            {
+                "label_id": "Child",
+                "name": "Child",
+                "type": "text",
+                "required": False,
+                "gating_expr": "Parent Label contains 'X' or Parent Label contains 'Y'",
+                "options": [],
+            },
+        ],
+    }
+
+    config = build_label_config(labelset)
+    child_entry = config.get("Child")
+    assert isinstance(child_entry, dict)
+    assert child_entry.get("gated_by") == "Parent"
+    assert child_entry.get("gating_logic") == "OR"
+    rules = child_entry.get("gating_rules")
+    assert isinstance(rules, list) and len(rules) == 2
+    assert rules[0]["parent"] == "Parent"
+    assert rules[0]["op"] == "contains"
+    assert rules[0]["values"] == ["X"]
+    assert rules[1]["parent"] == "Parent"
+    assert rules[1]["op"] == "contains"
+    assert rules[1]["values"] == ["Y"]
+
+
 def test_resolve_label_config_path_in_labelsets_dir(tmp_path: Path) -> None:
     project_root = tmp_path / "proj"
     paths = init_project(project_root, "proj", "Project", "tester")
