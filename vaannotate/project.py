@@ -309,6 +309,106 @@ def _extract_condition_value(raw: str) -> Optional[str]:
     return text
 
 
+def _split_logical_conditions(expr: str) -> Tuple[List[str], Optional[str]]:
+    text = (expr or "").strip()
+    if not text:
+        return [], None
+    parts = [p.strip() for p in re.split(r"\s+(and|or)\s+", text, flags=re.IGNORECASE) if p.strip()]
+    if len(parts) == 1:
+        return [parts[0]], None
+    conditions: List[str] = []
+    operators: List[str] = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 0:
+            conditions.append(part)
+        else:
+            operators.append(part.upper())
+    if not operators:
+        return conditions, None
+    if any(op != operators[0] for op in operators):
+        # Mixed AND/OR is not representable by the current flat gating_rules model.
+        # Fall back to AND (the safer/more restrictive default).
+        return conditions, "AND"
+    return conditions, operators[0]
+
+
+def _parse_condition(condition: str) -> Optional[Dict[str, object]]:
+    text = (condition or "").strip()
+    if not text:
+        return None
+
+    contains_match = re.match(r"^(?P<field>.+?)\s+(?P<op>contains|not\s+contains)\s+(?P<rhs>.+)$", text, flags=re.IGNORECASE)
+    if contains_match:
+        field = contains_match.group("field").strip()
+        rhs = _extract_condition_value(contains_match.group("rhs"))
+        if not field or rhs is None:
+            return None
+        op_token = contains_match.group("op").lower().replace(" ", "")
+        op = "notcontains" if op_token == "notcontains" else "contains"
+        return {"field": field, "op": op, "values": [rhs]}
+
+    in_match = re.match(r"^(?P<field>.+?)\s+(?P<op>in|not\s+in)\s*\((?P<rhs>.+)\)\s*$", text, flags=re.IGNORECASE)
+    if in_match:
+        field = in_match.group("field").strip()
+        raw_rhs = in_match.group("rhs")
+        vals = [_extract_condition_value(part) for part in re.split(r"\s*,\s*", raw_rhs) if part.strip()]
+        values = [v for v in vals if v is not None]
+        if not field or not values:
+            return None
+        op_token = in_match.group("op").lower().replace(" ", "")
+        op = "notin" if op_token == "notin" else "in"
+        return {"field": field, "op": op, "values": values}
+
+    cmp_match = re.match(r"^(?P<field>.+?)\s*(?P<op>==|!=)\s*(?P<rhs>.+)$", text)
+    if cmp_match:
+        field = cmp_match.group("field").strip()
+        rhs = _extract_condition_value(cmp_match.group("rhs"))
+        if not field or rhs is None:
+            return None
+        op = "in" if cmp_match.group("op") == "==" else "notin"
+        return {"field": field, "op": op, "values": [rhs]}
+
+    return None
+
+
+def _relationships_from_gating_expr(
+    label_id: str,
+    gating_expr: str,
+    *,
+    label_lookup: Mapping[str, Dict[str, object]],
+    name_lookup: Mapping[str, str],
+) -> Tuple[List[Dict[str, object]], Optional[str]]:
+    rules: List[Dict[str, object]] = []
+    conditions, logic = _split_logical_conditions(gating_expr)
+    for cond in conditions:
+        parsed = _parse_condition(cond)
+        if not parsed:
+            continue
+        field_key = str(parsed.get("field") or "").strip()
+        if not field_key:
+            continue
+        parent_id: Optional[str]
+        if field_key in label_lookup:
+            parent_id = field_key
+        else:
+            parent_id = name_lookup.get(_normalize_name(field_key))
+        if not parent_id or parent_id == label_id:
+            continue
+        values = [str(v) for v in parsed.get("values", []) if v is not None]
+        if not values:
+            continue
+        rules.append(
+            {
+                "label_id": parent_id,
+                "expression": cond,
+                "op": str(parsed.get("op") or "in"),
+                "values": values,
+                "value": values[0],
+            }
+        )
+    return rules, logic
+
+
 def build_label_config(labelset: dict) -> Dict[str, object]:
     labels: Sequence[Dict[str, object]] = labelset.get("labels", [])  # type: ignore[assignment]
     label_lookup: Dict[str, Dict[str, object]] = {}
@@ -326,34 +426,33 @@ def build_label_config(labelset: dict) -> Dict[str, object]:
 
     parent_map: Dict[str, List[Dict[str, object]]] = {}
     children_map: Dict[str, List[Dict[str, object]]] = {}
+    gating_logic_map: Dict[str, str] = {}
     for entry in labels:
         label_id = str(entry.get("label_id", "")).strip()
         if not label_id:
             continue
         gating_expr = str(entry.get("gating_expr") or "").strip()
-        if "==" not in gating_expr:
-            continue
-        lhs, _, rhs = gating_expr.partition("==")
-        field_key = lhs.strip()
-        if not field_key:
-            continue
-        parent_id: Optional[str] = None
-        if field_key in label_lookup:
-            parent_id = field_key
-        else:
-            normalized = _normalize_name(field_key)
-            parent_id = name_lookup.get(normalized)
-        if not parent_id or parent_id == label_id:
-            continue
-        condition_value = _extract_condition_value(rhs)
-        relationship = {"label_id": parent_id, "expression": gating_expr}
-        if condition_value is not None:
-            relationship["value"] = condition_value
-        parent_map.setdefault(label_id, []).append(relationship)
-        child_rel = {"label_id": label_id, "expression": gating_expr}
-        if condition_value is not None:
-            child_rel["value"] = condition_value
-        children_map.setdefault(parent_id, []).append(child_rel)
+        relationships, logic = _relationships_from_gating_expr(
+            label_id,
+            gating_expr,
+            label_lookup=label_lookup,
+            name_lookup=name_lookup,
+        )
+        if logic:
+            gating_logic_map[label_id] = logic
+        for relationship in relationships:
+            parent_id = str(relationship.get("label_id") or "").strip()
+            if not parent_id:
+                continue
+            parent_map.setdefault(label_id, []).append(dict(relationship))
+            child_rel = {
+                "label_id": label_id,
+                "expression": relationship.get("expression"),
+                "value": relationship.get("value"),
+                "op": relationship.get("op"),
+                "values": relationship.get("values", []),
+            }
+            children_map.setdefault(parent_id, []).append(child_rel)
 
     def _gating_type_for(label_id: str) -> str:
         raw_type = str(label_lookup.get(label_id, {}).get("type") or "").casefold()
@@ -453,18 +552,22 @@ def build_label_config(labelset: dict) -> Dict[str, object]:
                 if not parent_id:
                     continue
                 value = rel.get("value")
-                if value is None:
+                values = rel.get("values", [value] if value is not None else [])
+                normalized_values = [str(v) for v in (values if isinstance(values, list) else [values]) if v is not None]
+                if not normalized_values:
                     continue
                 parent_type = _gating_type_for(parent_id)
                 rule: Dict[str, object] = {
                     "parent": parent_id,
                     "type": parent_type,
-                    "op": "in",
-                    "values": [value],
+                    "op": str(rel.get("op") or "in"),
+                    "values": normalized_values,
                 }
                 gating_rules.append(rule)
             if gating_rules:
                 entry_payload["gating_rules"] = gating_rules
+            if label_id in gating_logic_map:
+                entry_payload["gating_logic"] = gating_logic_map[label_id]
         if parents_payload:
             entry_payload["parents"] = parents_payload
         if children_payload:

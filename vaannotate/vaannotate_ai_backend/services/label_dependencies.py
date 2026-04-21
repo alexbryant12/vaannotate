@@ -47,6 +47,14 @@ def _canon_cat(x):
     return s
 
 
+def _cat_tokens(x) -> List[str]:
+    s = _canon_str(x)
+    if not s:
+        return []
+    parts = [p.strip() for p in re.split(r"[,;\n]", s) if p.strip()]
+    return [_canon_cat(p) for p in parts]
+
+
 def build_label_dependencies(label_config: dict) -> Tuple[Dict[str, List[str]], Dict[str, List[str]], List[str]]:
     """Return (parent->children, child->parents, roots) from label_config.
 
@@ -169,12 +177,18 @@ def _check_rule(parent_value, parent_type: str, rule: dict) -> bool:
             return False
     else:
         s = _canon_cat(parent_value)
+        tokens = _cat_tokens(parent_value)
         op = str(rule.get('op', 'in')).lower()
         if op in ('in', 'notin'):
             vals = rule.get('values', [])
             vals = [_canon_cat(x) for x in (vals if isinstance(vals, list) else [vals])]
             ok = s in vals
             return ok if op == 'in' else (not ok)
+        elif op in ('contains', 'notcontains'):
+            vals = rule.get('values', [])
+            vals = [_canon_cat(x) for x in (vals if isinstance(vals, list) else [vals])]
+            ok = any(v in tokens for v in vals)
+            return ok if op == 'contains' else (not ok)
         elif op in ('==', '!='):
             val = _canon_cat(rule.get('value', rule.get('values', [None])[0] if isinstance(rule.get('values'), list) else None))
             if op == '==':
