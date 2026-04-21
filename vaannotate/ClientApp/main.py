@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import uuid
@@ -2231,19 +2232,141 @@ class AnnotationForm(QtWidgets.QScrollArea):
         expr = definition.gating_expr
         if not expr:
             return True
-        try:
-            field, expected = expr.split("==")
-        except ValueError:
+        conditions, logic = self._split_logical_conditions(expr)
+        if not conditions:
             return True
-        field = field.strip()
-        expected = expected.strip().strip("'\"")
-        parent_widgets = self._find_label_widgets(field)
-        if parent_widgets is None or not self._has_value(parent_widgets):
-            return False
-        value = values.get(field, "")
+        outcomes: List[bool] = []
+        for condition in conditions:
+            parsed = self._parse_condition(condition)
+            if not parsed:
+                continue
+            field = str(parsed.get("field") or "").strip()
+            if not field:
+                continue
+            parent_widgets = self._find_label_widgets(field)
+            if parent_widgets is None or not self._has_value(parent_widgets):
+                outcomes.append(False)
+                continue
+            outcomes.append(
+                self._matches_condition(
+                    values.get(field),
+                    str(parsed.get("op") or "in"),
+                    [str(v) for v in parsed.get("values", []) if v is not None],
+                )
+            )
+        if not outcomes:
+            return True
+        return any(outcomes) if logic == "OR" else all(outcomes)
+
+    @staticmethod
+    def _extract_condition_value(raw: str) -> Optional[str]:
+        text = raw.strip()
+        if not text:
+            return None
+        if text.startswith(("'", '"')) and text.endswith(("'", '"')) and len(text) >= 2:
+            return text[1:-1]
+        return text
+
+    @classmethod
+    def _parse_condition(cls, condition: str) -> Optional[Dict[str, object]]:
+        text = (condition or "").strip()
+        if not text:
+            return None
+
+        contains_match = re.match(
+            r"^(?P<field>.+?)\s+(?P<op>contains|not\s+contains)\s+(?P<rhs>.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if contains_match:
+            field = contains_match.group("field").strip()
+            rhs = cls._extract_condition_value(contains_match.group("rhs"))
+            if not field or rhs is None:
+                return None
+            op_token = contains_match.group("op").lower().replace(" ", "")
+            op = "notcontains" if op_token == "notcontains" else "contains"
+            return {"field": field, "op": op, "values": [rhs]}
+
+        in_match = re.match(
+            r"^(?P<field>.+?)\s+(?P<op>in|not\s+in)\s*\((?P<rhs>.+)\)\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if in_match:
+            field = in_match.group("field").strip()
+            raw_rhs = in_match.group("rhs")
+            vals = [
+                cls._extract_condition_value(part)
+                for part in re.split(r"\s*,\s*", raw_rhs)
+                if part.strip()
+            ]
+            values = [v for v in vals if v is not None]
+            if not field or not values:
+                return None
+            op_token = in_match.group("op").lower().replace(" ", "")
+            op = "notin" if op_token == "notin" else "in"
+            return {"field": field, "op": op, "values": values}
+
+        cmp_match = re.match(r"^(?P<field>.+?)\s*(?P<op>==|!=)\s*(?P<rhs>.+)$", text)
+        if cmp_match:
+            field = cmp_match.group("field").strip()
+            rhs = cls._extract_condition_value(cmp_match.group("rhs"))
+            if not field or rhs is None:
+                return None
+            op = "in" if cmp_match.group("op") == "==" else "notin"
+            return {"field": field, "op": op, "values": [rhs]}
+
+        return None
+
+    @staticmethod
+    def _split_logical_conditions(expr: str) -> Tuple[List[str], str]:
+        text = (expr or "").strip()
+        if not text:
+            return [], "AND"
+        parts = [p.strip() for p in re.split(r"\s+(and|or)\s+", text, flags=re.IGNORECASE) if p.strip()]
+        if len(parts) == 1:
+            return [parts[0]], "AND"
+        conditions: List[str] = []
+        operators: List[str] = []
+        for idx, part in enumerate(parts):
+            if idx % 2 == 0:
+                conditions.append(part)
+            else:
+                operators.append(part.upper())
+        if not operators:
+            return conditions, "AND"
+        if any(op != operators[0] for op in operators):
+            return conditions, "AND"
+        return conditions, operators[0]
+
+    @staticmethod
+    def _normalize_token(value: object) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+    @classmethod
+    def _value_tokens(cls, value: object) -> List[str]:
         if isinstance(value, list):
-            return expected in value
-        return str(value) == expected
+            return [cls._normalize_token(v) for v in value]
+        text = cls._normalize_token(value)
+        if not text:
+            return []
+        return [tok.strip() for tok in re.split(r"[,;\n]", text) if tok.strip()]
+
+    @classmethod
+    def _matches_condition(cls, parent_value: object, op: str, expected_values: List[str]) -> bool:
+        if not expected_values:
+            return False
+        expected = [cls._normalize_token(v) for v in expected_values]
+        scalar = cls._normalize_token(parent_value)
+        tokens = cls._value_tokens(parent_value)
+        op_key = (op or "in").strip().casefold()
+        if op_key == "contains":
+            return any(v in tokens for v in expected)
+        if op_key == "notcontains":
+            return all(v not in tokens for v in expected)
+        if op_key == "notin":
+            return scalar not in expected
+        return scalar in expected
 
     def _find_label_widgets(self, field: str) -> Optional[Dict[str, object]]:
         for widgets in self.label_widgets.values():
