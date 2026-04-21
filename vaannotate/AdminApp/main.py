@@ -4277,6 +4277,15 @@ class ProjectContext(QtCore.QObject):
             rows = conn.execute("SELECT label_id FROM labels").fetchall()
         return {str(row["label_id"]) for row in rows if row["label_id"]}
 
+    def labelset_round_usage(self, labelset_id: str) -> int:
+        db = self.require_db()
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM rounds WHERE labelset_id=?",
+                (labelset_id,),
+            ).fetchone()
+        return int((row["count"] if row else 0) or 0)
+
     def list_label_sets_for_pheno(self, pheno_id: str) -> List[Dict[str, object]]:
         db = self.require_db()
         with db.connect() as conn:
@@ -4528,6 +4537,82 @@ class ProjectContext(QtCore.QObject):
         self._mark_dirty()
         self.project_changed.emit()
         return record
+
+    def update_labelset(
+        self,
+        *,
+        labelset_id: str,
+        created_by: str,
+        notes: str,
+        include_reasoning: bool,
+        labels: List[Dict[str, object]],
+    ) -> None:
+        if self.labelset_round_usage(labelset_id) > 0:
+            raise RuntimeError("Label sets already used in rounds cannot be edited.")
+        db = self.require_db()
+        with db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE label_sets
+                SET created_by=?, notes=?, include_reasoning=?
+                WHERE labelset_id=?
+                """,
+                (created_by, notes, 1 if include_reasoning else 0, labelset_id),
+            )
+            conn.execute("DELETE FROM label_options WHERE labelset_id=?", (labelset_id,))
+            conn.execute("DELETE FROM labels WHERE labelset_id=?", (labelset_id,))
+            for order_index, label in enumerate(labels):
+                label_record = models.Label(
+                    label_id=label["label_id"],
+                    labelset_id=labelset_id,
+                    name=label["name"],
+                    type=label["type"],
+                    required=1 if label.get("required") else 0,
+                    order_index=order_index,
+                    rules=label.get("rules", ""),
+                    gating_expr=label.get("gating_expr"),
+                    na_allowed=1 if label.get("na_allowed") else 0,
+                    include_reasoning=1 if label.get("include_reasoning", include_reasoning) else 0,
+                    unit=label.get("unit"),
+                    min=label.get("min"),
+                    max=label.get("max"),
+                    keywords_json=json.dumps(label.get("keywords"))
+                    if isinstance(label.get("keywords"), (list, dict))
+                    else None,
+                    few_shot_json=json.dumps(label.get("few_shot_examples"))
+                    if isinstance(label.get("few_shot_examples"), list)
+                    else None,
+                )
+                label_record.save(conn)
+                for opt_index, option in enumerate(label.get("options", [])):
+                    option_record = models.LabelOption(
+                        option_id=option.get("option_id") or str(uuid.uuid4()),
+                        labelset_id=labelset_id,
+                        label_id=label_record.label_id,
+                        value=str(option.get("value", "")),
+                        display=str(option.get("display", option.get("value", ""))),
+                        order_index=opt_index,
+                        weight=option.get("weight"),
+                    )
+                    option_record.save(conn)
+        self._mark_dirty()
+        self.project_changed.emit()
+
+    def delete_labelset(self, labelset_id: str) -> None:
+        if self.labelset_round_usage(labelset_id) > 0:
+            raise RuntimeError("Label sets already used in rounds cannot be removed.")
+        db = self.require_db()
+        with db.transaction() as conn:
+            conn.execute("DELETE FROM label_options WHERE labelset_id=?", (labelset_id,))
+            conn.execute("DELETE FROM labels WHERE labelset_id=?", (labelset_id,))
+            conn.execute("DELETE FROM label_sets WHERE labelset_id=?", (labelset_id,))
+        project_root = self.project_root
+        if project_root:
+            labelset_dir = project_root / "label_sets" / labelset_id
+            if labelset_dir.exists():
+                shutil.rmtree(labelset_dir, ignore_errors=True)
+        self._mark_dirty()
+        self.project_changed.emit()
 
     def _ensure_phenotype_dir(self, name: str) -> Path:
         project_root = self.require_project()
@@ -4950,17 +5035,32 @@ class LabelEditorDialog(QtWidgets.QDialog):
 
 
 class LabelSetWizardDialog(QtWidgets.QDialog):
-    def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
+    def __init__(
+        self,
+        ctx: ProjectContext,
+        parent: Optional[QtWidgets.QWidget] = None,
+        *,
+        initial_payload: Optional[Dict[str, object]] = None,
+    ) -> None:
         super().__init__(parent)
         self.ctx = ctx
+        self._initial_payload = dict(initial_payload) if isinstance(initial_payload, dict) else None
+        self._editing_existing = self._initial_payload is not None
+        self._initial_labelset_id = (
+            str(self._initial_payload.get("labelset_id") or "").strip()
+            if self._initial_payload
+            else ""
+        )
         self.labels: List[Dict[str, object]] = []
         self.label_keywords: Dict[str, List[str]] = {}
         self.label_queries: Dict[str, str] = {}
         self.label_few_shot: Dict[str, List[Dict[str, str]]] = {}
-        self.setWindowTitle("Create label set")
+        self.setWindowTitle("Edit label set" if self._editing_existing else "Create label set")
         self.resize(520, 640)
         self._setup_ui()
         self._populate_copy_sources()
+        if self._initial_payload:
+            self._load_initial_payload(self._initial_payload)
 
     def _setup_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
@@ -5031,8 +5131,12 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         self.copy_combo.blockSignals(True)
         self.copy_combo.clear()
         self.copy_combo.addItem("Start from blank", None)
+        if self._editing_existing:
+            self.copy_combo.setEnabled(False)
         for row in self.ctx.list_label_sets():
             labelset_id = str(row["labelset_id"])
+            if self._editing_existing and labelset_id == self._initial_labelset_id:
+                continue
             created_at = ""
             if "created_at" in row.keys() and row["created_at"]:
                 created_at = str(row["created_at"])
@@ -5059,34 +5163,16 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             return
         self._apply_copied_labelset(payload)
 
-    def _generate_unique_label_id(self, base_id: str, used_ids: Set[str]) -> str:
-        sanitized = re.sub(r"\s+", "_", base_id.strip()) if base_id.strip() else "label"
-        candidate = sanitized
-        if candidate in used_ids:
-            suffix = 2
-            candidate = f"{sanitized}_copy"
-            while candidate in used_ids:
-                candidate = f"{sanitized}_{suffix}"
-                suffix += 1
-        used_ids.add(candidate)
-        return candidate
-
     def _apply_copied_labelset(self, payload: Dict[str, object]) -> None:
         if hasattr(self, "include_reasoning_checkbox"):
             self.include_reasoning_checkbox.setChecked(bool(payload.get("include_reasoning")))
-        used_ids = set(self.ctx.list_all_label_ids())
         new_labels: List[Dict[str, object]] = []
-        id_map: Dict[str, str] = {}
         raw_labels = payload.get("labels") or []
         if isinstance(raw_labels, list):
             for label in raw_labels:
                 if not isinstance(label, (dict, ABCMapping)):
                     continue
                 label_data = dict(label)
-                old_id = str(label_data.get("label_id") or "")
-                new_id = self._generate_unique_label_id(old_id, used_ids)
-                id_map[old_id] = new_id
-                label_data["label_id"] = new_id
                 options_payload: List[Dict[str, object]] = []
                 options = label_data.get("options")
                 if isinstance(options, list):
@@ -5098,16 +5184,6 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
                         options_payload.append(option_data)
                 label_data["options"] = options_payload
                 new_labels.append(label_data)
-        for label in new_labels:
-            expr = label.get("gating_expr")
-            if not isinstance(expr, str) or not expr.strip():
-                continue
-            updated = expr
-            for old_id, new_id in id_map.items():
-                if not old_id:
-                    continue
-                updated = re.sub(rf"\b{re.escape(old_id)}\b", new_id, updated)
-            label["gating_expr"] = updated
         self.labels = new_labels
         self.label_keywords = {
             str(label.get("label_id") or ""): label.get("keywords", [])
@@ -5136,6 +5212,14 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         base_labelset_id = str(payload.get("labelset_id") or "").strip()
         if base_labelset_id:
             self.id_edit.setPlaceholderText(f"{base_labelset_id}_copy")
+
+    def _load_initial_payload(self, payload: Dict[str, object]) -> None:
+        self.id_edit.setText(str(payload.get("labelset_id") or ""))
+        self.id_edit.setReadOnly(True)
+        self.creator_edit.setText(str(payload.get("created_by") or self.creator_edit.text()))
+        self.notes_edit.setPlainText(str(payload.get("notes") or ""))
+        self.include_reasoning_checkbox.setChecked(bool(payload.get("include_reasoning")))
+        self._apply_copied_labelset(payload)
 
     def _refresh_label_list(self, preserve_resources: bool = True) -> None:
         self.label_list.clear()
@@ -5195,15 +5279,10 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
 
     def _add_label(self) -> None:
         existing_ids = {
-            str(label_id)
-            for label_id in self.ctx.list_all_label_ids()
-            if isinstance(label_id, str) and label_id
-        }
-        existing_ids.update(
             str(label.get("label_id"))
             for label in self.labels
             if isinstance(label.get("label_id"), str) and label.get("label_id")
-        )
+        }
         dialog = LabelEditorDialog(existing_ids=existing_ids, parent=self)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
@@ -5216,15 +5295,10 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         if row < 0 or row >= len(self.labels):
             return
         existing_ids = {
-            str(label_id)
-            for label_id in self.ctx.list_all_label_ids()
-            if isinstance(label_id, str) and label_id
-        }
-        existing_ids.update(
             str(label.get("label_id"))
             for index, label in enumerate(self.labels)
             if index != row and isinstance(label.get("label_id"), str) and label.get("label_id")
-        )
+        }
         dialog = LabelEditorDialog(existing_ids=existing_ids, data=self.labels[row], parent=self)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
@@ -5256,7 +5330,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Label set", "Enter a label set ID.")
             return
         existing = self.ctx.get_labelset(labelset_id)
-        if existing:
+        if existing and labelset_id != self._initial_labelset_id:
             QtWidgets.QMessageBox.warning(self, "Label set", "A label set with this ID already exists.")
             return
         if not self.labels:
@@ -5290,6 +5364,193 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             "include_reasoning": bool(self.include_reasoning_checkbox.isChecked()),
             "labels": labels_payload,
         }
+
+
+class LabelSetManagerDialog(QtWidgets.QDialog):
+    def __init__(self, ctx: ProjectContext, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.ctx = ctx
+        self._entries: List[Dict[str, object]] = []
+        self.setWindowTitle("Manage label sets")
+        self.resize(760, 500)
+        self._setup_ui()
+        self._load()
+
+    def _setup_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        description = QtWidgets.QLabel(
+            "Add, edit, or remove project label sets. Label sets already used in rounds are locked."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setHorizontalHeaderLabels(
+            ["Label set", "Labels", "Created", "Created by", "Status"]
+        )
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table)
+
+        button_row = QtWidgets.QHBoxLayout()
+        self.add_btn = QtWidgets.QPushButton("Add…")
+        self.edit_btn = QtWidgets.QPushButton("Edit…")
+        self.delete_btn = QtWidgets.QPushButton("Remove…")
+        close_btn = QtWidgets.QPushButton("Close")
+        self.add_btn.clicked.connect(self._on_add)
+        self.edit_btn.clicked.connect(self._on_edit)
+        self.delete_btn.clicked.connect(self._on_delete)
+        close_btn.clicked.connect(self.accept)
+        button_row.addWidget(self.add_btn)
+        button_row.addWidget(self.edit_btn)
+        button_row.addWidget(self.delete_btn)
+        button_row.addStretch(1)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        self.table.selectionModel().selectionChanged.connect(self._update_actions)
+        self.table.itemDoubleClicked.connect(lambda _item: self._on_edit())
+
+    def _load(self) -> None:
+        rows = self.ctx.list_label_sets()
+        self._entries = []
+        self.table.setRowCount(0)
+        for row in rows:
+            record = dict(row)
+            labelset_id = str(record.get("labelset_id") or "")
+            if not labelset_id:
+                continue
+            usage_count = self.ctx.labelset_round_usage(labelset_id)
+            label_count = 0
+            payload = self.ctx.load_labelset_details(labelset_id)
+            if payload and isinstance(payload.get("labels"), list):
+                label_count = len(payload.get("labels") or [])
+            locked = usage_count > 0
+            self._entries.append(
+                {
+                    "labelset_id": labelset_id,
+                    "record": record,
+                    "usage_count": usage_count,
+                    "label_count": label_count,
+                    "locked": locked,
+                }
+            )
+
+        self.table.setRowCount(len(self._entries))
+        for idx, entry in enumerate(self._entries):
+            record = entry["record"]
+            labelset_id = str(entry["labelset_id"])
+            status = f"Locked (used in {entry['usage_count']} round(s))" if entry["locked"] else "Editable"
+            values = [
+                labelset_id,
+                str(entry["label_count"]),
+                str(record.get("created_at") or ""),
+                str(record.get("created_by") or ""),
+                status,
+            ]
+            for col, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, labelset_id)
+                if entry["locked"]:
+                    item.setForeground(QtGui.QBrush(QtGui.QColor("#9aa0a6")))
+                self.table.setItem(idx, col, item)
+        if self._entries:
+            self.table.selectRow(0)
+        self._update_actions()
+
+    def _selected_entry(self) -> Optional[Dict[str, object]]:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._entries):
+            return None
+        return self._entries[row]
+
+    def _update_actions(self) -> None:
+        entry = self._selected_entry()
+        locked = bool(entry.get("locked")) if entry else True
+        has_selection = entry is not None
+        self.edit_btn.setEnabled(has_selection and not locked)
+        self.delete_btn.setEnabled(has_selection and not locked)
+
+    def _on_add(self) -> None:
+        dialog = LabelSetWizardDialog(self.ctx, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        try:
+            self.ctx.create_labelset(
+                labelset_id=str(values.get("labelset_id", "")),
+                created_by=str(values.get("created_by", "admin")),
+                notes=str(values.get("notes", "")),
+                include_reasoning=bool(values.get("include_reasoning")),
+                labels=[dict(label) for label in values.get("labels", [])],
+            )
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Label set", f"Failed to create label set: {exc}")
+            return
+        self._load()
+
+    def _on_edit(self) -> None:
+        entry = self._selected_entry()
+        if not entry:
+            return
+        if entry.get("locked"):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Label set",
+                "Label sets already used in rounds cannot be edited.",
+            )
+            return
+        labelset_id = str(entry.get("labelset_id") or "")
+        payload = self.ctx.load_labelset_details(labelset_id)
+        if not payload:
+            return
+        dialog = LabelSetWizardDialog(self.ctx, self, initial_payload=payload)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        try:
+            self.ctx.update_labelset(
+                labelset_id=labelset_id,
+                created_by=str(values.get("created_by", "admin")),
+                notes=str(values.get("notes", "")),
+                include_reasoning=bool(values.get("include_reasoning")),
+                labels=[dict(label) for label in values.get("labels", [])],
+            )
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Label set", f"Failed to update label set: {exc}")
+            return
+        self._load()
+
+    def _on_delete(self) -> None:
+        entry = self._selected_entry()
+        if not entry:
+            return
+        if entry.get("locked"):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Label set",
+                "Label sets already used in rounds cannot be removed.",
+            )
+            return
+        labelset_id = str(entry.get("labelset_id") or "")
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Remove label set",
+            f"Remove label set '{labelset_id}'?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.ctx.delete_labelset(labelset_id)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Label set", f"Failed to remove label set: {exc}")
+            return
+        self._load()
 
 
 class PhenotypeLabelSetsDialog(QtWidgets.QDialog):
@@ -9003,8 +9264,8 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
         if node_type == "project":
             action = menu.addAction("Add phenotype…")
             action.triggered.connect(lambda: self._add_phenotype(item))
-            label_action = menu.addAction("Add label set…")
-            label_action.triggered.connect(lambda: self._add_labelset(item))
+            label_action = menu.addAction("Manage label sets…")
+            label_action.triggered.connect(lambda: self._manage_labelsets(item))
             corpus_action = menu.addAction("Create corpus…")
             corpus_action.triggered.connect(lambda: self._create_corpus(item))
         elif node_type == "corpus":
@@ -9077,8 +9338,12 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             return
         QtCore.QTimer.singleShot(0, lambda: self._select_corpus(record.corpus_id))
 
-    def _add_labelset(self, item: QtWidgets.QTreeWidgetItem) -> None:
+    def _manage_labelsets(self, item: QtWidgets.QTreeWidgetItem) -> None:
         del item
+        dialog = LabelSetManagerDialog(self.ctx, self)
+        dialog.exec()
+
+    def _add_labelset(self) -> None:
         dialog = LabelSetWizardDialog(self.ctx, self)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
@@ -9099,6 +9364,45 @@ class ProjectTreeWidget(QtWidgets.QTreeWidget):
             "Label set",
             f"Label set '{values.get('labelset_id')}' created.",
         )
+
+    def _edit_labelset(self, labelset_id: str) -> None:
+        payload = self.ctx.load_labelset_details(labelset_id)
+        if not payload:
+            QtWidgets.QMessageBox.warning(self, "Label set", f"Unable to load label set '{labelset_id}'.")
+            return
+        dialog = LabelSetWizardDialog(self.ctx, self, initial_payload=payload)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        try:
+            self.ctx.update_labelset(
+                labelset_id=labelset_id,
+                created_by=str(values.get("created_by", "admin")),
+                notes=str(values.get("notes", "")),
+                include_reasoning=bool(values.get("include_reasoning")),
+                labels=[dict(label) for label in values.get("labels", [])],
+            )
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Label set", f"Failed to update label set: {exc}")
+            return
+        QtWidgets.QMessageBox.information(self, "Label set", f"Label set '{labelset_id}' updated.")
+
+    def _delete_labelset(self, labelset_id: str) -> None:
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Delete label set",
+            f"Delete label set '{labelset_id}'?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.ctx.delete_labelset(labelset_id)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Label set", f"Failed to delete label set: {exc}")
+            return
+        QtWidgets.QMessageBox.information(self, "Label set", f"Label set '{labelset_id}' deleted.")
 
     def _view_labelsets(self, item: QtWidgets.QTreeWidgetItem) -> None:
         data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
