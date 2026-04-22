@@ -9240,6 +9240,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.created_round_number = round_number
         ctx.mark_dirty()
         ctx.update_cache_after_round(corpus_id)
+        try:
+            ctx.save_all()
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Round",
+                f"Round {round_number} was created, but auto-save failed: {exc}",
+            )
+            return False
         return True
 
     def _run_random_final_llm_labeling(
