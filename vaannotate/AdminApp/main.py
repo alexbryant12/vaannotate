@@ -5967,6 +5967,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._ai_engine_overrides: Dict[str, Any] = {}
         self._labelset_include_reasoning = False
         self._label_reasoning_by_label: Dict[str, bool] = {}
+        self._label_first_targets: List[Dict[str, object]] = []
+        self._label_first_label_catalog: Dict[str, Dict[str, object]] = {}
         self._assisted_review_reminder_shown = False
         self._llm_prompt_shown = False
         self.ctx.project_changed.connect(self._refresh_labelset_options)
@@ -6022,6 +6024,20 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             select_cfg["pct_easy_qc"] = float(self.ai_easy_pct.value())
         if hasattr(self, "ai_diversity_pct"):
             select_cfg["pct_diversity"] = float(self.ai_diversity_pct.value())
+        using_label_first = bool(getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked())
+        select_cfg["sampling_mode"] = "label_first" if using_label_first else "active_learning"
+        if using_label_first:
+            select_cfg["label_first_targets"] = copy.deepcopy(self._label_first_targets)
+            if hasattr(self, "label_first_pathway_combo"):
+                select_cfg["label_first_pathway"] = str(
+                    self.label_first_pathway_combo.currentData() or "enriched"
+                )
+            if hasattr(self, "label_first_pool_initial_spin"):
+                select_cfg["label_first_pool_initial_size"] = int(self.label_first_pool_initial_spin.value())
+            if hasattr(self, "label_first_pool_growth_spin"):
+                select_cfg["label_first_pool_growth_step"] = int(self.label_first_pool_growth_spin.value())
+            if hasattr(self, "label_first_pool_max_spin"):
+                select_cfg["label_first_pool_max_size"] = int(self.label_first_pool_max_spin.value())
         base_cfg["select"] = select_cfg
         llm_cfg = base_cfg.get("llm", {}) if isinstance(base_cfg.get("llm"), Mapping) else {}
         backend_choice = self._current_ai_backend()
@@ -6107,6 +6123,58 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             value = select_cfg.get(key)
             if isinstance(widget, QtWidgets.QDoubleSpinBox) and isinstance(value, (int, float)):
                 widget.setValue(float(value))
+        sampling_mode = str(select_cfg.get("sampling_mode") or "").strip().lower()
+        if sampling_mode == "label_first" and hasattr(self, "label_first_radio"):
+            self.label_first_radio.setChecked(True)
+        elif sampling_mode == "active_learning" and hasattr(self, "active_learning_radio"):
+            self.active_learning_radio.setChecked(True)
+        targets = select_cfg.get("label_first_targets")
+        if isinstance(targets, Sequence):
+            parsed_targets: List[Dict[str, object]] = []
+            for entry in targets:
+                if not isinstance(entry, Mapping):
+                    continue
+                label_id = str(entry.get("label_id") or "").strip()
+                if not label_id:
+                    continue
+                values = entry.get("values")
+                value_list = (
+                    [str(v).strip() for v in values if str(v).strip()]
+                    if isinstance(values, Sequence) and not isinstance(values, (str, bytes))
+                    else []
+                )
+                try:
+                    quota = int(entry.get("quota") or 0)
+                except (TypeError, ValueError):
+                    quota = 0
+                if quota <= 0:
+                    continue
+                parsed_targets.append(
+                    {
+                        "label_id": label_id,
+                        "values": value_list,
+                        "quota": quota,
+                        "operator": str(entry.get("operator") or "in").strip().lower(),
+                    }
+                )
+            self._label_first_targets = parsed_targets
+            self._render_label_first_targets()
+        if hasattr(self, "label_first_pathway_combo"):
+            idx = self.label_first_pathway_combo.findData(str(select_cfg.get("label_first_pathway") or ""))
+            if idx >= 0:
+                self.label_first_pathway_combo.setCurrentIndex(idx)
+        if hasattr(self, "label_first_pool_initial_spin"):
+            value = select_cfg.get("label_first_pool_initial_size")
+            if isinstance(value, (int, float)):
+                self.label_first_pool_initial_spin.setValue(int(value))
+        if hasattr(self, "label_first_pool_growth_spin"):
+            value = select_cfg.get("label_first_pool_growth_step")
+            if isinstance(value, (int, float)):
+                self.label_first_pool_growth_spin.setValue(int(value))
+        if hasattr(self, "label_first_pool_max_spin"):
+            value = select_cfg.get("label_first_pool_max_size")
+            if isinstance(value, (int, float)):
+                self.label_first_pool_max_spin.setValue(int(value))
         llm_cfg = (
             effective_cfg.get("llm", {})
             if isinstance(effective_cfg.get("llm"), Mapping)
@@ -6283,6 +6351,135 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
         if updated:
             self._apply_ai_config_to_controls(self._ai_engine_overrides)
+        self._refresh_label_first_catalog(schema)
+
+    def _refresh_label_first_catalog(self, schema: Optional[Mapping[str, object]]) -> None:
+        catalog: Dict[str, Dict[str, object]] = {}
+        labels = schema.get("labels") if isinstance(schema, Mapping) else None
+        if isinstance(labels, Sequence):
+            for label in labels:
+                if not isinstance(label, Mapping):
+                    continue
+                label_id = str(label.get("label_id") or "")
+                if not label_id:
+                    continue
+                options = label.get("options")
+                option_values: List[str] = []
+                if isinstance(options, Sequence):
+                    for option in options:
+                        if not isinstance(option, Mapping):
+                            continue
+                        value = str(option.get("value") or "").strip()
+                        if value:
+                            option_values.append(value)
+                catalog[label_id] = {
+                    "name": str(label.get("name") or label_id),
+                    "options": option_values,
+                }
+        self._label_first_label_catalog = catalog
+        combo = getattr(self, "label_first_label_combo", None)
+        if not isinstance(combo, QtWidgets.QComboBox):
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        for label_id, entry in sorted(catalog.items(), key=lambda item: str(item[1].get("name", item[0])).lower()):
+            display = f"{entry.get('name', label_id)} ({label_id})"
+            combo.addItem(display, label_id)
+        combo.blockSignals(False)
+        self._render_label_first_targets()
+
+    def _render_label_first_targets(self) -> None:
+        widget = getattr(self, "label_first_target_list", None)
+        if not isinstance(widget, QtWidgets.QListWidget):
+            return
+        widget.clear()
+        cleaned: List[Dict[str, object]] = []
+        for target in self._label_first_targets:
+            if not isinstance(target, Mapping):
+                continue
+            label_id = str(target.get("label_id") or "").strip()
+            if not label_id:
+                continue
+            values = target.get("values")
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                parsed_values = [str(v).strip() for v in values if str(v).strip()]
+            else:
+                parsed_values = [str(target.get("value") or "").strip()] if str(target.get("value") or "").strip() else []
+            try:
+                quota = int(target.get("quota") or 0)
+            except (TypeError, ValueError):
+                quota = 0
+            if quota <= 0:
+                continue
+            operator = str(target.get("operator") or "in").strip().lower()
+            entry = {
+                "label_id": label_id,
+                "values": parsed_values,
+                "quota": quota,
+                "operator": operator if operator in {"equals", "in"} else "in",
+            }
+            cleaned.append(entry)
+            label_meta = self._label_first_label_catalog.get(label_id, {})
+            label_name = str(label_meta.get("name") or label_id)
+            match_label = "equals" if entry["operator"] == "equals" else "any of"
+            values_text = ", ".join(parsed_values) if parsed_values else "(any non-empty)"
+            item = QtWidgets.QListWidgetItem(
+                f"{label_name} [{label_id}] • {match_label}: {values_text} • quota: {quota}"
+            )
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, entry)
+            widget.addItem(item)
+        self._label_first_targets = cleaned
+
+    def _on_add_label_first_target(self) -> None:
+        label_id = ""
+        if isinstance(getattr(self, "label_first_label_combo", None), QtWidgets.QComboBox):
+            data = self.label_first_label_combo.currentData()
+            label_id = str(data or "").strip()
+        if not label_id:
+            QtWidgets.QMessageBox.warning(self, "Label-first sampling", "Select a label target first.")
+            return
+        operator = "in"
+        if isinstance(getattr(self, "label_first_match_combo", None), QtWidgets.QComboBox):
+            operator = str(self.label_first_match_combo.currentData() or "in").strip().lower()
+        raw_values = (
+            self.label_first_values_edit.text().strip()
+            if isinstance(getattr(self, "label_first_values_edit", None), QtWidgets.QLineEdit)
+            else ""
+        )
+        values = [part.strip() for part in re.split(r"[,\n]", raw_values) if part.strip()]
+        if operator == "equals" and values:
+            values = values[:1]
+        if operator == "equals" and not values:
+            QtWidgets.QMessageBox.warning(
+                self, "Label-first sampling", "Provide exactly one value when using Equals."
+            )
+            return
+        quota = int(self.label_first_quota_spin.value()) if hasattr(self, "label_first_quota_spin") else 0
+        if quota <= 0:
+            QtWidgets.QMessageBox.warning(self, "Label-first sampling", "Quota must be greater than zero.")
+            return
+        self._label_first_targets.append(
+            {
+                "label_id": label_id,
+                "values": values,
+                "quota": quota,
+                "operator": operator,
+            }
+        )
+        if isinstance(getattr(self, "label_first_values_edit", None), QtWidgets.QLineEdit):
+            self.label_first_values_edit.clear()
+        self._render_label_first_targets()
+
+    def _on_remove_label_first_target(self) -> None:
+        widget = getattr(self, "label_first_target_list", None)
+        if not isinstance(widget, QtWidgets.QListWidget):
+            return
+        row = widget.currentRow()
+        if row < 0:
+            return
+        if 0 <= row < len(self._label_first_targets):
+            self._label_first_targets.pop(row)
+        self._render_label_first_targets()
 
     def _open_ai_advanced_settings(self) -> None:
         config = self._build_ai_config_snapshot()
@@ -6533,13 +6730,76 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         method_layout = QtWidgets.QHBoxLayout(method_group)
         self.random_sampling_radio = QtWidgets.QRadioButton("Random sampling")
         self.active_learning_radio = QtWidgets.QRadioButton("Active learning backend")
+        self.label_first_radio = QtWidgets.QRadioButton("Label-first sampling")
         method_layout.addWidget(self.random_sampling_radio)
         method_layout.addWidget(self.active_learning_radio)
+        method_layout.addWidget(self.label_first_radio)
         method_layout.addStretch()
         self.random_sampling_radio.setChecked(True)
         self.random_sampling_radio.toggled.connect(self._on_generation_mode_changed)
         self.active_learning_radio.toggled.connect(self._on_generation_mode_changed)
+        self.label_first_radio.toggled.connect(self._on_generation_mode_changed)
         scroll_layout.addWidget(method_group)
+
+        self.label_first_container = QtWidgets.QGroupBox("Label-first targets")
+        label_first_layout = QtWidgets.QVBoxLayout(self.label_first_container)
+        label_first_help = QtWidgets.QLabel(
+            "Pick label/value targets with quotas. The backend iteratively enriches and labels "
+            "new pools until quotas are met or candidates are exhausted."
+        )
+        label_first_help.setWordWrap(True)
+        label_first_layout.addWidget(label_first_help)
+        target_row = QtWidgets.QHBoxLayout()
+        self.label_first_label_combo = QtWidgets.QComboBox()
+        self.label_first_label_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        target_row.addWidget(self.label_first_label_combo, 2)
+        self.label_first_match_combo = QtWidgets.QComboBox()
+        self.label_first_match_combo.addItem("Equals", "equals")
+        self.label_first_match_combo.addItem("Any of (OR)", "in")
+        target_row.addWidget(self.label_first_match_combo, 1)
+        self.label_first_values_edit = QtWidgets.QLineEdit()
+        self.label_first_values_edit.setPlaceholderText("Value or comma-separated values")
+        target_row.addWidget(self.label_first_values_edit, 2)
+        self.label_first_quota_spin = QtWidgets.QSpinBox()
+        self.label_first_quota_spin.setRange(1, 1000000)
+        self.label_first_quota_spin.setValue(10)
+        target_row.addWidget(self.label_first_quota_spin, 1)
+        self.label_first_add_target_btn = QtWidgets.QPushButton("Add target")
+        self.label_first_add_target_btn.clicked.connect(self._on_add_label_first_target)
+        target_row.addWidget(self.label_first_add_target_btn, 0)
+        label_first_layout.addLayout(target_row)
+
+        self.label_first_target_list = QtWidgets.QListWidget()
+        self.label_first_target_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        label_first_layout.addWidget(self.label_first_target_list)
+        target_actions = QtWidgets.QHBoxLayout()
+        self.label_first_remove_target_btn = QtWidgets.QPushButton("Remove selected")
+        self.label_first_remove_target_btn.clicked.connect(self._on_remove_label_first_target)
+        target_actions.addWidget(self.label_first_remove_target_btn)
+        target_actions.addStretch()
+        label_first_layout.addLayout(target_actions)
+
+        lf_opts = QtWidgets.QFormLayout()
+        self.label_first_pathway_combo = QtWidgets.QComboBox()
+        self.label_first_pathway_combo.addItem("Targeted enrichment", "enriched")
+        self.label_first_pathway_combo.addItem("Random iterative", "random_iterative")
+        lf_opts.addRow("Pathway", self.label_first_pathway_combo)
+        self.label_first_pool_initial_spin = QtWidgets.QSpinBox()
+        self.label_first_pool_initial_spin.setRange(10, 1000000)
+        self.label_first_pool_initial_spin.setValue(200)
+        lf_opts.addRow("Initial pool size", self.label_first_pool_initial_spin)
+        self.label_first_pool_growth_spin = QtWidgets.QSpinBox()
+        self.label_first_pool_growth_spin.setRange(1, 1000000)
+        self.label_first_pool_growth_spin.setValue(100)
+        lf_opts.addRow("Pool growth step", self.label_first_pool_growth_spin)
+        self.label_first_pool_max_spin = QtWidgets.QSpinBox()
+        self.label_first_pool_max_spin.setRange(10, 2000000)
+        self.label_first_pool_max_spin.setValue(2000)
+        lf_opts.addRow("Max pool size", self.label_first_pool_max_spin)
+        label_first_layout.addLayout(lf_opts)
+        scroll_layout.addWidget(self.label_first_container)
 
         self.random_config_container = QtWidgets.QWidget()
         random_layout = QtWidgets.QVBoxLayout(self.random_config_container)
@@ -7297,12 +7557,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
     def _using_ai_backend(self) -> bool:
         radio = getattr(self, "active_learning_radio", None)
-        return bool(radio and radio.isChecked())
+        label_first = getattr(self, "label_first_radio", None)
+        return bool((radio and radio.isChecked()) or (label_first and label_first.isChecked()))
 
     def _on_generation_mode_changed(self) -> None:
         using_ai = self._using_ai_backend()
+        using_label_first = bool(getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked())
         if hasattr(self, "random_config_container"):
             self.random_config_container.setVisible(not using_ai)
+        if hasattr(self, "label_first_container"):
+            self.label_first_container.setVisible(using_label_first)
         if hasattr(self, "ai_group"):
             show_ai = using_ai or self._ai_job_running
             self.ai_group.setVisible(show_ai)
@@ -7502,6 +7766,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if not corpus_id:
             QtWidgets.QMessageBox.warning(self, "Round", "Select a corpus for this round.")
             return None
+        if bool(getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked()):
+            if not self._label_first_targets:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Label-first sampling",
+                    "Add at least one label/value target before generating a label-first round.",
+                )
+                return None
         independent = bool(self.independent_checkbox.isChecked()) if hasattr(self, "independent_checkbox") else False
         sampling_metadata: Dict[str, object] = {"independent": independent}
         excluded_units = self._load_reviewed_unit_ids(corpus_id) if independent else set()
@@ -7932,6 +8204,22 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             select["pct_easy_qc"] = float(self.ai_easy_pct.value())
         if hasattr(self, "ai_diversity_pct"):
             select["pct_diversity"] = float(self.ai_diversity_pct.value())
+        using_label_first = bool(
+            getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked()
+        )
+        select["sampling_mode"] = "label_first" if using_label_first else "active_learning"
+        if using_label_first:
+            select["label_first_targets"] = copy.deepcopy(self._label_first_targets)
+            if hasattr(self, "label_first_pathway_combo"):
+                select["label_first_pathway"] = str(
+                    self.label_first_pathway_combo.currentData() or "enriched"
+                )
+            if hasattr(self, "label_first_pool_initial_spin"):
+                select["label_first_pool_initial_size"] = int(self.label_first_pool_initial_spin.value())
+            if hasattr(self, "label_first_pool_growth_spin"):
+                select["label_first_pool_growth_step"] = int(self.label_first_pool_growth_spin.value())
+            if hasattr(self, "label_first_pool_max_spin"):
+                select["label_first_pool_max_size"] = int(self.label_first_pool_max_spin.value())
         if select:
             overrides["select"] = select
         if hasattr(self, "ai_final_llm_checkbox"):
