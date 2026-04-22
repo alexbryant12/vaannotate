@@ -72,6 +72,8 @@ def _build_shared_components(
                     payload["context"] = str(example.get("context"))
                 if example.get("answer") is not None:
                     payload["answer"] = str(example.get("answer"))
+                if example.get("reasoning") is not None:
+                    payload["reasoning"] = str(example.get("reasoning"))
                 if payload:
                     parsed.append(payload)
             if parsed:

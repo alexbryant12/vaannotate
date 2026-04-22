@@ -3001,6 +3001,53 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
     }
 
     _WORKFLOW_FIELD_ALLOWLISTS: dict[str, dict[str, set[str]]] = {
+        "active_learning": {
+            "index": {"type", "nlist", "nprobe", "hnsw_M", "hnsw_efSearch", "persist"},
+            "rag": {
+                "chunk_size",
+                "chunk_overlap",
+                "normalize_embeddings",
+                "top_k_final",
+                "use_mmr",
+                "mmr_lambda",
+                "keyword_fraction",
+                "min_context_chunks",
+                "neighbor_hops",
+                "pool_factor",
+                "pool_oversample",
+            },
+            "llm": {
+                "model_name",
+                "backend",
+                "temperature",
+                "timeout",
+                "retry_max",
+                "retry_backoff",
+                "max_context_chars",
+                "rpm_limit",
+                "include_reasoning",
+                "azure_api_version",
+                "azure_endpoint",
+                "local_model_dir",
+                "local_max_seq_len",
+                "local_max_new_tokens",
+                "context_order",
+            },
+            "select": {"batch_size", "pct_disagreement", "pct_uncertain", "pct_easy_qc", "pct_diversity"},
+            "llmfirst": {
+                "inference_labeling_mode",
+                "single_prompt_max_labels",
+                "single_prompt_max_chars",
+                "single_doc_context",
+                "single_doc_full_context_max_chars",
+                "context_order",
+                "progress_min_interval_s",
+            },
+            "disagree": {"method", "top_n", "min_gap"},
+            "diversity": {"enabled", "method", "k_clusters", "max_per_cluster"},
+            "scjitter": {"enabled", "temp_jitter", "top_p_jitter"},
+            "orchestrator": {"final_llm_labeling", "final_llm_labeling_n_consistency"},
+        },
         "prompt_precompute": {
             "index": {"type", "nlist", "nprobe", "hnsw_M", "hnsw_efSearch", "persist"},
             "rag": {
@@ -6172,6 +6219,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                             example["context"] = str(entry.get("context"))
                         if entry.get("answer"):
                             example["answer"] = str(entry.get("answer"))
+                        if entry.get("reasoning"):
+                            example["reasoning"] = str(entry.get("reasoning"))
                         if example:
                             parsed_examples.append(example)
                     if parsed_examples:

@@ -301,6 +301,55 @@ def test_round_builder_prefers_labelset_reasoning_flag() -> None:
     assert builder._final_llm_include_reasoning(config, labelset={"include_reasoning": False}) is False
 
 
+def test_round_builder_preserves_few_shot_reasoning() -> None:
+    config = {
+        "ai_backend": {
+            "llm": {
+                "few_shot_examples": {
+                    "flag": [
+                        {
+                            "context": "ctx",
+                            "answer": '{"prediction":"yes"}',
+                            "reasoning": "because",
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    labelset = {
+        "labels": [
+            {
+                "label_id": "fallback",
+                "few_shot_examples": [
+                    {
+                        "context": "fallback ctx",
+                        "answer": '{"prediction":"no"}',
+                        "reasoning": "fallback reasoning",
+                    }
+                ],
+            }
+        ]
+    }
+
+    extracted = RoundBuilder._extract_few_shot_examples(config, labelset=labelset)
+
+    assert extracted["flag"] == [
+        {
+            "context": "ctx",
+            "answer": '{"prediction":"yes"}',
+            "reasoning": "because",
+        }
+    ]
+    assert extracted["fallback"] == [
+        {
+            "context": "fallback ctx",
+            "answer": '{"prediction":"no"}',
+            "reasoning": "fallback reasoning",
+        }
+    ]
+
+
 def test_fetch_labelset_backfills_reasoning_for_legacy_schema() -> None:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
