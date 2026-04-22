@@ -114,6 +114,12 @@ class SelectionConfig:
     pct_uncertain: float = 0.3    # LLM-uncertain
     pct_easy_qc: float = 0.1      # LLM-certain
     pct_diversity: float = 0.3
+    sampling_mode: str = "active_learning"  # "active_learning" | "label_first"
+    label_first_targets: list[dict[str, object]] = field(default_factory=list)
+    label_first_pathway: str = "enriched"  # "enriched" | "random_iterative"
+    label_first_pool_initial_size: int = 200
+    label_first_pool_growth_step: int = 100
+    label_first_pool_max_size: int = 2000
 
 
 @dataclass

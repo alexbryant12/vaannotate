@@ -8,6 +8,18 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import pandas as pd
 
 from ..services import LLM_RECORDER
+from ..services.label_first import (
+    build_target_counts,
+    collect_required_labels,
+    enriched_pool,
+    evaluate_target_hits,
+    finalize_rows,
+    label_unit_single_prompt,
+    parse_label_first_targets,
+    quota_key,
+    random_pool,
+    unresolved_targets,
+)
 from ..utils.runtime import check_cancelled as default_check_cancelled
 from ..utils.runtime import iter_with_bar as default_iter_with_bar
 
@@ -186,6 +198,170 @@ class ActiveLearningPipeline:
         n_cer = int(self.cfg.select.batch_size * self.cfg.select.pct_easy_qc)
         return direct_uncertainty_selection(probe_df, n_cer, select_most_certain=True)
 
+    def _run_label_first_sampling(
+        self,
+        *,
+        current_rules_map: Dict[str, str],
+        current_label_types: Dict[str, str],
+        iter_with_bar: Callable[..., object],
+        check_cancelled: Callable[[], None],
+    ) -> pd.DataFrame:
+        from ..services.family_labeler import build_family_labeler
+
+        selection_cfg = getattr(self.cfg, "select", None)
+        targets = parse_label_first_targets(getattr(selection_cfg, "label_first_targets", []))
+        if not targets:
+            raise RuntimeError("Label-first sampling requires at least one target.")
+
+        required_labels = collect_required_labels(
+            label_config=self.label_config or {},
+            label_types=current_label_types,
+            target_label_ids=[target.label_id for target in targets],
+        )
+        if not required_labels:
+            raise RuntimeError("Label-first targets are not available in the selected label set.")
+
+        pathway = str(getattr(selection_cfg, "label_first_pathway", "enriched") or "enriched").strip().lower()
+        pool_size = max(1, int(getattr(selection_cfg, "label_first_pool_initial_size", 200) or 200))
+        growth_step = max(1, int(getattr(selection_cfg, "label_first_pool_growth_step", 100) or 100))
+        max_pool = max(pool_size, int(getattr(selection_cfg, "label_first_pool_max_size", 2000) or 2000))
+        target_total = max(
+            int(getattr(selection_cfg, "batch_size", 0) or 0),
+            sum(max(0, int(target.quota)) for target in targets),
+        )
+
+        all_units = [str(uid) for uid in self.repo.notes["unit_id"].astype(str).unique().tolist()]
+        seen_units = (
+            set(self.repo.ann["unit_id"].astype(str).unique().tolist())
+            if not self.repo.ann.empty
+            else set()
+        )
+        excluded = set(self.excluded_unit_ids or set()) | seen_units
+        remaining = [uid for uid in all_units if uid not in excluded]
+
+        fam = build_family_labeler(
+            self.llm,
+            self.retriever,
+            self.repo,
+            self.label_config,
+            self.cfg.scjitter,
+            self.cfg.llmfirst,
+        )
+        use_single_prompt = (
+            str(getattr(self.cfg.llmfirst, "inference_labeling_mode", "family")).strip().lower()
+            == "single_prompt"
+        )
+        label_order = [lid for lid in current_label_types.keys() if lid in required_labels]
+        rules_subset = {lid: current_rules_map.get(lid, "") for lid in label_order}
+        types_subset = {lid: current_label_types.get(lid, "categorical") for lid in label_order}
+
+        counts = build_target_counts(targets)
+        selected_units: list[str] = []
+        selected_set: set[str] = set()
+        matched_labels: dict[str, str] = {}
+        rng = __import__("random").Random()
+
+        while remaining and len(selected_units) < target_total:
+            check_cancelled()
+            unresolved = unresolved_targets(targets, counts)
+            if not unresolved:
+                break
+            this_pool_size = min(pool_size, len(remaining))
+            if this_pool_size <= 0:
+                break
+
+            if pathway == "random_iterative":
+                pool = random_pool(candidates=remaining, size=this_pool_size, rng=rng)
+            else:
+                pool = enriched_pool(
+                    candidates=remaining,
+                    size=this_pool_size,
+                    unresolved=unresolved,
+                    context_builder=self.ctx_builder,
+                    rules_map=rules_subset,
+                    rng=rng,
+                )
+            if not pool:
+                break
+
+            _progress_every = float(getattr(self.cfg.llmfirst, "progress_min_interval_s", 1.0) or 1.0)
+            for uid in iter_with_bar(
+                step="Label-first sampling",
+                iterable=pool,
+                total=len(pool),
+                min_interval_s=_progress_every,
+            ):
+                check_cancelled()
+                if uid in selected_set:
+                    continue
+                if use_single_prompt:
+                    predictions = label_unit_single_prompt(
+                        unit_id=uid,
+                        label_ids=label_order,
+                        label_types=types_subset,
+                        rules_map=rules_subset,
+                        llm_labeler=self.llm,
+                        context_builder=self.ctx_builder,
+                        label_config=self.label_config or {},
+                        max_chars=int(getattr(self.cfg.llmfirst, "single_prompt_max_chars", 16000) or 16000),
+                    )
+                else:
+                    probe_rows = fam.label_family_for_unit(
+                        uid,
+                        types_subset,
+                        rules_subset,
+                        json_only=True,
+                        json_n_consistency=int(getattr(self.cfg.llmfirst, "final_llm_label_consistency", 1) or 1),
+                        json_jitter=False,
+                    )
+                    predictions = {
+                        str(row.get("label_id")): row.get("prediction")
+                        for row in probe_rows
+                        if isinstance(row, dict) and row.get("label_id") is not None
+                    }
+                hits = evaluate_target_hits(
+                    unit_id=uid,
+                    predictions=predictions,
+                    targets=targets,
+                    counts=counts,
+                )
+                if not hits:
+                    continue
+                selected_units.append(uid)
+                selected_set.add(uid)
+                matched_labels[uid] = hits[0].label_id
+                for hit in hits:
+                    key = quota_key(hit)
+                    counts[key] = counts.get(key, 0) + 1
+                if len(selected_units) >= target_total or not unresolved_targets(targets, counts):
+                    break
+
+            remaining = [uid for uid in remaining if uid not in set(pool) and uid not in selected_set]
+            if pool_size < max_pool:
+                pool_size = min(max_pool, pool_size + growth_step)
+            elif pathway == "enriched" and unresolved_targets(targets, counts):
+                pathway = "random_iterative"
+
+        batch_size = int(getattr(selection_cfg, "batch_size", 0) or 0)
+        if len(selected_units) < batch_size and remaining:
+            topoff = random_pool(candidates=remaining, size=batch_size - len(selected_units), rng=rng)
+            for uid in topoff:
+                if uid in selected_set:
+                    continue
+                selected_units.append(uid)
+                selected_set.add(uid)
+                matched_labels.setdefault(uid, "")
+
+        final = finalize_rows(
+            selected_units=selected_units,
+            matched_labels=matched_labels,
+            label_types=current_label_types,
+            selection_reason="label_first",
+        )
+        if final.empty:
+            raise RuntimeError("Label-first sampling did not find any matching units.")
+        return final
+
     def run(self) -> pd.DataFrame:
         import pandas as pd
         from ..services.family_labeler import build_family_labeler, run_family_labeling_for_units
@@ -238,6 +414,94 @@ class ActiveLearningPipeline:
         selector.current_label_ids = current_label_ids
         selector.seen_units = seen_units
         selector.unseen_pairs = unseen_pairs_current
+
+        sampling_mode = str(getattr(self.cfg.select, "sampling_mode", "active_learning") or "active_learning").strip().lower()
+        if sampling_mode == "label_first":
+            final = self._run_label_first_sampling(
+                current_rules_map=current_rules_map,
+                current_label_types=current_label_types,
+                iter_with_bar=iter_with_bar,
+                check_cancelled=check_cancelled,
+            )
+            final.to_parquet(os.path.join(self.paths.outdir, "final_selection.parquet"), index=False)
+            empty = final.iloc[0:0].copy()
+            empty.to_parquet(os.path.join(self.paths.outdir, "bucket_disagreement.parquet"), index=False)
+            empty.to_parquet(os.path.join(self.paths.outdir, "bucket_diversity.parquet"), index=False)
+            empty.to_parquet(os.path.join(self.paths.outdir, "bucket_llm_uncertain.parquet"), index=False)
+            empty.to_parquet(os.path.join(self.paths.outdir, "bucket_llm_certain.parquet"), index=False)
+            result_df = final
+
+            final_out = None
+            if getattr(self.cfg, "final_llm_labeling", False):
+                fam = build_family_labeler(
+                    self.llm,
+                    self.retriever,
+                    self.repo,
+                    self.label_config,
+                    self.cfg.scjitter,
+                    self.cfg.llmfirst,
+                )
+                unit_ids = final["unit_id"].tolist()
+                rules_map = current_rules_map
+                types = current_label_types
+                json_n_consistency = int(
+                    getattr(self.cfg.llmfirst, "final_llm_label_consistency", 1) or 1
+                )
+                fam_df = run_family_labeling_for_units(
+                    fam,
+                    unit_ids=unit_ids,
+                    label_types=types,
+                    per_label_rules=rules_map,
+                    json_n_consistency=json_n_consistency,
+                    json_jitter=False,
+                    iter_with_bar_fn=iter_with_bar,
+                    progress_step="Final family labeling",
+                )
+                if not fam_df.empty and self.jsonify_cols:
+                    fam_df = self.jsonify_cols(
+                        fam_df,
+                        [c for c in ["rag_context", "llm_runs", "fc_probs"] if c in fam_df.columns],
+                    )
+                fam_df.to_parquet(os.path.join(self.paths.outdir, "final_llm_family_probe.parquet"), index=False)
+                if not fam_df.empty:
+                    pv = fam_df[["unit_id", "label_id", "llm_prediction"]].copy()
+                    pv["col"] = pv["label_id"].astype(str) + "_llm"
+                    fam_wide = pv.pivot_table(index="unit_id", columns="col", values="llm_prediction", aggfunc="first").reset_index()
+                    if "llm_reasoning" in fam_df.columns:
+                        rv = fam_df[["unit_id", "label_id", "llm_reasoning"]].copy()
+                        rv["colr"] = rv["label_id"].astype(str) + "_llm_reason"
+                        fam_reason_wide = rv.pivot_table(index="unit_id", columns="colr", values="llm_reasoning", aggfunc="first").reset_index()
+                        fam_wide = fam_wide.merge(fam_reason_wide, on="unit_id", how="left")
+                    final_units = final[["unit_id", "label_id", "label_type", "selection_reason"]].drop_duplicates()
+                    final_out = final_units.merge(fam_wide, on="unit_id", how="left")
+                    final_out.to_parquet(os.path.join(self.paths.outdir, "final_selection_with_llm.parquet"), index=False)
+
+                    labels_path = Path(self.paths.outdir) / "final_llm_labels.parquet"
+                    try:
+                        fam_wide.to_parquet(labels_path, index=False)
+                    except Exception:
+                        pass
+                    else:
+                        try:
+                            labels_path.with_suffix(".json").write_text(
+                                fam_wide.to_json(orient="records", indent=2, force_ascii=False),
+                                encoding="utf-8",
+                            )
+                        except TypeError:
+                            labels_path.with_suffix(".json").write_text(
+                                fam_wide.to_json(orient="records"),
+                                encoding="utf-8",
+                            )
+                try:
+                    probe_json_path = Path(self.paths.outdir) / "final_llm_family_probe.json"
+                    fam_df.to_json(probe_json_path, orient="records", indent=2, force_ascii=False)
+                except TypeError:
+                    fam_df.to_json(probe_json_path, orient="records")
+            if final_out is not None:
+                result_df = final_out
+            if self.attach_metadata:
+                result_df = self.attach_metadata(result_df)
+            return result_df
 
         total = int(self.cfg.select.batch_size)
         n_dis = int(total * self.cfg.select.pct_disagreement)
