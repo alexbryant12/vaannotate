@@ -1193,6 +1193,8 @@ class RoundBuilder:
                         example["context"] = str(entry.get("context"))
                     if entry.get("answer") is not None:
                         example["answer"] = str(entry.get("answer"))
+                    if entry.get("reasoning") is not None:
+                        example["reasoning"] = str(entry.get("reasoning"))
                     if example:
                         parsed_examples.append(example)
                 if parsed_examples:
@@ -1219,6 +1221,8 @@ class RoundBuilder:
                             example["context"] = str(entry.get("context"))
                         if entry.get("answer") is not None:
                             example["answer"] = str(entry.get("answer"))
+                        if entry.get("reasoning") is not None:
+                            example["reasoning"] = str(entry.get("reasoning"))
                         if example:
                             parsed_examples.append(example)
                     if parsed_examples and label_id not in cleaned:
