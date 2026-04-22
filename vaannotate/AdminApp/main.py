@@ -82,6 +82,19 @@ ASSIGNMENT_MODELS = [
 ]
 
 
+def _resize_for_screen(window: QtWidgets.QWidget, width: int, height: int) -> None:
+    """Resize a window while keeping it within the available screen geometry."""
+
+    screen = window.screen() or QtWidgets.QApplication.primaryScreen()
+    if screen is None:
+        window.resize(width, height)
+        return
+    available = screen.availableGeometry()
+    max_width = max(320, int(available.width() * 0.95))
+    max_height = max(240, int(available.height() * 0.95))
+    window.resize(min(width, max_width), min(height, max_height))
+
+
 def build_round_assignment_units(
     assignments: Mapping[str, ReviewerAssignment],
 ) -> Dict[str, List[RoundAssignmentUnit]]:
@@ -715,7 +728,7 @@ class InferenceExperimentDialog(QtWidgets.QDialog):
 
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Edit few-shot examples")
-        dialog.resize(760, 640)
+        _resize_for_screen(dialog, 760, 640)
         layout = QtWidgets.QVBoxLayout(dialog)
         editor = LabelFewShotExamplesEditor(labels, self._few_shot_examples)
         layout.addWidget(editor)
@@ -928,7 +941,7 @@ class AIRoundLogDialog(QtWidgets.QDialog):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("AI backend progress")
-        self.resize(640, 520)
+        _resize_for_screen(self, 640, 520)
         self._allow_close = False
         self._metrics_loader: Optional[Callable[[], List[dict]]] = None
         self._metrics_button: Optional[QtWidgets.QPushButton] = None
@@ -1031,7 +1044,7 @@ class InferenceMetricsDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Inference experiment metrics")
-        self.resize(780, 560)
+        _resize_for_screen(self, 780, 560)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -1231,7 +1244,7 @@ class LargeCorpusJobDialog(QtWidgets.QDialog):
 
     def _setup_ui(self) -> None:
         self.setWindowTitle("Large corpus inference")
-        self.resize(700, 520)
+        _resize_for_screen(self, 700, 520)
         layout = QtWidgets.QVBoxLayout(self)
 
         tabs = QtWidgets.QTabWidget()
@@ -2719,7 +2732,7 @@ class _FewShotEntryDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit few-shot example")
-        self.resize(760, 520)
+        _resize_for_screen(self, 760, 520)
 
         layout = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -3116,7 +3129,7 @@ class AIAdvancedConfigDialog(QtWidgets.QDialog):
         super().__init__(parent)
         workflow_name = self._WORKFLOW_LABELS.get(workflow, self._WORKFLOW_LABELS["general"])
         self.setWindowTitle(f"AI backend advanced settings ({workflow_name})")
-        self.resize(760, 820)
+        _resize_for_screen(self, 760, 820)
         self._config: Dict[str, Any] = dict(config)
         self.result_config: Dict[str, Any] = {}
         self._workflow = workflow if workflow in self._WORKFLOW_VISIBLE_SECTIONS else "general"
@@ -4764,7 +4777,7 @@ class PhenotypeDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.ctx = ctx
         self.setWindowTitle("Add phenotype")
-        self.resize(400, 260)
+        _resize_for_screen(self, 400, 260)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -4821,7 +4834,7 @@ class LabelEditorDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Label details")
-        self.resize(480, 520)
+        _resize_for_screen(self, 480, 520)
         self._existing_ids = existing_ids or set()
         self._initial_id = str(data.get("label_id")) if data and data.get("label_id") else None
         self._setup_ui()
@@ -5056,7 +5069,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         self.label_queries: Dict[str, str] = {}
         self.label_few_shot: Dict[str, List[Dict[str, str]]] = {}
         self.setWindowTitle("Edit label set" if self._editing_existing else "Create label set")
-        self.resize(520, 640)
+        _resize_for_screen(self, 520, 640)
         self._setup_ui()
         self._populate_copy_sources()
         if self._initial_payload:
@@ -5372,7 +5385,7 @@ class LabelSetManagerDialog(QtWidgets.QDialog):
         self.ctx = ctx
         self._entries: List[Dict[str, object]] = []
         self.setWindowTitle("Manage label sets")
-        self.resize(760, 500)
+        _resize_for_screen(self, 760, 500)
         self._setup_ui()
         self._load()
 
@@ -5567,7 +5580,7 @@ class PhenotypeLabelSetsDialog(QtWidgets.QDialog):
         self.pheno_name = str(self.pheno.get("name") or self.pheno_id)
         self._entries: List[Dict[str, object]] = []
         self.setWindowTitle(f"Label sets • {self.pheno_name}")
-        self.resize(720, 520)
+        _resize_for_screen(self, 720, 520)
         self._setup_ui()
         self._load_labelsets()
 
@@ -5886,7 +5899,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.created_round_id: Optional[str] = None
         self.created_round_number: Optional[int] = None
         self.setWindowTitle(f"New round • {pheno_row['name']}")
-        self.resize(720, 760)
+        _resize_for_screen(self, 720, 760)
         self._available_reviewers = self._load_existing_reviewers()
         self._selected_reviewer_ids: Set[str] = set()
         self._labelset_options = self._load_labelset_ids()
@@ -10986,7 +10999,7 @@ class IaaWidget(QtWidgets.QWidget):
         close_btn.clicked.connect(dialog.accept)
         button_row.addWidget(close_btn)
         layout.addLayout(button_row)
-        dialog.resize(600, 320)
+        _resize_for_screen(dialog, 600, 320)
         dialog.exec()
 
     def _selected_unit_index(self) -> Optional[int]:
@@ -12798,7 +12811,7 @@ class AdminMainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.ctx = ProjectContext()
         self.setWindowTitle("VAAnnotate Admin")
-        self.resize(1280, 860)
+        _resize_for_screen(self, 1280, 860)
         self._inference_log_dialog: Optional[AIRoundLogDialog] = None
         self._inference_log_output: Optional[QtWidgets.QPlainTextEdit] = None
         self._inference_metrics_loader: Optional[Callable[[], List[dict]]] = None
