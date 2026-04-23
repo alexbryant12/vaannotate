@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
+import json
 from collections import Counter
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
@@ -154,13 +155,7 @@ def _normalize_family_predictions_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # Extract a single reasoning field from the first run when present
     if "llm_runs" in df.columns and "llm_reasoning" not in df.columns:
-        df["llm_reasoning"] = df["llm_runs"].map(
-            lambda rs: (
-                rs[0].get("raw", {}).get("reasoning")
-                if isinstance(rs, list) and rs
-                else None
-            )
-        )
+        df["llm_reasoning"] = df["llm_runs"].map(_extract_reasoning_from_runs)
 
     if "llm_prediction" in df.columns:
         df["llm_prediction"] = df["llm_prediction"].map(
@@ -168,6 +163,26 @@ def _normalize_family_predictions_df(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     return df
+
+
+def _extract_reasoning_from_runs(runs: Any) -> Any:
+    runs_value = runs
+    if isinstance(runs_value, str):
+        try:
+            runs_value = json.loads(runs_value)
+        except Exception:  # noqa: BLE001
+            return None
+    if not isinstance(runs_value, list) or not runs_value:
+        return None
+    first_run = runs_value[0]
+    if not isinstance(first_run, Mapping):
+        return None
+    if first_run.get("reasoning") is not None:
+        return first_run.get("reasoning")
+    raw_value = first_run.get("raw")
+    if isinstance(raw_value, Mapping):
+        return raw_value.get("reasoning")
+    return None
 
 
 class FamilyLabeler:
@@ -878,6 +893,5 @@ def direct_uncertainty_selection(
                  .drop(columns=["_score"])
                  .reset_index(drop=True))
     return out
-
 
 

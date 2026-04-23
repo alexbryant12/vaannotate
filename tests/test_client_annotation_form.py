@@ -115,6 +115,12 @@ def test_extract_llm_reasoning_text_supports_legacy_reasoning_fields(
         form._extract_llm_reasoning_text({"llm_runs": [{"raw": {"reasoning": "from-runs"}}]})
         == "from-runs"
     )
+    assert (
+        form._extract_llm_reasoning_text(
+            {"llm_runs": '[{"logprobs":{"yes":-0.1},"reasoning":"run-level-reasoning"}]'}
+        )
+        == "run-level-reasoning"
+    )
 
 
 def test_extract_llm_reasoning_text_respects_reasoning_toggle(
