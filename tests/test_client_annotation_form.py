@@ -100,3 +100,28 @@ def test_gating_expr_or_contains_shows_child_only_when_parent_matches(qt_app: Qt
 
     parent_boxes[0].setChecked(True)  # X
     assert child_row.isVisible() is True
+
+
+def test_extract_llm_reasoning_text_supports_legacy_reasoning_fields(
+    qt_app: QtWidgets.QApplication,
+) -> None:
+    ctx = AssignmentContext()
+    ctx._final_llm_reasoning = True
+    form = AnnotationForm(ctx, _dummy_cursor, lambda: None)
+
+    assert form._extract_llm_reasoning_text({"llm_reasoning": "preferred"}) == "preferred"
+    assert form._extract_llm_reasoning_text({"reasoning": "legacy"}) == "legacy"
+    assert (
+        form._extract_llm_reasoning_text({"llm_runs": [{"raw": {"reasoning": "from-runs"}}]})
+        == "from-runs"
+    )
+
+
+def test_extract_llm_reasoning_text_respects_reasoning_toggle(
+    qt_app: QtWidgets.QApplication,
+) -> None:
+    ctx = AssignmentContext()
+    ctx._final_llm_reasoning = False
+    form = AnnotationForm(ctx, _dummy_cursor, lambda: None)
+
+    assert form._extract_llm_reasoning_text({"llm_reasoning": "hidden"}) is None
