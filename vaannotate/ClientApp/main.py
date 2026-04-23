@@ -9,7 +9,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
