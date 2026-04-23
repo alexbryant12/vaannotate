@@ -3775,6 +3775,10 @@ class AIRoundWorker(QtCore.QObject):
             payload["final_llm_include_reasoning"] = bool(
                 self.cfg_overrides.get("final_llm_include_reasoning")
             )
+        if "final_llm_visible_to_annotators" in self.cfg_overrides:
+            payload["final_llm_visible_to_annotators"] = bool(
+                self.cfg_overrides.get("final_llm_visible_to_annotators")
+            )
         handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
         with handle:
             json.dump(payload, handle, indent=2)
@@ -6086,6 +6090,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         base_cfg["llm"] = llm_cfg
         if hasattr(self, "ai_final_llm_checkbox"):
             base_cfg["final_llm_labeling"] = bool(self.ai_final_llm_checkbox.isChecked())
+        if hasattr(self, "ai_show_llm_to_annotators_checkbox"):
+            base_cfg["final_llm_visible_to_annotators"] = bool(
+                self.ai_show_llm_to_annotators_checkbox.isChecked()
+            )
         if "final_llm_labeling_n_consistency" not in base_cfg:
             try:
                 base_cfg["final_llm_labeling_n_consistency"] = int(
@@ -6225,6 +6233,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             try:
                 self.ai_final_llm_checkbox.setChecked(
                     bool(effective_cfg.get("final_llm_labeling"))
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if (
+            hasattr(self, "ai_show_llm_to_annotators_checkbox")
+            and "final_llm_visible_to_annotators" in effective_cfg
+        ):
+            try:
+                self.ai_show_llm_to_annotators_checkbox.setChecked(
+                    bool(effective_cfg.get("final_llm_visible_to_annotators"))
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -6878,6 +6896,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         random_llm_layout.setFieldGrowthPolicy(
             QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
         )
+        self.random_show_llm_to_annotators_checkbox = QtWidgets.QCheckBox(
+            "Allow annotators to view LLM labels/reasoning"
+        )
+        self.random_show_llm_to_annotators_checkbox.setChecked(True)
+        random_llm_layout.addRow("Client visibility", self.random_show_llm_to_annotators_checkbox)
 
         self.random_backend_combo = QtWidgets.QComboBox()
         self.random_backend_combo.addItem("Azure OpenAI", "azure")
@@ -7119,6 +7142,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_final_llm_checkbox.setChecked(True)
         self.ai_final_llm_checkbox.toggled.connect(self._on_ai_final_llm_toggled)
         ai_config_layout.addRow("Final LLM labeling", self.ai_final_llm_checkbox)
+        self.ai_show_llm_to_annotators_checkbox = QtWidgets.QCheckBox(
+            "Allow annotators to view LLM labels/reasoning"
+        )
+        self.ai_show_llm_to_annotators_checkbox.setChecked(True)
+        ai_config_layout.addRow("Client visibility", self.ai_show_llm_to_annotators_checkbox)
 
         self.ai_context_order_combo = QtWidgets.QComboBox()
         self.ai_context_order_combo.addItem("Relevance ranking", "relevance")
@@ -7424,6 +7452,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if hasattr(self, "random_final_llm_checkbox") and isinstance(final_llm_value, bool):
             self.random_final_llm_checkbox.setChecked(final_llm_value)
             self._on_random_final_llm_toggled(final_llm_value)
+        final_llm_visible_value = config.get("final_llm_visible_to_annotators")
+        if (
+            hasattr(self, "random_show_llm_to_annotators_checkbox")
+            and isinstance(final_llm_visible_value, bool)
+        ):
+            self.random_show_llm_to_annotators_checkbox.setChecked(final_llm_visible_value)
 
     def _collect_filters(self) -> SamplingFilters:
         conditions: List[MetadataFilterCondition] = []
@@ -8233,6 +8267,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             overrides["select"] = select
         if hasattr(self, "ai_final_llm_checkbox"):
             overrides["final_llm_labeling"] = bool(self.ai_final_llm_checkbox.isChecked())
+        if hasattr(self, "ai_show_llm_to_annotators_checkbox"):
+            overrides["final_llm_visible_to_annotators"] = bool(
+                self.ai_show_llm_to_annotators_checkbox.isChecked()
+            )
         if "final_llm_labeling_n_consistency" not in overrides:
             try:
                 overrides["final_llm_labeling_n_consistency"] = int(
@@ -9071,6 +9109,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             if hasattr(self, "random_final_llm_checkbox"):
                 final_llm_enabled = bool(self.random_final_llm_checkbox.isChecked())
                 config_payload["final_llm_labeling"] = final_llm_enabled
+            if hasattr(self, "random_show_llm_to_annotators_checkbox"):
+                config_payload["final_llm_visible_to_annotators"] = bool(
+                    self.random_show_llm_to_annotators_checkbox.isChecked()
+                )
             if final_llm_enabled or assisted_enabled:
                 include_reasoning = bool(getattr(self, "_labelset_include_reasoning", False))
                 if getattr(self, "_label_reasoning_by_label", {}):

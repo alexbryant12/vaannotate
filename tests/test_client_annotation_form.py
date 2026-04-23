@@ -131,3 +131,45 @@ def test_extract_llm_reasoning_text_respects_reasoning_toggle(
     form = AnnotationForm(ctx, _dummy_cursor, lambda: None)
 
     assert form._extract_llm_reasoning_text({"llm_reasoning": "hidden"}) is None
+
+
+def test_extract_llm_reasoning_text_respects_llm_visibility_toggle(
+    qt_app: QtWidgets.QApplication,
+) -> None:
+    ctx = AssignmentContext()
+    ctx._final_llm_reasoning = True
+    ctx._final_llm_visible_to_annotators = False
+    form = AnnotationForm(ctx, _dummy_cursor, lambda: None)
+
+    assert form._extract_llm_reasoning_text({"llm_reasoning": "hidden"}) is None
+
+
+def test_llm_button_is_disabled_when_round_hides_llm_annotations(
+    qt_app: QtWidgets.QApplication,
+) -> None:
+    ctx = AssignmentContext()
+    ctx.final_llm_enabled = True
+    ctx._final_llm_visible_to_annotators = False
+    ctx._final_llm_labels = {"unit-1": {"flag": {"label_id": "flag", "llm_prediction": "yes"}}}
+    form = AnnotationForm(ctx, _dummy_cursor, lambda: None)
+    label = LabelDefinition(
+        label_id="flag",
+        name="Flag",
+        type="boolean",
+        required=False,
+        na_allowed=False,
+        rules="",
+        unit=None,
+        value_range=None,
+        gating_expr=None,
+        options=[{"value": "yes", "display": "Yes"}, {"value": "no", "display": "No"}],
+    )
+    form.set_schema([label])
+    form.current_unit_id = "unit-1"
+    form._update_llm_button("flag")
+
+    llm_btn = form.label_widgets["flag"]["llm_btn"]  # type: ignore[index]
+    assert isinstance(llm_btn, QtWidgets.QPushButton)
+    assert llm_btn.isVisible() is True
+    assert llm_btn.isEnabled() is False
+    assert llm_btn.toolTip() == "LLM annotations are hidden for this round."

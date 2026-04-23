@@ -327,6 +327,7 @@ class AssignmentContext(QtCore.QObject):
         self._assisted_review_snippets: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
         self.final_llm_enabled: bool = False
         self._final_llm_reasoning: bool = True
+        self._final_llm_visible_to_annotators: bool = True
         self._final_llm_labels: Dict[str, Dict[str, Dict[str, object]]] = {}
 
     @staticmethod
@@ -374,6 +375,7 @@ class AssignmentContext(QtCore.QObject):
         self._assisted_review_snippets = {}
         self.final_llm_enabled = False
         self._final_llm_reasoning = True
+        self._final_llm_visible_to_annotators = True
         self._final_llm_labels = {}
         round_dir: Optional[Path] = None
         try:
@@ -451,12 +453,25 @@ class AssignmentContext(QtCore.QObject):
                     final_enabled = self._parse_bool(round_config.get("final_llm_labeling"), False)
                     outputs_cfg = round_config.get("final_llm_outputs")
                     include_reasoning_value = round_config.get("final_llm_include_reasoning")
+                    visible_to_annotators_value = round_config.get(
+                        "final_llm_visible_to_annotators"
+                    )
+                    self._final_llm_reasoning = self._parse_bool(include_reasoning_value, True)
+                    self._final_llm_visible_to_annotators = self._parse_bool(
+                        visible_to_annotators_value,
+                        True,
+                    )
                     if isinstance(outputs_cfg, Mapping):
                         if not final_enabled:
                             final_enabled = True
                         if include_reasoning_value is None:
                             include_reasoning_value = outputs_cfg.get("final_llm_include_reasoning")
+                        if visible_to_annotators_value is None:
+                            visible_to_annotators_value = outputs_cfg.get(
+                                "final_llm_visible_to_annotators"
+                            )
                         self._final_llm_reasoning = self._parse_bool(include_reasoning_value, True)
+                        self._final_llm_visible_to_annotators = self._parse_bool(visible_to_annotators_value, True)
                         by_unit_value = outputs_cfg.get("final_llm_labels_by_unit")
                         if by_unit_value:
                             try:
@@ -766,6 +781,9 @@ class AssignmentContext(QtCore.QObject):
 
     def has_final_llm_labels(self) -> bool:
         return bool(self.final_llm_enabled)
+
+    def final_llm_visible_to_annotators(self) -> bool:
+        return bool(self._final_llm_visible_to_annotators)
 
     def final_llm_reasoning_enabled(self) -> bool:
         return bool(self._final_llm_reasoning)
@@ -1655,12 +1673,18 @@ class AnnotationForm(QtWidgets.QScrollArea):
         if not isinstance(button, QtWidgets.QPushButton):
             return
         visible = self.ctx.has_final_llm_labels()
+        llm_visible_to_annotators = self.ctx.final_llm_visible_to_annotators()
         has_value = False
         if visible and self.current_unit_id:
             entry = self.ctx.get_final_llm_label(self.current_unit_id, label_id)
             has_value = bool(entry)
         button.setVisible(visible)
+        if not llm_visible_to_annotators:
+            button.setEnabled(False)
+            button.setToolTip("LLM annotations are hidden for this round.")
+            return
         button.setEnabled(has_value)
+        button.setToolTip("" if has_value else "No LLM label is available for this unit and label.")
 
     def _show_assisted_snippets(self, label_id: str) -> None:
         if not self.ctx.has_assisted_review():
@@ -1758,6 +1782,13 @@ class AnnotationForm(QtWidgets.QScrollArea):
                 "Final LLM labels are not available for this assignment.",
             )
             return
+        if not self.ctx.final_llm_visible_to_annotators():
+            QtWidgets.QMessageBox.information(
+                self,
+                "LLM label",
+                "LLM annotations are hidden for this round.",
+            )
+            return
         if not self.current_unit_id:
             QtWidgets.QMessageBox.information(
                 self,
@@ -1819,6 +1850,8 @@ class AnnotationForm(QtWidgets.QScrollArea):
         dialog.exec()
 
     def _extract_llm_reasoning_text(self, entry: Mapping[str, object]) -> Optional[str]:
+        if not self.ctx.final_llm_visible_to_annotators():
+            return None
         if not self.ctx.final_llm_reasoning_enabled():
             return None
         raw_reasoning = entry.get("llm_reasoning")
