@@ -95,6 +95,15 @@ def _resize_for_screen(window: QtWidgets.QWidget, width: int, height: int) -> No
     window.resize(min(width, max_width), min(height, max_height))
 
 
+def _truncate_for_display(text: str, *, max_length: int = 100) -> str:
+    """Clamp long UI strings so widgets do not force oversized minimum widths."""
+
+    normalized = " ".join(str(text).split())
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[: max_length - 1].rstrip() + "…"
+
+
 def build_round_assignment_units(
     assignments: Mapping[str, ReviewerAssignment],
 ) -> Dict[str, List[RoundAssignmentUnit]]:
@@ -5130,6 +5139,9 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         form.addRow("Label set ID", self.id_edit)
         self.copy_combo = QtWidgets.QComboBox()
         self.copy_combo.addItem("Start from blank", None)
+        self.copy_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.copy_combo.setMinimumContentsLength(36)
+        self.copy_combo.view().setTextElideMode(QtCore.Qt.TextElideMode.ElideRight)
         self.copy_combo.currentIndexChanged.connect(self._on_copy_source_changed)
         form.addRow("Copy from", self.copy_combo)
         self.creator_edit = QtWidgets.QLineEdit()
@@ -5207,7 +5219,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
             if created_at:
                 display += f" ({created_at})"
             if notes:
-                display += f" — {notes}"
+                display += f" — {_truncate_for_display(notes)}"
             self.copy_combo.addItem(display, labelset_id)
         self.copy_combo.blockSignals(False)
         self.copy_combo.setCurrentIndex(0)
