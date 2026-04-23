@@ -1780,11 +1780,7 @@ class AnnotationForm(QtWidgets.QScrollArea):
             label_name = definition.name
         prediction_value = entry.get("llm_prediction") or entry.get("prediction")
         prediction_text = str(prediction_value) if prediction_value is not None else "(none)"
-        reasoning_text = None
-        if self.ctx.final_llm_reasoning_enabled():
-            raw_reasoning = entry.get("llm_reasoning")
-            if raw_reasoning is not None:
-                reasoning_text = str(raw_reasoning)
+        reasoning_text = self._extract_llm_reasoning_text(entry)
         consistency_value = entry.get("llm_consistency") or entry.get("consistency")
         if consistency_value is not None:
             try:
@@ -1821,6 +1817,24 @@ class AnnotationForm(QtWidgets.QScrollArea):
         button_box.accepted.connect(dialog.accept)
         layout.addWidget(button_box)
         dialog.exec()
+
+    def _extract_llm_reasoning_text(self, entry: Mapping[str, object]) -> Optional[str]:
+        if not self.ctx.final_llm_reasoning_enabled():
+            return None
+        raw_reasoning = entry.get("llm_reasoning")
+        if raw_reasoning is None:
+            raw_reasoning = entry.get("reasoning")
+        if raw_reasoning is None:
+            runs_value = entry.get("llm_runs") or entry.get("runs")
+            if isinstance(runs_value, Sequence) and runs_value:
+                first_run = runs_value[0]
+                if isinstance(first_run, Mapping):
+                    raw_value = first_run.get("raw")
+                    if isinstance(raw_value, Mapping):
+                        raw_reasoning = raw_value.get("reasoning")
+        if raw_reasoning is None:
+            return None
+        return str(raw_reasoning)
 
     def _selected_highlight(self, label_id: str) -> Optional[Dict[str, object]]:
         widgets = self.label_widgets.get(label_id)
