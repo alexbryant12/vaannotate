@@ -1524,9 +1524,7 @@ class RoundBuilder:
             if "prediction" in fam_df.columns:
                 fam_df.rename(columns={"prediction": "llm_prediction"}, inplace=True)
             if include_reasoning and "llm_runs" in fam_df.columns:
-                fam_df["llm_reasoning"] = fam_df["llm_runs"].map(
-                    lambda runs: (runs[0].get("raw", {}).get("reasoning") if isinstance(runs, list) and runs else None)
-                )
+                fam_df["llm_reasoning"] = fam_df["llm_runs"].map(self._extract_reasoning_from_runs)
             fam_df = _jsonify_cols(
                 fam_df,
                 [col for col in ("rag_context", "llm_runs", "fc_probs") if col in fam_df.columns],
@@ -1658,6 +1656,27 @@ class RoundBuilder:
             except Exception:  # noqa: BLE001
                 pass
         return value
+
+    @staticmethod
+    def _extract_reasoning_from_runs(runs: object) -> object:
+        runs_value = runs
+        if isinstance(runs_value, str):
+            try:
+                runs_value = json.loads(runs_value)
+            except Exception:  # noqa: BLE001
+                return None
+        if not isinstance(runs_value, list) or not runs_value:
+            return None
+        first_run = runs_value[0]
+        if not isinstance(first_run, Mapping):
+            return None
+        direct_reasoning = first_run.get("reasoning")
+        if direct_reasoning is not None:
+            return direct_reasoning
+        raw_value = first_run.get("raw")
+        if isinstance(raw_value, Mapping):
+            return raw_value.get("reasoning")
+        return None
 
     @staticmethod
     def _build_label_schema_payload(labelset: Mapping[str, object]) -> Dict[str, object]:

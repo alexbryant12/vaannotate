@@ -1825,16 +1825,42 @@ class AnnotationForm(QtWidgets.QScrollArea):
         if raw_reasoning is None:
             raw_reasoning = entry.get("reasoning")
         if raw_reasoning is None:
-            runs_value = entry.get("llm_runs") or entry.get("runs")
-            if isinstance(runs_value, Sequence) and runs_value:
-                first_run = runs_value[0]
-                if isinstance(first_run, Mapping):
-                    raw_value = first_run.get("raw")
-                    if isinstance(raw_value, Mapping):
-                        raw_reasoning = raw_value.get("reasoning")
+            runs_value = self._coerce_llm_runs(entry.get("llm_runs") or entry.get("runs"))
+            raw_reasoning = self._extract_reasoning_from_runs(runs_value)
         if raw_reasoning is None:
             return None
         return str(raw_reasoning)
+
+    @staticmethod
+    def _coerce_llm_runs(raw_runs: object) -> Optional[List[Mapping[str, object]]]:
+        runs_value = raw_runs
+        if isinstance(runs_value, str):
+            try:
+                runs_value = json.loads(runs_value)
+            except Exception:  # noqa: BLE001
+                return None
+        if not isinstance(runs_value, Sequence) or isinstance(runs_value, (str, bytes)):
+            return None
+        runs: List[Mapping[str, object]] = []
+        for item in runs_value:
+            if isinstance(item, Mapping):
+                runs.append(item)
+        return runs or None
+
+    @staticmethod
+    def _extract_reasoning_from_runs(
+        runs_value: Optional[Sequence[Mapping[str, object]]],
+    ) -> Optional[object]:
+        if not runs_value:
+            return None
+        first_run = runs_value[0]
+        direct_reasoning = first_run.get("reasoning")
+        if direct_reasoning is not None:
+            return direct_reasoning
+        raw_value = first_run.get("raw")
+        if isinstance(raw_value, Mapping):
+            return raw_value.get("reasoning")
+        return None
 
     def _selected_highlight(self, label_id: str) -> Optional[Dict[str, object]]:
         widgets = self.label_widgets.get(label_id)

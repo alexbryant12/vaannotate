@@ -40,7 +40,8 @@ def test_run_family_labeling_for_units_normalizes_date_predictions():
         per_label_rules={"dob": "Provide date of birth"},
     )
 
-    assert list(df.columns) == [
+    assert "runtime_s" in df.columns
+    assert [col for col in ["unit_id", "label_id", "llm_prediction", "llm_runs", "llm_consistency", "llm_reasoning"] if col in df.columns] == [
         "unit_id",
         "label_id",
         "llm_prediction",
@@ -83,3 +84,30 @@ def test_probe_units_normalizes_date_predictions():
 
     assert df.iloc[0].llm_prediction == "2021-05-06T12:30:00"
     assert df.iloc[0].llm_reasoning == "observed signature date"
+
+
+def test_normalize_family_predictions_accepts_run_level_reasoning_stringified_runs():
+    class DummyFamilyLabeler:
+        def __init__(self):
+            self.cfg = types.SimpleNamespace(progress_min_interval_s=0.0)
+
+        def label_family_for_unit(self, uid, label_types, per_label_rules, **kwargs):
+            return [
+                {
+                    "unit_id": uid,
+                    "label_id": "flag",
+                    "prediction": "yes",
+                    "runs": '[{"logprobs":{"yes":-0.2},"reasoning":"run-level"}]',
+                    "consistency": 1.0,
+                }
+            ]
+
+    fam = DummyFamilyLabeler()
+    df = run_family_labeling_for_units(
+        fam,
+        unit_ids=["unit-1"],
+        label_types={"flag": "binary"},
+        per_label_rules={"flag": "Decide"},
+    )
+
+    assert df.iloc[0].llm_reasoning == "run-level"
