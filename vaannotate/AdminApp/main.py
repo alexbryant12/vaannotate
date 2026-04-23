@@ -5117,6 +5117,7 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         self.label_few_shot: Dict[str, List[Dict[str, str]]] = {}
         self.setWindowTitle("Edit label set" if self._editing_existing else "Create label set")
         _resize_for_screen(self, 520, 640)
+        self.setMinimumSize(480, 420)
         self._setup_ui()
         self._populate_copy_sources()
         if self._initial_payload:
@@ -5129,6 +5130,10 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
         self.id_edit.setPlaceholderText("Unique label set ID")
         form.addRow("Label set ID", self.id_edit)
         self.copy_combo = QtWidgets.QComboBox()
+        self.copy_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.copy_combo.setMinimumContentsLength(30)
         self.copy_combo.addItem("Start from blank", None)
         self.copy_combo.currentIndexChanged.connect(self._on_copy_source_changed)
         form.addRow("Copy from", self.copy_combo)
@@ -5334,7 +5339,11 @@ class LabelSetWizardDialog(QtWidgets.QDialog):
                 )
             else:
                 editor = LabelFewShotExamplesEditor(self.labels, self.label_few_shot)
-            tab.layout().addWidget(editor)  # type: ignore[union-attr]
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            scroll.setWidget(editor)
+            tab.layout().addWidget(scroll)  # type: ignore[union-attr]
             setattr(self, editor_attr, editor)
 
     def _add_label(self) -> None:
