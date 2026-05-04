@@ -256,6 +256,17 @@ class ActiveLearningPipeline:
         types_subset = {lid: current_label_types.get(lid, "categorical") for lid in label_order}
 
         counts = build_target_counts(targets)
+        target_by_key = {quota_key(target): target for target in targets}
+
+        def _quota_progress_line() -> str:
+            parts: list[str] = []
+            for target in targets:
+                key = quota_key(target)
+                current = int(counts.get(key, 0))
+                parts.append(f"{target.label_id} {current}/{int(target.quota)}")
+            return " | ".join(parts)
+
+        print(f"[label-first quotas] {_quota_progress_line()}")
         selected_units: list[str] = []
         selected_set: set[str] = set()
         matched_labels: dict[str, str] = {}
@@ -333,6 +344,14 @@ class ActiveLearningPipeline:
                 for hit in hits:
                     key = quota_key(hit)
                     counts[key] = counts.get(key, 0) + 1
+                hit_summary = ", ".join(
+                    f"{target_by_key[key].label_id}+{delta}"
+                    for key, delta in {
+                        quota_key(hit): sum(1 for h in hits if quota_key(h) == quota_key(hit))
+                        for hit in hits
+                    }.items()
+                )
+                print(f"[label-first quotas] matched {uid}: {hit_summary} :: {_quota_progress_line()}")
                 if len(selected_units) >= target_total or not unresolved_targets(targets, counts):
                     break
 
@@ -360,6 +379,7 @@ class ActiveLearningPipeline:
         )
         if final.empty:
             raise RuntimeError("Label-first sampling did not find any matching units.")
+        print(f"[label-first quotas] final :: {_quota_progress_line()}")
         return final
 
     def run(self) -> pd.DataFrame:
