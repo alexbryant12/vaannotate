@@ -150,7 +150,7 @@ class LLMLabeler:
 
     @staticmethod
     def _response_keys_text(include_reasoning: bool) -> str:
-        return "prediction (required) and reasoning (optional)" if include_reasoning else "prediction (required)"
+        return "reasoning (required) and prediction (required)" if include_reasoning else "prediction (required)"
 
     @staticmethod
     def _compact_json(payload: Any) -> str:
@@ -171,6 +171,8 @@ class LLMLabeler:
         parsed = self._parse_jsonish_answer(raw_answer)
         normalized: dict[str, Any] = {}
         if isinstance(parsed, Mapping):
+            if include_reasoning and parsed.get("reasoning") is not None:
+                normalized["reasoning"] = parsed.get("reasoning")
             if "prediction" in parsed:
                 normalized["prediction"] = parsed.get("prediction")
             else:
@@ -178,10 +180,10 @@ class LLMLabeler:
                 # object (common for legacy multi-select examples like
                 # {"Option A": "Yes", "Option B": "No"}).
                 normalized["prediction"] = dict(parsed)
-            if include_reasoning and parsed.get("reasoning") is not None:
-                normalized["reasoning"] = parsed.get("reasoning")
         else:
             normalized["prediction"] = parsed
+        if include_reasoning and "reasoning" not in normalized:
+            normalized["reasoning"] = ""
         if "prediction" not in normalized:
             normalized["prediction"] = "unknown"
         return normalized
@@ -262,6 +264,7 @@ class LLMLabeler:
             system_segments.append("If insufficient evidence, reply with 'unknown'.")
         if include_reasoning:
             system_segments.append("Think step-by-step citing specific evidence, and keep the reasoning concise.")
+            system_segments.append("Output JSON with reasoning first, then prediction.")
         system_segments.append(f"Return strict JSON only with keys: {response_keys}.")
         system_segments.append("No additional keys or text.")
 
@@ -271,12 +274,14 @@ class LLMLabeler:
         few_shot_msgs = self._few_shot_messages(label_id, include_reasoning=include_reasoning)
         schema = {
             "type": "object",
-            "properties": {"prediction": self._prediction_schema(label_type, option_values, categorical_types)},
+            "properties": {},
             "required": ["prediction"],
-            "additionalProperties": include_reasoning,
+            "additionalProperties": False,
         }
         if include_reasoning:
             schema["properties"]["reasoning"] = {"type": "string"}
+            schema["required"] = ["reasoning", "prediction"]
+        schema["properties"]["prediction"] = self._prediction_schema(label_type, option_values, categorical_types)
         return {
             "messages": [{"role": "system", "content": system}, *few_shot_msgs, {"role": "user", "content": ctx_text}],
             "prompt": {"system": system, "messages": few_shot_msgs, "user": ctx_text},
@@ -320,12 +325,14 @@ class LLMLabeler:
             include_reasoning = include_reasoning_by_label.get(str(lid), bool(getattr(self.cfg, "include_reasoning", True)))
             label_schema = {
                 "type": "object",
-                "properties": {"prediction": self._prediction_schema(ltype, option_values, self.CATEGORICAL_TYPES)},
+                "properties": {},
                 "required": ["prediction"],
-                "additionalProperties": include_reasoning,
+                "additionalProperties": False,
             }
             if include_reasoning:
                 label_schema["properties"]["reasoning"] = {"type": "string"}
+                label_schema["required"] = ["reasoning", "prediction"]
+            label_schema["properties"]["prediction"] = self._prediction_schema(ltype, option_values, self.CATEGORICAL_TYPES)
             schema["properties"][lid] = label_schema
             schema["required"].append(lid)
 
@@ -549,7 +556,7 @@ class LLMLabeler:
                 and answer is not None
                 and not isinstance(answer, Mapping)
             ):
-                answer = {"prediction": answer, "reasoning": reasoning}
+                answer = {"reasoning": reasoning, "prediction": answer}
             context = entry.get("context")
             if context is not None:
                 ctx_text = str(context)
@@ -582,7 +589,7 @@ class LLMLabeler:
                     and answer is not None
                     and not isinstance(answer, Mapping)
                 ):
-                    answer = {"prediction": answer, "reasoning": reasoning}
+                    answer = {"reasoning": reasoning, "prediction": answer}
                 if context is not None:
                     ctx_text = str(context).strip()
                     if ctx_text:
