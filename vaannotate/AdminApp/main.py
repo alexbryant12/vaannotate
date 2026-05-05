@@ -6758,14 +6758,17 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.random_sampling_radio = QtWidgets.QRadioButton("Random sampling")
         self.active_learning_radio = QtWidgets.QRadioButton("Active learning backend")
         self.label_first_radio = QtWidgets.QRadioButton("Label-first sampling")
+        self.relabel_sampling_radio = QtWidgets.QRadioButton("Re-label existing units")
         method_layout.addWidget(self.random_sampling_radio)
         method_layout.addWidget(self.active_learning_radio)
         method_layout.addWidget(self.label_first_radio)
+        method_layout.addWidget(self.relabel_sampling_radio)
         method_layout.addStretch()
         self.random_sampling_radio.setChecked(True)
         self.random_sampling_radio.toggled.connect(self._on_generation_mode_changed)
         self.active_learning_radio.toggled.connect(self._on_generation_mode_changed)
         self.label_first_radio.toggled.connect(self._on_generation_mode_changed)
+        self.relabel_sampling_radio.toggled.connect(self._on_generation_mode_changed)
         scroll_layout.addWidget(method_group)
 
         self.label_first_container = QtWidgets.QGroupBox("Label-first targets")
@@ -6827,6 +6830,26 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         lf_opts.addRow("Max pool size", self.label_first_pool_max_spin)
         label_first_layout.addLayout(lf_opts)
         scroll_layout.addWidget(self.label_first_container)
+
+        self.relabel_container = QtWidgets.QGroupBox("Re-label source")
+        relabel_layout = QtWidgets.QVBoxLayout(self.relabel_container)
+        self.relabel_source_rounds_radio = QtWidgets.QRadioButton("Use units from prior completed rounds")
+        self.relabel_source_file_radio = QtWidgets.QRadioButton("Load external unit_id file")
+        self.relabel_source_rounds_radio.setChecked(True)
+        relabel_layout.addWidget(self.relabel_source_rounds_radio)
+        relabel_layout.addWidget(self.relabel_source_file_radio)
+        self.relabel_rounds_list = QtWidgets.QListWidget()
+        self.relabel_rounds_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
+        relabel_layout.addWidget(self.relabel_rounds_list)
+        file_row = QtWidgets.QHBoxLayout()
+        self.relabel_file_edit = QtWidgets.QLineEdit()
+        self.relabel_file_edit.setPlaceholderText("Path to text/CSV file with unit IDs")
+        file_row.addWidget(self.relabel_file_edit)
+        self.relabel_file_browse_btn = QtWidgets.QPushButton("Browse…")
+        self.relabel_file_browse_btn.clicked.connect(self._on_browse_relabel_file)
+        file_row.addWidget(self.relabel_file_browse_btn)
+        relabel_layout.addLayout(file_row)
+        scroll_layout.addWidget(self.relabel_container)
 
         self.random_config_container = QtWidgets.QWidget()
         random_layout = QtWidgets.QVBoxLayout(self.random_config_container)
@@ -7295,6 +7318,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return
         latest_round: Optional[Mapping[str, object]] = None
         latest_number: Optional[int] = None
+        relabel_widget = getattr(self, "relabel_rounds_list", None)
+        if relabel_widget is not None:
+            relabel_widget.clear()
         for round_row in rounds:
             round_number = self._safe_mapping_get(round_row, "round_number")
             round_id = self._safe_mapping_get(round_row, "round_id")
@@ -7490,6 +7516,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             rounds = self.ctx.list_rounds(pheno_id)
         except Exception:
             return reviewed
+        relabel_widget = getattr(self, "relabel_rounds_list", None)
+        if relabel_widget is not None:
+            relabel_widget.clear()
         for round_row in rounds:
             round_number = self._safe_mapping_get(round_row, "round_number")
             if round_number is None:
@@ -7587,6 +7616,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             rounds = self.ctx.list_rounds(self.pheno_row["pheno_id"])
         except Exception:  # noqa: BLE001
             rounds = []
+        relabel_widget = getattr(self, "relabel_rounds_list", None)
+        if relabel_widget is not None:
+            relabel_widget.clear()
         for round_row in rounds:
             round_number = self._safe_mapping_get(round_row, "round_number")
             if round_number is None:
@@ -7597,6 +7629,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             except Exception:  # noqa: BLE001
                 continue
             self.ai_rounds_list.addItem(item)
+            if relabel_widget is not None:
+                r_item = QtWidgets.QListWidgetItem(f"Round {round_number}")
+                r_item.setData(QtCore.Qt.ItemDataRole.UserRole, int(round_number))
+                relabel_widget.addItem(r_item)
 
     def _using_ai_backend(self) -> bool:
         radio = getattr(self, "active_learning_radio", None)
@@ -7610,6 +7646,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.random_config_container.setVisible(not using_ai)
         if hasattr(self, "label_first_container"):
             self.label_first_container.setVisible(using_label_first)
+        if hasattr(self, "relabel_container"):
+            using_relabel = bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked())
+            self.relabel_container.setVisible(using_relabel)
         if hasattr(self, "ai_group"):
             show_ai = using_ai or self._ai_job_running
             self.ai_group.setVisible(show_ai)
@@ -8876,6 +8915,52 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return
         super().accept()
 
+    def _on_browse_relabel_file(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select unit ID file",
+            "",
+            "Text/CSV files (*.txt *.csv);;All files (*.*)",
+        )
+        if path and hasattr(self, "relabel_file_edit"):
+            self.relabel_file_edit.setText(path)
+
+    def _load_relabel_unit_ids(self, corpus_id: str) -> Set[str]:
+        using_relabel = bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked())
+        if not using_relabel:
+            return set()
+        if bool(getattr(self, "relabel_source_file_radio", None) and self.relabel_source_file_radio.isChecked()):
+            path = Path(self.relabel_file_edit.text().strip()) if hasattr(self, "relabel_file_edit") else None
+            if not path or not path.exists():
+                raise ValueError("Select a valid external unit ID file for re-label sampling.")
+            unit_ids: Set[str] = set()
+            for line in path.read_text(encoding="utf-8").splitlines():
+                for token in line.replace(",", " ").split():
+                    token = token.strip()
+                    if token and token.lower() != "unit_id":
+                        unit_ids.add(token)
+            return unit_ids
+        round_numbers: List[int] = []
+        if hasattr(self, "relabel_rounds_list"):
+            for i in range(self.relabel_rounds_list.count()):
+                item = self.relabel_rounds_list.item(i)
+                if item and item.isSelected():
+                    value = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                    if isinstance(value, int):
+                        round_numbers.append(value)
+        if not round_numbers:
+            raise ValueError("Select at least one completed prior round for re-label sampling.")
+        db = self.ctx.require_db()
+        with db.connect() as conn:
+            placeholders = ",".join("?" for _ in round_numbers)
+            rows = conn.execute(
+                f"""SELECT DISTINCT ra.unit_id FROM round_assignments ra
+                    JOIN rounds r ON r.round_id=ra.round_id
+                    WHERE r.pheno_id=? AND r.round_number IN ({placeholders})""",
+                (self.pheno_row["pheno_id"], *round_numbers),
+            ).fetchall()
+        return {str(row[0]) for row in rows if row and row[0]}
+
     def _create_round(self) -> bool:
         pheno_id = self.pheno_row["pheno_id"]
         pheno_level = self.pheno_row["level"]
@@ -8966,6 +9051,18 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if not corpus_rows:
             QtWidgets.QMessageBox.warning(self, "Round", "The selected corpus returned no candidate documents.")
             return False
+        if bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked()):
+            try:
+                relabel_units = self._load_relabel_unit_ids(corpus_id)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Re-label sampling", str(exc))
+                return False
+            corpus_rows = [row for row in corpus_rows if (self._row_unit_identifier(row) or "") in relabel_units]
+            sampling_metadata["relabel_mode"] = True
+            sampling_metadata["relabel_unit_count"] = len(relabel_units)
+            if not corpus_rows:
+                QtWidgets.QMessageBox.warning(self, "Re-label sampling", "No corpus candidates matched the selected re-label unit IDs.")
+                return False
         shortage_warned = False
         if independent:
             reviewed_units = self._load_reviewed_unit_ids(corpus_id)

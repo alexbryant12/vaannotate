@@ -260,6 +260,11 @@ class ActiveLearningPipeline:
         selected_set: set[str] = set()
         matched_labels: dict[str, str] = {}
         rng = __import__("random").Random()
+        quota_targets = {quota_key(target): int(target.quota) for target in targets}
+        last_status_ts = 0.0
+        random_labeled_units = 0
+        random_label_counts: dict[str, int] = {}
+        random_value_counts: dict[str, dict[str, int]] = {}
 
         while remaining and len(selected_units) < target_total:
             check_cancelled()
@@ -285,6 +290,7 @@ class ActiveLearningPipeline:
                 break
 
             _progress_every = float(getattr(self.cfg.llmfirst, "progress_min_interval_s", 1.0) or 1.0)
+            pool_processed = 0
             for uid in iter_with_bar(
                 step="Label-first sampling",
                 iterable=pool,
@@ -319,6 +325,45 @@ class ActiveLearningPipeline:
                         for row in probe_rows
                         if isinstance(row, dict) and row.get("label_id") is not None
                     }
+                pool_processed += 1
+                if pathway == "random_iterative":
+                    random_labeled_units += 1
+                    for label_id, pred_value in predictions.items():
+                        random_label_counts[label_id] = random_label_counts.get(label_id, 0) + 1
+                        value_key = str(pred_value)
+                        per_value = random_value_counts.setdefault(label_id, {})
+                        per_value[value_key] = per_value.get(value_key, 0) + 1
+
+                now = time.time()
+                should_log_status = (
+                    pool_processed == 1
+                    or pool_processed == len(pool)
+                    or now - last_status_ts >= _progress_every
+                )
+                if should_log_status:
+                    quota_progress = ", ".join(
+                        f"{key}: {counts.get(key, 0)}/{quota_targets.get(key, 0)}"
+                        for key in sorted(quota_targets.keys())
+                    )
+                    status_parts = [f"quota progress -> {quota_progress}"]
+                    if pathway == "random_iterative" and random_labeled_units > 0:
+                        prevalence_items = []
+                        for label_id in sorted(random_value_counts.keys()):
+                            label_n = random_label_counts.get(label_id, 0)
+                            if label_n <= 0:
+                                continue
+                            value_bits = ", ".join(
+                                f"{value}={cnt / label_n:.3f} ({cnt}/{label_n})"
+                                for value, cnt in sorted(random_value_counts[label_id].items())
+                            )
+                            prevalence_items.append(f"{label_id}: [{value_bits}]")
+                        if prevalence_items:
+                            status_parts.append(
+                                "random prevalence estimates -> " + " | ".join(prevalence_items)
+                            )
+                    print("[Label-first status] " + " ; ".join(status_parts))
+                    last_status_ts = now
+
                 hits = evaluate_target_hits(
                     unit_id=uid,
                     predictions=predictions,
@@ -341,6 +386,20 @@ class ActiveLearningPipeline:
                 pool_size = min(max_pool, pool_size + growth_step)
             elif pathway == "enriched" and unresolved_targets(targets, counts):
                 pathway = "random_iterative"
+
+        if random_labeled_units > 0:
+            prevalence_summary: list[str] = []
+            for label_id in sorted(random_value_counts.keys()):
+                label_n = random_label_counts.get(label_id, 0)
+                if label_n <= 0:
+                    continue
+                value_bits = ", ".join(
+                    f"{value}={cnt / label_n:.3f} ({cnt}/{label_n})"
+                    for value, cnt in sorted(random_value_counts[label_id].items())
+                )
+                prevalence_summary.append(f"{label_id}: [{value_bits}]")
+            if prevalence_summary:
+                print("[Label-first random prevalence summary] " + " | ".join(prevalence_summary))
 
         batch_size = int(getattr(selection_cfg, "batch_size", 0) or 0)
         if len(selected_units) < batch_size and remaining:
