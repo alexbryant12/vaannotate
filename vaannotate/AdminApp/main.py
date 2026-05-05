@@ -7378,9 +7378,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return
         latest_round: Optional[Mapping[str, object]] = None
         latest_number: Optional[int] = None
-        relabel_widget = getattr(self, "relabel_rounds_list", None)
-        if relabel_widget is not None:
-            relabel_widget.clear()
         for round_row in rounds:
             round_number = self._safe_mapping_get(round_row, "round_number")
             round_id = self._safe_mapping_get(round_row, "round_id")
@@ -7585,9 +7582,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             rounds = self.ctx.list_rounds(pheno_id)
         except Exception:
             return reviewed
-        relabel_widget = getattr(self, "relabel_rounds_list", None)
-        if relabel_widget is not None:
-            relabel_widget.clear()
         for round_row in rounds:
             round_number = self._safe_mapping_get(round_row, "round_number")
             if round_number is None:

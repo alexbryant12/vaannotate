@@ -1833,3 +1833,54 @@ def test_generate_round_auto_submit_llm_missing_predictions(
         assert missing_row["value"] in (None, "")
         assert missing_row["value_num"] is None
 
+
+def test_relabel_rounds_not_cleared_by_latest_defaults() -> None:
+    class _ListWidget:
+        def __init__(self) -> None:
+            self._items: list[object] = []
+
+        def clear(self) -> None:
+            self._items.clear()
+
+        def addItem(self, item: object) -> None:
+            self._items.append(item)
+
+        def count(self) -> int:
+            return len(self._items)
+
+    class _Item:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self._data: dict[int, object] = {}
+
+        def setData(self, role: int, value: object) -> None:
+            self._data[role] = value
+
+    class _Ctx:
+        def list_rounds(self, _pheno_id: str):
+            return [
+                {"round_number": 1, "round_id": "ph_test_r1"},
+                {"round_number": 2, "round_id": "ph_test_r2"},
+            ]
+
+        def get_round_config(self, _round_id: str):
+            return {}
+
+    original_item = admin_main.QtWidgets.QListWidgetItem
+    admin_main.QtWidgets.QListWidgetItem = _Item
+    try:
+        dialog = admin_main.RoundBuilderDialog.__new__(admin_main.RoundBuilderDialog)
+        dialog.ctx = _Ctx()
+        dialog.pheno_row = {"pheno_id": "ph_test", "level": "single_doc"}
+        dialog.ai_rounds_list = _ListWidget()
+        dialog.relabel_rounds_list = _ListWidget()
+        dialog._ai_engine_overrides = {}
+        dialog._apply_ai_config_to_controls = lambda _cfg: None
+
+        admin_main.RoundBuilderDialog._refresh_ai_round_options(dialog)
+        assert dialog.relabel_rounds_list.count() == 2
+
+        admin_main.RoundBuilderDialog._apply_latest_round_defaults(dialog)
+        assert dialog.relabel_rounds_list.count() == 2
+    finally:
+        admin_main.QtWidgets.QListWidgetItem = original_item
