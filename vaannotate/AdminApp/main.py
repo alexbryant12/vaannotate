@@ -6011,8 +6011,29 @@ class RoundBuilderDialog(QtWidgets.QDialog):
     def _update_ai_batch_size_label(self) -> None:
         if not hasattr(self, "ai_batch_size_label"):
             return
-        value = self.total_n_spin.value() if hasattr(self, "total_n_spin") else 0
-        self.ai_batch_size_label.setText(f"{value} (matches Total N)")
+        value = self._current_total_n()
+        self.ai_batch_size_label.setText(f"{value} (matches method Total N)")
+
+    def _current_seed(self) -> int:
+        if self._using_ai_backend() and hasattr(self, "ai_seed_spin"):
+            return int(self.ai_seed_spin.value())
+        if hasattr(self, "random_seed_spin"):
+            return int(self.random_seed_spin.value())
+        return 0
+
+    def _current_overlap(self) -> int:
+        if self._using_ai_backend() and hasattr(self, "ai_overlap_spin"):
+            return int(self.ai_overlap_spin.value())
+        if hasattr(self, "random_overlap_spin"):
+            return int(self.random_overlap_spin.value())
+        return 0
+
+    def _current_total_n(self) -> int:
+        if self._using_ai_backend() and hasattr(self, "ai_total_n_spin"):
+            return int(self.ai_total_n_spin.value())
+        if hasattr(self, "random_total_n_spin"):
+            return int(self.random_total_n_spin.value())
+        return 0
 
     def _build_ai_config_snapshot(self) -> Dict[str, Any]:
         try:
@@ -6027,8 +6048,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         base_cfg["rag"] = rag_cfg
         _deep_update_dict(base_cfg, self._ai_engine_overrides or {})
         select_cfg = base_cfg.get("select", {}) if isinstance(base_cfg.get("select"), Mapping) else {}
-        if hasattr(self, "total_n_spin"):
-            select_cfg["batch_size"] = int(self.total_n_spin.value())
+        select_cfg["batch_size"] = self._current_total_n()
         if hasattr(self, "ai_disagreement_pct"):
             select_cfg["pct_disagreement"] = float(self.ai_disagreement_pct.value())
         if hasattr(self, "ai_uncertain_pct"):
@@ -6125,9 +6145,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             else {}
         )
         batch_size = select_cfg.get("batch_size")
-        if hasattr(self, "total_n_spin") and isinstance(batch_size, (int, float)):
+        if hasattr(self, "ai_total_n_spin") and isinstance(batch_size, (int, float)):
             try:
-                self.total_n_spin.setValue(int(batch_size))
+                self.ai_total_n_spin.setValue(int(batch_size))
             except Exception:  # noqa: BLE001
                 pass
         for attr_name, key in (
@@ -6686,12 +6706,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if line_edit:
             line_edit.setPlaceholderText("Select or enter label set ID")
         self.labelset_combo.currentTextChanged.connect(lambda _text: self._on_labelset_changed())
-        self.seed_spin = QtWidgets.QSpinBox()
-        self.seed_spin.setMaximum(2**31 - 1)
-        self.overlap_spin = QtWidgets.QSpinBox()
-        self.overlap_spin.setRange(0, 1000)
-        self.total_n_spin = QtWidgets.QSpinBox()
-        self.total_n_spin.setRange(1, 1000000)
         self.status_combo = QtWidgets.QComboBox()
         self.status_combo.addItems(["draft", "active", "closed", "adjudicating", "finalized"])
         unit_label = "patients" if self.pheno_row["level"] == "multi_doc" else "documents"
@@ -6702,9 +6716,6 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             "When enabled, sampling will skip any units that were included in previous rounds for this phenotype."
         )
         setup_form.addRow("Label set", self.labelset_combo)
-        setup_form.addRow("Seed", self.seed_spin)
-        setup_form.addRow("Overlap N", self.overlap_spin)
-        setup_form.addRow("Total N", self.total_n_spin)
         setup_form.addRow("Status", self.status_combo)
         setup_form.addRow("Independent sampling", self.independent_checkbox)
         assisted_widget = QtWidgets.QWidget()
@@ -6854,6 +6865,17 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.random_config_container = QtWidgets.QWidget()
         random_layout = QtWidgets.QVBoxLayout(self.random_config_container)
         random_layout.setContentsMargins(0, 0, 0, 0)
+        self.random_seed_spin = QtWidgets.QSpinBox()
+        self.random_seed_spin.setMaximum(2**31 - 1)
+        self.random_overlap_spin = QtWidgets.QSpinBox()
+        self.random_overlap_spin.setRange(0, 1000)
+        self.random_total_n_spin = QtWidgets.QSpinBox()
+        self.random_total_n_spin.setRange(1, 1000000)
+        random_setup_form = QtWidgets.QFormLayout()
+        random_setup_form.addRow("Seed", self.random_seed_spin)
+        random_setup_form.addRow("Overlap N", self.random_overlap_spin)
+        random_setup_form.addRow("Total N", self.random_total_n_spin)
+        random_layout.addLayout(random_setup_form)
 
         filter_group = QtWidgets.QGroupBox("Sampling filters")
         filter_layout = QtWidgets.QVBoxLayout(filter_group)
@@ -7034,6 +7056,17 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
         self.ai_group = QtWidgets.QGroupBox("Active learning configuration")
         ai_layout = QtWidgets.QVBoxLayout(self.ai_group)
+        self.ai_seed_spin = QtWidgets.QSpinBox()
+        self.ai_seed_spin.setMaximum(2**31 - 1)
+        self.ai_overlap_spin = QtWidgets.QSpinBox()
+        self.ai_overlap_spin.setRange(0, 1000)
+        self.ai_total_n_spin = QtWidgets.QSpinBox()
+        self.ai_total_n_spin.setRange(1, 1000000)
+        ai_round_setup_form = QtWidgets.QFormLayout()
+        ai_round_setup_form.addRow("Seed", self.ai_seed_spin)
+        ai_round_setup_form.addRow("Overlap N", self.ai_overlap_spin)
+        ai_round_setup_form.addRow("Total N", self.ai_total_n_spin)
+        ai_layout.addLayout(ai_round_setup_form)
         self.ai_controls_container = QtWidgets.QWidget()
         ai_controls_layout = QtWidgets.QVBoxLayout(self.ai_controls_container)
         ai_controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -7307,7 +7340,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self._on_ai_final_llm_toggled(self.ai_final_llm_checkbox.isChecked())
         if hasattr(self, "assisted_review_checkbox"):
             self._on_assisted_review_toggled(self.assisted_review_checkbox.isChecked())
-        self.total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
+        self.ai_total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
+        self.random_total_n_spin.valueChanged.connect(self._update_ai_batch_size_label)
         self._on_generation_mode_changed()
         self._apply_latest_round_defaults()
 
@@ -7352,23 +7386,32 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     self.corpus_combo.setCurrentIndex(idx)
                     break
         rng_seed = config.get("rng_seed")
-        if hasattr(self, "seed_spin") and isinstance(rng_seed, (int, float)):
-            try:
-                self.seed_spin.setValue(int(rng_seed))
-            except Exception:  # noqa: BLE001
-                pass
+        if isinstance(rng_seed, (int, float)):
+            for widget_name in ("random_seed_spin", "ai_seed_spin"):
+                widget = getattr(self, widget_name, None)
+                if isinstance(widget, QtWidgets.QSpinBox):
+                    try:
+                        widget.setValue(int(rng_seed))
+                    except Exception:  # noqa: BLE001
+                        pass
         overlap_n = config.get("overlap_n")
-        if hasattr(self, "overlap_spin") and isinstance(overlap_n, (int, float)):
-            try:
-                self.overlap_spin.setValue(int(overlap_n))
-            except Exception:  # noqa: BLE001
-                pass
+        if isinstance(overlap_n, (int, float)):
+            for widget_name in ("random_overlap_spin", "ai_overlap_spin"):
+                widget = getattr(self, widget_name, None)
+                if isinstance(widget, QtWidgets.QSpinBox):
+                    try:
+                        widget.setValue(int(overlap_n))
+                    except Exception:  # noqa: BLE001
+                        pass
         total_n = config.get("total_n")
-        if hasattr(self, "total_n_spin") and isinstance(total_n, (int, float)):
-            try:
-                self.total_n_spin.setValue(int(total_n))
-            except Exception:  # noqa: BLE001
-                pass
+        if isinstance(total_n, (int, float)):
+            for widget_name in ("random_total_n_spin", "ai_total_n_spin"):
+                widget = getattr(self, widget_name, None)
+                if isinstance(widget, QtWidgets.QSpinBox):
+                    try:
+                        widget.setValue(int(total_n))
+                    except Exception:  # noqa: BLE001
+                        pass
         status_value = config.get("status")
         if hasattr(self, "status_combo") and isinstance(status_value, str):
             idx = self.status_combo.findText(status_value)
@@ -7834,9 +7877,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     ],
                 }
             )
-        seed = self.seed_spin.value()
-        overlap = self.overlap_spin.value()
-        total_n = self.total_n_spin.value()
+        seed = self._current_seed()
+        overlap = self._current_overlap()
+        total_n = self._current_total_n()
         if total_n < overlap:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -8276,8 +8319,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if not self._using_ai_backend():
             return overrides
         select: Dict[str, Any] = overrides.get("select", {}) if isinstance(overrides.get("select"), Mapping) else {}
-        if hasattr(self, "total_n_spin"):
-            select["batch_size"] = int(self.total_n_spin.value())
+        select["batch_size"] = self._current_total_n()
         if hasattr(self, "ai_disagreement_pct"):
             select["pct_disagreement"] = float(self.ai_disagreement_pct.value())
         if hasattr(self, "ai_uncertain_pct"):
@@ -8970,8 +9012,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "Round", "Project metadata is missing; reload the project and try again.")
             return False
         db = ctx.require_db()
-        seed = self.seed_spin.value()
-        overlap = self.overlap_spin.value()
+        seed = self._current_seed()
+        overlap = self._current_overlap()
         independent = self.independent_checkbox.isChecked()
         sampling_metadata: Dict[str, object] = {"independent": bool(independent)}
         reviewers = self._prompt_reviewers()
@@ -9013,7 +9055,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     ],
                 }
             )
-        total_n = self.total_n_spin.value()
+        total_n = self._current_total_n()
         if total_n < overlap:
             QtWidgets.QMessageBox.warning(
                 self,
