@@ -6864,18 +6864,23 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.relabel_source_rounds_radio.setChecked(True)
         relabel_layout.addWidget(self.relabel_source_rounds_radio)
         relabel_layout.addWidget(self.relabel_source_file_radio)
-        relabel_layout.addWidget(QtWidgets.QLabel("Prior rounds to relabel"))
+        self.relabel_rounds_label = QtWidgets.QLabel("Prior rounds to relabel")
+        relabel_layout.addWidget(self.relabel_rounds_label)
         self.relabel_rounds_list = QtWidgets.QListWidget()
         self.relabel_rounds_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
         relabel_layout.addWidget(self.relabel_rounds_list)
-        file_row = QtWidgets.QHBoxLayout()
+        self.relabel_file_row_widget = QtWidgets.QWidget()
+        file_row = QtWidgets.QHBoxLayout(self.relabel_file_row_widget)
+        file_row.setContentsMargins(0, 0, 0, 0)
         self.relabel_file_edit = QtWidgets.QLineEdit()
         self.relabel_file_edit.setPlaceholderText("Path to text/CSV file with unit IDs")
         file_row.addWidget(self.relabel_file_edit)
         self.relabel_file_browse_btn = QtWidgets.QPushButton("Browse…")
         self.relabel_file_browse_btn.clicked.connect(self._on_browse_relabel_file)
         file_row.addWidget(self.relabel_file_browse_btn)
-        relabel_layout.addLayout(file_row)
+        relabel_layout.addWidget(self.relabel_file_row_widget)
+        self.relabel_source_rounds_radio.toggled.connect(self._on_relabel_source_changed)
+        self.relabel_source_file_radio.toggled.connect(self._on_relabel_source_changed)
         relabel_form = QtWidgets.QFormLayout()
         relabel_form.addRow("Independent sampling", self.relabel_independent_checkbox)
         relabel_layout.addLayout(relabel_form)
@@ -7733,6 +7738,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.label_first_container.setVisible(using_label_first)
         if hasattr(self, "relabel_container"):
             self.relabel_container.setVisible(using_relabel)
+        self._on_relabel_source_changed()
         if hasattr(self, "filter_group"):
             self.filter_group.setVisible(not using_relabel)
         if hasattr(self, "strat_group"):
@@ -7748,6 +7754,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             should_enable = using_ai or self._ai_job_running
             self.ai_controls_container.setEnabled(should_enable)
         self._update_ai_buttons()
+
+    def _on_relabel_source_changed(self) -> None:
+        using_file = bool(getattr(self, "relabel_source_file_radio", None) and self.relabel_source_file_radio.isChecked())
+        if hasattr(self, "relabel_rounds_label"):
+            self.relabel_rounds_label.setVisible(not using_file)
+        if hasattr(self, "relabel_rounds_list"):
+            self.relabel_rounds_list.setVisible(not using_file)
+        if hasattr(self, "relabel_file_row_widget"):
+            self.relabel_file_row_widget.setVisible(using_file)
 
     def _update_ai_buttons(self) -> None:
         enabled = self._using_ai_backend()
@@ -9043,7 +9058,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     if isinstance(value, int):
                         round_numbers.append(value)
         if not round_numbers:
-            raise ValueError("Select at least one completed prior round for re-label sampling.")
+            raise ValueError("Select at least one prior round for re-label sampling.")
         db = self.ctx.require_db()
         with db.connect() as conn:
             placeholders = ",".join("?" for _ in round_numbers)
