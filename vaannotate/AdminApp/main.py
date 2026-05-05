@@ -6029,11 +6029,21 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         return 0
 
     def _current_total_n(self) -> int:
+        if bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked()):
+            return self._current_relabel_unit_count()
         if self._using_ai_backend() and hasattr(self, "ai_total_n_spin"):
             return int(self.ai_total_n_spin.value())
         if hasattr(self, "random_total_n_spin"):
             return int(self.random_total_n_spin.value())
         return 0
+
+    def _current_relabel_unit_count(self) -> int:
+        if not bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked()):
+            return 0
+        try:
+            return len(self._load_relabel_unit_ids(""))
+        except Exception:  # noqa: BLE001
+            return 0
 
     def _build_ai_config_snapshot(self) -> Dict[str, Any]:
         try:
@@ -6868,6 +6878,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         relabel_layout.addWidget(self.relabel_rounds_label)
         self.relabel_rounds_list = QtWidgets.QListWidget()
         self.relabel_rounds_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
+        self.relabel_rounds_list.itemSelectionChanged.connect(self._update_relabel_unit_count_display)
         relabel_layout.addWidget(self.relabel_rounds_list)
         self.relabel_file_row_widget = QtWidgets.QWidget()
         file_row = QtWidgets.QHBoxLayout(self.relabel_file_row_widget)
@@ -6881,6 +6892,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         relabel_layout.addWidget(self.relabel_file_row_widget)
         self.relabel_source_rounds_radio.toggled.connect(self._on_relabel_source_changed)
         self.relabel_source_file_radio.toggled.connect(self._on_relabel_source_changed)
+        self.relabel_file_edit.textChanged.connect(self._update_relabel_unit_count_display)
+        self.relabel_unit_count_label = QtWidgets.QLabel("Unique units selected: 0")
+        relabel_layout.addWidget(self.relabel_unit_count_label)
         relabel_form = QtWidgets.QFormLayout()
         relabel_form.addRow("Independent sampling", self.relabel_independent_checkbox)
         relabel_layout.addLayout(relabel_form)
@@ -6895,12 +6909,12 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.random_overlap_spin.setRange(0, 1000)
         self.random_total_n_spin = QtWidgets.QSpinBox()
         self.random_total_n_spin.setRange(1, 1000000)
-        random_setup_form = QtWidgets.QFormLayout()
-        random_setup_form.addRow("Seed", self.random_seed_spin)
-        random_setup_form.addRow("Overlap N", self.random_overlap_spin)
-        random_setup_form.addRow("Total N", self.random_total_n_spin)
-        random_setup_form.addRow("Independent sampling", self.random_independent_checkbox)
-        random_layout.addLayout(random_setup_form)
+        self.random_setup_form = QtWidgets.QFormLayout()
+        self.random_setup_form.addRow("Seed", self.random_seed_spin)
+        self.random_setup_form.addRow("Overlap N", self.random_overlap_spin)
+        self.random_setup_form.addRow("Total N", self.random_total_n_spin)
+        self.random_setup_form.addRow("Independent sampling", self.random_independent_checkbox)
+        random_layout.addLayout(self.random_setup_form)
 
         self.filter_group = QtWidgets.QGroupBox("Sampling filters")
         filter_layout = QtWidgets.QVBoxLayout(self.filter_group)
@@ -7696,6 +7710,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 r_item = QtWidgets.QListWidgetItem(f"Round {round_number}")
                 r_item.setData(QtCore.Qt.ItemDataRole.UserRole, int(round_number))
                 relabel_widget.addItem(r_item)
+        self._update_relabel_unit_count_display()
 
     def _using_ai_backend(self) -> bool:
         radio = getattr(self, "active_learning_radio", None)
@@ -7737,6 +7752,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.filter_group.setVisible(not using_relabel)
         if hasattr(self, "strat_group"):
             self.strat_group.setVisible(not using_relabel)
+        if hasattr(self, "random_total_n_spin"):
+            self.random_total_n_spin.setVisible(not using_relabel)
+            total_n_label = getattr(self, "random_setup_form", None)
+            if isinstance(total_n_label, QtWidgets.QFormLayout):
+                label_widget = total_n_label.labelForField(self.random_total_n_spin)
+                if label_widget is not None:
+                    label_widget.setVisible(not using_relabel)
         if hasattr(self, "ai_rounds_list"):
             self.ai_rounds_list.setVisible(not using_label_first)
         if hasattr(self, "ai_prior_label"):
@@ -7747,6 +7769,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if hasattr(self, "ai_controls_container"):
             should_enable = using_ai or self._ai_job_running
             self.ai_controls_container.setEnabled(should_enable)
+        self._update_relabel_unit_count_display()
         self._update_ai_buttons()
 
     def _on_relabel_source_changed(self) -> None:
@@ -7757,6 +7780,13 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.relabel_rounds_list.setVisible(not using_file)
         if hasattr(self, "relabel_file_row_widget"):
             self.relabel_file_row_widget.setVisible(using_file)
+        self._update_relabel_unit_count_display()
+
+    def _update_relabel_unit_count_display(self) -> None:
+        if not hasattr(self, "relabel_unit_count_label"):
+            return
+        count = self._current_relabel_unit_count()
+        self.relabel_unit_count_label.setText(f"Unique units selected: {count}")
 
     def _update_ai_buttons(self) -> None:
         enabled = self._using_ai_backend()
