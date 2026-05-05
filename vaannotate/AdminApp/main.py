@@ -7673,11 +7673,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 continue
             self.ai_rounds_list.addItem(item)
             if relabel_widget is not None:
-                status = str(self._safe_mapping_get(round_row, "status", "") or "").strip().lower()
-                if status == "completed":
-                    r_item = QtWidgets.QListWidgetItem(f"Round {round_number}")
-                    r_item.setData(QtCore.Qt.ItemDataRole.UserRole, int(round_number))
-                    relabel_widget.addItem(r_item)
+                r_item = QtWidgets.QListWidgetItem(f"Round {round_number}")
+                r_item.setData(QtCore.Qt.ItemDataRole.UserRole, int(round_number))
+                relabel_widget.addItem(r_item)
 
     def _using_ai_backend(self) -> bool:
         radio = getattr(self, "active_learning_radio", None)
