@@ -6709,15 +6709,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.status_combo = QtWidgets.QComboBox()
         self.status_combo.addItems(["draft", "active", "closed", "adjudicating", "finalized"])
         unit_label = "patients" if self.pheno_row["level"] == "multi_doc" else "documents"
-        self.independent_checkbox = QtWidgets.QCheckBox(
-            f"Exclude previously reviewed {unit_label}"
-        )
-        self.independent_checkbox.setToolTip(
-            "When enabled, sampling will skip any units that were included in previous rounds for this phenotype."
-        )
         setup_form.addRow("Label set", self.labelset_combo)
         setup_form.addRow("Status", self.status_combo)
-        setup_form.addRow("Independent sampling", self.independent_checkbox)
         assisted_widget = QtWidgets.QWidget()
         assisted_layout = QtWidgets.QHBoxLayout(assisted_widget)
         assisted_layout.setContentsMargins(0, 0, 0, 0)
@@ -6781,6 +6774,27 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.label_first_radio.toggled.connect(self._on_generation_mode_changed)
         self.relabel_sampling_radio.toggled.connect(self._on_generation_mode_changed)
         scroll_layout.addWidget(method_group)
+        self.random_independent_checkbox = QtWidgets.QCheckBox(
+            f"Exclude previously reviewed {unit_label}"
+        )
+        self.active_learning_independent_checkbox = QtWidgets.QCheckBox(
+            f"Exclude previously reviewed {unit_label}"
+        )
+        self.label_first_independent_checkbox = QtWidgets.QCheckBox(
+            f"Exclude previously reviewed {unit_label}"
+        )
+        self.relabel_independent_checkbox = QtWidgets.QCheckBox(
+            f"Exclude previously reviewed {unit_label}"
+        )
+        for checkbox in (
+            self.random_independent_checkbox,
+            self.active_learning_independent_checkbox,
+            self.label_first_independent_checkbox,
+            self.relabel_independent_checkbox,
+        ):
+            checkbox.setToolTip(
+                "When enabled, sampling will skip any units that were included in previous rounds for this phenotype."
+            )
 
         self.label_first_container = QtWidgets.QGroupBox("Label-first targets")
         label_first_layout = QtWidgets.QVBoxLayout(self.label_first_container)
@@ -6839,6 +6853,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.label_first_pool_max_spin.setRange(10, 2000000)
         self.label_first_pool_max_spin.setValue(2000)
         lf_opts.addRow("Max pool size", self.label_first_pool_max_spin)
+        lf_opts.addRow("Independent sampling", self.label_first_independent_checkbox)
         label_first_layout.addLayout(lf_opts)
         scroll_layout.addWidget(self.label_first_container)
 
@@ -6849,6 +6864,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.relabel_source_rounds_radio.setChecked(True)
         relabel_layout.addWidget(self.relabel_source_rounds_radio)
         relabel_layout.addWidget(self.relabel_source_file_radio)
+        relabel_layout.addWidget(QtWidgets.QLabel("Prior rounds to relabel"))
         self.relabel_rounds_list = QtWidgets.QListWidget()
         self.relabel_rounds_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
         relabel_layout.addWidget(self.relabel_rounds_list)
@@ -6860,6 +6876,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.relabel_file_browse_btn.clicked.connect(self._on_browse_relabel_file)
         file_row.addWidget(self.relabel_file_browse_btn)
         relabel_layout.addLayout(file_row)
+        relabel_form = QtWidgets.QFormLayout()
+        relabel_form.addRow("Independent sampling", self.relabel_independent_checkbox)
+        relabel_layout.addLayout(relabel_form)
         scroll_layout.addWidget(self.relabel_container)
 
         self.random_config_container = QtWidgets.QWidget()
@@ -6875,10 +6894,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         random_setup_form.addRow("Seed", self.random_seed_spin)
         random_setup_form.addRow("Overlap N", self.random_overlap_spin)
         random_setup_form.addRow("Total N", self.random_total_n_spin)
+        random_setup_form.addRow("Independent sampling", self.random_independent_checkbox)
         random_layout.addLayout(random_setup_form)
 
-        filter_group = QtWidgets.QGroupBox("Sampling filters")
-        filter_layout = QtWidgets.QVBoxLayout(filter_group)
+        self.filter_group = QtWidgets.QGroupBox("Sampling filters")
+        filter_layout = QtWidgets.QVBoxLayout(self.filter_group)
         self.filter_list = QtWidgets.QListWidget()
         self.filter_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.filter_list.itemDoubleClicked.connect(self._on_edit_filter)
@@ -6907,10 +6927,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.remove_filter_btn.clicked.connect(self._on_remove_filter)
         filter_controls.addWidget(self.remove_filter_btn)
         filter_layout.addLayout(filter_controls)
-        random_layout.addWidget(filter_group)
+        random_layout.addWidget(self.filter_group)
 
-        strat_group = QtWidgets.QGroupBox("Stratification")
-        strat_layout = QtWidgets.QVBoxLayout(strat_group)
+        self.strat_group = QtWidgets.QGroupBox("Stratification")
+        strat_layout = QtWidgets.QVBoxLayout(self.strat_group)
         self.strat_list = QtWidgets.QListWidget()
         self.strat_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.strat_list.currentRowChanged.connect(self._update_strat_buttons)
@@ -6926,7 +6946,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.remove_strat_btn.clicked.connect(self._on_remove_strat_field)
         strat_controls.addWidget(self.remove_strat_btn)
         strat_layout.addLayout(strat_controls)
-        random_layout.addWidget(strat_group)
+        random_layout.addWidget(self.strat_group)
 
         final_llm_row = QtWidgets.QHBoxLayout()
         self.random_final_llm_checkbox = QtWidgets.QCheckBox("Run final LLM labeling")
@@ -7194,6 +7214,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_diversity_pct.setSingleStep(0.05)
         self.ai_diversity_pct.setValue(0.30)
         ai_config_layout.addRow("Diversity pct", self.ai_diversity_pct)
+        ai_config_layout.addRow("Independent sampling", self.active_learning_independent_checkbox)
         self.ai_final_llm_checkbox = QtWidgets.QCheckBox("Run final LLM labeling")
         self.ai_final_llm_checkbox.setChecked(True)
         self.ai_final_llm_checkbox.toggled.connect(self._on_ai_final_llm_toggled)
@@ -7229,8 +7250,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         pct_hint.setWordWrap(True)
         ai_config_layout.addRow(pct_hint)
         ai_controls_layout.addWidget(ai_config_group)
-        prior_label = QtWidgets.QLabel("Prior rounds to include")
-        ai_controls_layout.addWidget(prior_label)
+        self.ai_prior_label = QtWidgets.QLabel("Prior rounds to include")
+        ai_controls_layout.addWidget(self.ai_prior_label)
         self.ai_rounds_list = QtWidgets.QListWidget()
         self.ai_rounds_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.MultiSelection
@@ -7419,8 +7440,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 self.status_combo.setCurrentIndex(idx)
         sampling_cfg = config.get("sampling", {}) if isinstance(config.get("sampling"), Mapping) else {}
         independent_value = sampling_cfg.get("independent") if isinstance(sampling_cfg, Mapping) else None
-        if hasattr(self, "independent_checkbox") and isinstance(independent_value, bool):
-            self.independent_checkbox.setChecked(independent_value)
+        if isinstance(independent_value, bool):
+            self._set_independent_sampling_enabled(independent_value)
         assisted_cfg = config.get("assisted_review") if isinstance(config.get("assisted_review"), Mapping) else {}
         if isinstance(assisted_cfg, Mapping) and hasattr(self, "assisted_review_checkbox"):
             enabled = bool(assisted_cfg.get("enabled"))
@@ -7682,16 +7703,44 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         label_first = getattr(self, "label_first_radio", None)
         return bool((radio and radio.isChecked()) or (label_first and label_first.isChecked()))
 
+    def _set_independent_sampling_enabled(self, enabled: bool) -> None:
+        for name in (
+            "random_independent_checkbox",
+            "active_learning_independent_checkbox",
+            "label_first_independent_checkbox",
+            "relabel_independent_checkbox",
+        ):
+            checkbox = getattr(self, name, None)
+            if isinstance(checkbox, QtWidgets.QCheckBox):
+                checkbox.setChecked(bool(enabled))
+
+    def _independent_sampling_enabled(self) -> bool:
+        if bool(getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked()):
+            return bool(getattr(self, "label_first_independent_checkbox", None) and self.label_first_independent_checkbox.isChecked())
+        if bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked()):
+            return bool(getattr(self, "relabel_independent_checkbox", None) and self.relabel_independent_checkbox.isChecked())
+        if bool(getattr(self, "active_learning_radio", None) and self.active_learning_radio.isChecked()):
+            return bool(getattr(self, "active_learning_independent_checkbox", None) and self.active_learning_independent_checkbox.isChecked())
+        return bool(getattr(self, "random_independent_checkbox", None) and self.random_independent_checkbox.isChecked())
+
     def _on_generation_mode_changed(self) -> None:
         using_ai = self._using_ai_backend()
         using_label_first = bool(getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked())
+        using_relabel = bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked())
         if hasattr(self, "random_config_container"):
             self.random_config_container.setVisible(not using_ai)
         if hasattr(self, "label_first_container"):
             self.label_first_container.setVisible(using_label_first)
         if hasattr(self, "relabel_container"):
-            using_relabel = bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked())
             self.relabel_container.setVisible(using_relabel)
+        if hasattr(self, "filter_group"):
+            self.filter_group.setVisible(not using_relabel)
+        if hasattr(self, "strat_group"):
+            self.strat_group.setVisible(not using_relabel)
+        if hasattr(self, "ai_rounds_list"):
+            self.ai_rounds_list.setVisible(not using_label_first)
+        if hasattr(self, "ai_prior_label"):
+            self.ai_prior_label.setVisible(not using_label_first)
         if hasattr(self, "ai_group"):
             show_ai = using_ai or self._ai_job_running
             self.ai_group.setVisible(show_ai)
@@ -7899,7 +7948,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     "Add at least one label/value target before generating a label-first round.",
                 )
                 return None
-        independent = bool(self.independent_checkbox.isChecked()) if hasattr(self, "independent_checkbox") else False
+        independent = self._independent_sampling_enabled()
         sampling_metadata: Dict[str, object] = {"independent": independent}
         excluded_units = self._load_reviewed_unit_ids(corpus_id) if independent else set()
         if independent:
@@ -8013,7 +8062,10 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         context = self._build_ai_context()
         if not context:
             return False
-        prior_rounds = self._selected_prior_round_numbers()
+        using_label_first = bool(
+            getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked()
+        )
+        prior_rounds = [] if using_label_first else self._selected_prior_round_numbers()
         timestamp = datetime.utcnow().isoformat()
         round_number = self._next_round_number()
         try:
@@ -9014,7 +9066,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         db = ctx.require_db()
         seed = self._current_seed()
         overlap = self._current_overlap()
-        independent = self.independent_checkbox.isChecked()
+        independent = self._independent_sampling_enabled()
         sampling_metadata: Dict[str, object] = {"independent": bool(independent)}
         reviewers = self._prompt_reviewers()
         if not reviewers:
