@@ -5968,6 +5968,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._selected_corpus_id: Optional[str] = None
         self._metadata_fields: List[MetadataField] = []
         self._metadata_lookup: Dict[str, MetadataField] = {}
+        self._metadata_fields_corpus_id: Optional[str] = None
         self._ai_thread: Optional[QtCore.QThread] = None
         self._ai_worker: Optional[AIRoundWorker] = None
         self._ai_pending_job: Optional[AIRoundJobConfig] = None
@@ -8702,7 +8703,19 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         del index
         corpus_id = self.corpus_combo.currentData()
         self._selected_corpus_id = corpus_id if isinstance(corpus_id, str) else None
-        self._load_metadata_fields(self._selected_corpus_id)
+        self._metadata_fields = []
+        self._metadata_lookup = {}
+        self._metadata_fields_corpus_id = None
+        if hasattr(self, "filter_list"):
+            self.filter_list.clear()
+        if hasattr(self, "filter_logic_combo"):
+            self.filter_logic_combo.setCurrentIndex(0)
+        if hasattr(self, "strat_list"):
+            self.strat_list.clear()
+        self._refresh_filter_field_options()
+        self._refresh_strat_field_options()
+        self._update_filter_buttons()
+        self._update_strat_buttons()
 
     def _on_import_corpus(self) -> None:
         start_dir = str(self.ctx.project_root or Path.home())
@@ -8732,16 +8745,22 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             fields = []
         self._metadata_fields = list(fields)
         self._metadata_lookup = {field.key: field for field in self._metadata_fields}
-        if hasattr(self, "filter_list"):
-            self.filter_list.clear()
-        if hasattr(self, "filter_logic_combo"):
-            self.filter_logic_combo.setCurrentIndex(0)
-        if hasattr(self, "strat_list"):
-            self.strat_list.clear()
+        self._metadata_fields_corpus_id = corpus_id if corpus_id and fields is not None else None
         self._refresh_filter_field_options()
         self._refresh_strat_field_options()
         self._update_filter_buttons()
         self._update_strat_buttons()
+
+
+    def _ensure_metadata_fields_loaded(self) -> bool:
+        corpus_id = self._selected_corpus_id
+        if not corpus_id:
+            QtWidgets.QMessageBox.warning(self, "Round", "Select a corpus for this round.")
+            return False
+        if self._metadata_fields_corpus_id == corpus_id:
+            return True
+        self._load_metadata_fields(corpus_id)
+        return self._metadata_fields_corpus_id == corpus_id
 
     def _available_metadata_fields(self) -> List[MetadataField]:
         return list(self._metadata_fields)
@@ -8840,6 +8859,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.filter_list.setCurrentItem(item)
 
     def _on_add_filter(self) -> None:
+        if not self._ensure_metadata_fields_loaded():
+            return
         data = self.filter_field_combo.currentData() if hasattr(self, "filter_field_combo") else None
         if not isinstance(data, str):
             return
@@ -8885,6 +8906,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._update_filter_buttons()
 
     def _on_add_strat_field(self) -> None:
+        if not self._ensure_metadata_fields_loaded():
+            return
         data = self.strat_field_combo.currentData() if hasattr(self, "strat_field_combo") else None
         if not isinstance(data, str):
             return
@@ -10735,96 +10758,45 @@ class CorpusWidget(QtWidgets.QWidget):
 
     def _load_corpus(self, corpus_id: str) -> None:
         try:
-            db = self.ctx.get_corpus_db(corpus_id)
+            corpus = self.ctx.get_corpus(corpus_id)
         except Exception as exc:  # noqa: BLE001
             self.summary_label.setText(f"Corpus unavailable: {exc}")
             self.table.setRowCount(0)
             return
-        with db.connect() as conn:
-            patient_count = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
-            document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-            columns = [row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()]
-            if columns:
-                truncated_columns = {"text"}
-                select_parts = []
-                for column in columns:
-                    identifier = f'"{column}"'
-                    if column in truncated_columns:
-                        select_parts.append(
-                            (
-                                "CASE WHEN length({identifier}) > 200 "
-                                "THEN substr({identifier}, 1, 200) || '…' "
-                                "ELSE {identifier} END AS {identifier}"
-                            ).format(identifier=identifier)
-                        )
-                    else:
-                        select_parts.append(identifier)
-                order_column: Optional[str]
-                if "date_note" in columns:
-                    order_column = '"date_note" DESC'
-                elif "doc_id" in columns:
-                    order_column = '"doc_id" DESC'
-                else:
-                    order_column = "rowid DESC"
-                query = "SELECT {columns} FROM documents ORDER BY {order} LIMIT 50".format(
-                    columns=", ".join(select_parts),
-                    order=order_column,
-                )
-                rows = conn.execute(query).fetchall()
-            else:
-                rows = []
-
-        metadata_column_order: List[str] = []
-        row_metadata: List[Dict[str, object]] = []
-        if rows and "metadata_json" in columns:
-            seen_metadata_keys: Set[str] = set()
-            for row in rows:
-                parsed_metadata: Dict[str, object] = {}
-                raw_metadata = row["metadata_json"]
-                if isinstance(raw_metadata, str) and raw_metadata.strip():
-                    try:
-                        metadata_payload = json.loads(raw_metadata)
-                    except json.JSONDecodeError:
-                        metadata_payload = None
-                    if isinstance(metadata_payload, Mapping):
-                        for key, value in metadata_payload.items():
-                            if isinstance(value, (dict, list)):
-                                display_value = json.dumps(value, ensure_ascii=False)
-                            else:
-                                display_value = value
-                            parsed_metadata[key] = display_value
-                            if key not in seen_metadata_keys:
-                                seen_metadata_keys.add(key)
-                                metadata_column_order.append(key)
-                row_metadata.append(parsed_metadata)
-        else:
-            row_metadata = [{} for _ in rows]
-
-        display_columns = [column for column in columns if column != "metadata_json"]
-        if metadata_column_order:
-            display_columns.extend(metadata_column_order)
-
+        if not corpus:
+            self.summary_label.setText("Corpus unavailable: not found in project metadata.")
+            self.table.setRowCount(0)
+            return
+        project_root = self.ctx.project_root
+        relative_path = str(corpus.get("relative_path") or "")
+        corpus_path = (project_root / relative_path).resolve() if project_root and relative_path else None
+        size_bytes = None
+        modified_text = "Unknown"
+        if corpus_path and corpus_path.exists():
+            try:
+                stat = corpus_path.stat()
+                size_bytes = int(stat.st_size)
+                modified_text = datetime.fromtimestamp(stat.st_mtime).isoformat(sep=" ", timespec="seconds")
+            except Exception:  # noqa: BLE001
+                pass
+        size_text = f"{size_bytes:,} bytes" if isinstance(size_bytes, int) else "Unknown"
         self.summary_label.setText(
-            f"Patients: {patient_count:,} • Documents: {document_count:,} • Showing {len(rows)} most recent notes"
+            "Corpus summary only (no document preview)."
         )
-        if display_columns:
-            self.table.setColumnCount(len(display_columns))
-            self.table.setHorizontalHeaderLabels(display_columns)
-        else:
-            self.table.setColumnCount(0)
-        self.table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            metadata_for_row = row_metadata[row_index] if row_metadata else {}
-            for col_index, column in enumerate(display_columns):
-                if column in metadata_column_order:
-                    value = metadata_for_row.get(column)
-                else:
-                    value = row[column]
-                text = "" if value is None else str(value).replace("\n", " ")
-                if len(text) > 200:
-                    text = f"{text[:200]}…"
-                item = QtWidgets.QTableWidgetItem(text)
-                self.table.setItem(row_index, col_index, item)
+        summary_rows = [
+            ("Corpus ID", str(corpus.get("corpus_id") or corpus_id)),
+            ("Name", str(corpus.get("name") or "")),
+            ("Relative path", relative_path),
+            ("Resolved path", str(corpus_path) if corpus_path else "Unknown"),
+            ("File size", size_text),
+            ("Last modified", modified_text),
+        ]
+        self.table.setColumnCount(2)
+        self.table.setHorizontalHeaderLabels(["Field", "Value"])
+        self.table.setRowCount(len(summary_rows))
+        for row_index, (key, value) in enumerate(summary_rows):
+            self.table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(key))
+            self.table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(value))
         self.table.resizeColumnsToContents()
 
 
@@ -12861,53 +12833,6 @@ class IaaWidget(QtWidgets.QWidget):
                 continue
         for unit_id in doc_ids_by_unit.keys():
             result.setdefault(str(unit_id), {})
-        required_doc_ids: Set[str] = set()
-        for unit_id, doc_ids in doc_ids_by_unit.items():
-            unit_key = str(unit_id)
-            known = set(result.get(unit_key, {}).keys())
-            for doc_id in doc_ids:
-                doc_key = str(doc_id)
-                if doc_key and doc_key not in known:
-                    required_doc_ids.add(doc_key)
-        corpus_db: Optional[Database] = None
-        corpus_id = (self.current_round or {}).get("corpus_id")
-        if corpus_id:
-            try:
-                corpus_db = self.ctx.get_corpus_db(corpus_id)
-            except Exception:  # noqa: BLE001
-                corpus_db = None
-        corpus_docs: Dict[str, Dict[str, object]] = {}
-        if corpus_db and required_doc_ids:
-            try:
-                with corpus_db.connect() as conn:
-                    doc_list = list(required_doc_ids)
-                    for chunk in self._chunked_list(doc_list, 200):
-                        if not chunk:
-                            continue
-                        placeholders = ",".join(["?"] * len(chunk))
-                        query = (
-                            "SELECT doc_id, text, metadata_json FROM documents "
-                            f"WHERE doc_id IN ({placeholders})"
-                        )
-                        rows = conn.execute(query, chunk).fetchall()
-                        for row in rows:
-                            doc_key = str(row["doc_id"] or "")
-                            corpus_docs[doc_key] = {
-                                "text": row["text"] or "",
-                                "metadata_json": row["metadata_json"] or "",
-                                "order_index": 0,
-                            }
-            except Exception:  # noqa: BLE001
-                corpus_docs = {}
-        for unit_id, doc_ids in doc_ids_by_unit.items():
-            unit_key = str(unit_id)
-            storage = result.setdefault(unit_key, {})
-            for doc_id in doc_ids:
-                doc_key = str(doc_id)
-                if not doc_key or doc_key in storage:
-                    continue
-                if doc_key in corpus_docs:
-                    storage[doc_key] = dict(corpus_docs[doc_key])
         return result
 
     def _populate_document_table(self, unit_row: Dict[str, object]) -> None:
@@ -12955,41 +12880,6 @@ class IaaWidget(QtWidgets.QWidget):
                 if isinstance(parsed, dict):
                     payload.update(parsed)
             metadata_by_doc[doc_id] = payload
-
-        corpus_db: Optional[Database] = None
-        corpus_id = (self.current_round or {}).get("corpus_id")
-        if corpus_id:
-            try:
-                corpus_db = self.ctx.get_corpus_db(corpus_id)
-            except Exception:
-                corpus_db = None
-        doc_ids = [row["doc_id"] for row in doc_rows]
-        if corpus_db and doc_ids:
-            columns = self._document_metadata_columns_cache.get(str(corpus_db.path))
-            if columns is None:
-                try:
-                    with corpus_db.connect() as conn:
-                        info_rows = conn.execute("PRAGMA table_info(documents)").fetchall()
-                    columns = [
-                        row["name"]
-                        for row in info_rows
-                        if row["name"].lower() not in {"doc_id", "text", "hash"}
-                    ]
-                except Exception:
-                    columns = []
-                self._document_metadata_columns_cache[str(corpus_db.path)] = columns
-            if columns:
-                with corpus_db.connect() as conn:
-                    placeholders = ",".join(["?"] * len(doc_ids))
-                    select_clause = ", ".join(columns)
-                    rows = conn.execute(
-                        f"SELECT doc_id, {select_clause} FROM documents WHERE doc_id IN ({placeholders})",
-                        doc_ids,
-                    ).fetchall()
-                for row in rows:
-                    payload = metadata_by_doc.setdefault(row["doc_id"], {})
-                    for column in columns:
-                        payload[column] = row[column]
 
         discovered_keys: List[str] = []
         for payload in metadata_by_doc.values():
