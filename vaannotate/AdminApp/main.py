@@ -4065,7 +4065,7 @@ class ProjectContext(QtCore.QObject):
         self._pending_text_writes[resolved] = content
         self._mark_dirty()
 
-    def _preload_round_assets(self) -> None:
+    def _preload_round_assets(self, *, preload_corpora: bool = False) -> None:
         if not self.project_root:
             return
         try:
@@ -4073,23 +4073,24 @@ class ProjectContext(QtCore.QObject):
             phenotypes = list(self.list_phenotypes())
         except Exception:  # noqa: BLE001
             return
-        for corpus in corpora:
-            corpus_id: Optional[object]
-            if isinstance(corpus, sqlite3.Row):
-                corpus_id = corpus["corpus_id"] if "corpus_id" in corpus.keys() else None
-            elif isinstance(corpus, Mapping):
-                corpus_id = corpus.get("corpus_id")
-            else:
+        if preload_corpora:
+            for corpus in corpora:
+                corpus_id: Optional[object]
+                if isinstance(corpus, sqlite3.Row):
+                    corpus_id = corpus["corpus_id"] if "corpus_id" in corpus.keys() else None
+                elif isinstance(corpus, Mapping):
+                    corpus_id = corpus.get("corpus_id")
+                else:
+                    try:
+                        corpus_id = corpus["corpus_id"]  # type: ignore[index]
+                    except Exception:  # noqa: BLE001
+                        corpus_id = None
+                if not corpus_id:
+                    continue
                 try:
-                    corpus_id = corpus["corpus_id"]  # type: ignore[index]
+                    self.get_corpus_db(str(corpus_id))
                 except Exception:  # noqa: BLE001
-                    corpus_id = None
-            if not corpus_id:
-                continue
-            try:
-                self.get_corpus_db(str(corpus_id))
-            except Exception:  # noqa: BLE001
-                continue
+                    continue
         for pheno in phenotypes:
             pheno_id: Optional[object]
             if isinstance(pheno, sqlite3.Row):
@@ -4128,7 +4129,7 @@ class ProjectContext(QtCore.QObject):
         self.project_root = directory
         self.project_db = project_db
         self.project_row = self._load_project_row()
-        self._preload_round_assets()
+        self._preload_round_assets(preload_corpora=False)
         self._emit_dirty_state()
         self.project_changed.emit()
 
