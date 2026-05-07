@@ -9183,6 +9183,61 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if path and hasattr(self, "relabel_file_edit"):
             self.relabel_file_edit.setText(path)
 
+    def _load_relabel_round_unit_rows(self) -> List[Dict[str, object]]:
+        round_numbers: List[int] = []
+        if hasattr(self, "relabel_rounds_list"):
+            for i in range(self.relabel_rounds_list.count()):
+                item = self.relabel_rounds_list.item(i)
+                if item and item.isSelected():
+                    value = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                    if isinstance(value, int):
+                        round_numbers.append(value)
+        if not round_numbers:
+            raise ValueError("Select at least one prior round for re-label sampling.")
+
+        pheno_id = str(self.pheno_row["pheno_id"])
+        rows_by_unit: Dict[str, Dict[str, object]] = {}
+        for round_number in round_numbers:
+            round_dir = self.ctx.resolve_round_dir(pheno_id, int(round_number))
+            aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=False)
+            if aggregate_db is not None:
+                with aggregate_db.connect() as agg_conn:
+                    agg_rows = agg_conn.execute(
+                        "SELECT DISTINCT unit_id, patient_icn, doc_id, note_count FROM unit_summary"
+                    ).fetchall()
+                for row in agg_rows:
+                    unit_id = str(row["unit_id"] or "").strip()
+                    if not unit_id or unit_id in rows_by_unit:
+                        continue
+                    rows_by_unit[unit_id] = {
+                        "unit_id": unit_id,
+                        "patient_icn": row["patient_icn"],
+                        "doc_id": row["doc_id"],
+                        "note_count": int(row["note_count"] or 0),
+                    }
+                continue
+
+            # Fallback for rounds without an aggregate: read units directly from reviewer assignments.
+            for assignment_path in sorted((round_dir / "assignments").glob("*/*assignment.db")):
+                assignment_db = self.ctx.get_assignment_db(assignment_path)
+                if assignment_db is None:
+                    continue
+                with assignment_db.connect() as assign_conn:
+                    assign_rows = assign_conn.execute(
+                        "SELECT DISTINCT unit_id, patient_icn, doc_id, note_count FROM units"
+                    ).fetchall()
+                for row in assign_rows:
+                    unit_id = str(row["unit_id"] or "").strip()
+                    if not unit_id or unit_id in rows_by_unit:
+                        continue
+                    rows_by_unit[unit_id] = {
+                        "unit_id": unit_id,
+                        "patient_icn": row["patient_icn"],
+                        "doc_id": row["doc_id"],
+                        "note_count": int(row["note_count"] or 0),
+                    }
+        return list(rows_by_unit.values())
+
     def _load_relabel_unit_ids(self, corpus_id: str) -> Set[str]:
         using_relabel = bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked())
         if not using_relabel:
@@ -9198,35 +9253,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     if token and token.lower() != "unit_id":
                         unit_ids.add(token)
             return unit_ids
-        round_numbers: List[int] = []
-        if hasattr(self, "relabel_rounds_list"):
-            for i in range(self.relabel_rounds_list.count()):
-                item = self.relabel_rounds_list.item(i)
-                if item and item.isSelected():
-                    value = item.data(QtCore.Qt.ItemDataRole.UserRole)
-                    if isinstance(value, int):
-                        round_numbers.append(value)
-        if not round_numbers:
-            raise ValueError("Select at least one prior round for re-label sampling.")
-        pheno_id = str(self.pheno_row["pheno_id"])
-        unit_ids: Set[str] = set()
-        for round_number in round_numbers:
-            round_dir = self.ctx.resolve_round_dir(pheno_id, int(round_number))
-            aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=False)
-            if aggregate_db is not None:
-                with aggregate_db.connect() as agg_conn:
-                    rows = agg_conn.execute("SELECT DISTINCT unit_id FROM unit_summary").fetchall()
-                unit_ids.update(str(row[0]) for row in rows if row and row[0])
-                continue
-            # Fallback for rounds without an aggregate: read units directly from reviewer assignments.
-            for assignment_path in sorted((round_dir / "assignments").glob("*/*assignment.db")):
-                assignment_db = self.ctx.get_assignment_db(assignment_path)
-                if assignment_db is None:
-                    continue
-                with assignment_db.connect() as assign_conn:
-                    rows = assign_conn.execute("SELECT DISTINCT unit_id FROM units").fetchall()
-                unit_ids.update(str(row[0]) for row in rows if row and row[0])
-        return unit_ids
+        return {str(row.get("unit_id", "")).strip() for row in self._load_relabel_round_unit_rows() if str(row.get("unit_id", "")).strip()}
 
     def _create_round(self) -> bool:
         pheno_id = self.pheno_row["pheno_id"]
@@ -9304,21 +9331,39 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Round", "Select a corpus for this round.")
             return False
         corpus_record = self.ctx.get_corpus(corpus_id)
-        try:
-            corpus_rows = candidate_documents(
-                ctx.get_corpus_db(corpus_id),
-                pheno_level,
-                filters,
-                metadata_fields=self._metadata_fields,
-                stratify_keys=strat_field_keys,
-            )
-        except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "Round", f"Failed to query corpus: {exc}")
-            return False
-        if not corpus_rows:
-            QtWidgets.QMessageBox.warning(self, "Round", "The selected corpus returned no candidate documents.")
-            return False
-        if bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked()):
+        using_relabel = bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked())
+        if using_relabel and bool(getattr(self, "relabel_source_rounds_radio", None) and self.relabel_source_rounds_radio.isChecked()):
+            try:
+                corpus_rows = self._load_relabel_round_unit_rows()
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Re-label sampling", str(exc))
+                return False
+            if not corpus_rows:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Re-label sampling",
+                    "No units were found in the selected prior rounds.",
+                )
+                return False
+            sampling_metadata["relabel_mode"] = True
+            sampling_metadata["relabel_unit_count"] = len(corpus_rows)
+            sampling_metadata["relabel_source"] = "round_artifacts"
+        else:
+            try:
+                corpus_rows = candidate_documents(
+                    ctx.get_corpus_db(corpus_id),
+                    pheno_level,
+                    filters,
+                    metadata_fields=self._metadata_fields,
+                    stratify_keys=strat_field_keys,
+                )
+            except Exception as exc:  # noqa: BLE001
+                QtWidgets.QMessageBox.critical(self, "Round", f"Failed to query corpus: {exc}")
+                return False
+            if not corpus_rows:
+                QtWidgets.QMessageBox.warning(self, "Round", "The selected corpus returned no candidate documents.")
+                return False
+        if using_relabel and not bool(getattr(self, "relabel_source_rounds_radio", None) and self.relabel_source_rounds_radio.isChecked()):
             try:
                 relabel_units = self._load_relabel_unit_ids(corpus_id)
             except ValueError as exc:
