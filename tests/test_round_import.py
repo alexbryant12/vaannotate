@@ -1957,3 +1957,35 @@ def test_load_relabel_unit_ids_reads_round_aggregate_units(tmp_path: Path) -> No
 
     unit_ids = admin_main.RoundBuilderDialog._load_relabel_unit_ids(dialog, "unused")
     assert unit_ids == {"unit_a", "unit_b"}
+
+
+def test_independent_sampling_disabled_for_relabel_mode() -> None:
+    dialog = admin_main.RoundBuilderDialog.__new__(admin_main.RoundBuilderDialog)
+    dialog.label_first_radio = types.SimpleNamespace(isChecked=lambda: False)
+    dialog.relabel_sampling_radio = types.SimpleNamespace(isChecked=lambda: True)
+    dialog.active_learning_radio = types.SimpleNamespace(isChecked=lambda: False)
+    dialog.relabel_independent_checkbox = types.SimpleNamespace(isChecked=lambda: True)
+    dialog.random_independent_checkbox = types.SimpleNamespace(isChecked=lambda: True)
+
+    assert admin_main.RoundBuilderDialog._independent_sampling_enabled(dialog) is False
+
+
+def test_current_total_n_uses_relabel_count() -> None:
+    dialog = admin_main.RoundBuilderDialog.__new__(admin_main.RoundBuilderDialog)
+    dialog.label_first_radio = types.SimpleNamespace(isChecked=lambda: False)
+    dialog.relabel_sampling_radio = types.SimpleNamespace(isChecked=lambda: True)
+    dialog._current_relabel_unit_count = lambda: 12
+    dialog._using_ai_backend = lambda: False
+    dialog.random_total_n_spin = types.SimpleNamespace(value=lambda: 250)
+
+    assert admin_main.RoundBuilderDialog._current_total_n(dialog) == 12
+
+
+def test_row_matches_relabel_units_by_any_identifier() -> None:
+    dialog = admin_main.RoundBuilderDialog.__new__(admin_main.RoundBuilderDialog)
+    dialog.pheno_row = {"level": "single_doc"}
+    row = {"unit_id": "unit_001", "doc_id": "doc_abc", "patient_icn": "pat_xyz"}
+
+    identifiers = admin_main.RoundBuilderDialog._row_unit_identifiers(dialog, row)
+
+    assert {"unit_001", "doc_abc", "pat_xyz"} == set(identifiers.values())
