@@ -566,6 +566,51 @@ def _read_round_annotations(
 
     return pd.DataFrame(rows, columns=columns)
 
+
+def _read_round_notes(round_dir: Path) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for assignment_path in _iter_assignment_dbs(round_dir):
+        con = sqlite3.connect(str(assignment_path))
+        try:
+            con.row_factory = sqlite3.Row
+            for row in con.execute(
+                """
+                SELECT
+                    un.unit_id AS unit_id,
+                    u.patient_icn AS patient_icn,
+                    un.doc_id AS doc_id,
+                    d.text AS text,
+                    d.metadata_json AS metadata_json
+                FROM unit_notes AS un
+                LEFT JOIN units AS u ON u.unit_id = un.unit_id
+                JOIN documents AS d ON d.doc_id = un.doc_id
+                ORDER BY un.unit_id, un.order_index
+                """
+            ):
+                unit_id = str(row["unit_id"] or "")
+                doc_id = str(row["doc_id"] or "")
+                if not unit_id or not doc_id:
+                    continue
+                rows.append(
+                    {
+                        "unit_id": unit_id,
+                        "patient_icn": str(row["patient_icn"] or ""),
+                        "doc_id": doc_id,
+                        "text": str(row["text"] or ""),
+                        "metadata_json": str(row["metadata_json"] or ""),
+                    }
+                )
+        finally:
+            con.close()
+
+    frame = pd.DataFrame(rows, columns=["unit_id", "patient_icn", "doc_id", "text", "metadata_json"])
+    if frame.empty:
+        return frame
+    frame["unit_id"] = frame["unit_id"].astype(str)
+    frame["doc_id"] = frame["doc_id"].astype(str)
+    frame["patient_icn"] = frame["patient_icn"].astype(str)
+    return frame.drop_duplicates(subset=["unit_id", "doc_id"], keep="first").reset_index(drop=True)
+
 def export_inputs_from_repo(
     project_root: Path,
     pheno_id: str,
@@ -577,17 +622,8 @@ def export_inputs_from_repo(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     root = Path(project_root)
     phenotype_dir = _resolve_phenotype_dir(root, pheno_id)
-    corpus_db = _find_corpus_db(
-        root,
-        pheno_id,
-        prior_rounds,
-        corpus_record=corpus_record,
-        corpus_id=corpus_id,
-        corpus_path=corpus_path,
-    )
-    notes_df = _read_corpus_db(corpus_db)
-
     ann_frames = []
+    notes_frames = []
     round_details = _load_round_details(project_root, pheno_id, prior_rounds)
     for r in prior_rounds:
         round_dir = phenotype_dir / "rounds" / f"round_{r}"
@@ -604,6 +640,23 @@ def export_inputs_from_repo(
         )
         if not frame.empty:
             ann_frames.append(frame)
+        notes_frame = _read_round_notes(round_dir)
+        if not notes_frame.empty:
+            notes_frames.append(notes_frame)
+
+    if notes_frames:
+        notes_df = pd.concat(notes_frames, ignore_index=True)
+        notes_df = notes_df.drop_duplicates(subset=["unit_id", "doc_id"], keep="first").reset_index(drop=True)
+    else:
+        corpus_db = _find_corpus_db(
+            root,
+            pheno_id,
+            prior_rounds,
+            corpus_record=corpus_record,
+            corpus_id=corpus_id,
+            corpus_path=corpus_path,
+        )
+        notes_df = _read_corpus_db(corpus_db)
 
     ann_df = (
         pd.concat(ann_frames, ignore_index=True)
