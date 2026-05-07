@@ -9197,6 +9197,23 @@ class RoundBuilderDialog(QtWidgets.QDialog):
 
         pheno_id = str(self.pheno_row["pheno_id"])
         rows_by_unit: Dict[str, Dict[str, object]] = {}
+
+        def _merge_row(row_data: Dict[str, object]) -> None:
+            unit_id = str(row_data.get("unit_id") or "").strip()
+            if not unit_id:
+                return
+            existing = rows_by_unit.get(unit_id)
+            if existing is None:
+                rows_by_unit[unit_id] = row_data
+                return
+            existing_docs = existing.get("documents") if isinstance(existing.get("documents"), list) else []
+            new_docs = row_data.get("documents") if isinstance(row_data.get("documents"), list) else []
+            if not existing_docs and new_docs:
+                existing["documents"] = new_docs
+            if (not existing.get("doc_id")) and row_data.get("doc_id"):
+                existing["doc_id"] = row_data.get("doc_id")
+            if int(existing.get("note_count") or 0) <= 0 and int(row_data.get("note_count") or 0) > 0:
+                existing["note_count"] = int(row_data.get("note_count") or 0)
         for round_number in round_numbers:
             round_dir = self.ctx.resolve_round_dir(pheno_id, int(round_number))
             aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=False)
@@ -9206,15 +9223,15 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         "SELECT DISTINCT unit_id, patient_icn, doc_id, note_count FROM unit_summary"
                     ).fetchall()
                 for row in agg_rows:
-                    unit_id = str(row["unit_id"] or "").strip()
-                    if not unit_id or unit_id in rows_by_unit:
-                        continue
-                    rows_by_unit[unit_id] = {
-                        "unit_id": unit_id,
-                        "patient_icn": row["patient_icn"],
-                        "doc_id": row["doc_id"],
-                        "note_count": int(row["note_count"] or 0),
-                    }
+                    _merge_row(
+                        {
+                            "unit_id": str(row["unit_id"] or "").strip(),
+                            "patient_icn": row["patient_icn"],
+                            "doc_id": row["doc_id"],
+                            "note_count": int(row["note_count"] or 0),
+                            "documents": [],
+                        }
+                    )
                 continue
 
             # Fallback for rounds without an aggregate: read units directly from reviewer assignments.
@@ -9226,16 +9243,51 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                     assign_rows = assign_conn.execute(
                         "SELECT DISTINCT unit_id, patient_icn, doc_id, note_count FROM units"
                     ).fetchall()
-                for row in assign_rows:
-                    unit_id = str(row["unit_id"] or "").strip()
-                    if not unit_id or unit_id in rows_by_unit:
-                        continue
-                    rows_by_unit[unit_id] = {
-                        "unit_id": unit_id,
-                        "patient_icn": row["patient_icn"],
-                        "doc_id": row["doc_id"],
-                        "note_count": int(row["note_count"] or 0),
-                    }
+                    for row in assign_rows:
+                        unit_id = str(row["unit_id"] or "").strip()
+                        if not unit_id:
+                            continue
+                        doc_rows = assign_conn.execute(
+                            """
+                            SELECT unit_notes.doc_id, unit_notes.order_index, documents.hash, documents.text, documents.metadata_json
+                            FROM unit_notes
+                            LEFT JOIN documents ON documents.doc_id = unit_notes.doc_id
+                            WHERE unit_notes.unit_id=?
+                            ORDER BY unit_notes.order_index
+                            """,
+                            (unit_id,),
+                        ).fetchall()
+                        documents: List[Dict[str, object]] = []
+                        for doc_row in doc_rows:
+                            metadata = {}
+                            raw_metadata = doc_row["metadata_json"]
+                            if raw_metadata:
+                                try:
+                                    parsed = json.loads(raw_metadata)
+                                    if isinstance(parsed, dict):
+                                        metadata = parsed
+                                except Exception:  # noqa: BLE001 - metadata is best-effort
+                                    metadata = {}
+                            doc_payload: Dict[str, object] = {
+                                "doc_id": doc_row["doc_id"],
+                                "order_index": int(doc_row["order_index"] or 0),
+                                "hash": doc_row["hash"] or "",
+                                "text": doc_row["text"] or "",
+                            }
+                            if metadata:
+                                doc_payload["metadata"] = metadata
+                            documents.append(doc_payload)
+                        _merge_row(
+                            {
+                                "unit_id": unit_id,
+                                "patient_icn": row["patient_icn"],
+                                "doc_id": row["doc_id"],
+                                "note_count": int(row["note_count"] or len(documents) or 0),
+                                "documents": documents,
+                            }
+                        )
+                continue
+
         return list(rows_by_unit.values())
 
     def _load_relabel_unit_ids(self, corpus_id: str) -> Set[str]:
