@@ -7682,11 +7682,20 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         return reviewed
 
     def _row_unit_identifier(self, row: sqlite3.Row | Dict[str, object]) -> Optional[str]:
-        keys = ["unit_id"]
-        if self.pheno_row["level"] == "multi_doc":
-            keys.append("patient_icn")
-        else:
-            keys.extend(["doc_id", "patient_icn"])
+        identifiers = self._row_unit_identifiers(row)
+        for key in (
+            ("unit_id", "patient_icn")
+            if self.pheno_row["level"] == "multi_doc"
+            else ("unit_id", "doc_id", "patient_icn")
+        ):
+            value = identifiers.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    def _row_unit_identifiers(self, row: sqlite3.Row | Dict[str, object]) -> Dict[str, str]:
+        keys = ["unit_id", "doc_id", "patient_icn"]
+        identifiers: Dict[str, str] = {}
         for key in keys:
             value: Optional[object] = None
             if isinstance(row, dict):
@@ -7697,8 +7706,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 except (KeyError, IndexError, TypeError):
                     value = None
             if value not in (None, ""):
-                return str(value)
-        return None
+                identifiers[key] = str(value)
+        return identifiers
 
     def _prompt_reviewers(self) -> Optional[List[Dict[str, str]]]:
         reviewers: List[Dict[str, str]] = []
@@ -7784,6 +7793,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if bool(getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked()):
             return bool(getattr(self, "label_first_independent_checkbox", None) and self.label_first_independent_checkbox.isChecked())
         if bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked()):
+            # Re-label workflows intentionally sample from known prior units.
             return False
         if bool(getattr(self, "active_learning_radio", None) and self.active_learning_radio.isChecked()):
             return bool(getattr(self, "active_learning_independent_checkbox", None) and self.active_learning_independent_checkbox.isChecked())
@@ -7814,6 +7824,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 label_widget = total_n_label.labelForField(self.random_total_n_spin)
                 if label_widget is not None:
                     label_widget.setVisible(random_total_visible)
+                independent_label = total_n_label.labelForField(getattr(self, "random_independent_checkbox", None))
+                if independent_label is not None:
+                    independent_label.setVisible(not using_relabel)
+        if hasattr(self, "random_independent_checkbox"):
+            self.random_independent_checkbox.setVisible(not using_relabel)
         if hasattr(self, "ai_total_n_spin"):
             ai_total_visible = not using_label_first
             self.ai_total_n_spin.setVisible(ai_total_visible)
@@ -9309,7 +9324,11 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             except ValueError as exc:
                 QtWidgets.QMessageBox.warning(self, "Re-label sampling", str(exc))
                 return False
-            corpus_rows = [row for row in corpus_rows if (self._row_unit_identifier(row) or "") in relabel_units]
+            corpus_rows = [
+                row
+                for row in corpus_rows
+                if any(value in relabel_units for value in self._row_unit_identifiers(row).values())
+            ]
             sampling_metadata["relabel_mode"] = True
             sampling_metadata["relabel_unit_count"] = len(relabel_units)
             if not corpus_rows:
