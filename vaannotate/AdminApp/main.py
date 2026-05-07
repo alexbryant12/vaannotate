@@ -6022,13 +6022,26 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         return 0
 
     def _current_overlap(self) -> int:
-        if self._using_ai_backend() and hasattr(self, "ai_overlap_spin"):
-            return int(self.ai_overlap_spin.value())
-        if hasattr(self, "random_overlap_spin"):
-            return int(self.random_overlap_spin.value())
-        return 0
+        total_n = self._current_total_n()
+        if total_n <= 0:
+            return 0
+        overlap_pct = 0.0
+        if self._using_ai_backend() and hasattr(self, "ai_overlap_pct_spin"):
+            overlap_pct = float(self.ai_overlap_pct_spin.value())
+        elif hasattr(self, "random_overlap_pct_spin"):
+            overlap_pct = float(self.random_overlap_pct_spin.value())
+        overlap = int(round((overlap_pct / 100.0) * total_n))
+        return max(0, min(overlap, total_n))
 
     def _current_total_n(self) -> int:
+        if bool(getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked()):
+            total = 0
+            for target in self._label_first_targets:
+                try:
+                    total += int(target.get("quota") or 0)
+                except Exception:  # noqa: BLE001
+                    continue
+            return max(0, total)
         if bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked()):
             return self._current_relabel_unit_count()
         if self._using_ai_backend() and hasattr(self, "ai_total_n_spin"):
@@ -6044,6 +6057,29 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return len(self._load_relabel_unit_ids(""))
         except Exception:  # noqa: BLE001
             return 0
+
+    def _selected_reviewer_count(self) -> int:
+        if not hasattr(self, "reviewer_list"):
+            return 0
+        return int(self.reviewer_list.count())
+
+    def _update_overlap_controls(self) -> None:
+        reviewers_count = self._selected_reviewer_count()
+        enabled = reviewers_count > 1
+        for widget_name, label_attr in (
+            ("random_overlap_pct_spin", "random_overlap_pct_label"),
+            ("ai_overlap_pct_spin", "ai_overlap_pct_label"),
+        ):
+            widget = getattr(self, widget_name, None)
+            if isinstance(widget, QtWidgets.QDoubleSpinBox):
+                widget.setEnabled(enabled)
+                if not enabled:
+                    widget.setValue(0.0)
+            label_widget = getattr(self, label_attr, None)
+            if isinstance(label_widget, QtWidgets.QWidget):
+                label_widget.setVisible(enabled)
+            if isinstance(widget, QtWidgets.QWidget):
+                widget.setVisible(enabled)
 
     def _build_ai_config_snapshot(self) -> Dict[str, Any]:
         try:
@@ -6895,6 +6931,8 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.relabel_file_edit.textChanged.connect(self._update_relabel_unit_count_display)
         self.relabel_unit_count_label = QtWidgets.QLabel("Unique units selected: 0")
         relabel_layout.addWidget(self.relabel_unit_count_label)
+        self.relabel_total_n_value_label = QtWidgets.QLabel("Total N (calculated): 0")
+        relabel_layout.addWidget(self.relabel_total_n_value_label)
         relabel_form = QtWidgets.QFormLayout()
         relabel_form.addRow("Independent sampling", self.relabel_independent_checkbox)
         relabel_layout.addLayout(relabel_form)
@@ -6905,13 +6943,17 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         random_layout.setContentsMargins(0, 0, 0, 0)
         self.random_seed_spin = QtWidgets.QSpinBox()
         self.random_seed_spin.setMaximum(2**31 - 1)
-        self.random_overlap_spin = QtWidgets.QSpinBox()
-        self.random_overlap_spin.setRange(0, 1000)
+        self.random_overlap_pct_spin = QtWidgets.QDoubleSpinBox()
+        self.random_overlap_pct_spin.setRange(0.0, 100.0)
+        self.random_overlap_pct_spin.setDecimals(1)
+        self.random_overlap_pct_spin.setSingleStep(1.0)
+        self.random_overlap_pct_spin.setSuffix("%")
         self.random_total_n_spin = QtWidgets.QSpinBox()
         self.random_total_n_spin.setRange(1, 1000000)
         self.random_setup_form = QtWidgets.QFormLayout()
         self.random_setup_form.addRow("Seed", self.random_seed_spin)
-        self.random_setup_form.addRow("Overlap N", self.random_overlap_spin)
+        self.random_overlap_pct_label = QtWidgets.QLabel("Overlap %")
+        self.random_setup_form.addRow(self.random_overlap_pct_label, self.random_overlap_pct_spin)
         self.random_setup_form.addRow("Total N", self.random_total_n_spin)
         self.random_setup_form.addRow("Independent sampling", self.random_independent_checkbox)
         random_layout.addLayout(self.random_setup_form)
@@ -7097,15 +7139,19 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         ai_layout = QtWidgets.QVBoxLayout(self.ai_group)
         self.ai_seed_spin = QtWidgets.QSpinBox()
         self.ai_seed_spin.setMaximum(2**31 - 1)
-        self.ai_overlap_spin = QtWidgets.QSpinBox()
-        self.ai_overlap_spin.setRange(0, 1000)
+        self.ai_overlap_pct_spin = QtWidgets.QDoubleSpinBox()
+        self.ai_overlap_pct_spin.setRange(0.0, 100.0)
+        self.ai_overlap_pct_spin.setDecimals(1)
+        self.ai_overlap_pct_spin.setSingleStep(1.0)
+        self.ai_overlap_pct_spin.setSuffix("%")
         self.ai_total_n_spin = QtWidgets.QSpinBox()
         self.ai_total_n_spin.setRange(1, 1000000)
-        ai_round_setup_form = QtWidgets.QFormLayout()
-        ai_round_setup_form.addRow("Seed", self.ai_seed_spin)
-        ai_round_setup_form.addRow("Overlap N", self.ai_overlap_spin)
-        ai_round_setup_form.addRow("Total N", self.ai_total_n_spin)
-        ai_layout.addLayout(ai_round_setup_form)
+        self.ai_round_setup_form = QtWidgets.QFormLayout()
+        self.ai_round_setup_form.addRow("Seed", self.ai_seed_spin)
+        self.ai_overlap_pct_label = QtWidgets.QLabel("Overlap %")
+        self.ai_round_setup_form.addRow(self.ai_overlap_pct_label, self.ai_overlap_pct_spin)
+        self.ai_round_setup_form.addRow("Total N", self.ai_total_n_spin)
+        ai_layout.addLayout(self.ai_round_setup_form)
         self.ai_controls_container = QtWidgets.QWidget()
         ai_controls_layout = QtWidgets.QVBoxLayout(self.ai_controls_container)
         ai_controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -7433,11 +7479,14 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         pass
         overlap_n = config.get("overlap_n")
         if isinstance(overlap_n, (int, float)):
-            for widget_name in ("random_overlap_spin", "ai_overlap_spin"):
+            total_for_pct = config.get("total_n")
+            total_n_value = int(total_for_pct) if isinstance(total_for_pct, (int, float)) and int(total_for_pct) > 0 else 0
+            overlap_pct = (float(overlap_n) / float(total_n_value) * 100.0) if total_n_value > 0 else 0.0
+            for widget_name in ("random_overlap_pct_spin", "ai_overlap_pct_spin"):
                 widget = getattr(self, widget_name, None)
-                if isinstance(widget, QtWidgets.QSpinBox):
+                if isinstance(widget, QtWidgets.QDoubleSpinBox):
                     try:
-                        widget.setValue(int(overlap_n))
+                        widget.setValue(overlap_pct)
                     except Exception:  # noqa: BLE001
                         pass
         total_n = config.get("total_n")
@@ -7753,12 +7802,23 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if hasattr(self, "strat_group"):
             self.strat_group.setVisible(not using_relabel)
         if hasattr(self, "random_total_n_spin"):
-            self.random_total_n_spin.setVisible(not using_relabel)
+            random_total_visible = not (using_label_first or using_relabel)
+            self.random_total_n_spin.setVisible(random_total_visible)
+            self.random_total_n_spin.setEnabled(random_total_visible)
             total_n_label = getattr(self, "random_setup_form", None)
             if isinstance(total_n_label, QtWidgets.QFormLayout):
                 label_widget = total_n_label.labelForField(self.random_total_n_spin)
                 if label_widget is not None:
-                    label_widget.setVisible(not using_relabel)
+                    label_widget.setVisible(random_total_visible)
+        if hasattr(self, "ai_total_n_spin"):
+            ai_total_visible = not using_label_first
+            self.ai_total_n_spin.setVisible(ai_total_visible)
+            self.ai_total_n_spin.setEnabled(not using_relabel and ai_total_visible)
+            ai_form = getattr(self, "ai_round_setup_form", None)
+            if isinstance(ai_form, QtWidgets.QFormLayout):
+                ai_label_widget = ai_form.labelForField(self.ai_total_n_spin)
+                if ai_label_widget is not None:
+                    ai_label_widget.setVisible(ai_total_visible)
         if hasattr(self, "ai_rounds_list"):
             self.ai_rounds_list.setVisible(not using_label_first)
         if hasattr(self, "ai_prior_label"):
@@ -7770,6 +7830,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             should_enable = using_ai or self._ai_job_running
             self.ai_controls_container.setEnabled(should_enable)
         self._update_relabel_unit_count_display()
+        self._update_overlap_controls()
         self._update_ai_buttons()
 
     def _on_relabel_source_changed(self) -> None:
@@ -7787,6 +7848,9 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             return
         count = self._current_relabel_unit_count()
         self.relabel_unit_count_label.setText(f"Unique units selected: {count}")
+        if hasattr(self, "relabel_total_n_value_label"):
+            self.relabel_total_n_value_label.setText(f"Total N (calculated): {count}")
+        self._update_ai_batch_size_label()
 
     def _update_ai_buttons(self) -> None:
         enabled = self._using_ai_backend()
@@ -8892,6 +8956,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         item.setData(QtCore.Qt.ItemDataRole.UserRole, reviewer)
         self.reviewer_list.addItem(item)
         self._selected_reviewer_ids.add(reviewer_id)
+        self._update_overlap_controls()
         if reviewer_id.lower() == RoundBuilder.LLM_REVIEWER_ID:
             self._handle_llm_reviewer_added()
 
@@ -8923,6 +8988,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             reviewer_id = data.get("id")
             if reviewer_id:
                 self._selected_reviewer_ids.discard(reviewer_id)
+        self._update_overlap_controls()
 
     def _next_round_number(self) -> int:
         pheno_id = self.pheno_row["pheno_id"]
