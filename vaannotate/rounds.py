@@ -12,7 +12,7 @@ import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Set
 
@@ -1639,7 +1639,7 @@ class RoundBuilder:
                 return RoundBuilder._normalize_for_json(value.item())
             except Exception:  # noqa: BLE001
                 return float(value)
-        if isinstance(value, (pd.Timestamp, datetime)):
+        if isinstance(value, (pd.Timestamp, datetime, date)):
             return value.isoformat()
         if isinstance(value, dict):
             return {str(k): RoundBuilder._normalize_for_json(v) for k, v in value.items()}
