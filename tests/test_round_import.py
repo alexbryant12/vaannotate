@@ -1989,3 +1989,9 @@ def test_row_matches_relabel_units_by_any_identifier() -> None:
     identifiers = admin_main.RoundBuilderDialog._row_unit_identifiers(dialog, row)
 
     assert {"unit_001", "doc_abc", "pat_xyz"} == set(identifiers.values())
+
+
+def test_roundbuilder_normalize_for_json_handles_date() -> None:
+    from datetime import date
+
+    assert RoundBuilder._normalize_for_json(date(2026, 5, 7)) == "2026-05-07"
