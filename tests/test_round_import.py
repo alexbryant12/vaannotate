@@ -1884,3 +1884,76 @@ def test_relabel_rounds_not_cleared_by_latest_defaults() -> None:
         assert dialog.relabel_rounds_list.count() == 2
     finally:
         admin_main.QtWidgets.QListWidgetItem = original_item
+
+
+def test_load_relabel_unit_ids_reads_round_aggregate_units(tmp_path: Path) -> None:
+    class _Item:
+        def __init__(self, value: int, selected: bool) -> None:
+            self._value = value
+            self._selected = selected
+
+        def isSelected(self) -> bool:
+            return self._selected
+
+        def data(self, _role: int) -> object:
+            return self._value
+
+    class _ListWidget:
+        def __init__(self, items: list[_Item]) -> None:
+            self._items = items
+
+        def count(self) -> int:
+            return len(self._items)
+
+        def item(self, index: int) -> _Item:
+            return self._items[index]
+
+    class _Db:
+        def __init__(self, path: Path) -> None:
+            self._path = path
+
+        def connect(self):
+            conn = sqlite3.connect(self._path)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+    class _Ctx:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        def resolve_round_dir(self, pheno_id: str, round_number: int) -> Path:
+            return self.root / "phenotypes" / pheno_id / "rounds" / f"round_{round_number}"
+
+        def get_round_aggregate_db(self, round_dir: Path, *, create: bool = False):
+            _ = create
+            path = round_dir / "round_aggregate.db"
+            if not path.exists():
+                return None
+            return _Db(path)
+
+        def get_assignment_db(self, _path: Path):
+            return None
+
+    round_dir = tmp_path / "phenotypes" / "ph_test" / "rounds" / "round_1"
+    round_dir.mkdir(parents=True)
+    with sqlite3.connect(round_dir / "round_aggregate.db") as conn:
+        conn.execute("CREATE TABLE unit_summary(round_id TEXT, unit_id TEXT, patient_icn TEXT, doc_id TEXT, metadata_json TEXT)")
+        conn.executemany(
+            "INSERT INTO unit_summary(round_id, unit_id, patient_icn, doc_id, metadata_json) VALUES (?,?,?,?,?)",
+            [
+                ("ph_test_r1", "unit_a", "", "", None),
+                ("ph_test_r1", "unit_b", "", "", None),
+                ("ph_test_r1", "unit_a", "", "", None),
+            ],
+        )
+        conn.commit()
+
+    dialog = admin_main.RoundBuilderDialog.__new__(admin_main.RoundBuilderDialog)
+    dialog.ctx = _Ctx(tmp_path)
+    dialog.pheno_row = {"pheno_id": "ph_test", "level": "single_doc"}
+    dialog.relabel_sampling_radio = types.SimpleNamespace(isChecked=lambda: True)
+    dialog.relabel_source_file_radio = types.SimpleNamespace(isChecked=lambda: False)
+    dialog.relabel_rounds_list = _ListWidget([_Item(1, True)])
+
+    unit_ids = admin_main.RoundBuilderDialog._load_relabel_unit_ids(dialog, "unused")
+    assert unit_ids == {"unit_a", "unit_b"}
