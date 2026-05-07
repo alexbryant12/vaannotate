@@ -9149,16 +9149,25 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                         round_numbers.append(value)
         if not round_numbers:
             raise ValueError("Select at least one prior round for re-label sampling.")
-        db = self.ctx.require_db()
-        with db.connect() as conn:
-            placeholders = ",".join("?" for _ in round_numbers)
-            rows = conn.execute(
-                f"""SELECT DISTINCT ra.unit_id FROM round_assignments ra
-                    JOIN rounds r ON r.round_id=ra.round_id
-                    WHERE r.pheno_id=? AND r.round_number IN ({placeholders})""",
-                (self.pheno_row["pheno_id"], *round_numbers),
-            ).fetchall()
-        return {str(row[0]) for row in rows if row and row[0]}
+        pheno_id = str(self.pheno_row["pheno_id"])
+        unit_ids: Set[str] = set()
+        for round_number in round_numbers:
+            round_dir = self.ctx.resolve_round_dir(pheno_id, int(round_number))
+            aggregate_db = self.ctx.get_round_aggregate_db(round_dir, create=False)
+            if aggregate_db is not None:
+                with aggregate_db.connect() as agg_conn:
+                    rows = agg_conn.execute("SELECT DISTINCT unit_id FROM unit_summary").fetchall()
+                unit_ids.update(str(row[0]) for row in rows if row and row[0])
+                continue
+            # Fallback for rounds without an aggregate: read units directly from reviewer assignments.
+            for assignment_path in sorted((round_dir / "assignments").glob("*/*assignment.db")):
+                assignment_db = self.ctx.get_assignment_db(assignment_path)
+                if assignment_db is None:
+                    continue
+                with assignment_db.connect() as assign_conn:
+                    rows = assign_conn.execute("SELECT DISTINCT unit_id FROM units").fetchall()
+                unit_ids.update(str(row[0]) for row in rows if row and row[0])
+        return unit_ids
 
     def _create_round(self) -> bool:
         pheno_id = self.pheno_row["pheno_id"]
