@@ -1523,6 +1523,10 @@ class RoundBuilder:
                 fam_df.rename(columns={"consistency": "llm_consistency"}, inplace=True)
             if "prediction" in fam_df.columns:
                 fam_df.rename(columns={"prediction": "llm_prediction"}, inplace=True)
+            if "llm_prediction" in fam_df.columns:
+                fam_df["llm_prediction"] = fam_df["llm_prediction"].map(
+                    lambda value: value.isoformat() if isinstance(value, (date, datetime)) else value
+                )
             if include_reasoning and "llm_runs" in fam_df.columns:
                 fam_df["llm_reasoning"] = fam_df["llm_runs"].map(self._extract_reasoning_from_runs)
             fam_df = _jsonify_cols(
