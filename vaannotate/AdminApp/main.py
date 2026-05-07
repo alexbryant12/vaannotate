@@ -4065,7 +4065,7 @@ class ProjectContext(QtCore.QObject):
         self._pending_text_writes[resolved] = content
         self._mark_dirty()
 
-    def _preload_round_assets(self) -> None:
+    def _preload_round_assets(self, *, preload_corpora: bool = False) -> None:
         if not self.project_root:
             return
         try:
@@ -4073,23 +4073,24 @@ class ProjectContext(QtCore.QObject):
             phenotypes = list(self.list_phenotypes())
         except Exception:  # noqa: BLE001
             return
-        for corpus in corpora:
-            corpus_id: Optional[object]
-            if isinstance(corpus, sqlite3.Row):
-                corpus_id = corpus["corpus_id"] if "corpus_id" in corpus.keys() else None
-            elif isinstance(corpus, Mapping):
-                corpus_id = corpus.get("corpus_id")
-            else:
+        if preload_corpora:
+            for corpus in corpora:
+                corpus_id: Optional[object]
+                if isinstance(corpus, sqlite3.Row):
+                    corpus_id = corpus["corpus_id"] if "corpus_id" in corpus.keys() else None
+                elif isinstance(corpus, Mapping):
+                    corpus_id = corpus.get("corpus_id")
+                else:
+                    try:
+                        corpus_id = corpus["corpus_id"]  # type: ignore[index]
+                    except Exception:  # noqa: BLE001
+                        corpus_id = None
+                if not corpus_id:
+                    continue
                 try:
-                    corpus_id = corpus["corpus_id"]  # type: ignore[index]
+                    self.get_corpus_db(str(corpus_id))
                 except Exception:  # noqa: BLE001
-                    corpus_id = None
-            if not corpus_id:
-                continue
-            try:
-                self.get_corpus_db(str(corpus_id))
-            except Exception:  # noqa: BLE001
-                continue
+                    continue
         for pheno in phenotypes:
             pheno_id: Optional[object]
             if isinstance(pheno, sqlite3.Row):
@@ -4128,7 +4129,7 @@ class ProjectContext(QtCore.QObject):
         self.project_root = directory
         self.project_db = project_db
         self.project_row = self._load_project_row()
-        self._preload_round_assets()
+        self._preload_round_assets(preload_corpora=False)
         self._emit_dirty_state()
         self.project_changed.emit()
 
@@ -7759,6 +7760,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
                 r_item = QtWidgets.QListWidgetItem(f"Round {round_number}")
                 r_item.setData(QtCore.Qt.ItemDataRole.UserRole, int(round_number))
                 relabel_widget.addItem(r_item)
+        self._sync_relabel_independent_state()
         self._update_relabel_unit_count_display()
 
     def _using_ai_backend(self) -> bool:
@@ -7781,7 +7783,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if bool(getattr(self, "label_first_radio", None) and self.label_first_radio.isChecked()):
             return bool(getattr(self, "label_first_independent_checkbox", None) and self.label_first_independent_checkbox.isChecked())
         if bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked()):
-            return bool(getattr(self, "relabel_independent_checkbox", None) and self.relabel_independent_checkbox.isChecked())
+            return False
         if bool(getattr(self, "active_learning_radio", None) and self.active_learning_radio.isChecked()):
             return bool(getattr(self, "active_learning_independent_checkbox", None) and self.active_learning_independent_checkbox.isChecked())
         return bool(getattr(self, "random_independent_checkbox", None) and self.random_independent_checkbox.isChecked())
@@ -7797,6 +7799,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         if hasattr(self, "relabel_container"):
             self.relabel_container.setVisible(using_relabel)
         self._on_relabel_source_changed()
+        self._sync_relabel_independent_state()
         if hasattr(self, "filter_group"):
             self.filter_group.setVisible(not using_relabel)
         if hasattr(self, "strat_group"):
@@ -7833,6 +7836,23 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self._update_overlap_controls()
         self._update_ai_buttons()
 
+    def _sync_relabel_independent_state(self) -> None:
+        checkbox = getattr(self, "relabel_independent_checkbox", None)
+        if not isinstance(checkbox, QtWidgets.QCheckBox):
+            return
+        using_relabel = bool(getattr(self, "relabel_sampling_radio", None) and self.relabel_sampling_radio.isChecked())
+        using_rounds_source = bool(getattr(self, "relabel_source_rounds_radio", None) and self.relabel_source_rounds_radio.isChecked())
+        lock_off = using_relabel and using_rounds_source
+        if lock_off:
+            checkbox.setChecked(False)
+            checkbox.setEnabled(False)
+            checkbox.setToolTip("Re-labeling prior-round units cannot exclude previously reviewed units.")
+            return
+        checkbox.setEnabled(True)
+        checkbox.setToolTip(
+            "When enabled, sampling will skip any units that were included in previous rounds for this phenotype."
+        )
+
     def _on_relabel_source_changed(self) -> None:
         using_file = bool(getattr(self, "relabel_source_file_radio", None) and self.relabel_source_file_radio.isChecked())
         if hasattr(self, "relabel_rounds_label"):
@@ -7841,6 +7861,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             self.relabel_rounds_list.setVisible(not using_file)
         if hasattr(self, "relabel_file_row_widget"):
             self.relabel_file_row_widget.setVisible(using_file)
+        self._sync_relabel_independent_state()
         self._update_relabel_unit_count_display()
 
     def _update_relabel_unit_count_display(self) -> None:
