@@ -354,10 +354,34 @@ def _read_corpus_db(corpus_db: Path) -> pd.DataFrame:
 
 
 def _iter_assignment_dbs(round_dir: Path) -> List[Path]:
+    candidates: List[Path] = []
+
+    # Imported assignments (legacy/current import path).
     imports_dir = round_dir / "imports"
-    if not imports_dir.exists():
-        return []
-    return sorted(p for p in imports_dir.glob("*_assignment.db") if p.is_file())
+    if imports_dir.exists():
+        candidates.extend(
+            p for p in imports_dir.glob("*_assignment.db") if p.is_file()
+        )
+
+    # Native VAAnnotate round outputs (round generation path).
+    assignments_dir = round_dir / "assignments"
+    if assignments_dir.exists():
+        candidates.extend(
+            p for p in assignments_dir.glob("*/assignment.db") if p.is_file()
+        )
+
+    # Back-compat for occasional direct reviewer-named DB drops.
+    candidates.extend(p for p in round_dir.glob("*_assignment.db") if p.is_file())
+
+    seen: set[Path] = set()
+    ordered: List[Path] = []
+    for path in sorted(candidates):
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(path)
+    return ordered
 
 
 def _normalize_reviewer_id(assignment_path: Path) -> str:

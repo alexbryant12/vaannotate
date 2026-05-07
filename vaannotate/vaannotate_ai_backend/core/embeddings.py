@@ -598,8 +598,16 @@ class EmbeddingStore:
                     iterable=notes_df.itertuples(index=False),
                     total=total_docs,
                     min_interval_s=float(getattr(getattr(self, "models", None), "progress_min_interval_s", 0.6) or 0.6)):
-                # Chunk the text
-                chunks = splitter.split_text(getattr(row, "text"))
+                # Chunk the text; tolerate empty/whitespace documents by emitting
+                # one fallback chunk so assisted-review generation can still run.
+                raw_text = getattr(row, "text", "")
+                if raw_text is None:
+                    raw_text = ""
+                doc_text = str(raw_text).strip()
+                chunks = splitter.split_text(doc_text) if doc_text else []
+                if not chunks:
+                    fallback = f"[No note text available for doc_id={getattr(row, 'doc_id', '')}]"
+                    chunks = [fallback]
                 for i, ch in enumerate(chunks):
                     md = {"unit_id": getattr(row, "unit_id"),
                           "doc_id": getattr(row, "doc_id"),
