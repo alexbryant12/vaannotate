@@ -28,6 +28,9 @@ import math
 import os
 import re
 import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
 from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
@@ -898,6 +901,94 @@ class ExLlamaV2Backend(LLMBackend):  # pragma: no cover - requires heavy optiona
         )
 
       
+
+class KoboldCppBackend(LLMBackend):
+    """Backend that calls an external KoboldCpp OpenAI-compatible endpoint."""
+
+    def __init__(self, cfg: LLMConfig):
+        super().__init__(cfg)
+        endpoint = (cfg.koboldcpp_endpoint or os.getenv("KOBOLDCPP_ENDPOINT") or "").strip()
+        if not endpoint:
+            raise ValueError("KoboldCpp backend requires koboldcpp_endpoint / KOBOLDCPP_ENDPOINT.")
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("KoboldCpp endpoint must be a valid http(s) URL.")
+        if getattr(cfg, "koboldcpp_require_localhost", True):
+            host = (parsed.hostname or "").lower()
+            if host not in {"localhost", "127.0.0.1", "::1"}:
+                raise ValueError(
+                    "KoboldCpp endpoint must be localhost/loopback for PHI safety. "
+                    "Override koboldcpp_require_localhost=false only in trusted environments."
+                )
+        self.endpoint = endpoint.rstrip("/") + "/v1/chat/completions"
+        self.api_key = (cfg.koboldcpp_api_key or os.getenv("KOBOLDCPP_API_KEY") or "").strip()
+
+    def _post_chat(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        timeout = float(getattr(self.cfg, "timeout", 60.0) or 60.0)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"KoboldCpp request failed: {exc}") from exc
+        return json.loads(body)
+
+    def json_call(self, messages, *, temperature, logprobs, top_logprobs, response_format=None, **_):
+        self._respect_rpm_limit()
+        payload = {
+            "model": self.cfg.model_name,
+            "messages": list(messages),
+            "temperature": float(temperature),
+        }
+        if response_format:
+            payload["response_format"] = {"type": "json_object"}
+        started = time.perf_counter()
+        raw = self._post_chat(payload)
+        self._post_call()
+        latency = time.perf_counter() - started
+        choices = raw.get("choices") or []
+        if not choices:
+            raise RuntimeError("KoboldCpp returned no choices.")
+        msg = choices[0].get("message", {})
+        parsed = msg.get("parsed")
+        content = msg.get("content", "")
+        data_candidate, raw_content = self._parse_json_candidate(content=content, parsed=parsed)
+        self._validate_json_object_candidate(
+            response_format=response_format,
+            data_candidate=data_candidate,
+            raw_content=raw_content,
+        )
+        if not isinstance(data_candidate, MappingABC):
+            data_candidate = {"text": str(data_candidate)}
+        return JSONCallResult(data=data_candidate, content=raw_content, raw_response=raw, latency_s=latency)
+
+    def forced_choice(self, system, user, *, options, letters, top_logprobs=5):
+        prompt = (
+            f"{system.strip()}\n\n{user.strip()}\n\n"
+            f"Choose exactly one option: {', '.join(letters)}. Reply with one letter only."
+        )
+        result = self.json_call(
+            [{"role": "user", "content": prompt}],
+            temperature=0.0,
+            logprobs=False,
+            top_logprobs=top_logprobs,
+            response_format=None,
+        )
+        txt = (result.content or "").strip().upper()
+        pick = next((l for l in letters if l.upper() in txt[:2]), letters[0])
+        probs = {l: (1.0 if l == pick else 0.0) for l in letters}
+        logs = {l: (0.0 if l == pick else -1e9) for l in letters}
+        return ForcedChoiceResult(option_probs=probs, option_logprobs=logs, prediction=pick, entropy=0.0, latency_s=result.latency_s, raw_response=result.raw_response)
+
+
 def build_llm_backend(cfg: LLMConfig) -> LLMBackend:
     """Factory helper that instantiates the requested backend."""
 
@@ -906,4 +997,6 @@ def build_llm_backend(cfg: LLMConfig) -> LLMBackend:
         return AzureOpenAIBackend(cfg)
     if backend_name in {"exllama", "exllamav2", "local"}:
         return ExLlamaV2Backend(cfg)
+    if backend_name in {"koboldcpp", "kobold"}:
+        return KoboldCppBackend(cfg)
     raise ValueError(f"Unsupported LLM backend: {cfg.backend}")
