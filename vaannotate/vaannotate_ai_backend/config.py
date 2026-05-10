@@ -103,6 +103,15 @@ class LLMConfig:
     local_max_new_tokens: Optional[int] = field(
         default_factory=lambda: _env_int("LOCAL_LLM_MAX_NEW_TOKENS")
     )
+    # KoboldCpp OpenAI-compatible endpoint knobs
+    koboldcpp_endpoint: Optional[str] = field(
+        default_factory=lambda: os.getenv("KOBOLDCPP_ENDPOINT")
+    )
+    koboldcpp_api_key: Optional[str] = field(
+        default_factory=lambda: os.getenv("KOBOLDCPP_API_KEY")
+    )
+    koboldcpp_require_localhost: bool = True
+
     # Context ordering for snippets
     context_order: str = "relevance"  # relevance | chronological
 

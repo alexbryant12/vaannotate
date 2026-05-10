@@ -7033,6 +7033,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.random_backend_combo = QtWidgets.QComboBox()
         self.random_backend_combo.addItem("Azure OpenAI", "azure")
         self.random_backend_combo.addItem("Local ExLlamaV2", "exllamav2")
+        self.random_backend_combo.addItem("KoboldCpp (local endpoint)", "koboldcpp")
         self.random_backend_combo.currentIndexChanged.connect(self._update_random_backend_fields)
         random_llm_layout.addRow("Backend", self.random_backend_combo)
 
@@ -7168,6 +7169,7 @@ class RoundBuilderDialog(QtWidgets.QDialog):
         self.ai_backend_combo = QtWidgets.QComboBox()
         self.ai_backend_combo.addItem("Azure OpenAI", "azure")
         self.ai_backend_combo.addItem("Local ExLlamaV2", "exllamav2")
+        self.ai_backend_combo.addItem("KoboldCpp (local endpoint)", "koboldcpp")
         self.ai_backend_combo.currentIndexChanged.connect(self._update_ai_backend_fields)
         ai_config_layout.addRow("LLM backend", self.ai_backend_combo)
         self.ai_azure_key_edit = QtWidgets.QLineEdit()
@@ -8354,6 +8356,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             else:
                 env["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
             env["LLM_BACKEND"] = "azure"
+        elif backend_choice == "koboldcpp":
+            endpoint = self.ai_azure_endpoint_edit.text().strip() if hasattr(self, "ai_azure_endpoint_edit") else ""
+            api_key = self.ai_azure_key_edit.text().strip() if hasattr(self, "ai_azure_key_edit") else ""
+            if not endpoint:
+                missing.append("KoboldCpp endpoint URL")
+            else:
+                env["KOBOLDCPP_ENDPOINT"] = endpoint
+            if api_key:
+                env["KOBOLDCPP_API_KEY"] = api_key
+            env["LLM_BACKEND"] = "koboldcpp"
         else:
             model_path = ""
             if hasattr(self, "ai_local_model_path_edit"):
@@ -8464,6 +8476,16 @@ class RoundBuilderDialog(QtWidgets.QDialog):
             else:
                 env["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
             env["LLM_BACKEND"] = "azure"
+        elif backend_choice == "koboldcpp":
+            endpoint = self.random_azure_endpoint_edit.text().strip() if hasattr(self, "random_azure_endpoint_edit") else ""
+            api_key = self.random_azure_key_edit.text().strip() if hasattr(self, "random_azure_key_edit") else ""
+            if not endpoint:
+                missing.append("KoboldCpp endpoint URL")
+            else:
+                env["KOBOLDCPP_ENDPOINT"] = endpoint
+            if api_key:
+                env["KOBOLDCPP_API_KEY"] = api_key
+            env["LLM_BACKEND"] = "koboldcpp"
         else:
             model_path = (
                 self.random_local_model_path_edit.text().strip()

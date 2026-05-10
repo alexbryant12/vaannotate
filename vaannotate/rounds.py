@@ -835,6 +835,14 @@ class RoundBuilder:
                     local_max_new_value = None
                 if local_max_new_value and local_max_new_value > 0:
                     env_overrides["LOCAL_LLM_MAX_NEW_TOKENS"] = str(local_max_new_value)
+        elif backend_choice in {"koboldcpp", "kobold"}:
+            backend_env_value = "koboldcpp"
+            endpoint = str(ai_backend_config.get("koboldcpp_endpoint") or ai_backend_config.get("azure_endpoint") or "").strip()
+            if endpoint:
+                env_overrides["KOBOLDCPP_ENDPOINT"] = endpoint
+            api_key = str(ai_backend_config.get("koboldcpp_api_key") or ai_backend_config.get("azure_api_key") or "").strip()
+            if api_key:
+                env_overrides["KOBOLDCPP_API_KEY"] = api_key
         if backend_env_value:
             env_overrides["LLM_BACKEND"] = backend_env_value
         embed_path = self._resolve_optional_path(ai_backend_config.get("embedding_model_dir"), config_base)
